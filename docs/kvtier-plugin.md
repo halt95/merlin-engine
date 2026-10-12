@@ -356,9 +356,12 @@ Stated plainly, because a reviewer must not misread this as a token-gated surfac
   read `VLLM_E2_TIER_DEV_TOKEN` for access control at all; a value set there is ignored and the boot logs one
   `WARNING` saying so. Since 0.2.72 the **peer-address check is gone**, including `VLLM_E2_TIER_DEV_ALLOW`, whose
   name is now recognised purely so a boot can report that setting it does nothing. It was removed rather than
-  tightened because it could not fail the way a gate must: the proxy that drives this tier runs on the same host,
-  so it *is* the loopback peer, and the check passed the traffic it existed to stop while telling the operator the
-  surface was gated. Headers were never consulted and still are not.
+  tightened because it could not fail the way a gate must. The sanctioned reader of these routes reaches them by
+  running `curl 127.0.0.1:8000` **on the box itself** (the proxy drives it over SSH), so the traffic that must get
+  through presents as the loopback peer - the address it checks is the one it has to admit, and every other local
+  process on the box (a sidecar, any unit running there) is admitted by the same rule. Meanwhile an address that is
+  *not* local - the only kind an access control would actually filter - could only arrive by being put on the
+  allowlist, which is the operator opening the port rather than a gate holding it shut. Headers were never consulted and still are not.
 - **The one gate is an opt-in, not an access control.** `VLLM_E2_TIER_DEV` off ⇒ every route answers `503` and the
   surface does not exist. On ⇒ **every route answers every client that can reach the port, authenticated by
   nothing**, over the LAN or whatever that port is routed to. Two boot `WARNING`s say so and `/status` publishes it
