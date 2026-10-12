@@ -141,6 +141,7 @@ Full patch notes, with every measurement: [CHANGELOG.md](CHANGELOG.md).
   [2026-09-05](benchmarks/2026-09-05/BENCH-CARD.md)).
 - [docs/topology-selector.md](docs/topology-selector.md): `AUTO_TOPO=1` for NVLink pairs and hosts with more than
   four GPUs.
+- [docs/kvtier-plugin.md](docs/kvtier-plugin.md): the optional `kvtier-dev-plugin` host-RAM and NVMe KV tier.
 - [docs/history.md](docs/history.md): earlier releases in full (v2.2.0, v2.0.1, v2, the v1 TP4 lane).
 
 ## Known limitations
