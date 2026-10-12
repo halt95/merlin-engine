@@ -112,9 +112,12 @@ and two additions to the `vllm serve` line:
   `cpu_bytes_to_use` and `kv_role` only when a size was given; with `--kv-offloading-size` absent your JSON survives
   verbatim with **no** `cpu_bytes_to_use` and the connector boots at `DEFAULT_CPU_CAPACITY_BYTES`
   (same file, `:76`), a silently wrong-sized tier rather than no tier.
-- **`kv_load_failure_policy: "recompute"` is what makes a failed read cheap.** The engine default is `"fail"`
-  (`vllm/config/kv_transfer.py:103`), which turns an NVMe miss between the scheduler's lookup and the worker's read
-  into a failed request instead of a slower-but-correct recompute.
+- **A failed read costs tokens, not the request** (plugin 0.2.72). The ENGINE default of
+  `kv_load_failure_policy` is `"fail"` (`vllm/config/kv_transfer.py:103`), which turns an NVMe miss between the
+  scheduler's lookup and the worker's read into a failed request instead of a slower-but-correct recompute. Since
+  0.2.72 the plugin sets `"recompute"` itself **when your JSON omits the field**, and it never overrides an explicit
+  value - including an explicit `"fail"`; the boot line's `LOAD_POLICY[what:who]` token reports the value in force
+  and who chose it. Passing it explicitly, as the command above does, stays correct and is the clearest form.
 - **`KVTIER_DISK_BOOT_ENABLE` is a disable switch, not an enable switch** (`config.py:753`): unset or `1` arms the
   spill tier at connector creation and raises the boot's serve posture with no POST; `0` restores the manual posture.
   It reads nothing persisted from an earlier boot, and `VLLM_E2_TIER_DEV_BOOT_INERT` (which arms nothing at all)
@@ -349,20 +352,35 @@ restart**.
 
 Stated plainly, because a reviewer must not misread this as a token-gated surface.
 
-- **There is no credential.** Since 0.2.68 the plugin does not read `VLLM_E2_TIER_DEV_TOKEN` for access control at
-  all; a value set there is ignored and the boot logs one `WARNING` saying so. What gates the surface is the **peer
-  address of the TCP connection**: loopback, or an entry in `VLLM_E2_TIER_DEV_ALLOW` (individual addresses or CIDRs;
-  **unset or empty means loopback only**). Headers are never consulted, so `X-Forwarded-For: 127.0.0.1` grants
-  nothing, and for that reason do **not** put uvicorn's proxy-headers middleware in front of it, which would rewrite
-  the peer and hand the forgeability back. A malformed allowlist entry is logged and skipped, never fatal and never an
-  opening; `localhost` is never resolved, so name addresses.
-- **`/plugins/*` is outside vLLM's `--api-key`**, which covers `/v1`, `/v2`, `/inference` and `/cohere` only. A key in
-  front of `/v1` protects nothing here. An address on the allowlist reaches this surface unauthenticated and can arm
-  guard mode, arm the spill tier, reload the policy module and read parked KV bytes. Keep the list at `/32`s, never
-  `0.0.0.0/0`, and unset it when you are done. The transport is plaintext HTTP with no TLS.
-- The engine also binds `0.0.0.0` when you set `HOST=0.0.0.0` for serving (README, Quick start), so the tier's routes
-  become reachable from the network the moment the allowlist names a non-loopback address. The default posture —
-  unset the variable and read over loopback or SSH — is the one we run.
+- **There is no credential, and as of 0.2.72 there is no address gate either.** Since 0.2.68 the plugin does not
+  read `VLLM_E2_TIER_DEV_TOKEN` for access control at all; a value set there is ignored and the boot logs one
+  `WARNING` saying so. Since 0.2.72 the **peer-address check is gone**, including `VLLM_E2_TIER_DEV_ALLOW`, whose
+  name is now recognised purely so a boot can report that setting it does nothing. It was removed rather than
+  tightened because it could not fail the way a gate must: the proxy that drives this tier runs on the same host,
+  so it *is* the loopback peer, and the check passed the traffic it existed to stop while telling the operator the
+  surface was gated. Headers were never consulted and still are not.
+- **The one gate is an opt-in, not an access control.** `VLLM_E2_TIER_DEV` off ⇒ every route answers `503` and the
+  surface does not exist. On ⇒ **every route answers every client that can reach the port, authenticated by
+  nothing**, over the LAN or whatever that port is routed to. Two boot `WARNING`s say so and `/status` publishes it
+  as `exposure`, `peer_gate`, `allow_env_gates: false` and `mutating_ops_refused_on_get`, so the posture is readable
+  rather than remembered.
+- **`/plugins/*` is outside vLLM's `--api-key`**, which covers `/v1`, `/v2`, `/inference` and `/cohere` only. A key
+  in front of `/v1` protects nothing here. Everything is under `/plugins/kvtier`, never `/v1/*`, so an operator
+  putting an authenticating proxy in front of the engine can deny this prefix explicitly and see that they did.
+- **Network protection is the operator's job, not the plugin's.** Enable the surface only while you are working on
+  it, and disable it when you are done; if the engine binds `0.0.0.0` (README, Quick start), an enabled dev surface
+  is reachable from the network with no further check. The transport is plaintext HTTP with no TLS. Do not put
+  uvicorn's proxy-headers middleware in front of it - not because a gate would read the rewritten peer, but
+  because a surface with no credential should not be given a middleware that makes its own address ambiguous.
+- **What the plugin does enforce is method, not identity.** Mutating verbs (`arm`, `disarm`, `offers`,
+  `read-threads`, spill and reload verbs) are refused `405` on `GET`, from one list of truth
+  (`route_policy.py`) rather than one answer per route - before 0.2.72 that question had one answer per route, and
+  five of them answered it nowhere, so `GET /guard?op=arm` really did arm guard mode. `/disk` is the one route with
+  **two** layers: the route's own refusal plus an engine-side `safe_method` check in `disk_store` that re-reads the
+  same list, so a mutating op admitted by one half is caught by the other. Everywhere else there is one layer, and a
+  property test asserts both halves read the same source so a verb cannot be added to a dispatch table without being
+  named as mutating. **This is a defence against a mis-clicked `curl`, a browser's image request, and a route
+  author's omission - it is not authentication and must never be described as one.**
 
 ## Open questions we have not answered
 
