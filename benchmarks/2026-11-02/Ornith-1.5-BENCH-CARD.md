@@ -57,4 +57,14 @@ off, temperature 0. Total tok/s = tokens decoded while all eight stream / that o
 |---|---|---|---|---|
 | Four cards | 486 | 468 | +3.9 % | 8.09 |
 
-Sessions held at once, images, GSM8K-200 and the needle panel were not re-run; the [3.0.0 card](../2026-10-20/Ornith-1.5-BENCH-CARD.md) has them. The KV pool and the sessions it holds are unchanged.
+**Thinking on, reasoning effort medium** (the server default). The same eight conversations and follow-ups, with thinking on and each request setting medium. A 512-token follow-up may end inside the reasoning, and reasoning tokens count, so these totals measure decoded tokens, not finished answers.
+
+| layout | 3.0.1 total tok/s, thinking on | overlap window s |
+|---|---|---|
+| Four cards | 528 | 7.36 |
+
+## 5. GSM8K-200 at reasoning effort medium
+
+The 3.0.0 set (the same 200 problems, 5-shot, same scorer, temperature 0), with thinking on at medium, on four cards: **196/200** correct, none cut at the 8,192-token cap (mean 261 tokens, longest 3,634). The thinking-off score on the 3.0.0 card is 190/200.
+
+Sessions held at once, images, the thinking-off GSM8K-200 and the needle panel were not re-run; the [3.0.0 card](../2026-10-20/Ornith-1.5-BENCH-CARD.md) has them. The KV pool and the sessions it holds are unchanged.
