@@ -13,9 +13,9 @@ with vision, tool calls and MTP speculative decoding, behind one OpenAI-compatib
 [![Context](https://img.shields.io/badge/context-262K_per_request-ffb000)](../qwen38-27b/docs/reference.md#the-kv-budget)
 [![ThinkingCap](https://img.shields.io/badge/%F0%9F%A4%97_checkpoint-ThinkingCap--Qwen3.8--27B--W4A16--Merlin-ffd21e)](https://huggingface.co/halt95/ThinkingCap-Qwen3.8-27B-W4A16-Merlin)
 
-> **Recipe 3.0.0 / Merlin 3.0.0:** **vLLM 0.32.0**. ThinkingCap is a profile of the
+> **Recipe 3.0.0 / Merlin 3.0.1:** **vLLM 0.32.0**. ThinkingCap is a profile of the
 > [Qwen3.8-27B recipe](../qwen38-27b/README.md). Its wrappers forward to the TP2/TP4 base launchers.
-> Both use **FGPC ON** (`--enable-mamba-shared-prefix-checkpoint`), pools **826,689 / 2,012,105 tokens** (TP4 = RecoverSSM on; ThinkingCap TP4 gate PASS, 32/32 checks),
+> Both use **FGPC ON** (`--enable-mamba-shared-prefix-checkpoint`), pools **826,689 / 2,012,105 tokens** (TP4 = RecoverSSM on; ThinkingCap TP4 check PASS, 32/32 checks),
 > and the **8 MP (8,388,608 pixel)** release cap. The integrated launchers default to this cap.
 > The measured FlashInfer **0.7.0.post1** tile patch is packaged in the shared installer; the dependency lock is complete with 222 exact pins and SHA-256 hashes.
 
@@ -23,9 +23,9 @@ The [2026-10-15 base-checkpoint card](../qwen38-27b/benchmarks/2026-10-15/BENCH-
 4K / 32K / 131K of **19.99 / 21.41 / 25.27 ms**, TP4 **15.83 / 16.62 / 18.37 ms**,
 and GSM8K-200 tile on mean **192.0/200** against v1.3.0's **196/200** (−2.0 pp,
 95 % Newcombe CI **[−5.89, +1.61] pp**, within CI and not significantly worse).
-27B TP2 serves images up to 8 MP. With the vision-peak option on (`VLLM_MERLIN_VISION_PEAK=1`, the TP2 launcher default), the 50-item TP2 stress sweep's worst minimum free was 806 MiB per card (2026-10-15), above the 524 MiB floor. A separate knob OFF/ON identity check matched tokens and logprobs on 6/6 prompts. This was measured on the Qwen3.8-27B checkpoint (TP2); On the ThinkingCap checkpoint itself (TP2, 2026-10-16 release mini gate), four ~8 MP images after an 8K prefill left a minimum of 806 MiB free per card, sampled every 100 ms, above the 524 MiB floor. Flash-Next (902 MiB) meets the target. 27B TP4 left 690 MiB free on the retired RecoverSSM-off pin; at the shipped chunk 4096 with RecoverSSM on, the 2026-10-20 bench card measured 862 MiB lowest free (one 8 MP image, two at once, and four in one prompt; 2 cards: 886 MiB), above the 524 MiB floor.
-These are base-checkpoint results. ThinkingCap's own decode, prefill, agents and GSM8K were measured on the release wheel on
-2026-10-20 (two-card agents and GSM8K: a 2026-10-17 pre-release build; below); its **token savings have not been remeasured on 0.32**, and the table and the 2026-10-12 card keep historical **vLLM 0.30** measurements.
+27B TP2 serves images up to 8 MP. With the vision-peak option on (`VLLM_MERLIN_VISION_PEAK=1`, the TP2 launcher default), the 50-item TP2 stress sweep's worst minimum free was 806 MiB per card (2026-10-15), above the 524 MiB floor. A separate knob OFF/ON identity check matched tokens and logprobs on 6/6 prompts. This was measured on the Qwen3.8-27B checkpoint (TP2); On the ThinkingCap checkpoint itself (TP2, 2026-10-16 release mini check), four ~8 MP images after an 8K prefill left a minimum of 806 MiB free per card, sampled every 100 ms, above the 524 MiB floor. Flash-Next (902 MiB) meets the target. 27B TP4 left 690 MiB free on the retired RecoverSSM-off pin; at the shipped chunk 4096 with RecoverSSM on, the 2026-10-20 bench card measured 862 MiB lowest free (one 8 MP image, two at once, and four in one prompt; 2 cards: 886 MiB), above the 524 MiB floor.
+These are base-checkpoint results. ThinkingCap's own decode, prefill, agents and GSM8K at medium were measured for 3.0.1 on
+2026-11-01 to 2026-11-02 (below); its **token savings have not been remeasured on 0.32**, and the table and the 2026-10-12 card keep historical **vLLM 0.30** measurements.
 
 This directory holds the ThinkingCap launchers, the checkpoint checksum list, the licences and the bench card. The checkpoint is
 [halt95/ThinkingCap-Qwen3.8-27B-W4A16-Merlin](https://huggingface.co/halt95/ThinkingCap-Qwen3.8-27B-W4A16-Merlin): BottleCap AI's
@@ -40,24 +40,24 @@ it is **not** published, reviewed or endorsed by BottleCap AI or Qwen.
 | Serve scripts (dual / quad card) | [`../qwen38-27b/serve.sh`](../qwen38-27b/serve.sh) / [`serve-tp4.sh`](../qwen38-27b/serve-tp4.sh) | [`serve.sh`](serve.sh) / [`serve-tp4.sh`](serve-tp4.sh) |
 | Checkpoint list | [`checkpoint.sha256`](../qwen38-27b/checkpoint.sha256) | [`checkpoint.sha256`](checkpoint.sha256) |
 | Weights licence | Apache-2.0 | PolyForm Small Business 1.0.0 plus BottleCap AI's personal-use permission ([License](#license)) |
-| Historical 0.30 numbers | single-stream thinking decode at 32K: 198 tok/s dual card, 249 quad card | x0.860 of the base's median thinking tokens at medium effort at the same GSM8K accuracy (97.27 %, 1,319 items); 172.8 tok/s at 32K on dual card (2026-10-08 gate) and 223.4 on quad card (2026-10-12) |
+| Historical 0.30 numbers | single-stream thinking decode at 32K: 198 tok/s dual card, 249 quad card | x0.860 of the base's median thinking tokens at medium effort at the same GSM8K accuracy (97.27 %, 1,319 items); 172.8 tok/s at 32K on dual card (2026-10-08 check) and 223.4 on quad card (2026-10-12) |
 
 Both checkpoints run on the same engine, pins, port (8100) and served name (`qwen38-27b`). The measurements, each dated per row, are in the
 [ThinkingCap bench card](benchmarks/2026-10-12/ThinkingCap-BENCH-CARD.md); the profile's detail (what differs, token cost by effort,
 capacity rows) is in [ThinkingCap checkpoint profile](../qwen38-27b/docs/reference.md#thinkingcap-checkpoint-profile).
 
-## Merlin 3.0.0 bench card (2026-10-20)
+## Merlin 3.0.1 bench card (2026-11-02)
 
-Maintainer measurements on 4× RTX 3090 (220 W, PCIe Gen4 with P2P) with the Merlin 3.0.0 release wheel, one fresh `merlin serve` boot per configuration, 2026-10-20, except the two-card agents and GSM8K (a 2026-10-17 pre-release build); method and every cell in the [bench card](benchmarks/2026-10-20/BENCH-CARD.md). Decode is one stream with thinking on (tok/s after the first streamed token); prefill is one cold request.
+Maintainer measurements on 4× RTX 3090 (220 W, PCIe Gen4) with P2P (the aikitoria patched driver) and the Zagitta [gpu-unlock](https://github.com/Zagitta/gpu-unlock) kernel module, one fresh `merlin serve` boot per configuration, 2026-11-01 to 2026-11-02; method and every cell in the [bench card](benchmarks/2026-11-02/BENCH-CARD.md). Decode is one stream with thinking on at reasoning effort medium, the server default (tok/s after the first streamed token); prefill is one cold request. With thinking on, a 512-token agent follow-up may end inside the reasoning, and reasoning tokens count. GSM8K at medium ran on four cards. Thinking-off GSM8K is from the 3.0.0 runs (two-card: a 2026-10-17 pre-release build). The agent overlap windows on four cards are under 5 s: read those totals loosely. Rows marked (3.0.0 run) were not re-run for 3.0.1; they and the rest of the 3.0.0 figures are on the [3.0.0 bench card](benchmarks/2026-10-20/BENCH-CARD.md).
 
 | Measurement | 2× RTX 3090 (TP2) | 4× RTX 3090 (TP4) |
 |---|---|---|
-| Decode, 4K / 131K / 262K prompt | 198 / 182 / 165 tok/s | 253 / 255 / 248 tok/s |
-| Cold prefill, 10K / 100K prompt | 1,829 / 1,297 tok/s | 3,013 / 2,295 tok/s |
-| Agents at once (8 × 16K conversations), total | 502 tok/s | 733 tok/s |
-| GSM8K-200 (5-shot, thinking off) | 193/200 | 195/200 |
-| Sessions held at once | 3 × 262K and 6 × 131K, every session resident (re-sent prompts ≥ 99.98 % cached), 0 preemptions | 7 × 262K and 14 × 131K, every session resident (re-sent prompts ≥ 99.98 % cached), 0 preemptions |
-| 8 MP image | one, two at once and four in one prompt (32,842 tokens) correct; lowest free memory 886 MiB on any card | one, two at once and four in one prompt (32,842 tokens) correct; lowest free memory 862 MiB on any card |
+| Decode, 4K / 131K / 262K prompt | 203 / 162 / 160 tok/s | 244 / 230 / 238 tok/s |
+| Cold prefill, 10K / 100K / 262K prompt | 2,319 / 1,679 / 1,114 tok/s | 3,869 / 2,990 / 2,099 tok/s |
+| Agents at once (8 × 16K conversations), total, thinking on / off | 697 / 633 tok/s | 952 / 832 tok/s |
+| GSM8K-200 (5-shot), correct of 200, thinking on at medium / thinking off | – / 193 | 198 / 195 |
+| Sessions held at once (3.0.0 run) | 3 × 262K and 6 × 131K, every session resident (re-sent prompts ≥ 99.98 % cached), 0 preemptions | 7 × 262K and 14 × 131K, every session resident (re-sent prompts ≥ 99.98 % cached), 0 preemptions |
+| 8 MP image (3.0.0 run) | one, two at once and four in one prompt (32,842 tokens) correct; lowest free memory 886 MiB on any card | one, two at once and four in one prompt (32,842 tokens) correct; lowest free memory 862 MiB on any card |
 
 ## Quick start
 

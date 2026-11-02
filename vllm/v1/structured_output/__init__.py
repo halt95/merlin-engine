@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by the Merlin project; see NOTICE.
 import multiprocessing
 from collections.abc import Iterable, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -327,6 +328,49 @@ class StructuredOutputManager:
         validated = grammar.validate_tokens(spec_tokens[grammar_start:])
         return prefix + validated
 
+    # The scheduler trims drafts with
+    # this instead of validate_tokens. Dropping the first grammar-invalid draft
+    # turned its position into a bonus sample from the target, which biases the
+    # output under a probabilistic draft (MTP). Keeping it lets the rejection
+    # sampler reject it there (its masked target probability is 0) and resample
+    # from the residual, which is distribution-exact. The grammar is not
+    # advanced; grammar_bitmask() fills the row of the kept token from the state
+    # after the valid prefix and rolls back what it accepted.
+    def trim_spec_tokens(self, request: "Request", spec_tokens: list[int]) -> list[int]:
+        """Return the grammar-valid prefix of `spec_tokens` plus the first
+        grammar-invalid token, if any (-1 padding stripped)."""
+        if not request.use_structured_output:
+            return spec_tokens
+        spec_config = getattr(self.vllm_config, "speculative_config", None)
+        if getattr(spec_config, "rejection_sample_method", None) == "synthetic":
+            # Synthetic acceptance ignores the token, so a kept invalid draft
+            # could be accepted; drop it as before.
+            return self.validate_tokens(request, spec_tokens)
+
+        spec_tokens = strip_speculative_padding(spec_tokens)
+        grammar_start, constraint_start = self._get_constraint_bounds(
+            request, spec_tokens
+        )
+        if grammar_start >= len(spec_tokens):
+            return spec_tokens
+
+        structured_req = request.structured_output_request
+        if TYPE_CHECKING:
+            assert structured_req is not None
+        grammar = structured_req.grammar
+        if TYPE_CHECKING:
+            assert isinstance(grammar, StructuredOutputGrammar)
+        if grammar.is_terminated():
+            return spec_tokens[:grammar_start]
+        first_invalid = grammar_start + len(
+            grammar.validate_tokens(spec_tokens[grammar_start:])
+        )
+        if first_invalid < constraint_start:
+            # An implicit reasoning end: this position's row is unconstrained,
+            # so a kept invalid token would not be rejected. Cut it as before.
+            return spec_tokens[:first_invalid]
+        return spec_tokens[: first_invalid + 1]
+
     def grammar_bitmask(
         self,
         requests: dict[str, "Request"],
@@ -427,12 +471,8 @@ class StructuredOutputManager:
                             state_advancements += 1
                         else:
                             failed_index = cumulative_index
-                            logger.error(
-                                "Unexpected: grammar terminated or rejected draft "
-                                "token %s for request %s during bitmask fill.",
-                                token,
-                                req_id,
-                            )
+                            # An expected rejection: trim_spec_tokens keeps
+                            # the first invalid draft.
                     cumulative_index += 1
 
                 # Diffusion LLMs don't sample a bonus token after the

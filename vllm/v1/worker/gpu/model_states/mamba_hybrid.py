@@ -8,8 +8,12 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+from vllm import envs
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
+from vllm.merlin.flashinfer_smallq import (
+    scheduled_prefill_flags,
+)
 from vllm.model_executor.layers.mamba.mamba_utils import MambaStateCopyFuncsByType
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadataBuilder
@@ -45,6 +49,8 @@ class MambaHybridAttnMetadata(ModelSpecificAttnMetadata):
     num_accepted_tokens: torch.Tensor | None = None
     num_decode_draft_tokens_cpu: torch.Tensor | None = None
 
+    workload_prefill_flags: list[bool] | None = None
+
     def get_extra_common_attn_kwargs(
         self, kv_cache_group_id: int, num_reqs: int
     ) -> dict[str, Any]:
@@ -53,6 +59,8 @@ class MambaHybridAttnMetadata(ModelSpecificAttnMetadata):
     def get_extra_attn_kwargs(
         self, attn_metadata_builder: Any, num_reqs: int
     ) -> dict[str, Any]:
+        if getattr(attn_metadata_builder, "_workload_tile", False):
+            return {"workload_prefill_flags": self.workload_prefill_flags}
         if not isinstance(
             attn_metadata_builder,
             (
@@ -376,6 +384,10 @@ class MambaHybridModelState(DefaultModelState):
             num_accepted_tokens=num_accepted_tokens,
             num_decode_draft_tokens_cpu=num_decode_draft_tokens_cpu,
         )
+        if envs.MERLIN_FLASHINFER_WORKLOAD_TILE:
+            mamba_attn_metadata.workload_prefill_flags = scheduled_prefill_flags(
+                input_batch, num_reqs
+            )
         attn_metadata = build_attn_metadata(
             attn_groups=attn_groups,
             num_reqs=num_reqs,

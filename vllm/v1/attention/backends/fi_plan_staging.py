@@ -10,9 +10,9 @@ workspace (include/flashinfer/attention/scheduler.cuh, the MATERIALIZE tail of
 DecodePlan and PrefillPlanImpl), with no sync afterwards. A pinned source is read
 when the GPU reaches the copy, not when it is issued. If the host plans the same
 wrapper again before then, the queued copy carries the LATER plan and the earlier
-launch runs with it: wrong output, or a kernel that loops for minutes (#6533: 5/5
-mismatches on SM86 with FlashInfer 0.7.0.post1; vllm#61239: illegal address or GPU
-hang under async scheduling).
+launch runs with it: wrong output, or a kernel that loops for minutes
+(flashinfer#6533: 5/5 mismatches on SM86 with FlashInfer 0.7.0.post1;
+vllm#61239: illegal address or GPU hang under async scheduling).
 
 Who is exposed. A blocking ``seq_lens.cpu()`` before a plan drains the stream, so
 the previous copy has run. Builds that skip it can re-plan a wrapper while its copy

@@ -1,5 +1,8 @@
 # Swift1.5-Huihui bench card — 2026-10-12 (abliterated Swift 1.5 checkpoint; gate on v2.5.1, speed on v2.5.2)
 
+> **Historical switch.** `VLLM_E2_GUARD_IDLE` below belongs to the measured v2.x engines. It is no longer registered on
+> vLLM 0.32, where idle parking is built in; setting it does not restore polling. See the [current running notes](../../models/flash-next/docs/reference.md#running-notes).
+
 Checkpoint: [halt95/Swift1.5-Huihui-Qwen3.8-Flash-Next-W4A16-Merlin](https://huggingface.co/halt95/Swift1.5-Huihui-Qwen3.8-Flash-Next-W4A16-Merlin),
 served by `scripts/serve-huihui.sh`. The engine's own card for v2.5.2 is [`BENCH-CARD.md`](Flash-Next-BENCH-CARD.md).
 

@@ -3,10 +3,12 @@
 
 Every release's bench card, newest first. Cards up to 2026-10-12 come from the earlier per-model repositories
 (qwen38-flash-next-3090s, qwen38-27b-3090s, Swift1.5-qwen38-flash-next-3090s) and are unchanged apart from their file
-names, which now carry the checkpoint so cards from the same day sit side by side.
+names, which now carry the checkpoint so cards from the same day sit side by side, and a historical-switch note on
+two 2026-10-12 cards.
 
 | date | card | release |
 |---|---|---|
+| 2026-11-02 | [Merlin 3.0.1: all checkpoints](2026-11-02/README.md) | Merlin 3.0.1 (measured with gpu-unlock plus P2P) |
 | 2026-10-20 | [Merlin 3.0.0: all checkpoints](2026-10-20/README.md) | Merlin 3.0.0 (one engine for every checkpoint) |
 | 2026-10-12 | [Flash-Next v2.5.2](2026-10-12/Flash-Next-BENCH-CARD.md) | qwen38-flash-next-3090s v2.5.2 |
 | 2026-10-12 | [Swift1.5-Huihui](2026-10-12/Swift1.5-Huihui-BENCH-CARD.md) | qwen38-flash-next-3090s v2.5.3 |

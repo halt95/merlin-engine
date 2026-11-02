@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by the Merlin project; see NOTICE.
 
 import json
 from dataclasses import dataclass, field
@@ -196,14 +197,15 @@ class XgrammarGrammar(StructuredOutputGrammar):
         """
         if self._is_terminated:
             return True
-        for token in tokens:
+        # All or nothing: a rejected
+        # token rolls back what this call accepted. A rejected draft is
+        # expected (it is kept for the rejection sampler), so no error log.
+        for num_accepted, token in enumerate(tokens):
             if not self.matcher.accept_token(token):
-                logger.error(
-                    "Failed to advance FSM for request %s "
-                    "for tokens %s. Please file an issue.",
-                    request_id,
-                    token,
-                )
+                if num_accepted:
+                    self.matcher.rollback(num_accepted)
+                    self.num_processed_tokens -= num_accepted
+                    self._is_terminated = self.matcher.is_terminated()
                 return False
             self.num_processed_tokens += 1
             self._is_terminated = self.matcher.is_terminated()

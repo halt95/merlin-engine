@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright 2026 halt95 (Merlin modifications)
 """Merlin preflight: read the hardware, pick a launch profile, print the label.
 
 Standard library only, no GPU and no CUDA context. It reads ``nvidia-smi`` and ``/proc`` (or a described
@@ -8,7 +8,9 @@ inventory), compares them with the profile registry in ``tools/merlin/profiles/`
 
 * what it found (GPU arch and count, VRAM, BAR1, P2P, host RAM, driver, virtualisation),
 * which profile it picked (or why none fits) and that profile's status label:
-  ``tested on the reference host`` or ``untested / community-validated``,
+  ``tested on the reference host``, ``🟡 testing: ...`` (full-model runs passed on
+  cloud-hosted hardware; kernel parity qualification still to run) or
+  ``untested / community-validated``,
 * PASS / WARN / FAIL checks for the host prerequisites.
 
 It never starts a server, never writes outside ``--write-launchers`` and ``--emit``, and measures nothing.
@@ -41,6 +43,7 @@ from pathlib import Path
 from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import gpu_unlock as U  # noqa: E402
 import registry as R  # noqa: E402
 
 GIB = 2**30
@@ -52,13 +55,31 @@ SCHEMA = 1
 # Thresholds follow models/flash-next/docs/reference.md.
 RAM_WARN_GIB = 96.0  # qualified allocation
 RAM_FLOOR_GIB = 69.0  # measured resident floor at four workers: below it the load OOMs
+# Capped-host bisection (systemd scope memory.max, swap 0, tier off, fn-swift1.5-quad-3090, the reference host):
+# 64 GiB was OOM-killed at boot, 72 and 76 GiB booted and passed 262K identity + needle; the uncapped footprint was 68.4 GiB. The floor lies in (64, 72]; 72 is the
+# tested minimum. launch.py carries both (FN_RAM_FLOOR_KB, FN_RAM_TESTED_MIN_GIB) and refuses below the floor.
 RAM_PER_EXTRA_WORKER_GIB = (
     2.0  # estimate: ~8 GiB across four workers and the engine
 )
+# The PLE-table term inside RAM_FLOOR_GIB: the FP8 table every Flash-Next row pins today (~47.7 GiB). This is the one
+# place the floor's table size lives. A checkpoint carrying the INT6 g32 table (--ple int6: config.json
+# text_config.ple_embedding_dtype) swaps it for FN_PLE_OPT_IN_GIB's; the rest of the floor is unchanged.
+FN_PLE_TABLE_GIB = 47.68
+FN_PLE_OPT_IN_GIB = {"int6_g32": 38.74}  # launch.PLE_OPT_IN_TABLES (the launcher's floor swaps the same term)
+FN_PLE_TEST_GIB = {"bfloat16": 95.37, "int8_row": 48.28}  # launch.PLE_TEST_TABLES (boot only on request)
+# The host-RAM KV tier: GiB of host RAM per rank (TP x PP), 0 = off. Every RAM gate adds it on top
+# of the floor, per server; merlin serve --kv-ram-cache sets it per rank and launch.py passes it to the engine.
+KV_HOST_TIER_ENV = "MERLIN_KV_HOST_TIER_GIB"
 SHM_MIN_MIB = 1024
 BAR1_MIN_MIB = 1024  # a card below 1 GB BAR1 hangs NCCL warmup on any P2P pair that includes it
 BUSY_MIB = 1024  # the KV pool is pinned in bytes and leaves ~1 GB per card
 KV_MIN_BYTES = 1 << 30  # the 27B / Super VL launcher refuses KV_BYTES under 1 GiB (launch.py); preflight refuses the same pin
+
+
+def min_restore_unit_gib_per_rank(ranks: int, model: str | None = None, profile: dict | None = None) -> int:
+    """Whole GiB per rank needed for one 262K restore unit: from the profile's host row size when it is recorded
+    (registry.restore_unit_min_gib_per_rank), else 4 GiB per server."""
+    return R.restore_unit_min_gib_per_rank(model, profile, ranks)
 DRIVER_MIN_MAJOR = 580  # CUDA 13.0 driver: the 580 series or later
 
 
@@ -79,6 +100,7 @@ class Gpu:
     power_limit_w: float | None = None
     bus_id: str | None = None
     numa_node: int | None = None  # the NUMA node the card hangs off (nvidia-smi topo -m, else /sys), None when unknown
+    pcie_link: dict[str, int | None] | None = None  # sysfs current/max gen and width; information only
 
 
 @dataclass
@@ -88,6 +110,9 @@ class Host:
     virt: str | None = None  # "bare", "container", "vm", or None when unknown
     driver: str | None = None
     system: str = "linux"
+    iommu_cmdline: list[str] | None = None  # requested settings, not proof of the effective mode
+    iommu_groups: int | None = None  # visible groups; zero does not prove IOMMU is disabled
+    iommu_group_types: list[str] | None = None  # kernel-reported domain types (e.g. identity, DMA)
 
 
 @dataclass
@@ -99,6 +124,8 @@ class Inventory:
     notes: list[str] = field(default_factory=list)
     p2p_ok: list[list[int]] | None = None  # the GPU index pairs the driver reports P2P OK (None = not read)
     links: list[list[Any]] | None = None  # [a, b, kind] per GPU pair from nvidia-smi topo -m (PIX / PXB / PHB / NODE / SYS / NV#)
+    kv_tier_gib: int = 0  # the serve setting the RAM gates count: MERLIN_KV_HOST_TIER_GIB per rank (kv_host_tier_gib), 0 = off
+    ple_table_gib: float = FN_PLE_TABLE_GIB  # the checkpoint's PLE table in host RAM (ple_table_gib_of): FP8, or INT6 g32
 
     def link(self, a: int, b: int) -> str | None:
         """The PCIe / NVLink relation between two cards as ``nvidia-smi topo -m`` prints it; None when not read."""
@@ -141,7 +168,7 @@ class Report:
     inventory: Inventory
     profile_id: str | None = None
     profile_title: str | None = None
-    status: str | None = None  # "tested" | "untested"
+    status: str | None = None  # "tested" | "testing" | "untested" (| "parked")
     label: str | None = None
     p2p_mode: str | None = None  # "on" | "off" | None
     effective_p2p: str = "unknown"
@@ -155,6 +182,7 @@ class Report:
     findings: list[Finding] = field(default_factory=list)
     no_profile_reason: str | None = None
     adjusted: dict[str, Any] | None = None  # capacity re-scaled to the reported VRAM (an estimate)
+    gpu_unlock: dict[str, Any] | None = None  # live probes only: gpu_unlock.probe (informational, never gates)
     exit_code: int = 0
 
     def add(self, level: str, code: str, text: str) -> None:
@@ -398,7 +426,11 @@ def default_runner(cmd: list[str]) -> str | None:
         )
     except (OSError, subprocess.SubprocessError):
         return None
-    return cp.stdout if cp.returncode == 0 or cp.stdout.strip() else None
+    if cp.returncode == 0:
+        return cp.stdout
+    # A failed nvidia-smi may still have printed part of the answer; a partial GPU probe would build a silently short
+    # inventory. Other tools (systemd-detect-virt prints "none" and exits 1) keep their stdout.
+    return cp.stdout if cp.stdout.strip() and cmd[:1] != ["nvidia-smi"] else None
 
 
 def _read(path: str) -> str | None:
@@ -407,6 +439,76 @@ def _read(path: str) -> str | None:
             return f.read()
     except OSError:
         return None
+
+
+
+def _listdir(path: str) -> list[str] | None:
+    try:
+        return os.listdir(path)
+    except OSError:
+        return None
+
+
+def pcie_generation(speed: str | None) -> int | None:
+    """Decode sysfs GT/s values; unsupported or unknown rates stay unknown."""
+    match = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s+GT/s(?:\s+PCIe)?\s*", speed or "")
+    if not match:
+        return None
+    return {2.5: 1, 5.0: 2, 8.0: 3, 16.0: 4, 32.0: 5, 64.0: 6}.get(float(match[1]))
+
+
+def probe_interconnect(
+    inv: Inventory,
+    read: Callable[[str], str | None] = _read,
+    listdir: Callable[[str], list[str] | None] = _listdir,
+) -> None:
+    """Read diagnostic snapshots only; leave the legacy PCIe warning inputs unchanged."""
+    for gpu in inv.gpus:
+        link: dict[str, int | None] = {}
+        base = f"/sys/bus/pci/devices/{sysfs_bus_id(gpu.bus_id)}/" if gpu.bus_id else None
+        for state in ("current", "max"):
+            speed = read(base + state + "_link_speed") if base else None
+            width = (read(base + state + "_link_width") or "").strip() if base else ""
+            link[state + "_gen"] = pcie_generation(speed)
+            link[state + "_width"] = int(width) if width.isdecimal() and int(width) > 0 else None
+        gpu.pcie_link = link
+
+    host = inv.host
+    cmdline = read("/proc/cmdline")
+    host.iommu_cmdline = None if cmdline is None else [
+        token for token in cmdline.split()
+        if token.split("=", 1)[0] in ("iommu", "intel_iommu", "amd_iommu", "iommu.passthrough")
+    ]
+    root = "/sys/kernel/iommu_groups"
+    entries = listdir(root)
+    if entries is not None:
+        groups = [name for name in entries if name.isdecimal()]
+        host.iommu_groups = len(groups)
+        types = [(read(f"{root}/{name}/type") or "").strip() for name in groups]
+        host.iommu_group_types = sorted(set(t for t in types if t))
+        if any(not t for t in types):
+            host.iommu_group_types.append("unknown")
+
+
+def interconnect_text(inv: Inventory) -> list[str]:
+    """Per-GPU link snapshots and requested/visible IOMMU state, with explicit unknowns."""
+    out = []
+    for gpu in inv.gpus:
+        # Older inventories only captured maximum generation and current width.
+        link = gpu.pcie_link if gpu.pcie_link is not None else {
+            "current_width": gpu.pcie_width, "max_gen": gpu.pcie_gen,
+        }
+        current = f"Gen{link.get('current_gen') or '?'} x{link.get('current_width') or '?'}"
+        maximum = f"Gen{link.get('max_gen') or '?'} x{link.get('max_width') or '?'}"
+        out.append(f"  GPU{gpu.index} ({gpu.bus_id or 'bus unknown'}): PCIe current {current}; max {maximum} (? = unknown)")
+    host = inv.host
+    cmdline = ("unknown" if host.iommu_cmdline is None
+               else " ".join(host.iommu_cmdline) or "no explicit setting (kernel default unknown)")
+    groups = "unknown" if host.iommu_groups is None else str(host.iommu_groups)
+    types = ", ".join(host.iommu_group_types or []) or "unknown"
+    out.append(f"  IOMMU: cmdline {cmdline}; visible groups {groups}; group types {types}")
+    out.append("  PCIe current links may downshift at idle; IOMMU cmdline settings describe requested mode.")
+    return out
 
 
 def sysfs_bus_id(bus_id: str) -> str:
@@ -425,18 +527,47 @@ def _cgroup_bytes(read: Callable[[str], str | None], path: str) -> int | None:
     return int(v)
 
 
+# The v2 and v1 memory-controller file sets: (mount, limit, usage, memory.stat key of the reclaimable page cache).
+CGROUP_MEMORY_SETS = (
+    ("/sys/fs/cgroup", "memory.max", "memory.current", "inactive_file"),
+    ("/sys/fs/cgroup/memory", "memory.limit_in_bytes", "memory.usage_in_bytes", "total_inactive_file"),
+)
+
+
+def cgroup_memory_dirs(read: Callable[[str], str | None], mount: str, limit_file: str) -> list[str]:
+    """The memory cgroup directories that bound this process under ``mount``, its own first and the mount (the cgroup
+    namespace's root) last. The process's cgroup comes from /proc/self/cgroup (v2: the ``0::<path>`` line; v1: the
+    line whose controllers include ``memory``), so a systemd ``MemoryMax`` on a unit or scope, or a nested slice's
+    limit, is seen as well as one set at the container root (docker --memory, LXC). Just the mount, as before, when
+    /proc/self/cgroup is unreadable, names no such line, names the root, or names a path that is not a cgroup under
+    the mount (neither its limit file nor cgroup.procs reads: v1 without a cgroup namespace, say)."""
+    v2 = mount == "/sys/fs/cgroup"
+    rel = None
+    for ln in (read("/proc/self/cgroup") or "").splitlines():
+        parts = ln.strip().split(":", 2)
+        if len(parts) != 3:
+            continue
+        if (v2 and parts[0] == "0" and parts[1] == "") or (not v2 and "memory" in parts[1].split(",")):
+            rel = parts[2]
+            break
+    segs = [x for x in (rel or "").split("/") if x and x not in (".", "..")]
+    dirs = [mount + "/" + "/".join(segs[:i]) for i in range(len(segs), 0, -1)]
+    if not dirs or (read(f"{dirs[0]}/{limit_file}") is None and read(f"{dirs[0]}/cgroup.procs") is None):
+        return [mount]
+    return dirs + [mount]
+
+
 def host_ram_mib(read: Callable[[str], str | None] = _read) -> int | None:
-    """MemTotal, lowered to a finite cgroup limit when there is one (as serve.sh does)."""
+    """MemTotal, lowered to the smallest finite cgroup memory limit on the way from this process's cgroup up to the
+    root (as serve.sh does at the root; ``cgroup_memory_dirs``)."""
     total = parse_meminfo_mib(read("/proc/meminfo") or "")
-    for f in (
-        "/sys/fs/cgroup/memory.max",
-        "/sys/fs/cgroup/memory/memory.limit_in_bytes",
-    ):
-        lim = _cgroup_bytes(read, f)
-        if lim is not None:
-            lim_mib = lim // MIB
-            if total is None or lim_mib < total:
-                total = lim_mib
+    for mount, lim_name, _use, _key in CGROUP_MEMORY_SETS:
+        for d in cgroup_memory_dirs(read, mount, lim_name):
+            lim = _cgroup_bytes(read, f"{d}/{lim_name}")
+            if lim is not None:
+                lim_mib = lim // MIB
+                if total is None or lim_mib < total:
+                    total = lim_mib
     return total
 
 
@@ -447,46 +578,115 @@ def _cgroup_stat(read: Callable[[str], str | None], path: str, key: str) -> int 
 
 
 def mem_available_mib(read: Callable[[str], str | None] = _read) -> int | None:
-    """What a new server can still take: the host's MemAvailable, capped by what the cgroup has left. The cgroup's
-    usage counts the page cache it holds, which the kernel reclaims on demand, so the reclaimable part
-    (``inactive_file`` in v2 ``memory.stat``, ``total_inactive_file`` in v1) is taken out first, the way container
-    runtimes report working-set memory: left = max - max(0, current - inactive_file). A missing stat subtracts
-    nothing; an unlimited or unreadable cgroup adds no cap; None when nothing could be read."""
+    """What a new server can still take: the host's MemAvailable, capped by what every cgroup level from this process's
+    own up to the root has left (``cgroup_memory_dirs``; the smallest wins). A cgroup's usage counts the page cache it
+    holds, which the kernel reclaims on demand, so the reclaimable part (``inactive_file`` in v2 ``memory.stat``,
+    ``total_inactive_file`` in v1) is taken out first, the way container runtimes report working-set memory:
+    left = max - max(0, current - inactive_file). A missing stat subtracts nothing; an unlimited or unreadable level
+    adds no cap; None when nothing could be read."""
     avail: int | None = None
     m = re.search(r"(?m)^MemAvailable:\s+(\d+)\s*kB", read("/proc/meminfo") or "")
     if m:
         avail = int(m.group(1)) // 1024
-    for lim_f, use_f, stat_f, key in (
-        ("/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory.current", "/sys/fs/cgroup/memory.stat", "inactive_file"),
-        ("/sys/fs/cgroup/memory/memory.limit_in_bytes", "/sys/fs/cgroup/memory/memory.usage_in_bytes",
-         "/sys/fs/cgroup/memory/memory.stat", "total_inactive_file"),
-    ):
-        lim, use = _cgroup_bytes(read, lim_f), _cgroup_bytes(read, use_f)
-        if lim is not None and use is not None:
-            use = max(0, use - (_cgroup_stat(read, stat_f, key) or 0))
-            left = max(0, lim - use) // MIB
-            if avail is None or left < avail:
-                avail = left
+    for mount, lim_name, use_name, key in CGROUP_MEMORY_SETS:
+        for d in cgroup_memory_dirs(read, mount, lim_name):
+            lim, use = _cgroup_bytes(read, f"{d}/{lim_name}"), _cgroup_bytes(read, f"{d}/{use_name}")
+            if lim is not None and use is not None:
+                use = max(0, use - (_cgroup_stat(read, f"{d}/memory.stat", key) or 0))
+                left = max(0, lim - use) // MIB
+                if avail is None or left < avail:
+                    avail = left
     return avail
 
 
-def ram_available_text(cards: int, avail_mib: int) -> str:
-    """serve's refusal (and doctor's FAIL) when the memory a host has left is under a Flash-Next server's floor."""
+def ram_available_text(cards: int, avail_mib: int, tier_gib: int = 0, ple_gib: float = FN_PLE_TABLE_GIB) -> str:
+    """serve's refusal (and doctor's FAIL) when the memory a host has left is under a Flash-Next server's floor (with
+    the KV host tier, ``tier_gib`` per rank, when on)."""
     return (f"host memory available now is {_gib(avail_mib):.0f} GiB (MemAvailable, capped by what the cgroup has left); a "
-            f"{cards}-card Flash-Next server pins a ~47.7 GiB PLE table and needs ~{ram_floor_gib(cards):.0f} GiB resident "
+            f"{cards}-card Flash-Next server pins a ~{ple_gib:.1f} GiB PLE table and needs "
+            f"~{ram_floor_gib(cards, tier_gib, ple_gib):.0f} GiB resident{ram_tier_text(cards, tier_gib)} "
             f"(another Merlin server or a large page cache user?)")
 
 
-def ram_floor_gib(cards: int) -> float:
+def ram_floor_gib(cards: int, tier_gib: int = 0, ple_gib: float = FN_PLE_TABLE_GIB) -> float:
     """The resident host RAM one Flash-Next server needs: the measured four-worker floor plus one allowance per worker
-    above four (a TP2xPP4 octo = 69 + 4 x 2 = 77 GiB)."""
-    return RAM_FLOOR_GIB + max(0, cards - 4) * RAM_PER_EXTRA_WORKER_GIB
+    above four (a TP2xPP4 octo = 69 + 4 x 2 = 77 GiB), plus the KV host tier's arena, ``tier_gib`` per rank
+    (``cards`` = TP x PP ranks; 0 = off adds nothing), with the FP8 table term swapped for ``ple_gib`` (INT6 g32:
+    69 - 47.68 + 38.74 = 60.06 GiB at four workers; an estimate, no capped-host boot record yet)."""
+    return RAM_FLOOR_GIB - FN_PLE_TABLE_GIB + ple_gib + max(0, cards - 4) * RAM_PER_EXTRA_WORKER_GIB + max(0, tier_gib) * cards
+
+
+def ple_table_gib_of(ckpt: str | None, default: float = FN_PLE_TABLE_GIB) -> float:
+    """The host-RAM size of the PLE table the checkpoint in ``ckpt`` carries (text_config.ple_embedding_dtype, read the
+    way the launcher reads it): the INT6 g32 opt-in table's or a test table's, else the FP8 one; ``default`` when there
+    is no readable config.json (a folder setup has not built yet: setup passes the table it will build)."""
+    if not ckpt:
+        return default  # no folder: never the current directory's config.json
+    try:
+        with open(os.path.join(ckpt, "config.json"), encoding="utf-8") as f:
+            ple = (json.load(f).get("text_config") or {}).get("ple_embedding_dtype")
+    except (OSError, ValueError, AttributeError, TypeError):
+        return default
+    return {**FN_PLE_OPT_IN_GIB, **FN_PLE_TEST_GIB}.get(ple, FN_PLE_TABLE_GIB)
+
+
+def ram_tier_text(cards: int, tier_gib: int) -> str:
+    """The clause the RAM messages add when the KV host tier is on; empty when it is off."""
+    if tier_gib <= 0:
+        return ""
+    return f" (including a KV host tier of {tier_gib} GiB x {cards} ranks = {tier_gib * cards} GiB)"
+
+
+def dflash2_tier_conflicts(model: str | None, env: dict[str, str], saved: dict | None) -> list[str]:
+    """A KV RAM cache with DFlash2 on the Flash-Next family, which merlin serve refuses in 3.0.1: from the
+    environment (SPEC=dflash2 + MERLIN_KV_HOST_TIER_GIB) or from setup's saved answers (.merlin/setup.json)."""
+    out = []
+    if model == "flash-next" and (env.get("SPEC") or "").strip() == "dflash2" and kv_host_tier_gib(env) > 0:
+        out.append(f"SPEC=dflash2 with {KV_HOST_TIER_ENV}={kv_host_tier_gib(env)}: the KV RAM cache is qualified with MTP "
+                   "only in 3.0.1; merlin serve refuses the pair. Unset SPEC (MTP) or set "
+                   f"{KV_HOST_TIER_ENV}=0")
+    saved = saved if isinstance(saved, dict) else {}
+    models = saved.get("models") if isinstance(saved.get("models"), dict) else {}
+    name = saved.get("model")
+    block = models.get(name) if isinstance(name, str) else None
+    gib = block.get("kv_ram_cache_gib") if isinstance(block, dict) else None
+    if (isinstance(block, dict) and block.get("spec") == "dflash2" and isinstance(gib, int)
+            and not isinstance(gib, bool) and gib > 0):
+        out.append(f"saved setup answers for {name} (.merlin/setup.json) pair --spec dflash2 with --kv-ram-cache {gib}g; "
+                   "merlin serve refuses the pair in 3.0.1. Run ./setup.sh --kv-ram-cache 0 or ./setup.sh --spec mtp")
+    return out
+
+
+def saved_ple_table_gib(model: str | None, saved: dict | None) -> float:
+    """doctor's PLE table: setup's saved answer for the current model (.merlin/setup.json ple_table int6 -> INT6 g32),
+    else the FP8 table; merlin serve reads the served checkpoint's config instead (ple_table_gib_of)."""
+    saved = saved if isinstance(saved, dict) else {}
+    models = saved.get("models") if isinstance(saved.get("models"), dict) else {}
+    block = models.get(saved.get("model")) if isinstance(saved.get("model"), str) else None
+    if model == "flash-next" and isinstance(block, dict) and block.get("ple_table") == "int6":
+        return FN_PLE_OPT_IN_GIB["int6_g32"]
+    return FN_PLE_TABLE_GIB
+
+
+def _saved_setup(repo: Path) -> dict | None:
+    try:
+        return json.loads((repo / ".merlin" / "setup.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
+def kv_host_tier_gib(env: dict[str, str] | None = None) -> int:
+    """The KV host tier the environment asks for, GiB per rank (``MERLIN_KV_HOST_TIER_GIB``); 0 when unset, 0 or not a
+    whole number (launch.py refuses a malformed value itself)."""
+    v = ((os.environ if env is None else env).get(KV_HOST_TIER_ENV) or "").strip()
+    return int(v) if v.isdigit() else 0
 
 
 def probe(
     run: Runner = default_runner,
     read: Callable[[str], str | None] = _read,
     env: dict[str, str] | None = None,
+    listdir: Callable[[str], list[str] | None] = _listdir,
 ) -> Inventory:
     env = os.environ if env is None else env
     host = Host(system="linux" if sys.platform.startswith("linux") else sys.platform)
@@ -514,6 +714,7 @@ def probe(
         return inv
     gpus, host.driver = parse_query_csv(out)
     inv.gpus = gpus
+    probe_interconnect(inv, read, listdir)
     mem = run(["nvidia-smi", "-q", "-d", "MEMORY"])
     bars = parse_bar1(mem or "")
     if len(bars) == len(gpus):
@@ -539,7 +740,7 @@ def probe(
     host.ram_mib = host_ram_mib(read)
     try:
         st = os.statvfs("/dev/shm")
-        host.shm_mib = st.f_blocks * st.f_frsize // MIB
+        host.shm_mib = st.f_bavail * st.f_frsize // MIB  # free space an unprivileged writer has, not the mount size
     except (OSError, AttributeError):
         host.shm_mib = None
     virt = run(["systemd-detect-virt"])
@@ -551,6 +752,10 @@ def probe(
             host.virt = "vm"
         elif "container=" in (read("/proc/1/environ") or ""):
             host.virt = "container"
+    if "microsoft" in (read("/proc/sys/kernel/osrelease") or "").lower():
+        # the WSL2 kernel wins: systemd-detect-virt reports the innermost layer (docker inside WSL2), and without it the
+        # hypervisor flag would read as VM passthrough
+        host.virt = "wsl"
     cvd = env.get("CUDA_VISIBLE_DEVICES", "").strip()
     if cvd and re.fullmatch(r"\d+(,\d+)*", cvd):
         want = [int(x) for x in cvd.split(",")]
@@ -835,7 +1040,7 @@ def explain_no_profile(
         return f"one {vclass or '?'} GB card cannot hold the ~67.5 GiB of weights; the smallest single-card row is 1 x 80 GB (sm_80)."
     if n == 2 and vclass == 40:
         return (
-            "2 x 40 GB is the trap row: the weights leave ~3 GiB per card, which cannot hold one 262K session at bf16 "
+            "2 x 40 GB is too small: the weights leave ~3 GiB per card, which cannot hold one 262K session at bf16 "
             "(see the capacity table in docs/merlin/hardware-matrix.md)."
         )
     if n == 8 and vclass == 24 and arch == "sm_89":
@@ -988,6 +1193,11 @@ def _alt_fits(reg: dict[str, Any], pid: str, actual_gib: float) -> bool:
     return adj is None or (adj > 0 and adjusted_capacity(p, adj)["holds_one_262k"])
 
 
+def _names_ok(pats: list[str], inv: Inventory) -> bool:
+    """Every card's name matches one of ``pats`` (regexes)."""
+    return all(any(re.search(p, g.name) for p in pats) for g in inv.gpus)
+
+
 def _tested_name_ok(prof: dict[str, Any], inv: Inventory) -> bool:
     """A tested row is 'tested' only on the cards it was tested on (match.tested_gpu_names: regexes on the GPU name)."""
     pats = prof["match"].get("tested_gpu_names")
@@ -1004,8 +1214,15 @@ def evaluate(
     p2p: str = "auto",
     gpus: list[int] | None = None,
     prefer_latency: bool = False,
+    kv_dtype: str | None = None,
 ) -> Report:
     rep = Report(model=model, inventory=inv)
+    try:
+        reg = R.with_kv_dtype(reg, kv_dtype)
+    except R.ProfileError as e:
+        rep.add("FAIL", "kv-dtype", str(e))
+        rep.exit_code = 2
+        return rep
     subset = gpus is not None and len(gpus) < len(inv.gpus)
     if gpus is not None:
         if len(set(gpus)) != len(gpus):
@@ -1025,7 +1242,7 @@ def evaluate(
             return rep
         inv = Inventory(
             gpus=keep, host=inv.host, p2p=inv.p2p_among(gpus), source=inv.source, notes=inv.notes,
-            p2p_ok=inv.p2p_ok, links=inv.links,
+            p2p_ok=inv.p2p_ok, links=inv.links, kv_tier_gib=inv.kv_tier_gib, ple_table_gib=inv.ple_table_gib,
         )
         rep.inventory = inv
     for note in inv.notes:
@@ -1066,7 +1283,7 @@ def evaluate(
     total_gib = sum(_gib(g.vram_mib) for g in inv.gpus)
     if arch not in R.SUPPORTED_ARCHS:
         what = (
-            "outside the v3 target (Ampere sm_80/sm_86 and Lovelace sm_89 only; sm_90+ is out of scope)"
+            "outside the Merlin 3.x targets (Ampere sm_80/sm_86 and Lovelace sm_89 only; sm_90+ is out of scope)"
             if arch and int(arch[3:]) >= 90
             else "unknown or older than Ampere"
         )
@@ -1122,8 +1339,10 @@ def evaluate(
             def keyf(p: dict[str, Any]) -> tuple[Any, ...]:
                 exact = 0 if p["match"]["p2p"] == rep.effective_p2p else 1
                 lat = 0 if (prefer_latency and p.get("latency")) else 1
-                tested = 0 if p["status"] == "tested" else 1  # release decision of 2026-10-17: tested rows first
-                return (lat, tested, p.get("rank", 9), exact)
+                tested = 0 if p["status"] == "tested" else 1  # tested rows first
+                # a named alternative (auto_select false) runs by --profile
+                named = 0 if R.auto_selectable(p) else 1
+                return (named, lat, tested, p.get("rank", 9), exact)
 
             cands.sort(key=keyf)
     if not cands:
@@ -1176,13 +1395,27 @@ def evaluate(
             f"{prof['id']} was tested on {', '.join(prof['match']['tested_gpu_names'])} only; "
             f"{' + '.join(other)} resolves to the same row but is untested / community-validated",
         )
-    if status == "tested" and inv.host.virt == "wsl":
-        status = "untested"  # WSL2 is untested for the engine: never report a tested row there
+    if status in (R.LABEL_TESTED, R.LABEL_TESTING) and inv.host.virt == "wsl":
+        status = R.LABEL_UNTESTED  # WSL2 is untested for the engine: no tested or testing row there
+    run_on = prof["match"].get("testing_gpu_names")
+    if status == R.LABEL_TESTING and run_on and not _names_ok(run_on, inv):
+        status = R.LABEL_UNTESTED  # the cloud-hosted runs used other cards
+        other = sorted({g.name for g in inv.gpus
+                        if not any(re.search(p, g.name) for p in run_on)})
+        rep.add(
+            "WARN",
+            "testing-hw",
+            f"{prof['id']} ran on {', '.join(run_on)} only; {' + '.join(other)} "
+            "resolves to the same row but is untested / community-validated",
+        )
     rep.status = status
     rep.label = R.label_text(reg, prof, status)
     rep.layout = prof.get("layout") or {"tp": prof["serve"]["tensor_parallel"], "pp": 1}
     rep.serve = prof["serve"]
     rep.capacity = prof["capacity"]
+    warning = R.sm80_fp8_warning(model, prof)
+    if warning:
+        rep.add("WARN", "kv-dtype", warning)
 
     if model == "flash-next":
         shared = (
@@ -1316,6 +1549,8 @@ def evaluate(
                 text += (f". The {prof['serve']['image_max_pixels']:,}-pixel image cap is the shipped default and is not "
                          "lowered here; check the free memory beside a full-size image on this card")
             rep.add("WARN", "provisional", text)
+    if prof.get("fp8_opt_in") and rep.start:
+        rep.start = "KV_DTYPE=fp8 " + rep.start
     _host_checks(rep, inv, prof)
     _label_finding(rep, prof)
     if subset and rep.start:  # the checked set is part of a bigger host: the start line must name it
@@ -1331,8 +1566,7 @@ def _label_finding(rep: Report, prof: dict[str, Any]) -> None:
         rep.add(
             "WARN",
             "label",
-            f"{prof['id']}: {rep.label.upper()}. It was gated on the reference host but is not part of this release; "
-            "no launcher for it ships here",
+            f"{prof['id']}: {rep.label.upper()}. This profile is parked and has no launcher in this release",
         )
     else:
         what = (prof.get("evidence") or ["none"])[0]
@@ -1362,14 +1596,27 @@ def _host_checks(rep: Report, inv: Inventory, prof: dict[str, Any] | None) -> No
             rep.add("PASS", "driver", f"driver {h.driver}")
     else:
         rep.add("INFO", "driver", "driver version unknown")
+    tier = inv.kv_tier_gib
+    if tier > 0:
+        ranks = int(prof["match"]["cards"]) if prof is not None else max(n, 1)
+        minimum = min_restore_unit_gib_per_rank(ranks, rep.model, prof)
+        if tier < minimum:
+            rep.add(
+                "FAIL",
+                "kv-tier",
+                f"{KV_HOST_TIER_ENV}={tier} GiB per rank cannot hold one 262K restore unit "
+                f"for this {ranks}-rank layout; needs at least {minimum} GiB per rank.",
+            )
     if rep.model == "flash-next":
-        floor = ram_floor_gib(n)
-        warn = RAM_WARN_GIB
+        tier = inv.kv_tier_gib
+        floor = ram_floor_gib(n, tier, inv.ple_table_gib)
+        warn = RAM_WARN_GIB + max(0, tier) * n  # the qualified allocation is for the tier off: the tier comes on top
+        t = ram_tier_text(n, tier)
         if h.ram_mib is None:
             rep.add(
                 "WARN",
                 "ram",
-                f"host RAM unknown; Flash-Next needs ~{floor:.0f} GiB resident (~47.7 GiB pinned PLE table) "
+                f"host RAM unknown; Flash-Next needs ~{floor:.0f} GiB resident (~{inv.ple_table_gib:.1f} GiB pinned PLE table{t}) "
                 f"and {warn:.0f} GiB is qualified",
             )
         else:
@@ -1378,22 +1625,37 @@ def _host_checks(rep: Report, inv: Inventory, prof: dict[str, Any] | None) -> No
                 rep.add(
                     "FAIL",
                     "ram",
-                    f"host RAM {ram:.0f} GiB is below the ~{floor:.0f} GiB resident floor: the model load is "
+                    f"host RAM {ram:.0f} GiB is below the ~{floor:.0f} GiB resident floor{t}: the model load is "
                     "expected to be OOM-killed",
                 )
             elif ram < warn:
                 rep.add(
                     "WARN",
                     "ram",
-                    f"host RAM {ram:.0f} GiB is below the qualified {warn:.0f} GiB (floor ~{floor:.0f} GiB; "
+                    f"host RAM {ram:.0f} GiB is below the qualified {warn:.0f} GiB (floor ~{floor:.0f} GiB{t}; "
                     "the boot peak is unmeasured)",
                 )
             else:
                 rep.add(
                     "PASS",
                     "ram",
-                    f"host RAM {ram:.0f} GiB (>= {warn:.0f} GiB qualified)",
+                    f"host RAM {ram:.0f} GiB (>= {warn:.0f} GiB qualified{t})",
                 )
+    elif rep.model in ("27b", "ornith") and inv.kv_tier_gib > 0:
+        # The 27B and Ornith have no measured resident floor; the KV host tier's arenas (GiB per rank, pinned)
+        # come on top of it. Ranks = TP x PP (Ornith: TP2 x PP2 = 4; the 27B is TP only)
+        srv = (prof or {}).get("serve", {})
+        ranks = int(srv.get("tensor_parallel") or n) * int(srv.get("pipeline_parallel") or 1)
+        need = inv.kv_tier_gib * ranks
+        own = "Ornith's" if rep.model == "ornith" else "the 27B's"
+        what = (f"the KV host tier needs {inv.kv_tier_gib} GiB x {ranks} ranks = {need} GiB of pinned host RAM on top of "
+                f"{own} own")
+        if h.ram_mib is None:
+            rep.add("WARN", "ram", f"host RAM unknown; {what}")
+        elif _gib(h.ram_mib) < need:
+            rep.add("FAIL", "ram", f"host RAM {_gib(h.ram_mib):.0f} GiB is too small: {what}")
+        else:
+            rep.add("INFO", "ram", f"host RAM {_gib(h.ram_mib):.0f} GiB; {what}")
     if h.shm_mib is not None:
         if h.shm_mib < SHM_MIN_MIB:
             rep.add(
@@ -1415,7 +1677,10 @@ def _host_checks(rep: Report, inv: Inventory, prof: dict[str, Any] | None) -> No
             "WARN",
             "virt",
             "WSL2: untested for the Merlin engine; the WSL2 driver's free-memory reading is reported unreliable by the "
-            "community, and vLLM's profiling still reads it. Run a pool-only boot first",
+            "community, and vLLM's profiling still reads it. Run a pool-only boot first. Host-resident embeddings need "
+            "pinned memory: VLLM_WSL2_ENABLE_PIN_MEMORY=1 on a current WSL2 kernel (the launcher sets it, except for "
+            "Flash-Next). Peer access is usually absent there (an unreadable P2P probe counts as off), and nvidia-smi "
+            "cannot change persistence mode under WSL. See docs/merlin/hardware-matrix.md#wsl2",
         )
     elif h.virt in ("bare", "container"):
         rep.add(
@@ -1430,7 +1695,7 @@ def _host_checks(rep: Report, inv: Inventory, prof: dict[str, Any] | None) -> No
             "card, so another process (a display server, a running server) can stop the boot",
         )
     off_pm = [g.index for g in inv.gpus if g.persistence is False]
-    if off_pm:
+    if off_pm and inv.host.virt != "wsl":  # WSL: nvidia-smi cannot change persistence; the WSL WARN covers it
         rep.add(
             "WARN",
             "persistence",
@@ -1489,14 +1754,9 @@ def render_text(rep: Report, reg: dict[str, Any]) -> str:
         g = inv.gpus[0]
         homo = len({(x.name, x.vram_mib) for x in inv.gpus}) == 1
         if homo:
-            link = (
-                f", PCIe Gen{g.pcie_gen} x{g.pcie_width}"
-                if g.pcie_gen and g.pcie_width
-                else ""
-            )
             bar = f", BAR1 {g.bar1_mib} MiB" if g.bar1_mib is not None else ""
             out.append(
-                f"  {len(inv.gpus)} x {g.name}  {g.arch or 'arch unknown'}  {_gib(g.vram_mib):.1f} GiB{bar}{link}"
+                f"  {len(inv.gpus)} x {g.name}  {g.arch or 'arch unknown'}  {_gib(g.vram_mib):.1f} GiB{bar}"
             )
         else:
             for x in inv.gpus:
@@ -1507,12 +1767,14 @@ def render_text(rep: Report, reg: dict[str, Any]) -> str:
         out.append("  no NVIDIA GPU found")
     if len(inv.gpus) > 1:
         out.append(f"  P2P: driver view '{inv.p2p}', effective '{rep.effective_p2p}'")
+    out.extend(interconnect_text(inv))
     h = inv.host
     ram = f"{_gib(h.ram_mib):.0f} GiB" if h.ram_mib else "unknown"
     shm = f"{h.shm_mib} MiB" if h.shm_mib is not None else "unknown"
     out.append(
         f"  host RAM {ram}, /dev/shm {shm}, virtualisation {h.virt or 'unknown'}, driver {h.driver or 'unknown'}"
     )
+    out.extend(U.text_lines(rep.gpu_unlock))
     out.append("")
     out.append("Decision")
     if rep.profile_id:
@@ -1548,6 +1810,8 @@ def render_text(rep: Report, reg: dict[str, Any]) -> str:
             if cap.get("estimate")
             else "measured on the reference host"
             if rep.status == "tested"
+            else "measured on cloud-hosted cards; kernel parity not yet qualified"
+            if rep.status == R.LABEL_TESTING
             else "measured on the reference host with RTX 3090s; this card is untested"
         )
         out.append(
@@ -1582,6 +1846,16 @@ def render_text(rep: Report, reg: dict[str, Any]) -> str:
         out.append(
             "4K/131K/262K, needles) are the validation. See docs/merlin/hardware-matrix.md."
         )
+    if rep.profile_id and rep.status == R.LABEL_TESTING:
+        out.append(
+            "This hardware row is 🟡 TESTING: full-model serving runs passed on cloud-hosted"
+        )
+        out.append(
+            "hardware; kernel parity qualification is still to run, and merlin serve"
+        )
+        out.append(
+            "picks it like an untested row. See docs/merlin/hardware-matrix.md."
+        )
     out.append(f"exit {rep.exit_code}")
     return "\n".join(out) + "\n"
 
@@ -1614,6 +1888,7 @@ def report_dict(rep: Report) -> dict[str, Any]:
         "alternatives": rep.alternatives,
         "no_profile_reason": rep.no_profile_reason,
         "findings": [asdict(f) for f in rep.findings],
+        "gpu_unlock": rep.gpu_unlock,
     }
 
 
@@ -1769,6 +2044,11 @@ def main(
     except (R.ProfileError, OSError, json.JSONDecodeError) as e:
         print(f"preflight: cannot load the profile registry: {e}", file=sys.stderr)
         return 2
+    try:
+        serving_reg = R.with_kv_dtype(reg, os.environ.get("KV_DTYPE"))
+    except R.ProfileError as e:
+        print(f"preflight: {e}", file=sys.stderr)
+        return 2
     if args.list:
         out.write(render_list(reg))
         return 0
@@ -1803,6 +2083,7 @@ def main(
             print(f"preflight: {e}", file=sys.stderr)
             return 2
         return 0
+    reg = serving_reg
     try:
         gpus = [int(x) for x in args.gpus.split(",")] if args.gpus else None
     except ValueError:
@@ -1831,6 +2112,8 @@ def main(
     except (ValueError, OSError, KeyError, TypeError, json.JSONDecodeError) as e:
         print(f"preflight: {e}", file=sys.stderr)
         return 2
+    inv.kv_tier_gib = kv_host_tier_gib()  # the RAM gates count the KV host tier merlin serve would start with
+    inv.ple_table_gib = saved_ple_table_gib(args.model, _saved_setup(Path(__file__).resolve().parents[2]))
     if args.emit == "inventory":
         out.write(
             json.dumps(
@@ -1862,12 +2145,30 @@ def main(
     if picked is not None and len(picked) < len(inv.gpus):
         rep.add("INFO", "selection", f"merlin serve would use GPUs {','.join(map(str, picked))} of "
                 f"{len(inv.gpus)}; the report covers that set (--gpus checks another)")
+    if inv.source == "probe" and rep.inventory.gpus:  # read-only and informational: it never changes the exit code
+        cards = [(g.index, sysfs_bus_id(g.bus_id) if g.bus_id else None) for g in rep.inventory.gpus]
+        try:
+            rep.gpu_unlock = U.probe(cards, rep.inventory.host.virt, read, system=rep.inventory.host.system)
+        except Exception as e:  # noqa: BLE001 - informational: doctor must never fail here
+            rep.gpu_unlock = U.failed(cards, e)
+    if inv.source == "probe":
+        import launch as L
+
+        try:
+            L.check_cache_links(L.cache_root_for(args.model, dict(os.environ)))
+        except L.LaunchError as e:
+            rep.add("FAIL", "cache-link", str(e))
+            rep.exit_code = rep.exit_code or 1
     if inv.source == "probe" and rep.profile_id and args.model == "flash-next":
         # the same live gate merlin serve applies (serve_cli.resolve): what the host has left now, against this layout
-        avail = mem_available_mib(read)
-        if avail is not None and _gib(avail) < ram_floor_gib(len(rep.inventory.gpus)):
-            rep.add("FAIL", "ram-available", ram_available_text(len(rep.inventory.gpus), avail) + "; merlin serve refuses to start")
+        avail, tier, ple = mem_available_mib(read), rep.inventory.kv_tier_gib, rep.inventory.ple_table_gib
+        if avail is not None and _gib(avail) < ram_floor_gib(len(rep.inventory.gpus), tier, ple):
+            rep.add("FAIL", "ram-available", ram_available_text(len(rep.inventory.gpus), avail, tier, ple)
+                    + "; merlin serve refuses to start")
             rep.exit_code = rep.exit_code or 1
+    for text in dflash2_tier_conflicts(args.model, dict(os.environ), _saved_setup(Path(__file__).resolve().parents[2])):
+        rep.add("FAIL", "kv-tier", text)
+        rep.exit_code = rep.exit_code or 1
     if (
         args.strict
         and rep.exit_code == 0
@@ -1883,4 +2184,5 @@ def main(
 
 
 if __name__ == "__main__":
+    R.safe_stdio()
     sys.exit(main())

@@ -40,11 +40,13 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     should_use_host_embed_table,
 )
 from vllm.model_executor.models.interfaces import (
+    EagleModelMixin,
     HasInnerState,
     IsHybrid,
     MambaStateShapes,
     MixtureOfExperts,
     MultiModalEmbeddings,
+    SupportsEagle3,
     SupportsHCSP,
     SupportsLoRA,
     SupportsMRoPE,
@@ -105,7 +107,7 @@ from .qsa import Qwen4ExpQSAAttention, load_qsa_static_kv_scales
 logger = init_logger(__name__)
 
 # Transformers v5.18 renamed `qwen_sparse_attention` to `indexed_attention`
-# TODO: Delete qwen_... once Transformers 5.18.0 is the minimum required version.
+# The qwen_sparse_attention alias can go once Transformers 5.18.0 is the minimum.
 _QSA_LAYER_TYPES = ("qwen_sparse_attention", "indexed_attention")
 
 
@@ -134,11 +136,10 @@ QSA_SUPPORTED_BLOCK_TOPK = (512, 2048)
 def validate_qsa_block_topk(config: Qwen4ExpTextConfig) -> None:
     """Fork check at model init.
 
-    vLLM 0.30's own ``Qwen4ExpConfig`` refused a QSA config whose block top-k
-    (``indexer_budget // indexer_compress_ratio``) is not 512 or 2048. 0.32
-    takes the config class from ``transformers`` (vllm#57387), which does not
-    enforce it, so the check is restored here. A config without QSA
-    (``indexer_n_heads`` unset) is not checked.
+    A QSA config's block top-k (``indexer_budget // indexer_compress_ratio``)
+    must be 512 or 2048. Upstream takes the config class from ``transformers``
+    (vllm#57387), which does not enforce it, so the check is made here. A config
+    without QSA (``indexer_n_heads`` unset) is not checked.
     """
     if getattr(config, "indexer_n_heads", None) is None:
         return
@@ -564,8 +565,11 @@ class Qwen4ExpMixtureOfExperts(MixtureOfExperts):
         "deepstack_input_embeds": 0,
     }
 )
-class Qwen4ExpModel(nn.Module):
+class Qwen4ExpModel(nn.Module, EagleModelMixin):
     hf_to_vllm_mapper = Qwen3_5Model.hf_to_vllm_mapper | _EXTRA_WEIGHTS_MAPPER
+    # DFlash2 taps completed layer outputs (aux layer L = output of layer L-1),
+    # averaged over the hyper-connection streams; PP stages relay them.
+    supports_aux_hidden_states_over_pp = True
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
@@ -721,6 +725,9 @@ class Qwen4ExpModel(nn.Module):
             hidden_states = intermediate_tensors["hidden_states"]
 
         full_num_tokens = positions.shape[-1]
+        # Taps from earlier PP stages, then this stage's (DFlash2 only).
+        remote_aux = self.collect_remote_aux_hidden_states(intermediate_tensors)
+        aux_hidden_states: list[torch.Tensor] = []
         block_output = None
         injection = None
         last_layer = None
@@ -776,6 +783,12 @@ class Qwen4ExpModel(nn.Module):
                 block_output = None
                 injection = None
                 hidden_states = hidden_states + deepstack_embed
+            if (layer_idx + 1) in self.aux_hidden_state_layers:
+                aux_hidden_states.append(
+                    self._aux_hidden_state(
+                        layer, hidden_states, block_output, injection
+                    )
+                )
 
         if not get_pp_group().is_last_rank:
             # PP transports one tensor, not the delayed HC tuple. Materialize
@@ -784,7 +797,12 @@ class Qwen4ExpModel(nn.Module):
                 hidden_states = last_layer.mlp_hyper_connection.combine(
                     hidden_states, block_output, injection
                 )
-            return IntermediateTensors({"hidden_states": hidden_states})
+            return IntermediateTensors(
+                {
+                    "hidden_states": hidden_states,
+                    **self.pack_local_aux_hidden_states(aux_hidden_states),
+                }
+            )
 
         # The final mixer consumes the last pending combine and returns both
         # the sampled single stream and the materialized multi-stream state.
@@ -817,7 +835,46 @@ class Qwen4ExpModel(nn.Module):
             # this tensor is needed by the final mixer regardless).
             num_tokens = multi_hidden.shape[0]
             self._mtp_hidden_buffer[:num_tokens].copy_(multi_hidden)
+        if self.aux_hidden_state_layers:
+            if self.use_hc_sequence_parallel and aux_hidden_states:
+                hidden_size = self.config.hidden_size
+                packed_aux = sp_all_gather(torch.cat(aux_hidden_states, dim=-1))[
+                    :full_num_tokens
+                ]
+                aux_hidden_states = list(packed_aux.split(hidden_size, dim=-1))
+            return sample_hidden_states, remote_aux + aux_hidden_states
         return sample_hidden_states
+
+    def _set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+        # Under HC-SP the relayed taps would be row-sharded; only the last
+        # stage's own taps are gathered, so refuse the combination.
+        if layers and self.use_hc_sequence_parallel and get_pp_group().world_size > 1:
+            raise NotImplementedError(
+                "Qwen4Exp aux hidden-state capture does not support HC sequence "
+                "parallel together with pipeline parallel"
+            )
+        super()._set_aux_hidden_state_layers(layers)
+
+    def _aux_hidden_state(
+        self,
+        layer: "Qwen4ExpDecoderLayer",
+        hidden_states: torch.Tensor,
+        block_output: torch.Tensor | None,
+        injection: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """One DFlash2 tap: the completed multi-stream layer output, mean over
+        the hc_count streams -> [T, hidden_size].
+
+        The pending combine is computed as a side value; the forward keeps its
+        delayed-combine tuple, so target numerics do not change.
+        """
+        if block_output is not None:
+            hidden_states = layer.mlp_hyper_connection.combine(
+                hidden_states, block_output, injection
+            )
+        return hidden_states.unflatten(
+            -1, (self.config.hc_count, self.config.hidden_size)
+        ).mean(dim=-2)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         weights = (
@@ -870,12 +927,18 @@ class Qwen4ExpForCausalLM(
     SupportsLoRA,
     SupportsMRoPE,
     SupportsPP,
+    SupportsEagle3,
     Qwen4ExpMixtureOfExperts,
     IsHybrid,
     SupportsReplaySSM,
 ):
     packed_modules_mapping = {
-        "qkv_proj": ["q_proj", "k_proj", "v_proj", "indexer.index_qk_proj"],
+        # Port of vllm#62318: the QSA
+        # indexer is not listed: quant configs read this mapping before the
+        # model is built, and `Qwen4ExpQSAAttention` fuses
+        # `indexer.index_qk_proj` into `qkv_proj` only when it is quantized
+        # like q/k/v.
+        "qkv_proj": ["q_proj", "k_proj", "v_proj"],
         "gate_up_proj": ["gate_proj", "up_proj"],
         "kv_proj": ["key_proj", "value_proj"],
         "in_proj_qkvz": ["in_proj_qkv", "in_proj_z"],
@@ -896,12 +959,9 @@ class Qwen4ExpForCausalLM(
         assert_graph_profile_is_executable(vllm_config, role="target")
         assert_ple_mode(vllm_config, role="target")
         config: Qwen4ExpTextConfig = vllm_config.model_config.hf_text_config
-        if vllm_config.lora_config is not None:
-            # LoRA does not support the merged QKV/indexer projection, so its
-            # packed mapping must keep the indexer separate.
-            self.packed_modules_mapping = self.packed_modules_mapping | {
-                "qkv_proj": ["q_proj", "k_proj", "v_proj"],
-            }
+        # Port of vllm#62318: packed_modules_mapping never lists the indexer
+        # projection; QSA fuses it into qkv_proj itself (qsa.py) only without
+        # LoRA and with a matching quant method.
         self.vllm_config = vllm_config
         self.model_config = vllm_config.model_config
         self.quant_config = vllm_config.quant_config
@@ -910,8 +970,8 @@ class Qwen4ExpForCausalLM(
         self.model = Qwen4ExpModel(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )
-        # has_compiled_submodule() at gpu/cudagraph_utils.py:605 is what capture
-        # actually tests; check the same property here.
+        # has_compiled_submodule() (vllm/v1/worker/gpu/cudagraph_utils.py) is what
+        # capture actually tests; check the same property here.
         assert_compiled_submodule(self.model, vllm_config, role="target")
         # PP ownership: logits are computed on the
         # last stage only; earlier stages carried an unused 0.59 GiB head.
@@ -1187,12 +1247,9 @@ class Qwen4ExpForConditionalGeneration(
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "model") -> None:
         nn.Module.__init__(self)
         config: Qwen4ExpConfig = vllm_config.model_config.hf_config
-        if vllm_config.lora_config is not None:
-            # LoRA does not support the merged QKV/indexer projection, so its
-            # packed mapping must keep the indexer separate.
-            self.packed_modules_mapping = self.packed_modules_mapping | {
-                "qkv_proj": ["q_proj", "k_proj", "v_proj"],
-            }
+        # Port of vllm#62318: packed_modules_mapping never lists the indexer
+        # projection; QSA fuses it into qkv_proj itself (qsa.py) only without
+        # LoRA and with a matching quant method.
         quant_config = vllm_config.quant_config
         multimodal_config = vllm_config.model_config.multimodal_config
         if multimodal_config is None:

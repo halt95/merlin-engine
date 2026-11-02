@@ -185,9 +185,8 @@ struct PersistentTopKParams {
   bool det_large;
   // Large-path fault injector.  -1 disables it; any other value names the
   // `cta_in_group` whose CTA-LOCAL fault predicate is forced, and suppresses
-  // __trap().  The host always passes -1 (its environment reader was pruned);
-  // the MERLIN_TOPK_DIAG_FORCE_FAULT build forces the same predicate with the
-  // trap kept.
+  // __trap().  The host always passes -1; the MERLIN_TOPK_DIAG_FORCE_FAULT
+  // build forces the same predicate with the trap kept.
   int fault_inject_cta;
   // Which fault the injector forces in that CTA: false = the PRE-EMISSION
   // predicate `my_keep > local_eq` (X3, emission skipped on that row); true =
@@ -195,7 +194,7 @@ struct PersistentTopKParams {
   // exercise `suffix_sum[6]`).  The host always passes false.
   bool fault_inject_emit;
   // MERLIN_TOPK_SORTED_EMIT: every row leaves
-  // the kernel in the canonical order MERLIN_QSA_SORT used to impose in
+  // the kernel in the canonical order MERLIN_QSA_SORT would impose in
   // Python -- ascending index, padding last as -1 -- so the Python sort can be
   // dropped.  Paths that already emit that order by construction (trivial,
   // medium-path restart, deterministic large path) are untouched; the paths that
@@ -209,20 +208,19 @@ struct PersistentTopKParams {
 // ============================================================================
 // Device-global exact-path counters -- DECLARED HERE, ABOVE EVERY USER.
 //
-// This enum used to live beside the medium-path restart,
-// ~200 lines BELOW the decode template that increments
-// `kCtrDecodeOverflow`.  `counters` is a plain `unsigned long long*`
-// parameter, so that enumerator is a NON-DEPENDENT name: two-phase lookup
-// resolves it when the template is DEFINED, not when it is instantiated,
-// and the Linux build rejected the tree with
-//   persistent_topk.cuh(442): identifier "kCtrDecodeOverflow" is undefined.
+// The decode template increments `kCtrDecodeOverflow` through `counters`, a
+// plain `unsigned long long*` parameter, so that enumerator is a NON-DEPENDENT
+// name: two-phase lookup resolves it when the template is DEFINED, not when it
+// is instantiated, and with the enum declared below the template the Linux
+// build rejects the tree with
+//   identifier "kCtrDecodeOverflow" is undefined.
 // An offline `nvcc -cubin` on a non-Linux host does NOT reproduce that on its own: nvcc
 // can drive cicc in Microsoft mode (`--ms_c++17 --microsoft_version=`), and that mode
 // defers non-dependent lookup to instantiation, where the enum is already
 // visible.  `-Xcudafe --dep_name` restores strict two-phase lookup and the
 // offline harness then reproduces the Linux diagnostic verbatim.
 //
-// The fix is the declaration ORDER, not a literal: every increment still
+// The safeguard is the declaration ORDER, not a literal: every increment still
 // names its enumerator, so a slot renumbering stays a one-line edit here.
 // ============================================================================
 
@@ -786,8 +784,8 @@ __device__ __noinline__ bool histogram_2048_topk(
 // and re-select from scratch (`prefix = 0`, `remaining = TopK`) with a
 // full-row radix rescan.  Because the restart starts from an empty prefix and
 // an undebited `remaining`, the coarse pass's winners are re-counted rather
-// than double-counted -- the "coarse handoff" defect of an earlier revision
-// cannot occur by construction.
+// than double-counted: a coarse-pass handoff that double-counts cannot occur
+// by construction.
 //
 // Where we diverge from #52149: its rescan emits by raw `atomicAdd` arrival
 // order in both the `> pivot` and `== pivot` phases, which is set-exact but
@@ -830,11 +828,11 @@ __device__ __noinline__ bool histogram_2048_topk(
 // ============================================================================
 // DIAGNOSTIC BUILDS ONLY -- never set in a release or serving build.
 //
-// Three compile-time defines exist so the two large-path
-// diagnostic cells.  Every one defaults to 0 and every use
+// The compile-time defines below build the diagnostic variants of the
+// large-path fault cases.  Every one defaults to 0 and every use
 // sits behind `#if`, so the default build's device code is identical to the
-// tree without them (offline, real TU, sm_86, against an earlier commit: SASS identical,
-// cubin identical after masking nvcc's per-compile internal-linkage TU hash,
+// tree without them (checked offline on sm_86: SASS identical, cubin
+// identical after masking nvcc's per-compile internal-linkage TU hash,
 // which differs even between two compiles of the SAME source).
 // A build carrying any of them prints a
 // `[merlin] persistent_topk DIAGNOSTIC BUILD` line on its first launch
@@ -851,8 +849,8 @@ __device__ __noinline__ bool histogram_2048_topk(
 //       as the arrival count completes.
 //   MERLIN_TOPK_DIAG_PREREPAIR=1
 //       Compile out the histogram-publication barrier.  This is the
-//       PRE-REPAIR control for the delayed-publication stress: with a delay it
-//       is expected to return wrong or faulted rows; the repaired build with
+//       negative control for the delayed-publication stress: with a delay it
+//       is expected to return wrong or faulted rows; the normal build with
 //       the same delay must not.  Only meaningful with MERLIN_TOPK_DIAG_DELAY.
 //       Do NOT run it with MERLIN_TOPK_DET_LARGE=0: the legacy tail bounds no
 //       emission slot, so a disagreeing pivot writes out of bounds there.
@@ -878,7 +876,7 @@ __device__ __noinline__ bool histogram_2048_topk(
   ((MERLIN_TOPK_DIAG_DELAY) != 0 || (MERLIN_TOPK_DIAG_PREREPAIR) != 0 || \
    (MERLIN_TOPK_DIAG_FORCE_FAULT) != 0)
 #if MERLIN_TOPK_DIAG_FORCE_FAULT && !MERLIN_TOPK_EXACT_TRAP
-  #error "MERLIN_TOPK_DIAG_FORCE_FAULT is the trap-ON cell; it needs MERLIN_TOPK_EXACT_TRAP=1"
+  #error "MERLIN_TOPK_DIAG_FORCE_FAULT is the trap-ON diagnostic build; it needs MERLIN_TOPK_EXACT_TRAP=1"
 #endif
 #if MERLIN_TOPK_DIAG_FORCE_FAULT && (MERLIN_TOPK_DIAG_DELAY || MERLIN_TOPK_DIAG_PREREPAIR)
   #error "build the trap-ON and the delayed-publication diagnostics separately"
@@ -961,9 +959,9 @@ __device__ __noinline__ void medium_exact_restart(
   // ---- four 8-bit radix rounds over the full row -------------------------
 #pragma unroll
   for (uint32_t round = 0; round < 4; ++round) {
-    // An entry fault (bad length) previously still paid four
-    // full-row rescans before anyone looked at the flag.  Block-uniform --
-    // the flag is only ever written before a barrier that precedes this read.
+    // An entry fault (bad length) skips the four full-row rescans.
+    // Block-uniform -- the flag is only ever written before a barrier that
+    // precedes this read.
     if (smem->fault != 0u) break;
     for (uint32_t bin = tx; bin < RADIX; bin += kThreadsPerBlock) {
       smem->histogram[bin] = 0;
@@ -1028,10 +1026,8 @@ __device__ __noinline__ void medium_exact_restart(
 
   // Note: a fault raised before emission short-circuits ALL
   // selection work -- no tie walk, no scan, no candidate index ever written
-  // -- so the row goes straight to the -1 fill below.  Previously the scan
-  // ran and could write candidates that the fill then overwrote: correct in
-  // the end, but wasted work on the fault path and harder to debug.  The
-  // condition is block-uniform (shared, read after the barrier above).
+  // -- so the row goes straight to the -1 fill below.  The condition is
+  // block-uniform (shared, read after the barrier above).
   if (smem->fault == 0u) {
     // ---- tie cut at the k-th value --------------------------------------
     //
@@ -1123,7 +1119,7 @@ __device__ __noinline__ void medium_exact_restart(
 
   // Re-test AFTER the tie walks.  The guard above was
   // entered before them, so a fault raised at their bin-walk failure sites
-  // used to fall straight through into emission.  No barrier is needed
+  // is caught here, before emission.  No barrier is needed
   // between the two tests: the tie walks write the flag from tx == 0 and
   // each is followed by a barrier inside the block above.
   if (smem->fault == 0u) {
@@ -1294,7 +1290,7 @@ __device__ __noinline__ bool histogram_256_topk(
   if (thread_id < RADIX && shared_histogram[0][thread_id] > remaining_k &&
       shared_histogram[0][thread_id + 1] <= remaining_k) {
     shared_threshold_bin = thread_id;
-    // Medium-path restart / guard site M1 (was `:512`).  shared_histogram[0] is in suffix-sum
+    // Medium-path restart / guard site M1.  shared_histogram[0] is in suffix-sum
     // form here -- it is what the predicate just above tests -- so
     // hist[t] - hist[t+1] is the EXACT population of the threshold bin, which
     // is exactly what the collection loop below would buffer.  The prediction
@@ -1350,13 +1346,13 @@ __device__ __noinline__ bool histogram_256_topk(
   // without the restart -- on its own it would emit nothing, which is a
   // fail-loud half, never a silently-truncated one.
   //
-  // The entry predicate must be IMMUTABLE.  It used to read
-  // `shared_buffered_count[0]`, which the loop body then increments -- so with
+  // The entry predicate must be IMMUTABLE, so it does not read
+  // `shared_buffered_count[0]`, which the loop body increments: with
   // exact_medium = false (the control arm, where the count starts at 0 and a
   // real overflow pushes it past capacity mid-loop) a late warp could evaluate
   // the predicate after early warps had driven the count over 4096 and skip
-  // ALL of its elements, including above-threshold winners.  That made `=0` a
-  // new timing-dependent truncation rather than the v2.0.1 baseline.
+  // ALL of its elements, including above-threshold winners, a timing-dependent
+  // truncation.
   // `shared_overflow_counted` is the M1 prediction, written once before the
   // barrier above and never touched here; combined with the kernel parameter
   // it is block-uniform and constant for the whole loop.
@@ -1386,7 +1382,7 @@ __device__ __noinline__ bool histogram_256_topk(
     const int src_buffer = pass % 2;
     const int dst_buffer = src_buffer ^ 1;
     const int raw_buffered = shared_buffered_count[src_buffer];
-    // Medium-path restart / guard site M2 (was `:582`) and the M1 sentinel land here.  The
+    // Medium-path restart / guard site M2 and the M1 sentinel land here.  The
     // append's atomicAdd sits OUTSIDE the capacity guard, so raw_buffered
     // keeps counting past capacity and a post-hoc test is exact.  pass == 3
     // emits through shared_final_k without buffering, so every buffer filled
@@ -1949,9 +1945,9 @@ __device__ __noinline__ void radix_emit_deterministic(
         if (slot < static_cast<uint32_t>(TopK) && !force_emit_fault) {
           row_output[slot] = static_cast<int32_t>(my_chunk_start + i);
         } else {
-          // An out-of-range slot used to bump a counter and
-          // carry on, so with trapping ON it neither trapped nor produced the
-          // promised all-`-1` row.  It is now recorded as a row failure and
+          // An out-of-range slot must not bump a counter and
+          // carry on: with trapping ON that would neither trap nor produce the
+          // promised all-`-1` row.  It is recorded as a row failure and
           // goes through the SAME policy as the pre-emission faults below: no
           // store here, and the row is filled with -1 after the group agrees.
           //
@@ -1971,8 +1967,8 @@ __device__ __noinline__ void radix_emit_deterministic(
       gt_run += tile_gt;
       eq_run += tile_eq;
     }
-    // No thread may start the next row's chunk load — which writes
-    // shared_ordered — until every warp has finished reading it here.
+    // No thread may start the next row's chunk load -- which writes
+    // shared_ordered -- until every warp has finished reading it here.
     __syncthreads();
   }
 
@@ -2318,7 +2314,7 @@ __device__ void radix_topk(const float* __restrict__ row_input,
 }
 
 // ============================================================================
-// Persistent kernel — BS≤32, decode/medium/large paths with RadixTopK
+// Persistent kernel -- BS<=32, decode/medium/large paths with RadixTopK
 // BS>32 uses standalone histogram_256_buffered_topk (separate kernel,
 // see filtered_topk.cuh)
 // ============================================================================
@@ -2353,7 +2349,7 @@ __global__ void __launch_bounds__(kThreadsPerBlock, 2)
 
   // RadixRowState for multi-CTA cooperative radix.
   // Zero-initialization is done host-side via cudaMemsetAsync in topk.cu
-  // before launch — that gives a stream-ordered happens-before edge for all
+  // before launch -- that gives a stream-ordered happens-before edge for all
   // CTAs, which the previous in-kernel init (CTA-0 only + intra-CTA
   // __syncthreads) did not provide and which manifested as a race against
   // CTA-1+'s first red_release on arrival_counter.
@@ -2573,7 +2569,7 @@ __global__ void __launch_bounds__(kThreadsPerBlock)
 
 // ============================================================================
 // ============================================================================
-// Optimized FilteredTopK — single CTA per row for bs > 32.
+// Optimized FilteredTopK -- single CTA per row for bs > 32.
 // Kept with persistent_topk so the portable fallback owns the non-cluster path.
 // ============================================================================
 namespace filtered_topk {
@@ -2581,7 +2577,7 @@ namespace filtered_topk {
 namespace hist4096 = topk_histogram_4096;
 
 // ============================================================================
-// FilteredTopK — single CTA per row for bs > 32
+// FilteredTopK -- single CTA per row for bs > 32
 // Adapted from https://github.com/flashinfer-ai/flashinfer/pull/2215
 // ============================================================================
 

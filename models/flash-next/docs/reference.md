@@ -1,11 +1,12 @@
 # Reference
 
-The detail behind the [README](../README.md) for Merlin 3.0.0, Merlin engine **built on vLLM 0.32.0**.
+The detail behind the [README](../README.md) for Merlin 3.0.1, Merlin engine **built on vLLM 0.32.0**.
 The current measured claims are in [Benchmarks](#benchmarks). Historical measurements are explicitly marked
 **v3.0.0 (0.30) figure**; their original release labels are retained, and they are not re-measured 0.32 results.
 
 - [Overview](#overview)
 - [Build and serve](#build-and-serve)
+- [Merlin 3.0.1 options](#merlin-301-options)
 - [Container](#container) and [Proxmox LXC](#proxmox-lxc)
 - [Check it's working](#check-its-working), [Troubleshooting](#troubleshooting)
 - [Multi-GPU hosts and topology (opt-in)](#multi-gpu-hosts-and-topology-opt-in), [Running notes](#running-notes)
@@ -20,7 +21,7 @@ The current measured claims are in [Benchmarks](#benchmarks). Historical measure
 Qwen3.8-Flash-Next is served at its native 262,144-token context limit on four RTX 3090s:
 TP2 × PP2 with expert parallel, MTP K=3 by default, and a measured **924,993-token FP8 KV pool**.
 The host-mapped PLE table and host-resident token embeddings leave VRAM for model state and the KV cache.
-The Merlin 3.0.0 engine is built on vLLM 0.32.0; its source lives at the repository root.
+The Merlin 3.0.1 engine is built on vLLM 0.32.0; its source lives at the repository root.
 
 ## Build and serve
 
@@ -36,6 +37,7 @@ qualify this engine.
 | `release/` | Shared installer, environment pins and release tooling; see its current status above |
 | `models/flash-next/serve.sh` | Canonical 0.32 launcher; requires a verified build-product marker |
 | `models/flash-next/make-e1-config.py` | Adds the checkpoint's PLE dtype key if missing |
+| `models/flash-next/make-ple-int6-pack.py` | Builds the INT6 PLE pack from the FP8 table or, with `--from-bf16` (needs NumPy), from the BF16 one; a dry run unless `--build`. Setup downloads the published pack, so most users never run it |
 | `models/flash-next/scales/qsa_kv_scales_262k.json` | Shipped FP8 KV-scale sidecar |
 | `models/flash-next/lxc/` | Imported Proxmox deployment recipe; build integration unqualified on 0.32 |
 
@@ -58,6 +60,104 @@ qualification numbers are **v3.0.0 (0.30) figure** guidance, not 0.32 install qu
 Use the shared install documentation and `release/requirements-0.32.lock` for the current toolchain and pins. In particular, the old
 compiled-ops reuse claim is not carried forward. The supplied current measurements use the reference
 4×3090 host with working P2P; no no-P2P throughput result was supplied for 0.32.
+
+## Merlin 3.0.1 options
+
+These are opt-ins; the default is MTP with the host-RAM KV cache off.
+
+Launcher knobs new in 3.0.1: `SEQS` (sessions at once; the CUDA-graph capture follows it), `MAXLEN` (context
+length), `PP_PARTITION` (the pipeline split) and `MERLIN_MARLIN_MOE_CFG` (passed through). A value off the tested
+row prints a note. `SPEC=none` turns speculation off for diagnosis only; it is not a serving lane.
+
+### DFlash2
+
+Use `merlin serve flash-next <checkpoint-dir> --spec dflash2`, or
+`./setup.sh --model flash-next --spec dflash2` to download and verify the drafter before serving.
+The drafter is `incoai/Qwen3.8-Flash-Next-DFlash2`, about 1.2 GB, checked against
+[`dflash2.sha256`](../dflash2.sha256). Serving uses `DFLASH2_MODEL` when set, otherwise
+`~/models/flash-next-dflash2`, and refuses to start if the drafter is missing.
+For a direct recipe launch, set `SPEC=dflash2 DFLASH2_MODEL=/path/to/drafter`.
+
+Only the three 4 x 3090 P2P rows have qualified DFlash2 geometry: `fn-quad-3090`,
+`fn-swift1.5-quad-3090` and `fn-swift1.5-huihui-quad-3090`. Select the corresponding checkpoint name for a
+variant.
+Other rows and the 27B, Super VL and Ornith families refuse DFlash2. The qualified geometry uses a
+3,468,165,120-byte KV pin per rank instead of the MTP pin. Decode measured +5–18 % versus MTP on
+4 x 3090, but the 789,668-token pool holds 3 x 262K sessions, not 6 x 131K.
+
+### Host-RAM KV cache
+
+`merlin serve flash-next <checkpoint-dir> --kv-ram-cache 64g` enables the host-RAM tier for evicted
+prefix KV blocks; the same flag is accepted by `./setup.sh`. It restores a matching prefix from RAM
+instead of recomputing it. It adds no GPU context or simultaneous-session capacity, does not change the session cap
+(`merlin serve --swarm` does: 24 sessions instead of 8 on the 4 x 3090 profiles, with the cache at the tested 48g), and
+never uses disk.
+
+SIZE is whole GiB per server, split across TP x PP ranks: `64g` on TP2 x PP2 is 16 GiB per rank
+(`MERLIN_KV_HOST_TIER_GIB=16` for a direct recipe launch). A size that does not split evenly is
+rounded down to whole GiB per rank; a size that cannot hold one 262K restore unit per rank is refused (on
+4 x 3090 the smallest is `8g`, 2 GiB per rank; [SETUP](../../../docs/SETUP.md) lists the other layouts). With `--instances N`,
+each server gets SIZE. `--kv-ram-cache 0` disables the tier. **On the Flash-Next family the tier is
+experimental in 3.0.1** (the server logs a warning when it is on): a session evicted while other
+requests are prefilling heavily may recompute instead of restoring from the cache (output identical);
+a fix is planned. It runs with the MTP drafter only: `--kv-ram-cache` with `--spec dflash2`
+is refused in 3.0.1 (with DFlash2 the cache restored nothing on the reference host).
+
+On the reference 4 x RTX 3090 host a 262K restore took 1.2–1.4 s, against about 56 s to recompute. Host
+memory grows in steps over the first 262K requests while the request history fills (bounded: about 70 MiB).
+These are measured results for the reference layout, not an increase in the GPU pool or a promise for every
+session length and layout.
+
+Add the cache allocation to the server's host-RAM requirement. The tier locks its memory and refuses
+to start if it cannot: use `LimitMEMLOCK=infinity` under systemd or `--ulimit memlock=-1` with Docker.
+See [host-RAM sizing](../../../docs/SETUP.md#flash-next-host-ram-ple-table-and-kv-ram-cache)
+for the table and worker memory budget.
+
+#### KV RAM cache tuning knobs
+
+The defaults are the served configuration; these environment variables exist for testing and diagnosis, and apply
+to every family that runs the cache (Flash-Next, the 27B, Ornith). Each needs the cache on (`MERLIN_KV_HOST_TIER_GIB`
+> 0, which `--kv-ram-cache` sets): they combine with `--kv-ram-cache SIZE` and are refused with `--kv-ram-cache 0`
+or at boot without the cache. `merlin serve` checks the values before the boot;
+blank means unset.
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `MERLIN_KV_HOST_TIER__COPY_CREDITS` | `32` | Restore (host to GPU) rows in flight per rank; also the default for the copy credits below. Positive integer. |
+| `MERLIN_KV_HOST_TIER__COPY_CREDITS_D` | `COPY_CREDITS` | Copy (GPU to host) rows in flight per rank. Positive integer. Running-session copies take at most a quarter of it (at least one row). |
+| `MERLIN_KV_HOST_TIER__COPY_BYTES_D_MIB` | `0` | Optional cap on copy bytes in flight per rank, in MiB; every copy counts, running-session copies included. `0` = rows only; a nonzero cap below one row is refused at boot. |
+| `MERLIN_KV_HOST_TIER__N_RESTORE` | `2` | Restores in flight at once. A request that finds them all busy waits while they progress (see below). Positive integer. |
+| `MERLIN_KV_HOST_TIER__MAX_ASSEMBLING` | `2` | Units copied at once whose landed rows are held until the unit is complete; a new unit waits while this many are in progress. Positive integer. |
+| `MERLIN_KV_HOST_TIER__ESCAPE_STEPS` | `8` | Waits without progress after which an admission held for a pending copy goes ahead anyway (the copy is then missed). Positive integer. |
+| `MERLIN_KV_HOST_TIER__ADMISSION` | off | `off`, `0` or `lru`: plain LRU. `slru` (experimental): new units enter probation, a host restore promotes a unit to protected (at most 80 % of published rows), and a copy for a session that is not returning never displaces protected content. |
+| `MERLIN_KV_HOST_TIER_CENSUS` | `0` | `1` turns on the debug census (a per-step occupancy scan); off on the served path. |
+| `VLLM_RECOVERSSM_CHECK_OWNERSHIP` | `0` | Debug only: `1` checks RecoverSSM state ownership, with a host sync per commit. |
+| `MERLIN_KV_HOST_TIER_FAIL_LOADS`, `MERLIN_KV_HOST_TIER_FAIL_STORES` | `0` | Debug only: the first N restore / copy transfers per rank fail, to drive the recompute path. Never serve with them set. |
+
+Fixed rules, not knobs: a request waiting for a restore slot recomputes its host part only when no restore has
+progressed for 4 x the measured batch latency, on both clocks: at least 8 scheduler steps and at least 2 s (before the
+first measurement the latency is the larger of 0.5 s and the last batch issued at 2 GiB/s, and 0.5 s before any batch
+was issued). Running-session copies (the lowest-priority lane) run
+only when no other copy, restore or admission is waiting.
+
+## Engine defaults
+
+Engine switches that are on by default in every launch, for every family. The defaults are the served
+configuration; change them only to diagnose a problem.
+
+| knob | default | what it does |
+|---|---|---|
+| `VLLM_MERLIN_VISION_CHUNK_ROWS` | `8192` | Runs the vision encoder's per-row operations in chunks of this many rows on large images, to lower the memory peak; `0` turns chunking off. |
+| `VLLM_MERLIN_VISION_CHUNK_MIN_PIXELS` | `8388608` | Smallest image (in pixels) that is chunked; values below 8 MP are raised to 8 MP. |
+| `VLLM_MERLIN_PROMPT_LOGPROBS_CHUNK_SIZE` | `256` | Prompt tokens scored per chunk for `prompt_logprobs` requests. |
+| `VLLM_SPEC_PROFILE_SHAPES` | on | Runs the drafter's MoE shapes during startup memory profiling; `0` skips them. |
+| `VLLM_GDN_BA_SPLITK` | on | Split-K GEMM for the GDN `in_proj_ba`; `0` off. |
+| `VLLM_DRAFT_SEQ_LENS_NOSYNC` | on | No device sync for the second MTP draft step; `0` off. |
+| `VLLM_E2_GUARD_TRANSPORT` | `mapped` | How the bounds-guard counters reach the host: `mapped` (page-locked host memory, checked at every step) or `copy`. |
+| `VLLM_PLE_PROGRESS_DEADLINE_S` | `300` | Seconds a host-embedding (PLE) transaction may take while serving before the engine reports a progress-deadline failure; greater than 0, up to 86,400. |
+
+`VLLM_E2_MEMSTATS` (default `0`, off) is debug-only allocator telemetry: a poll interval in seconds, written under
+`VLLM_E2_MEMSTATS_DIR`. Never serve with it set.
 
 ## Container
 
@@ -109,6 +209,11 @@ First requests can compile kernels. The old readiness and warmup timings have no
 
 ## Multi-GPU hosts and topology (opt-in)
 
+Qwen4Exp sequence parallelism stays default-off. When effective SP is enabled, startup warns about rounding differences;
+independent topology checks still refuse SP with pipeline parallelism. The warning and checks are in
+[`Qwen4ExpForConditionalGenerationConfig.verify_and_update_config`](../../../vllm/model_executor/models/config.py),
+with test coverage in the engine's development tree.
+
 By default `serve.sh` uses the settings the release was qualified with: GPUs 0-3 in PCI bus order, vLLM's P2P
 check skipped, `NCCL_P2P_LEVEL=SYS`, `NCCL_PROTO=Simple`, FlashInfer's PCIe IPC all-reduce for decode
 (`VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC=1`) and vLLM's custom all-reduce off. On a host that does not look like the reference one, set
@@ -134,6 +239,9 @@ The launcher clears inherited fork knobs and exports its profile explicitly.
 `GUARD` takes precedence over an inherited `VLLM_E2_GUARD_MODE`, then defaults to `warn`;
 the current launcher accepts `raise|warn` and refuses `off`.
 `VLLM_E2_GUARD_INTERVAL` must be finite and positive. The reader parks after the engine drains.
+Idle parking is built in on vLLM 0.32; `VLLM_E2_GUARD_IDLE` is no longer registered, so setting it does not disable parking.
+See [`guard_telemetry.py`](../../../vllm/v1/worker/guard_telemetry.py) (`enable_idle_gate`, `_park`) and
+[`envs.py`](../../../vllm/envs.py). Mentions of this switch in older bench cards describe those historical engines.
 
 The PLE offload process deliberately refuses a CUDA context. Its blocked-CUDA-initialization messages are
 expected. A named bounds-guard or transport failure is a reason to inspect the first error in the log.
@@ -189,13 +297,13 @@ The implementation history is in [history.md](history.md).
 
 ### Stack
 
-| Piece | Merlin 3.0.0 |
+| Piece | Merlin 3.0.1 |
 |---|---|
 | Engine | Merlin, built on vLLM 0.32.0; source at the repository root |
 | Environment and compiled ops | Shared 0.32 installer and engine wheel integrated; `release/requirements-0.32.lock` is complete with 222 exact pins and SHA-256 hashes; a fresh install (2026-10-21) and a from-source build (2026-10-22) passed on the reference host |
 | Release dependency facts | humming-kernels 0.1.17; instanttensor ≥ 0.2.2 floor |
 | Parallel shape | TP2 × PP2 + EP; layer partition 25,23 |
-| Speculation | MTP K=3, probabilistic; full-vocabulary draft head, precision `DRAFT_HEAD=bf16\|int8\|int4` (default `bf16`); reduced draft vocabulary off and unavailable in this release (`REDUCED_DRAFT_VOCAB=1` needs `DRAFT_VOCAB=<path>` to the pinned table, which does not ship) |
+| Speculation | MTP K=3, probabilistic; full-vocabulary draft head, precision `DRAFT_HEAD=bf16\|int8\|int4` (default `bf16`); reduced draft vocabulary removed in 3.0.1 (`REDUCED_DRAFT_VOCAB` / `DRAFT_VOCAB` stop the launch; an empty value, or `REDUCED_DRAFT_VOCAB=0`, is accepted) |
 | Context and scheduling | 262,144 tokens per request; up to 8 sequences; 1,024-token prefill chunk |
 | KV | 4.1e9 bytes per rank, FP8 e4m3, shipped scale sidecar; block size 4,096 |
 | Prefix caching | On, align mode, match unit 64; **FGPC off** (omit `--enable-mamba-shared-prefix-checkpoint`) |
@@ -214,9 +322,7 @@ It needs `ple_embedding_dtype: float8_e4m3fn` inside `text_config` in `config.js
 For an older download, `models/flash-next/make-e1-config.py` adds the key without changing weights.
 The shipped sidecar is `scales/qsa_kv_scales_262k.json`. A Flash-Next-family checkpoint that ships its own scales as
 `qsa_kv_scales.json` beside its weights is served with them (the launcher prints a note); `SCALES=<path>` overrides
-both. Serve such a variant with `merlin serve flash-next <checkpoint-dir>`. No reduced draft-vocabulary table ships with this release, so the
-`REDUCED_DRAFT_VOCAB=1` setting is unavailable: the launcher accepts only a `DRAFT_VOCAB=<path>` table whose sha256 is
-pinned as `draft_vocab_sha256` in `tools/merlin/profiles/flash-next.json`, which is not distributed.
+both. Serve such a variant with `merlin serve flash-next <checkpoint-dir>`. Reduced draft vocabulary was removed in Merlin 3.0.1: the MTP drafter scores the full vocabulary, and `REDUCED_DRAFT_VOCAB` or `DRAFT_VOCAB` set in the environment stops the launch (an empty value, or `REDUCED_DRAFT_VOCAB=0`, is accepted).
 Checkpoint checksum lists are in `models/flash-next/checkpoint.sha256`.
 
 ### Serving an agent
@@ -235,7 +341,7 @@ multi-conversation follow-up reuse percentages under MTP.
 ## Benchmarks
 
 The [2026-10-15 0.32 summary](../benchmarks/2026-10-15/BENCH-CARD.md) records the maintainer-supplied
-Concurrent decode, cache-hit, image-cap and pool results. Raw streams, boot logs and a full release-gate card
+Concurrent decode, cache-hit, image-cap and pool results. Raw streams, boot logs and a full release-check card
 are not included. No new GPU measurement was performed for this docs refresh.
 
 The [2026-10-09 v3.0.0 card](../benchmarks/2026-10-09/BENCH-CARD.md) is historical:
@@ -265,7 +371,7 @@ no new rates, fault campaign or fresh-compile determinism claim are established 
 
 ## What ships next
 
-Merlin 3.0.0 ships the 0.32 launcher, 8 MP cap, FGPC off and the defaults listed in [Stack](#stack).
+Merlin 3.0.x ships the 0.32 launcher, 8 MP cap, FGPC off and the defaults listed in [Stack](#stack).
 RecoverSSM metadata reuse and warm-start controls remain configured; the draft head scores the full vocabulary (`DRAFT_HEAD` sets its precision).
 The old 34 MiB INT4 reduced-vocabulary draft-head cost and 22.5–33.0 W idle-power measurements are
 **v3.0.0 (0.30) figure** results, not re-measured on 0.32.
@@ -292,6 +398,6 @@ own qualification. Local-argmax remains opt-in; no new performance result is cla
 - Quantised experts: [Intel/Qwen3.8-Flash-Next-W4A16-AutoRound](https://huggingface.co/Intel/Qwen3.8-Flash-Next-W4A16-AutoRound);
   FP8 PLE table: [RadixArk/Qwen3.8-Flash-Next-NVFP4](https://huggingface.co/RadixArk/Qwen3.8-Flash-Next-NVFP4);
   MTP INT4 packing recipe adapted from [DominikBucko/qwen38-flash-next-2x3090](https://github.com/DominikBucko/qwen38-flash-next-2x3090);
-  P2P on consumer Ampere: aikitoria's open-kernel-module patch
+  P2P on consumer Ampere: aikitoria's open-kernel-module patch; bench basis from 3.0.1: Zagitta's [gpu-unlock](https://github.com/Zagitta/gpu-unlock) kernel module (its NVIDIA firmware is personal-use and not shipped; [Sudzpel](https://github.com/Sudzpel), who proposed it with the first measurements on Merlin)
 - Independent work on the same hardware class: Neiko2002,
   [noonghunna/club-3090](https://github.com/noonghunna/club-3090), [tfriedel/qwen3.6-rtx3090-lab](https://github.com/tfriedel/qwen3.6-rtx3090-lab)

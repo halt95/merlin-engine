@@ -13,7 +13,7 @@ The Swift recipe now belongs to Merlin 3.0.0 in this repository, on the vLLM 0.3
 
 - Generated launcher status: **tested on the reference host**: the launcher qualification (2026-10-16) and the [2026-10-20 release bench card](benchmarks/2026-10-20/BENCH-CARD.md).
 - Default image cap: **8 MP (8,388,608 pixels)**. Swift measured **902 MiB stage-0 minimum free memory** on 4× RTX 3090 / 0.32 on 2026-10-15; the generated launcher's 2026-10-16 8 MP burst after 8K prefill left 544 MiB, 20 MiB above the 524 MiB floor.
-- MTP K=3 uses the full-vocabulary head (`DRAFT_HEAD=bf16|int8|int4`, default bf16); no reduced draft-vocabulary table ships or is qualified, so `REDUCED_DRAFT_VOCAB=1` is unavailable. FGPC stays off.
+- MTP K=3 uses the full-vocabulary head (`DRAFT_HEAD=bf16|int8|int4`, default bf16); no reduced draft-vocabulary table ships (the switch was removed in 3.0.1). FGPC stays off.
 - Huihui inherits Swift's heavy results. The 924,993-token pool was measured on both generated launchers (2026-10-16); session residency is an inherited target; earlier speed and quality figures below are historical, not new 0.32 measurements.
 - Current install and serving instructions use the repository checkout; the retired package installer and container commands are kept only in the historical releases.
 

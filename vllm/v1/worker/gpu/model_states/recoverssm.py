@@ -162,9 +162,9 @@ class RecoverSSMState:
         num_accepted_tokens: torch.Tensor,
         num_computed_tokens: Sequence[torch.Tensor | None] | None = None,
     ) -> None:
-        """The commit chain of one step: every group's commit (plan, conv
-        compaction, final and boundary folds), each followed by its align
-        postprocess. The eager path calls it with the step's own tensors; the
+        """Run each backend's commit, then align postprocess.
+        GDN fuses the final and boundary state folds in its commit kernel.
+        The eager path calls this with the step's own tensors; the
         staged and graph paths with staged copies (``num_computed_tokens``: one
         per group, replacing the metadata's align count tensor)."""
         for i, metadata in enumerate(step):

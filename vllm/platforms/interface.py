@@ -1458,14 +1458,16 @@ class Platform:
                     logger.warning(
                         "Unknown vLLM environment variable detected: %s", env
                     )
-            # warn only, never raise: a
-            # build-time MERLIN_* name in a shell must not stop a boot.
+            # Warn only, never raise: a
+            # build-time MERLIN_* name in a shell must not stop a boot; a
+            # retired knob is named retired, not misspelt, and a name only
+            # the Merlin tools read is not reported.
             elif env.startswith("MERLIN_") and env not in envs.environment_variables:
-                logger.warning(
-                    "Unknown Merlin environment variable detected: %s "
-                    "(not a registered knob; check the spelling)",
-                    env,
-                )
+                from vllm.merlin.envs import unknown_merlin_env_warning
+
+                message = unknown_merlin_env_warning(env)
+                if message is not None:
+                    logger.warning("%s", message)
 
 
 class UnspecifiedPlatform(Platform):

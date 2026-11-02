@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by the Merlin project; see NOTICE.
 """Generative Scoring implementation for generative models.
 
 This module implements generative scoring functionality that computes the
@@ -16,6 +17,7 @@ from typing import Any, Literal
 from fastapi import Request
 from pydantic import Field, model_validator
 
+import vllm.envs as envs
 from vllm.engine.protocol import EngineClient
 from vllm.entrypoints.generate.base.protocol import validate_cache_salt
 from vllm.entrypoints.generate.label_reads import next_token_label_reads
@@ -32,8 +34,17 @@ from vllm.logger import init_logger
 from vllm.sampling_params import SamplingParams
 from vllm.tokenizers import TokenizerLike
 from vllm.utils import random_uuid
+from vllm.utils.async_utils import make_async
 
 logger = init_logger(__name__)
+
+
+# The one token-budget check.
+def _check_scoring_tokens(total_tokens: int, max_tokens: int) -> None:
+    if total_tokens > max_tokens:
+        raise ValueError(
+            f"Request exceeds MERLIN_GENERATIVE_SCORING_MAX_TOKENS ({max_tokens})."
+        )
 
 
 # ============================================================================
@@ -214,6 +225,11 @@ class ServingGenerativeScoring(BaseServing):
         # Check if engine is alive
         if self.engine_client.errored:
             raise self.engine_client.dead_error
+        max_items = envs.MERLIN_GENERATIVE_SCORING_MAX_ITEMS
+        if len(request.items) > max_items:
+            return self.create_error_response(
+                f"items exceeds MERLIN_GENERATIVE_SCORING_MAX_ITEMS ({max_items})."
+            )
         self.engine_client.check_admission(len(request.items))
 
         # Get tokenizer
@@ -375,14 +391,21 @@ class ServingGenerativeScoring(BaseServing):
             Tuple of (list of EngineInput, list of prompt token counts).
 
         """
+        encode = make_async(tokenizer.encode, executor=self.renderer._executor)
+        max_tokens = envs.MERLIN_GENERATIVE_SCORING_MAX_TOKENS
+
         # Tokenize query if it's a string
         if isinstance(request.query, str):
-            query_token_ids = tokenizer.encode(
+            query_token_ids = await encode(
                 request.query,
                 add_special_tokens=request.add_special_tokens,
             )
         else:
             query_token_ids = request.query
+
+        # Count the repeated query and one output token per item before truncation.
+        total_tokens = (len(query_token_ids) + 1) * len(request.items)
+        _check_scoring_tokens(total_tokens, max_tokens)
 
         engine_inputs: list[EngineInput] = []
         prompt_token_counts: list[int] = []
@@ -391,12 +414,15 @@ class ServingGenerativeScoring(BaseServing):
             # Tokenize item if it's a string
             if isinstance(item, str):
                 # Don't add special tokens for items to avoid duplicate BOS/EOS
-                item_token_ids = tokenizer.encode(
+                item_token_ids = await encode(
                     item,
                     add_special_tokens=False,
                 )
             else:
                 item_token_ids = item
+
+            total_tokens += len(item_token_ids)
+            _check_scoring_tokens(total_tokens, max_tokens)
 
             # Concatenate based on item_first setting
             if request.item_first:

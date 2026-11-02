@@ -6,6 +6,7 @@
 from dataclasses import dataclass, replace
 from enum import Enum
 import inspect
+import os
 from functools import cache, partial, wraps
 from typing import Any, ClassVar
 
@@ -39,6 +40,11 @@ from vllm.distributed.parallel_state import (
     get_dcp_world_size_and_rank,
 )
 from vllm.logger import init_logger
+from vllm.merlin.flashinfer_smallq import (
+    decode_wrapper_key,
+    note_event,
+    select_smallq_mode,
+)
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     QuantKey,
     kFp8StaticTensorSym,
@@ -951,6 +957,8 @@ class FlashInferMetadata:
     Will be `None` if `num_decode_tokens == 0`.
     """
 
+    flashinfer_smallq_mode: int = -1
+
 
 class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
     kv_cache_spec: AttentionSpec
@@ -967,6 +975,33 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         # 27B series patches are family/device-gated (dense Qwen3.5 on sm_86 only),
         # asked about this builder's own execution device.
         self._qwen35_series = series_active(vllm_config, device=device)
+        if (
+            envs.MERLIN_FLASHINFER_WORKLOAD_TILE
+            and not vllm_config.use_v2_model_runner
+        ):
+            raise ValueError("MERLIN_FLASHINFER_WORKLOAD_TILE requires the V2 runner")
+        self._workload_tile = (
+            self._qwen35_series and envs.MERLIN_FLASHINFER_WORKLOAD_TILE
+        )
+        if self._workload_tile:
+            api = getattr(
+                BatchDecodeWithPagedKVCacheWrapper, "sm8x_smallq_plan_api", 0
+            )
+            if api not in (1, 2):
+                raise RuntimeError(
+                    "MERLIN_FLASHINFER_WORKLOAD_TILE requires FlashInfer patch 0002"
+                )
+            if vllm_config.parallel_config.use_ubatching:
+                raise ValueError(
+                    "MERLIN_FLASHINFER_WORKLOAD_TILE requires ubatching disabled"
+                )
+        # FLASHINFER_SM8X_FP8_SMALLQ belongs to the patched FlashInfer (its
+        # planner reads it); it is read here only to mirror that tile choice,
+        # so it is not a vLLM or Merlin registry knob.
+        self._smallq_cta32 = self._workload_tile and (
+            os.environ.get("FLASHINFER_SM8X_FP8_SMALLQ") == "cta32"
+        )
+        self._decode_wrappers_smallq: dict[int, Any] = {}
         # only the spec-as-decode clause below asks
         # the wider gate (it also admits Qwen3.5 MoE with MERLIN_MOE_UNIFORM_VERIFY=1).
         self._uniform_verify = uniform_verify_active(vllm_config, device=device)
@@ -1027,7 +1062,8 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             # For full cudagraph capture, one `decode_wrapper` for each batch
             # size is needed for FlashInfer.
             self._decode_wrappers_cudagraph: dict[
-                tuple[int, int], BatchDecodeWithPagedKVCacheWrapper
+                tuple[int, int] | tuple[int, int, int],
+                BatchDecodeWithPagedKVCacheWrapper,
             ] = {}
             self._decode_cudagraph_max_bs = (1 + num_spec_tokens) * max_num_reqs
             if self.compilation_config.max_cudagraph_capture_size is not None:
@@ -1567,14 +1603,18 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         return self._prefill_wrapper
 
     def _get_decode_wrapper(
-        self, batch_size: int, use_cudagraph: bool = False, q_len_per_req: int = 1
+        self,
+        batch_size: int,
+        use_cudagraph: bool = False,
+        q_len_per_req: int = 1,
+        smallq_mode: int = -1,
     ):
-        # q_len_per_req is part of the frozen cudagraph shape (FlashInfer #3871), so
-        # cache graph wrappers per (batch_size, q_len).
+        use_cudagraph = use_cudagraph and smallq_mode != 0
+        key = decode_wrapper_key(batch_size, q_len_per_req, smallq_mode)
         if use_cudagraph:
-            decode_wrapper = self._decode_wrappers_cudagraph.get(
-                (batch_size, q_len_per_req), None
-            )
+            decode_wrapper = self._decode_wrappers_cudagraph.get(key)
+        elif smallq_mode != -1:
+            decode_wrapper = self._decode_wrappers_smallq.get(smallq_mode)
         else:
             decode_wrapper = self._decode_wrapper
 
@@ -1603,14 +1643,21 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 use_tensor_cores=True,
                 backend=backend,
             )
+            if smallq_mode != -1:
+                decode_wrapper.sm8x_smallq_mode = smallq_mode
+                note_event(
+                    f"wrapper created mode={smallq_mode} graph={use_cudagraph} "
+                    f"bs={batch_size} q={q_len_per_req}",
+                    logger.info,
+                )
             # plan cache (27B series) only on dense Qwen3.5 / sm_86 wrappers
             decode_wrapper._vllm_plan_cache_ok = self._qwen35_series
 
             # save the decode wrapper
             if use_cudagraph:
-                self._decode_wrappers_cudagraph[(batch_size, q_len_per_req)] = (
-                    decode_wrapper
-                )
+                self._decode_wrappers_cudagraph[key] = decode_wrapper
+            elif smallq_mode != -1:
+                self._decode_wrappers_smallq[smallq_mode] = decode_wrapper
             else:
                 self._decode_wrapper = decode_wrapper
 
@@ -1987,12 +2034,24 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             ev = wrapper._vllm_tsl_plan_event = torch.cuda.Event()
         ev.record()
 
+    def build_for_cudagraph_capture(
+        self, common_attn_metadata: CommonAttentionMetadata
+    ) -> FlashInferMetadata:
+        return self.build(
+            common_prefix_len=0,
+            common_attn_metadata=common_attn_metadata,
+            workload_prefill_flags=(
+                [False] * common_attn_metadata.num_reqs if self._workload_tile else None
+            ),
+        )
+
     @_abort_plan_staging_on_error
     def build(
         self,
         common_prefix_len: int,
         common_attn_metadata: CommonAttentionMetadata,
         fast_build: bool = False,
+        workload_prefill_flags: list[bool] | None = None,
     ) -> FlashInferMetadata:
         num_reqs = common_attn_metadata.num_reqs
         num_actual_tokens = common_attn_metadata.num_actual_tokens
@@ -2506,8 +2565,28 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 # batch size and kv metadata are per request, not per token.
                 assert num_decode_tokens % num_decodes == 0
                 decode_q_len = num_decode_tokens // num_decodes
+                smallq_mode = -1
+                if self._workload_tile and decode_q_len in (4, 5):
+                    query_lens = (
+                        qo_indptr_cpu[1 : num_reqs + 1] - qo_indptr_cpu[:num_reqs]
+                    ).tolist()
+                    smallq_mode = select_smallq_mode(
+                        enabled=True,
+                        q_len=decode_q_len,
+                        query_lens=query_lens,
+                        prefill_flags=workload_prefill_flags,
+                        cta32_allowed=self._smallq_cta32,
+                        has_prefill=num_prefill_tokens > 0 or num_prefills > 0,
+                    )
+                if self._workload_tile:
+                    attn_metadata.flashinfer_smallq_mode = smallq_mode
+                    note_event(f"plan mode={smallq_mode}", logger.info)
+                use_cudagraph = use_cudagraph and smallq_mode != 0
                 decode_wrapper = self._get_decode_wrapper(
-                    num_decodes, use_cudagraph, q_len_per_req=decode_q_len
+                    num_decodes,
+                    use_cudagraph,
+                    q_len_per_req=decode_q_len,
+                    smallq_mode=smallq_mode,
                 )
                 # Use the persistent buffer with padding length,
                 # instead of the same address but chunked version
@@ -3489,6 +3568,10 @@ def fast_plan_decode(
         raise RuntimeError(
             "The installed FlashInfer does not support uniform multi-token decode."
         )
+    smallq_mode = getattr(self, "sm8x_smallq_mode", -1)
+    planned_mode = getattr(self, "_sm8x_smallq_planned_mode", smallq_mode)
+    if self.is_cuda_graph_enabled and planned_mode != smallq_mode:
+        raise ValueError("FlashInfer graph wrapper changed its small-q tile")
     uniform_decode_kwargs: dict[str, Any] = {}
     if supports_uniform_multi_token:
         uniform_decode_kwargs["q_len_per_req"] = q_len_per_req
@@ -3555,6 +3638,7 @@ def fast_plan_decode(
             tuple(indptr_cpu.tolist()),
             len(last_page_len_cpu),
             q_len_per_req,
+            smallq_mode,
             num_qo_heads,
             num_kv_heads,
             head_dim,

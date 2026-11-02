@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright 2026 halt95 (Merlin modifications)
 """Launch-profile registry and launcher renderer for the Merlin engine.
 
 Standard library only (Python >= 3.10), no GPU needed. The registry lives in
@@ -9,8 +9,9 @@ Standard library only (Python >= 3.10), no GPU needed. The registry lives in
   row is a flat record (layout, serving numbers, interconnect environment, capacity
   estimate, evidence, status label). ``fn-quad-3090`` is the one profile that has
   been qualified on the reference host (with the Swift 1.5 and Huihui quads since the 3.0.0 bench
-  card). Every other row is labelled "untested / community-validated" until a run says
-  otherwise.
+  card). Rows whose full-model runs passed on cloud-hosted hardware (4 x RTX 4090 24 GB,
+  CMP 170HX 64 GB) are labelled "testing" until kernel parity qualification runs; every
+  other row is labelled "untested / community-validated" until a run says otherwise.
 * ``qwen38-27b.json`` / ``nemotron-super-vl.json`` / ``ornith.json``: the 27B (1 / 2 / 4 cards), Super VL and Ornith 1.5 rows; their
   ``launch`` block holds the family values ``launch.py`` needs. Their launcher files are shims too.
 
@@ -25,6 +26,7 @@ from __future__ import annotations
 
 import json
 import re
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -34,19 +36,31 @@ LAUNCHERS_DIR = HERE / "launchers"
 
 LABEL_TESTED = "tested"
 LABEL_UNTESTED = "untested"
+# Full-model serving runs passed on cloud-hosted hardware; kernel parity qualification
+# still to run. Shown as 🟡 in human output. Layout picking treats it exactly like
+# untested: it never satisfies a tested gate (tested_label, match.tested_gpu_names,
+# the tested-first sort, the WSL / card-name gates).
+LABEL_TESTING = "testing"
 LABEL_PARKED = "parked"  # 27B only: a gated profile that is not part of the release
 REFERENCE_ID = "fn-quad-3090"
 
-# The only archs the v3 engine line targets: Ampere sm_80 + sm_86, Lovelace sm_89.
+# The only archs the Merlin 3.x engine line targets: Ampere sm_80 + sm_86, Lovelace sm_89.
 SUPPORTED_ARCHS = ("sm_80", "sm_86", "sm_89")
-# Archs on which the engine admits fp8_e4m3 KV (qsa.py _validated_qsa_fp8_dtype): sm_86 via the Merlin byte decoder,
-# sm_89+ via upstream's native cast. sm_80 is refused.
-FP8_KV_ARCHS = frozenset({"sm_86", "sm_89"})
+# Archs on which the engine admits fp8_e4m3 KV (qsa.py _validated_qsa_fp8_dtype):
+# sm_80/sm_86 via the byte decoder, sm_89+ via the native cast; Flash-Next sm_80 FP8 is opt-in and untested.
+FP8_KV_ARCHS = frozenset({"sm_80", "sm_86", "sm_89"})
 KV_TAG = {"fp8_e4m3": "fp8", "bfloat16": "bf16"}
+SM80_FP8_WARNING = "sm_80 FP8 KV: untested by us (no sm_80 run yet); BF16 is the default"
+SM80_27B_FP8_WARNING = (
+    "sm_80 FP8 KV: 27B rows serve fp8_e4m3 KV; only CMP 170HX 64 GB runs are recorded, "
+    "with kernel parity qualification still pending; other sm_80 rows are untested"
+)
 N_LAYERS = (
     48  # Flash-Next decoder layers (the MTP layer is extra and rides the last stage)
 )
 MTP_K = 3
+# The qualified DFlash2 FP8 geometry (TP2 x PP2, 24/24) uses this many bytes per block (measured 2026-10-22).
+DFLASH2_KV_BLOCK_BYTES = 14155776
 
 # vLLM-style capture-size ladder used by the shipped profile; extended in steps of 16 above 32,
 # matching the octo profiles ([.., 32, 40, 48, 64, 80, 96, 112, 128]).
@@ -97,6 +111,24 @@ def vram_class(gib: float) -> int | None:
     return None
 
 
+def _check_swarm_gate(p: dict[str, Any]) -> list[str]:
+    """``serve.kv_tier_seqs`` (the swarm cap, merlin serve --swarm) on any family: the cap above the row's default,
+    the KV RAM cache GiB per rank it needs, ``status`` tested (a qualification run covered this row at the cap) or untested (the notes then
+    say so), and a basis."""
+    srv = p.get("serve") or {}
+    gate = srv.get("kv_tier_seqs")
+    if gate is None:
+        return []
+    pid = p.get("id")
+    if (not isinstance(gate, dict) or not all(isinstance(gate.get(k), int) and gate[k] > 0 for k in ("max_num_seqs", "min_gib_per_rank"))
+            or gate.get("status") not in (LABEL_TESTED, LABEL_UNTESTED) or not isinstance(gate.get("basis"), str)):
+        return [f"{pid}: serve.kv_tier_seqs needs positive integer max_num_seqs and min_gib_per_rank, a status of "
+                f"{LABEL_TESTED} or {LABEL_UNTESTED}, and a basis"]
+    if gate["max_num_seqs"] <= srv.get("max_num_seqs", 0):
+        return [f"{pid}: serve.kv_tier_seqs.max_num_seqs must be above the default max_num_seqs"]
+    return []
+
+
 def _check_flash_next_profile(p: dict[str, Any], labels: dict[str, Any]) -> list[str]:
     errs: list[str] = []
     pid = p.get("id", "?")
@@ -129,6 +161,8 @@ def _check_flash_next_profile(p: dict[str, Any], labels: dict[str, Any]) -> list
             errs.append(f"{pid}: tested_label is only for status 'tested'")
         if not p["match"].get("tested_gpu_names"):
             errs.append(f"{pid}: tested_label needs match.tested_gpu_names (the cards it was tested on)")
+    if "auto_select" in p and not isinstance(p["auto_select"], bool):
+        errs.append(f"{pid}: auto_select must be true or false")
     m, lay, srv, cap = p["match"], p["layout"], p["serve"], p["capacity"]
     cards = m["cards"]
     if lay["tp"] * lay["pp"] != cards:
@@ -147,13 +181,22 @@ def _check_flash_next_profile(p: dict[str, Any], labels: dict[str, Any]) -> list
         errs.append(f"{pid}: cuda_visible_devices does not list {cards} GPUs")
     if srv["kv_cache_dtype"] not in ("fp8_e4m3", "bfloat16"):
         errs.append(f"{pid}: kv_cache_dtype {srv['kv_cache_dtype']!r}")
-    # Engine gate (qsa.py _validated_qsa_fp8_dtype): fp8_e4m3 KV is admitted on sm_86 (Merlin byte decoder) and
-    # sm_89+ (upstream native cast); sm_80 is refused and needs bfloat16.
+    # Engine gate (qsa.py _validated_qsa_fp8_dtype): sm_80/sm_86 use the byte decoder;
+    # sm_89+ uses the native cast. Admission does not establish hardware validation.
     if srv["kv_cache_dtype"] == "fp8_e4m3" and not set(m["arch"]) <= FP8_KV_ARCHS:
         errs.append(
             f"{pid}: fp8_e4m3 KV is refused by the engine on {sorted(set(m['arch']) - FP8_KV_ARCHS)}; "
             "the default for a profile that lists such an arch is bfloat16"
         )
+    opt_in = p.get("capacity_fp8_opt_in")
+    if opt_in is not None:
+        if m["arch"] != ["sm_80"] or srv["kv_cache_dtype"] != "bfloat16":
+            errs.append(f"{pid}: capacity_fp8_opt_in requires an sm_80 BF16 default")
+        if opt_in.get("estimate") is not True:
+            errs.append(f"{pid}: capacity_fp8_opt_in must be marked estimate")
+        for key in ("kv_blocks", "pool_tokens", "fit_262k", "fit_131k"):
+            if not isinstance(opt_in.get(key), int) or opt_in[key] < 1:
+                errs.append(f"{pid}: capacity_fp8_opt_in needs positive {key}")
     for dtype, alt in srv.get("kv_alt", {}).items():
         if dtype == srv["kv_cache_dtype"] or dtype not in ("fp8_e4m3", "bfloat16"):
             errs.append(f"{pid}: kv_alt dtype {dtype!r} must be the other KV dtype")
@@ -166,13 +209,34 @@ def _check_flash_next_profile(p: dict[str, Any], labels: dict[str, Any]) -> list
             errs.append(f"{pid}: kv_alt {dtype} capacity must be marked estimate")
         if not 1 <= alt.get("max_num_seqs", 0) <= 8:
             errs.append(f"{pid}: kv_alt {dtype} needs max_num_seqs in 1..8")
+    errs.extend(_check_swarm_gate(p))
+    dfl = srv.get("dflash2")
+    if dfl is not None:  # SPEC=dflash2's geometry: a PP split, chunk and whole-block KV pin that hold 3 x 262K
+        keys = ("partition", "max_num_batched_tokens", "kv_cache_memory", "kv_blocks", "pool_tokens", "fit_262k", "basis")
+        if not isinstance(dfl, dict) or any(k not in dfl for k in keys):
+            errs.append(f"{pid}: serve.dflash2 needs {', '.join(keys)}")
+        else:
+            dpart = dfl["partition"]
+            if lay["pp"] < 2 or not isinstance(dpart, list) or len(dpart) != lay["pp"] or sum(dpart) != N_LAYERS:
+                errs.append(f"{pid}: serve.dflash2 partition {dpart} must have pp={lay['pp']} (>= 2) entries summing to {N_LAYERS}")
+            if not all(isinstance(dfl[k], int) and dfl[k] > 0 for k in keys[1:6]):
+                errs.append(f"{pid}: serve.dflash2 sizes must be positive integers")
+            elif dfl["kv_cache_memory"] != dfl["kv_blocks"] * DFLASH2_KV_BLOCK_BYTES:
+                errs.append(f"{pid}: serve.dflash2 kv_cache_memory must be kv_blocks whole blocks "
+                            f"of {DFLASH2_KV_BLOCK_BYTES} bytes")
+            elif dfl["pool_tokens"] < dfl["fit_262k"] * 262144:
+                errs.append(f"{pid}: serve.dflash2 pool_tokens {dfl['pool_tokens']} does not hold fit_262k x 262144")
+            if srv["kv_cache_dtype"] != "fp8_e4m3":
+                errs.append(f"{pid}: serve.dflash2 is qualified with FP8 KV only")
+            if not str(dfl["basis"]).strip():
+                errs.append(f"{pid}: serve.dflash2 needs a basis")
     if srv["capture_sizes"] != capture_sizes_for(srv["max_num_seqs"]):
         errs.append(
             f"{pid}: capture_sizes do not match the ladder for max_num_seqs={srv['max_num_seqs']}"
         )
     for a in m["arch"]:
         if a not in SUPPORTED_ARCHS:
-            errs.append(f"{pid}: arch {a} is not a v3 target")
+            errs.append(f"{pid}: arch {a} is not a Merlin 3.x target")
     ic = p["interconnect"]
     if (
         not ic.get("modes")
@@ -196,7 +260,12 @@ def _check_flash_next_profile(p: dict[str, Any], labels: dict[str, Any]) -> list
         )
     if p["status"] == LABEL_UNTESTED and not p["evidence"]:
         errs.append(f"{pid}: untested rows must say what evidence exists (even 'none')")
-    if cap.get("estimate") is not True and p["status"] != LABEL_TESTED:
+    if p["status"] == LABEL_TESTING and not p["evidence"]:
+        errs.append(f"{pid}: testing rows must cite the cloud-hosted runs that passed")
+    # a testing row may carry a pool measured on the cloud-hosted cards; an untested
+    # row's capacity is an estimate
+    measured_ok = (LABEL_TESTED, LABEL_TESTING)
+    if cap.get("estimate") is not True and p["status"] not in measured_ok:
         errs.append(f"{pid}: capacity of an untested row must be marked estimate")
     return errs
 
@@ -209,7 +278,7 @@ def validate_registry(reg: dict[str, Any]) -> list[str]:
     if errs:
         return errs
     labels = reg["labels"]
-    allowed = {LABEL_TESTED, LABEL_UNTESTED} | (
+    allowed = {LABEL_TESTED, LABEL_UNTESTED, LABEL_TESTING} | (
         {LABEL_PARKED} if reg["model"] == "27b" else set()
     )
     if set(labels) != allowed:
@@ -221,6 +290,13 @@ def validate_registry(reg: dict[str, Any]) -> list[str]:
             errs.append(
                 f"{p.get('id')}: status {p.get('status')!r} is not a known label"
             )
+        # a testing row names the cards its cloud-hosted runs used (regexes on the GPU
+        # name); on other cards preflight reports it untested
+        names = (p.get("match") or {}).get("testing_gpu_names")
+        if p.get("status") == LABEL_TESTING and not names:
+            errs.append(f"{p.get('id')}: testing rows need match.testing_gpu_names")
+        if names is not None and p.get("status") != LABEL_TESTING:
+            errs.append(f"{p.get('id')}: match.testing_gpu_names is only for testing")
     seen: set[str] = set()
     for p in reg["profiles"]:
         pid = p.get("id")
@@ -236,7 +312,7 @@ def validate_registry(reg: dict[str, Any]) -> list[str]:
                     key in entry
                     for key in (
                         "hf_repo", "scales", "served_names", "reasoning_effort",
-                        "draft_vocab_sha256", "checkpoint_marker",
+                        "checkpoint_marker",
                     )
                 ):
                     errs.append(f"{pid}: incomplete checkpoint {checkpoint!r}")
@@ -253,6 +329,7 @@ def validate_registry(reg: dict[str, Any]) -> list[str]:
             ):
                 if key not in p:
                     errs.append(f"{pid}: missing {key}")
+            errs.extend(_check_swarm_gate(p))
     if reg["model"] == "flash-next" and REFERENCE_ID not in seen:
         errs.append(f"reference profile {REFERENCE_ID} is missing")
     if "launch" not in reg:
@@ -262,6 +339,47 @@ def validate_registry(reg: dict[str, Any]) -> list[str]:
             if p.get("launch_shape") not in reg["launch"].get("shapes", {}):
                 errs.append(f"{p.get('id')}: launch_shape must name one of launch.shapes")
     return errs
+
+
+def with_kv_dtype(reg: dict[str, Any], value: str | None) -> dict[str, Any]:
+    """Apply the Flash-Next-only KV_DTYPE=fp8 opt-in before profile fit checks."""
+    if value is None:
+        return reg
+    if value != "fp8":
+        raise ProfileError(f"KV_DTYPE must be fp8 (or unset for the profile default), got {value!r} "
+                           "(from the exported KV_DTYPE variable: unset it for the default)")
+    if reg["model"] != "flash-next":
+        raise ProfileError("KV_DTYPE=fp8 is only supported for Flash-Next (including Swift/Huihui)")
+    rows = []
+    for p in reg["profiles"]:
+        if not set(p["match"]["arch"]) <= FP8_KV_ARCHS:
+            raise ProfileError(f"{p['id']}: KV_DTYPE=fp8 is refused by the engine on {p['match']['arch']}")
+        if p["serve"]["kv_cache_dtype"] == "fp8_e4m3":
+            rows.append(p)  # sm_86/sm_89 defaults: exact no-op
+            continue
+        cap = p.get("capacity_fp8_opt_in")
+        if p["match"]["arch"] != ["sm_80"] or cap is None:
+            raise ProfileError(f"{p['id']}: KV_DTYPE=fp8 has no sized FP8 opt-in capacity")
+        v = json.loads(json.dumps(p))
+        v["serve"]["kv_cache_dtype"] = "fp8_e4m3"
+        v["capacity"] = v["capacity_fp8_opt_in"]
+        v["status"] = LABEL_UNTESTED
+        v.pop("tested_label", None)
+        v["fp8_opt_in"] = True
+        v["title"] = p["title"].replace("bf16 KV", "fp8 KV opt-in")
+        v["evidence"] = ["⚫ untested: a profile ships, not yet run by us, expected to work; BF16 evidence does not qualify FP8."]
+        rows.append(v)
+    return {**reg, "profiles": rows}
+
+
+def sm80_fp8_warning(model: str, p: dict[str, Any]) -> str | None:
+    """The FP8 qualification warning, without changing the selected profile."""
+    if p.get("fp8_opt_in"):
+        return SM80_FP8_WARNING
+    if (model == "27b" and "sm_80" in p["match"]["arch"]
+            and p["serve"].get("kv_cache_dtype") == "fp8_e4m3"):
+        return SM80_27B_FP8_WARNING
+    return None
 
 
 def kv_variants(p: dict[str, Any]) -> list[str]:
@@ -282,6 +400,8 @@ def variant_profile(p: dict[str, Any], dtype: str) -> dict[str, Any]:
     v = json.loads(json.dumps(p))
     srv = v["serve"]
     srv.pop("kv_alt", None)
+    srv.pop("dflash2", None)  # the DFlash2 geometry is qualified for the row's own KV dtype only
+    srv.pop("kv_tier_seqs", None)  # so is the swarm session cap: the variant keeps its own seqs
     srv["kv_cache_dtype"] = dtype
     srv["max_num_seqs"] = alt["max_num_seqs"]
     srv["capture_sizes"] = capture_sizes_for(alt["max_num_seqs"])
@@ -289,7 +409,7 @@ def variant_profile(p: dict[str, Any], dtype: str) -> dict[str, Any]:
     v["match"]["arch"] = list(alt["archs"])
     v["status"] = LABEL_UNTESTED
     v["variant_of"] = p["id"]
-    v["title"] = f"{p['title'].replace(' (the shipped v3.0.0 profile)', '')} [{KV_TAG[dtype]} KV variant]"
+    v["title"] = f"{p['title']} [{KV_TAG[dtype]} KV variant]"
     v["evidence"] = [
         f"None for {dtype} KV on this profile: the default variant's evidence ({p['status']}) does not carry over."
     ]
@@ -310,6 +430,56 @@ def variant_launcher_name(profile_id: str, dtype: str) -> str:
     return "serve-" + re.sub(r"^fn-", "", profile_id) + f"-kv-{KV_TAG[dtype]}.sh"
 
 
+# One 262K restore unit of the host-RAM KV tier, in host rows per rank (the engine's min_tier_rows): the full-attention
+# pages that hold 262,144 tokens plus the one holding the boundary token, and three recurrent-state rows. Pages are the
+# row's KV block (serve.block_size; else the family default: 4,096 tokens on Flash-Next, 960 on the 27B), so
+# Flash-Next has 65 + 3 = 68 rows, the 27B 274 + 3 = 277 at 960 tokens and 257 + 3 = 260 at 1,024. A host row is
+# one KV block of the rank, so its size is the row's pinned KV bytes over its block count.
+RESTORE_UNIT_TOKENS = 262144
+RESTORE_UNIT_PAGE_TOKENS = {"flash-next": 4096, "27b": 960}
+RESTORE_UNIT_RECURRENT_ROWS = 3
+RESTORE_UNIT_FALLBACK_GIB = 4  # per server, for a row with no measured block count (its true minimum may be higher)
+
+
+def safe_stdio() -> None:
+    """Let the CLIs print their status marks (the untested and testing emoji) on a terminal or pipe whose encoding
+    cannot show them: such characters print as "?" instead of stopping the command with UnicodeEncodeError."""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="replace")
+        except (AttributeError, ValueError, OSError):
+            pass  # not a text stream that can be reconfigured (a test's StringIO, a closed stream)
+
+
+def host_row_bytes(p: dict[str, Any] | None) -> int | None:
+    """Bytes of one host-tier row on one rank of ``p`` (pinned KV bytes over KV blocks), None when not recorded."""
+    if not p:
+        return None
+    mem = p.get("serve", {}).get("kv_cache_memory")
+    blocks = (p.get("capacity") or {}).get("kv_blocks")
+    if not isinstance(mem, int) or not isinstance(blocks, int) or blocks <= 0:
+        return None
+    return mem // blocks
+
+
+def restore_unit_rows(model: str | None, p: dict[str, Any] | None) -> int | None:
+    """Host rows per rank of one 262K restore unit on ``p``; None for a family without a known page layout."""
+    page = (p or {}).get("serve", {}).get("block_size") or RESTORE_UNIT_PAGE_TOKENS.get(model or "")
+    if not page:
+        return None
+    return RESTORE_UNIT_TOKENS // int(page) + 1 + RESTORE_UNIT_RECURRENT_ROWS
+
+
+def restore_unit_min_gib_per_rank(model: str | None, p: dict[str, Any] | None, ranks: int) -> int:
+    """Whole GiB per rank the engine needs for one 262K restore unit on ``p``: the unit's rows plus the arena's null
+    row, at the row's size. Rows without a recorded block count fall back to 4 GiB per server."""
+    rows = restore_unit_rows(model, p) if model in RESTORE_UNIT_PAGE_TOKENS else None
+    row = host_row_bytes(p)
+    if rows and row:
+        return max(1, -(-(rows + 1) * row // (1 << 30)))
+    return -(-RESTORE_UNIT_FALLBACK_GIB // max(ranks, 1))
+
+
 def get_profile(reg: dict[str, Any], profile_id: str) -> dict[str, Any]:
     for p in reg["profiles"]:
         if p["id"] == profile_id:
@@ -318,6 +488,16 @@ def get_profile(reg: dict[str, Any], profile_id: str) -> dict[str, Any]:
         f"no profile {profile_id!r}; known: "
         + ", ".join(p["id"] for p in reg["profiles"])
     )
+
+
+def auto_selectable(profile: dict[str, Any]) -> bool:
+    """False for a named alternative (``"auto_select": false``).
+
+    Automatic selection ranks such a row after every other row of its
+    class, so it runs when named with --profile (or when nothing else of
+    the class fits).
+    """
+    return profile.get("auto_select", True) is not False
 
 
 def label_text(reg: dict[str, Any], profile: dict[str, Any], status: str | None = None) -> str:
@@ -394,7 +574,7 @@ def diff_vs_reference(reg: dict[str, Any], p: dict[str, Any]) -> list[str]:
         out.append("KV scale sidecar: " + checkpoint["scales"])
         cmp("served names", reg["base"]["served_names"], checkpoint["served_names"])
         cmp("default reasoning effort", REASONING_EFFORT_DEFAULT, checkpoint["reasoning_effort"])
-        out.append(f"Full-vocabulary MTP head (DRAFT_HEAD sets its precision; default {DRAFT_HEAD_DEFAULT}); no reduced draft table ships or is qualified (REDUCED_DRAFT_VOCAB=1 is refused).")
+        out.append(f"Full-vocabulary MTP head (DRAFT_HEAD sets its precision; default {DRAFT_HEAD_DEFAULT}); the reduced draft vocabulary was removed in 3.0.1 (REDUCED_DRAFT_VOCAB is refused).")
     return out
 
 
@@ -408,7 +588,12 @@ DRAFT_HEAD_DEFAULT = "bf16"
 # A request still picks its own (`chat_template_kwargs.reasoning_effort`).
 REASONING_EFFORT_DEFAULT = "medium"
 
-SHIM_MAX_LINES = 10
+SHIM_MAX_LINES = 12
+# Every generated shim carries the house SPDX header (Merlin-added files).
+SHIM_SPDX = (
+    "# SPDX-License-Identifier: Apache-2.0",
+    "# SPDX-FileCopyrightText: Copyright 2026 halt95 (Merlin modifications)",
+)
 
 
 def launcher_name(profile_id: str) -> str:
@@ -424,11 +609,11 @@ def render_shim(profile_id: str, kv: str | None = None, checkpoint: str | None =
     MERLIN_PYTHON the interpreter.
     """
     flags = f"--profile {profile_id}" + (f" --kv {kv}" if kv else "") + (f" --checkpoint {checkpoint}" if checkpoint else "")
-    lines = ["#!/usr/bin/env bash"]
+    lines = ["#!/usr/bin/env bash", *SHIM_SPDX]
     if generate:
         lines.append(f"# GENERATED by `{generate}`: shim for the one launcher, tools/merlin/launch.py {flags}; do not edit by hand.")
     else:
-        lines.append(f"# Merlin 3.0.0: shim for the one launcher, tools/merlin/launch.py {flags}.")
+        lines.append(f"# Shim for the one Merlin launcher, tools/merlin/launch.py {flags}.")
     if usage:
         lines.append(f"#   {usage}")
     lines += [
@@ -460,7 +645,12 @@ def render_launcher(reg: dict[str, Any], p: dict[str, Any]) -> str:
                            f"bash {recipe} /path/to/{ck} [extra vllm args]")
     name = variant_launcher_name(variant, p["serve"]["kv_cache_dtype"]) if variant else launcher_name(p["id"])
     return render_shim(pid, kv, p.get("checkpoint"), gen + f" > tools/merlin/launchers/{name}",
-                       f"bash tools/merlin/launchers/{name} /path/to/checkpoint [extra vllm args]   ({label_text(reg, p)})")
+                       f"bash tools/merlin/launchers/{name} /path/to/checkpoint [extra vllm args]   ({_ascii(label_text(reg, p))})")
+
+
+def _ascii(text: str) -> str:
+    """``text`` for a shell comment: ASCII only (a label's status emoji dropped), spaces collapsed."""
+    return " ".join(text.encode("ascii", "ignore").decode("ascii").split())
 
 
 def render_all(reg: dict[str, Any], ids: list[str] | None = None) -> dict[str, str]:

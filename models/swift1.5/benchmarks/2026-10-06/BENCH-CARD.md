@@ -1,4 +1,4 @@
-# v2.5.1-swift1.5 card — 2026-10-06 (the Swift 1.5 checkpoint on the Flash-Next v2.5.1 engine: release gate)
+# v2.5.1-swift1.5 card — 2026-10-06 (the Swift 1.5 checkpoint on the Flash-Next v2.5.1 engine: release check)
 
 > **Historical vLLM 0.30 evidence.** The results and commands below belong to the named v2.x engine. They do not qualify the generated 0.32 launcher or assert current performance/capacity. Current status and the measured 8 MP result: [Swift README](../../README.md#qualification-status).
 

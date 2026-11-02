@@ -118,8 +118,8 @@ bool sorted_emit_enabled() {
 // ---------------------------------------------------------------------------
 // Say the effective tie policy out loud, once.
 //
-// "TIE_DET=1 TIE_RECENT=0" used to mean three different things on the three
-// paths, and nothing printed the difference.  One stderr line at the first
+// The tie flags alone do not show what each of the three paths
+// applies.  One stderr line at the first
 // launch of the process naming the policy the kernel will actually apply on
 // EVERY path.  It is a plain fprintf on the host: no CUDA call, so it is safe
 // from a capturing thread, and the `static` initialiser makes it exactly once
@@ -344,7 +344,8 @@ void launch_persistent_topk(const torch::stable::Tensor& logits,
   // come from merlin::sampled_topk (symbol isolation), the rows are
   // re-emitted ascending afterwards, as on the FilteredTopK branch, because
   // qsa_indexer.py skips its own sort when toggle-state field 6 says the
-  // kernel sorted, and the gate below.
+  // kernel sorted, and the gate below closes the branch under the deterministic
+  // tie policy.
   // merlin-hook: det-ties-fallback-gate. The atomic fallbacks (sampled_topk
   // and FilteredTopK here, top_k_per_row_decode / FilteredTopK when the
   // cooperative launch does not fit) settle ties by atomic arrival order, so
@@ -452,7 +453,7 @@ void launch_persistent_topk(const torch::stable::Tensor& logits,
     uint32_t max_resident_ctas = hw_resident_cap;
     if (needs_cooperative) {
       // Reserve one CTA per SM when occupancy allows; fall back to a single
-      // CTA when occupancy == 1 (the most deadlock-prone case — any straggler
+      // CTA when occupancy == 1 (the most deadlock-prone case -- any straggler
       // kernel that takes the only slot on one SM hangs the barrier). Never
       // drop below one full group's worth.
       uint32_t headroom = (occupancy > 1) ? static_cast<uint32_t>(num_sms) : 1u;
@@ -585,10 +586,9 @@ void launch_persistent_topk(const torch::stable::Tensor& logits,
     // exact_rows_topk_kernel above, and with them off it degrades to the
     // v2.0.1 tail and says so once.
     params.det_large = det_large_enabled() && det_large_fits;
-    // The large-path fault injector (MERLIN_TOPK_LARGE_FAULT_INJECT / _KIND,
-    // test only) was pruned: never inject, keep __trap() armed --
-    // the served values. The kernel's fault predicates are unchanged; the
-    // MERLIN_TOPK_DIAG_FORCE_FAULT diagnostic build still exercises them.
+    // The served kernel never injects a fault and keeps __trap() armed. The
+    // kernel's fault predicates are unchanged; the MERLIN_TOPK_DIAG_FORCE_FAULT
+    // diagnostic build exercises them.
     params.fault_inject_cta = -1;
     params.fault_inject_emit = false;
     if (det_large_enabled() && !det_large_fits) {
@@ -618,10 +618,9 @@ void launch_persistent_topk(const torch::stable::Tensor& logits,
                                 ? get_exact_counters(device_index)
                                 : ensure_exact_counters(device_index, stream);
     // Note: this check is UNCONDITIONAL -- eager as well as
-    // capturing, and in both arms.  Previously only a capturing launch was
-    // rejected, so an eager launch ran with nullptr and the reader then
-    // reported [0,0,0,0,1]: an unavailable instrument encoded as healthy zero
-    // counts, which is the exact failure the counters exist to prevent.
+    // capturing, and in both arms.  An eager launch with nullptr would have the
+    // reader report [0,0,0,0,1]: an unavailable instrument encoded as healthy
+    // zero counts, which is the exact failure the counters exist to prevent.
     STD_TORCH_CHECK(
         params.exact_counters != nullptr,
         "persistent_topk: the medium-path exact-restart counters are unavailable on "
@@ -784,9 +783,9 @@ void persistent_topk_exact_counters(torch::stable::Tensor& out, int64_t reset,
   unsigned long long* src =
       ensure_exact_counters(static_cast<int>(out.get_device_index()), stream);
 
-  // An unavailable buffer used to be reported as four zeros
-  // plus "enabled", i.e. an instrument failure indistinguishable from "no
-  // medium work and no faults".  Fail instead.
+  // An unavailable buffer must not read as four zeros plus "enabled" (an
+  // instrument failure indistinguishable from "no medium work and no
+  // faults"), so it fails instead.
   STD_TORCH_CHECK(src != nullptr,
                   "persistent_topk_exact_counters: the counter buffer could "
                   "not be allocated on this device; the instrument is "
@@ -842,7 +841,7 @@ void persistent_topk_exact_counters(torch::stable::Tensor& out, int64_t reset,
 
 // How many 64-bit slots THIS build's counter array carries.
 //
-// The Python reader used to guess from MERLIN_TOPK_COUNTER_SLOTS (default 5)
+// A Python reader must not guess from MERLIN_TOPK_COUNTER_SLOTS (default 5)
 // and name the slots by that length. The decode restart makes the array 11 and the large path makes
 // it 10, so a guess is now wrong on at least one branch, and a reader that
 // allocates the wrong length is rejected by the length check above -- the

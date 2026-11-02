@@ -186,10 +186,8 @@ def _worker_exit_waitables(
     owning worker does: registering its host buffers under the "file_system"
     sharing strategy starts a torch_shm_manager child, which keeps the write
     end, and which lives while any client -- rank 0's PLE child, for a TP1
-    worker's buffers -- still maps them. In a rank-1 fault test PP0_TP1 died
-    in release_outputs, sat as a zombie, its sentinel never fired and the
-    engine hung; rank 0's death only looked detected because its PLE child
-    (and so both managers) died with it, ~8 s later.
+    worker's buffers -- still maps them. A worker that dies then stays a
+    zombie whose sentinel never fires, and the engine hangs.
 
     Returns (waitable, proc, pidfd-to-close-or-None) per process, falling back
     to the sentinel where no pidfd can be opened.
@@ -231,7 +229,7 @@ def _make_inherited_pipes_close_on_exec() -> None:
     the sentinel pipe (and the ready / death pipes) as INHERITABLE fds, so any
     program the worker fork+execs keeps them open: the torch_shm_manager that
     the PLE host-buffer registration starts did, and outlived the worker, so
-    neither the sentinel nor the ready pipe reported its death (rank-1 fault injection).
+    neither the sentinel nor the ready pipe reported its death.
     Nothing this process execs needs them -- multiprocessing children get
     their fds passed explicitly, subprocess closes them by default -- so mark
     every inherited pipe above stderr close-on-exec. The executor's pidfd
@@ -610,6 +608,38 @@ class MultiprocExecutor(Executor):
             timeout=envs.VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS,
         )
 
+    # This check bounds boot waits, not profiling time.
+    def _check_profile_workers(self) -> None:
+        for worker in self.workers:
+            exitcode = worker.proc.exitcode
+            if exitcode is not None:
+                self.is_failed = True
+                raise RuntimeError(
+                    "Engine core initialization failed: "
+                    f"worker rank {worker.rank} ({worker.proc.name}) died during "
+                    "determine_available_memory/profile run "
+                    f"(exit code: {exitcode})."
+                )
+
+    def _dequeue_profile_response(self, mq: MessageQueue, deadline: float | None):
+        while True:
+            self._check_profile_workers()
+            remaining = (
+                None if deadline is None else max(0.0, deadline - time.monotonic())
+            )
+            timeout = 0.1 if remaining is None else min(0.1, remaining)
+            try:
+                return mq.dequeue(timeout=timeout)
+            except TimeoutError:
+                # A different PP rank can die while this rank waits in NCCL.
+                self._check_profile_workers()
+                if deadline is not None and time.monotonic() >= deadline:
+                    raise
+            except RuntimeError:
+                # The worker monitor can cancel the queue during this wait.
+                self._check_profile_workers()
+                raise
+
     def collective_rpc(  # type: ignore[override]
         self,
         method: str | Callable,
@@ -623,6 +653,9 @@ class MultiprocExecutor(Executor):
     ) -> Any:
         """Returns single result if unique_reply_rank and/or an output
         aggregator is provided, otherwise list."""
+        # Retain rank on pre-existing failure.
+        if method == "determine_available_memory":
+            self._check_profile_workers()
         assert self.rpc_broadcast_mq is not None, (
             "collective_rpc should not be called on follower node"
         )
@@ -668,7 +701,11 @@ class MultiprocExecutor(Executor):
                     None if deadline is None else max(0.0, deadline - time.monotonic())
                 )
                 try:
-                    status, result = mq.dequeue(timeout=dequeue_timeout)
+                    # No serving RPC polling.
+                    if method == "determine_available_memory":
+                        status, result = self._dequeue_profile_response(mq, deadline)
+                    else:
+                        status, result = mq.dequeue(timeout=dequeue_timeout)
                 except TimeoutError as e:
                     raise TimeoutError(f"RPC call to {method} timed out.") from e
                 if status != WorkerProc.ResponseStatus.SUCCESS:
@@ -699,18 +736,13 @@ class MultiprocExecutor(Executor):
         after_failure: a worker already died. Survivors split in two. Those
         that never started WorkerProc.shutdown() are parked in a collective
         with the dead rank (NCCL / gloo, in C, where neither the grace nor a
-        SIGTERM reaches them -- in a fault-injection test two ranks ran the full
-        5 s + 4 s ladder to SIGKILL): they get _FAILED_WORKER_WAIT_S to start
+        SIGTERM reaches them): they get _FAILED_WORKER_WAIT_S to start
         their shutdown, then SIGTERM, then SIGKILL after as long again. Those
         whose shutdown_states entry shows the shutdown started (FINAL DRAIN,
         flushes) get _FAILED_DRAIN_GRACE_S from the start of the ladder, then
         SIGTERM, then SIGKILL after _FAILED_WORKER_WAIT_S: a started shutdown
-        can itself block on the dead rank (in a drain fault-injection test one
-        survivor had started its shutdown and never logged its FINAL DRAIN --
-        the drain's device synchronize waits on work paired with the dead
-        rank -- and ran the full orderly ladder, workers gone 17.6 s after the
-        fault). Before the drain-order fix the engine died on the late SIGTERM and
-        PDEATHSIG killed all survivors at once. A worker with no state (None,
+        can itself block on the dead rank (the drain's device synchronize
+        waits on work paired with it). A worker with no state (None,
         or no shutdown_states) counts as parked. The orderly ladder (no
         failure) is unchanged.
         """

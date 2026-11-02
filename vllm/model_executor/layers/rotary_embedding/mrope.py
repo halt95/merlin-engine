@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by the Merlin project; see NOTICE.
 
 
 import numpy as np
@@ -325,7 +326,13 @@ class MRotaryEmbedding(RotaryEmbeddingBase):
         mscale_all_dim: float | None = None,
         attention_factor: float | None = None,
         truncate: bool = True,
+        yarn_served_max_position: int = 0,
     ) -> None:
+        # The YaRN cache holds
+        # original * factor rows; a larger served max_position (e.g. a
+        # max_position_embeddings override past original * factor) must not
+        # index past it. Floors the row count only; rows below are unchanged.
+        self.yarn_cache_floor = yarn_served_max_position * positions_factor
         self.scaling_factor = scaling_factor
         self.beta_fast = beta_fast
         self.beta_slow = beta_slow
@@ -344,15 +351,14 @@ class MRotaryEmbedding(RotaryEmbeddingBase):
         else:
             self.mscale = 1.0
 
-        # In Qwen2.5-VL, the maximum index value is related to the duration of
-        # the input video. We enlarge max_position_embeddings to 4 times to get
-        # a larger the cos and sin cache. Models whose positions never exceed
-        # the token count pass `positions_factor=1`.
+        # Video pruning enlarges only the cos/sin cache, keeping the original
+        # max position for YaRN's correction range. Models whose positions
+        # never exceed the token count pass `positions_factor=1`.
         self.cache_max_position_num = max_position_embeddings * positions_factor
         super().__init__(
             head_size,
             rotary_dim,
-            self.cache_max_position_num,
+            max_position_embeddings,
             base,
             is_neox_style,
             dtype,
@@ -370,8 +376,18 @@ class MRotaryEmbedding(RotaryEmbeddingBase):
 
     def _compute_cos_sin_cache(self) -> torch.Tensor:
         if self.scaling_factor is None:
-            return super()._compute_cos_sin_cache()
-        return YaRNScalingRotaryEmbedding._compute_cos_sin_cache(self)
+            inv_freq = self._compute_inv_freq(self.base)
+            cache_length = self.cache_max_position_num
+        else:
+            inv_freq = self._compute_inv_freq(self.scaling_factor)
+            cache_length = self.cache_max_position_num * self.scaling_factor
+            # Preserve the served-position floor.
+            cache_length = max(cache_length, self.yarn_cache_floor)
+        t = torch.arange(cache_length, dtype=torch.float32)
+        freqs = torch.einsum("i,j -> ij", t, inv_freq)
+        cos = freqs.cos() * self.mscale
+        sin = freqs.sin() * self.mscale
+        return torch.cat((cos, sin), dim=-1)
 
     def forward_native(
         self,

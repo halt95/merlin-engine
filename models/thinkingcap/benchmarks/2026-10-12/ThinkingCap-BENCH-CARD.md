@@ -19,7 +19,7 @@ checkpoint appear in this card;** nothing here is inferred from the base checkpo
 **Evidence.** Every figure is a maintainer measurement on the reference host, by the harnesses named in each section; the raw
 run artifacts are not published. Measured 2026-10-08 to 2026-10-12 (UTC); where each row was measured:
 
-- **2026-10-08 gate** (sections 1-2 and the gate rows of 4-6): dual card, the base profile's `serve/serve.sh` with its `medium`
+- **2026-10-08 check** (sections 1-2 and the gate rows of 4-6): dual card, the base profile's `serve/serve.sh` with its `medium`
   default (each harness sets its own per-request effort), the build directory's earlier `tokenizer.json`; 2026-10-08
   21:05-22:52 UTC. The section 1 thinking-token run ran on the renamed tree of the Qwen3.8-27B card's section 7.
 - **2026-10-09** (section 7 and the quad rows of sections 4-5): dual and quad card with the `xhigh` default, on an earlier tree (before the final patch revision), the upstream `tokenizer.json` staged.
@@ -56,14 +56,14 @@ percentage points.
   thinking tokens per item (the table's median is rounded by the tool). One task family (GSM8K-style arithmetic word problems),
   one sampling setup; the saving on code, long-context or agentic work was not measured.
 
-## 2. Single stream over context depth (dual card, 2026-10-08 gate)
+## 2. Single stream over context depth (dual card, 2026-10-08 check)
 
 ![ThinkingCap-Qwen3.8-27B · Merlin 3.0.0 over context depth: cold prefill, single-stream decode and decode step time, dual and quad card](../merlin-3.0.0/thinkingcap-merlin-3.0.0-ctx-pp-tg-itl.png)
 
 *The chart is the Merlin 3.0.0 chart (engine on vLLM 0.32.0); the tables below are the historical v1.3.0 / vLLM 0.30 results and are not redrawn in it.*
 
 Medians of 3 cold requests per depth, thinking on (effort `low`, 256-token outputs): dual card from this section's ladder
-(2026-10-08 gate), quad card from section 3's ladder (2026-10-12). Prefill = prompt tokens / time to first token; decode moves
+(2026-10-08 check), quad card from section 3's ladder (2026-10-12). Prefill = prompt tokens / time to first token; decode moves
 with how many drafted tokens each text accepts (the 255K point accepts more, 4.5-4.8 per step); step time is per decode step.
 
 Same harness and method as the Qwen3.8-27B card's section 1 (c1, 3 cold requests per depth and mode; thinking on: effort `low`, `max_tokens` 256;
@@ -147,7 +147,7 @@ run in the Qwen3.8-27B card's section 11: 8 conversations, 1,200 s, prefix seed 
 **96.5 %**, TTFT p50 / p99 5.5 s / 101.5 s, 0 preemptions, peak KV pool usage 80.9 %; multi-turn replay median follow-up
 **1.80 s**.
 
-## 5. Quality gates
+## 5. Quality checks
 
 | | dual, gate (`medium` default) | dual, 2026-10-11 (`xhigh` default) | quad, 2026-10-09 (`xhigh` default) |
 |---|---|---|---|
@@ -159,7 +159,7 @@ run in the Qwen3.8-27B card's section 11: 8 conversations, 1,200 s, prefix seed 
 Loop protocol as in the Qwen3.8-27B card's section 4. The thinking-token run's truncation counts (section 1: 0 of 1,319 at medium, 0 of 400 at `xhigh`) are
 the long-thought check.
 
-## 6. KV pool, memory and boot (2026-10-08 gate)
+## 6. KV pool, memory and boot (2026-10-08 check)
 
 | | dual (boot 1) | dual (boot 2) |
 |---|---:|---:|

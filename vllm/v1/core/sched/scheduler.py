@@ -28,6 +28,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1 import (
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
 from vllm.logger import init_logger
+from vllm.merlin import kv_host_tier
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
 from vllm.multimodal.encoder_budget import MultiModalBudget
 from vllm.multimodal.utils import get_mm_features_in_window
@@ -39,7 +40,10 @@ from vllm.v1.core.encoder_cache_manager import (
 )
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
-from vllm.v1.core.kv_cache_utils import KVCacheBlock
+from vllm.v1.core.kv_cache_utils import (
+    KVCacheBlock,
+    sliding_window_context_kv_is_causal,
+)
 from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
 from vllm.v1.core.sched.output import (
     CachedRequestData,
@@ -221,6 +225,13 @@ class Scheduler(SchedulerInterface):
 
             self.requires_kv_delivery = self.connector.requires_kv_delivery
 
+        # prefix-cache pins stay on with the
+        # host-RAM KV tier (kv_host_tier.keeps_prefix_pins), off with any
+        # other connector.
+        self.prefix_pins = self.connector is None or kv_host_tier.keeps_prefix_pins(
+            self.vllm_config
+        )
+
         if (
             not self.defer_block_free
             and self.vllm_config.max_concurrent_batches > 1
@@ -290,6 +301,7 @@ class Scheduler(SchedulerInterface):
         # update_from_output.
         self.grammar_compile_error_reqs: set[str] = set()
         self.encoder_cache_mismatch_reqs: set[str] = set()
+        self.kv_capacity_error_reqs: set[str] = set()
 
         # Encoder-related.
         # Calculate encoder cache size if applicable
@@ -382,6 +394,9 @@ class Scheduler(SchedulerInterface):
             enable_mamba_shared_prefix_checkpoint=(
                 self.cache_config.enable_mamba_shared_prefix_checkpoint
             ),
+            causal_sliding_window_kv=sliding_window_context_kv_is_causal(
+                vllm_config.speculative_config
+            ),
         )
         # see
         # MambaManager.publish_decode_checkpoints.
@@ -406,8 +421,20 @@ class Scheduler(SchedulerInterface):
         # Bind after construction so connectors can access the cache manager.
         if self.connector is not None:
             self.connector.bind_kv_cache_manager(self.kv_cache_manager)
-            # Finished turns' grace pins are off with a connector, as
-            # waiter pins are (_pin_waiting_hits).
+        # The host tier admits through one
+        # two-tier PrefixHitPlan (vllm/merlin/kv_host_tier_plans.py); the tier is refused
+        # with bounded prefix replay (kv_host_tier.refuse_prefix_replay).
+        self.tier_plans = (
+            getattr(
+                getattr(self.connector, "scheduler_manager", None), "tier_plans", None
+            )
+            if self.connector is not None
+            else None
+        )
+        # Finished turns' grace pins are off with a
+        # connector, as waiter pins are (_pin_waiting_hits); the host-RAM KV
+        # tier keeps both.
+        if not self.prefix_pins:
             self.kv_cache_manager.enable_grace_pins = False
 
         self.thrash = cache_thrash.Admission(self)
@@ -428,6 +455,14 @@ class Scheduler(SchedulerInterface):
         )
 
         self.has_mamba_layers = kv_cache_config.has_mamba_layers
+        # Request-private state a stopped session cannot rewind in place: the
+        # recurrent state of every Mamba/GDN/linear-attention mode and cache
+        # mode, and ring buffers (e.g. the Qwen4Exp QSA key ring).
+        self.resume_state_is_private = self.has_mamba_layers or any(
+            isinstance(spec, CircularBufferSpec)
+            for group in kv_cache_config.kv_cache_groups
+            for spec in iter_layer_specs(group.kv_cache_spec)
+        )
         self.needs_kv_cache_zeroing = kv_cache_config.needs_kv_cache_zeroing
         self._skip_ring_clear_block_ids: set[int] = set()
         self.need_mamba_block_aligned_split = (
@@ -625,7 +660,7 @@ class Scheduler(SchedulerInterface):
         """One startup line per prefix-cache retention feature that is active
         (nothing when it is off)."""
         manager = self.kv_cache_manager
-        if manager.enable_caching and self.connector is None:
+        if manager.enable_caching and self.prefix_pins:
             logger.info(
                 "Prefix cache: waiting requests' cached prefixes are pinned "
                 "until admission (up to %d waiters; hash unit %d, block %d)",
@@ -654,11 +689,15 @@ class Scheduler(SchedulerInterface):
         manager = self.kv_cache_manager
         if (
             not manager.enable_caching
-            or self.connector is not None
+            or not self.prefix_pins
             or manager.num_pinned_waiters >= manager.MAX_PINNED_WAITERS
         ):
             return
-        for request in itertools.islice(self.waiting, max_requests):
+        # a bounded front of the queue.
+        limit = getattr(manager, "MAX_INSPECTED_WAITERS", None)
+        if max_requests is not None:
+            limit = max_requests if limit is None else min(limit, max_requests)
+        for request in itertools.islice(self.waiting, limit):
             if manager.num_pinned_waiters >= manager.MAX_PINNED_WAITERS:
                 break
             if (
@@ -680,6 +719,28 @@ class Scheduler(SchedulerInterface):
             self.kv_cache_manager.get_computed_blocks(request)
         )
         return blocks, num_local, shared_prefix_boundary, False
+
+    def _admit_prefix_plan(
+        self, request: Request
+    ) -> tuple[KVCacheBlocks, int, int, bool, int] | None:
+        """(adopted blocks, B, shared-prefix boundary, async restore, GPU-only
+        boundary) of the request's leased PrefixHitPlan; None = wait. After a
+        plan failed to fit with nothing to wait for, the GPU tier alone, then
+        cold."""
+        plans = self.tier_plans
+        assert plans is not None
+        if plans.use_cold(request):
+            return self.kv_cache_manager.empty_kv_cache_blocks, 0, 0, False, 0
+        hit = plans.admit(request)
+        if hit is None:
+            return None
+        return (
+            self.kv_cache_manager.create_kv_cache_blocks(hit.blocks),
+            hit.boundary,
+            hit.shared_prefix_boundary,
+            hit.restore,
+            hit.gpu_boundary,
+        )
 
     def _reserve_prefill_lookahead(
         self,
@@ -909,6 +970,47 @@ class Scheduler(SchedulerInterface):
                     if self.kv_cache_manager.yield_pinned_hits(limit=1):
                         continue
 
+                    # Replaying a lone request cannot create capacity. Wait for
+                    # outstanding work first, then shed its optional checkpoints
+                    # before deciding that its next step cannot fit.
+                    if len(self.running) == 1 and not any(
+                        other is not request and self._holds_kv_blocks(other)
+                        for other in self.requests.values()
+                    ):
+                        if self.deferred_frees or any(
+                            other.num_in_flight_tokens
+                            for other in self.requests.values()
+                        ):
+                            break
+                        released_checkpoint = False
+                        for manager in (
+                            self.kv_cache_manager.coordinator.single_type_managers
+                        ):
+                            held = manager.pop_retained_checkpoints(request.request_id)
+                            if held:
+                                manager.block_pool.free_blocks(held)
+                                released_checkpoint = True
+                        if released_checkpoint:
+                            continue
+
+                        pool = self.kv_cache_manager.block_pool
+                        request.stop_reason = (
+                            "KV cache capacity exhausted: the lone running request "
+                            f"cannot allocate its next {num_new_tokens} token(s) "
+                            f"with {self.num_lookahead_tokens} lookahead token(s) "
+                            f"after {request.num_computed_tokens} computed tokens "
+                            f"({pool.get_num_free_blocks()} free blocks, "
+                            f"{pool.num_gpu_blocks} total blocks). "
+                            "Increase KV cache memory or reduce the request length."
+                        )
+                        logger.error(
+                            "Request %s failed: %s",
+                            request.request_id,
+                            request.stop_reason,
+                        )
+                        self.kv_capacity_error_reqs.add(request.request_id)
+                        break
+
                     # The request cannot be scheduled.
                     # Preempt the lowest-priority request.
                     if self.policy == SchedulingPolicy.PRIORITY:
@@ -930,6 +1032,12 @@ class Scheduler(SchedulerInterface):
                             req_index -= 1
 
                         if preempted_req in scheduled_running_reqs:
+                            # Its allocate_slots this step already keyed blocks
+                            # for a forward that will not run: withdraw them
+                            # before the free leaves them hittable.
+                            self.kv_cache_manager.invalidate_step_publications(
+                                preempted_req
+                            )
                             preempted_req_id = preempted_req.request_id
                             scheduled_running_reqs.remove(preempted_req)
                             restored = num_scheduled_tokens.pop(preempted_req_id)
@@ -1075,8 +1183,41 @@ class Scheduler(SchedulerInterface):
                 connector_prefix_cache_queries, connector_prefix_cache_hits = 0, 0
                 did_prefix_cache_lookup = False
 
+                # The plan gives the computed
+                # tokens (B), the adopted GPU pages and the host restore slots.
+                plan_hit = None
+                if request.num_computed_tokens == 0 and self.tier_plans is not None:
+                    plan_hit = self._admit_prefix_plan(request)
+                    if plan_hit is None:
+                        skip_request(request_queue)
+                        continue
+                if plan_hit is not None:
+                    did_prefix_cache_lookup = True
+                    (
+                        new_computed_blocks,
+                        num_new_local_computed_tokens,
+                        request.shared_prefix_boundary,
+                        load_kv_async,
+                        gpu_boundary,
+                    ) = plan_hit
+                    num_computed_tokens = num_new_local_computed_tokens
+                    window_loaded = False
+                    connector_prefix_cache_queries = request.num_tokens - gpu_boundary
+                    connector_prefix_cache_hits = num_computed_tokens - gpu_boundary
+                    if self._ec_transfer_pending(request, num_computed_tokens):
+                        skip_request(request_queue)
+                        continue
+                    if request.prefill_stats and request.num_preemptions <= 0:
+                        request.prefill_stats.set(
+                            num_prompt_tokens=request.num_prompt_tokens,
+                            num_local_cached_tokens=gpu_boundary,
+                            num_external_cached_tokens=connector_prefix_cache_hits,
+                        )
+                    self._set_kv_fetch_stage(
+                        request, KV_FETCH_WAITING_TO_START if load_kv_async else None
+                    )
                 # Get already-cached tokens.
-                if request.num_computed_tokens == 0:
+                elif request.num_computed_tokens == 0:
                     did_prefix_cache_lookup = True
                     (
                         new_computed_blocks,
@@ -1237,7 +1378,8 @@ class Scheduler(SchedulerInterface):
 
                 if load_kv_async:
                     # KVTransfer: loading remote KV, do not allocate for new work.
-                    assert num_external_computed_tokens > 0
+                    # Or a plan's host slots.
+                    assert num_external_computed_tokens > 0 or plan_hit is not None
                     num_new_tokens = 0
                 elif defer_prefills and num_computed_tokens < request.num_tokens - 1:
                     # DP prefill balancing: defer this step's local prefill
@@ -1448,10 +1590,12 @@ class Scheduler(SchedulerInterface):
                         or kv_cache_manager.num_pinned_waiters > 0
                     )
                 )
+                # Pin yields for a real
+                # shortfall only; the retries reuse this pass's plan.
                 if yield_for_head:
                     self.thrash.site("admit", request, num_computed_tokens)
                     if (
-                        self.connector is None
+                        self.prefix_pins
                         and request.num_computed_tokens == 0
                         and kv_cache_manager.pin_waiting_hit(request) > 0
                     ):
@@ -1469,7 +1613,9 @@ class Scheduler(SchedulerInterface):
                             has_scheduled_reqs=bool(self.running),
                         )
                     yield_for_head = new_blocks is None and (
-                        kv_cache_manager.last_alloc_shortfall
+                        # A retry that
+                        # turned into a demotion wait (shortfall 0) yields nothing.
+                        0 < kv_cache_manager.last_alloc_shortfall
                         <= kv_cache_manager.num_yieldable_blocks(
                             keep=request_id, keep_hit=new_computed_blocks.blocks
                         )
@@ -1521,7 +1667,8 @@ class Scheduler(SchedulerInterface):
                 while (
                     yield_for_head
                     and new_blocks is None
-                    and kv_cache_manager.last_alloc_shortfall
+                    # No yield for a wait.
+                    and 0 < kv_cache_manager.last_alloc_shortfall
                     <= kv_cache_manager.num_yieldable_blocks(
                         keep=request_id, keep_hit=new_computed_blocks.blocks
                     )
@@ -1543,6 +1690,14 @@ class Scheduler(SchedulerInterface):
 
                 if new_blocks is None:
                     # The request cannot be scheduled.
+                    # a plan that waiting cannot
+                    # fit lowers its boundary next pass, never stalls.
+                    if plan_hit is not None and kv_cache_manager.last_alloc_shortfall:
+                        self.tier_plans.note_unfit(
+                            request,
+                            shortfall=kv_cache_manager.last_alloc_shortfall,
+                            num_running=len(self.running),
+                        )
 
                     # NOTE: we need to untouch the request from the encode cache
                     # manager
@@ -1683,6 +1838,9 @@ class Scheduler(SchedulerInterface):
                 self.kv_holding_waiting.prepend_requests(step_skipped_kv_holding)
             if step_skipped_waiting:
                 self.waiting.prepend_requests(step_skipped_waiting)
+            # No plan lease outlives a pass.
+            if self.tier_plans is not None:
+                self.tier_plans.release_pending()
 
             # Whoever is still waiting keeps its prefix-cache hit.
             self._pin_waiting_hits()
@@ -1821,6 +1979,29 @@ class Scheduler(SchedulerInterface):
         # 1. Plan the KV cache store
         # 2. Wrap up all the KV cache load / save ops into an opaque object
         # 3. Clear the internal states of the connector
+        # Exact H_run for the write-back walker:
+        # the next step's block need of the running requests, before
+        # _update_after_schedule advances them.
+        if self.kv_cache_manager.running_headroom_hook is not None:
+            self.kv_cache_manager.running_headroom_hook(
+                self.kv_cache_manager.coordinator,
+                self.kv_cache_manager.empty_kv_cache_blocks.blocks,
+                self.running,
+                num_scheduled_tokens,
+                token_budget=self.max_num_scheduled_tokens,
+                max_model_len=self.max_model_len,
+                num_spec_tokens=self.num_spec_tokens,
+                num_lookahead_tokens=self.num_lookahead_tokens,
+                sampled_per_step=self.num_sampled_tokens_per_step,
+                long_prefill_threshold=long_prefill_token_threshold,
+                # Next step's full budgets, not this step's remainder.
+                input_budget=self.scheduler_config.max_num_batched_tokens,
+                draft_slots=draft_slots,
+                # Parked KV-holding waiters (a streaming
+                # session) resume writing into their own tables.
+                kv_holders=tuple(self.kv_holding_waiting),
+            )
+
         if self.connector is not None:
             meta = self._build_kv_connector_meta(self.connector, scheduler_output)
             scheduler_output.kv_connector_metadata = meta
@@ -1893,6 +2074,20 @@ class Scheduler(SchedulerInterface):
         )
         if self.aux_output_connector is not None:
             self.aux_output_connector.request_finished(request)
+        # a preempted prefix is a restore unit,
+        # recorded before its blocks are freed.
+        record_preempted = getattr(self.connector, "record_preempted", None)
+        if record_preempted is not None:
+            record_preempted(request)
+        # Lifecycle (preempt grace); absent
+        # without the tier.
+        tier_preempted = getattr(
+            getattr(self.connector, "scheduler_manager", None),
+            "tier_preempted",
+            None,
+        )
+        if tier_preempted is not None:
+            tier_preempted(request)
         self._free_request_blocks(request)
         self.encoder_cache_manager.free(request)
         self._inflight_prefills.discard(request)
@@ -1961,14 +2156,15 @@ class Scheduler(SchedulerInterface):
 
         Discards the last sampled output token from the prior input chunk.
         """
-        # Current streaming input behaviour: Keep only computed output tokens
-        # (discard final sampled output token).
-        num_computed_tokens = session.num_computed_tokens
+        # Port of vllm#58778.
+        # Keep all output tokens but the final sampled one.
+        keep_end = session.num_tokens - 1
+        assert keep_end >= session.num_computed_tokens
         kept_output_tokens = session._all_token_ids[
-            session.num_prompt_tokens : num_computed_tokens
+            session.num_prompt_tokens : keep_end
         ]
-        del session._all_token_ids[num_computed_tokens:]
-        del session.block_hashes[num_computed_tokens // self.hash_block_size :]
+        del session._all_token_ids[keep_end:]
+        del session.block_hashes[keep_end // self.hash_block_size :]
         session._output_token_ids.clear()
         assert session.prompt_token_ids is not None
         # Extend prompt with kept output tokens.
@@ -1992,7 +2188,16 @@ class Scheduler(SchedulerInterface):
         session.max_tokens = update.max_tokens
         if session.status == RequestStatus.WAITING_FOR_STREAMING_REQ:
             self.num_waiting_for_streaming_input -= 1
+            if session.resume_needs_rewind:
+                # Parked holding its blocks; after the rewind it holds none.
+                self.kv_holding_waiting.remove_requests([session])
+                self.deferred_waiting.discard(session)
+                self._rewind_session(session)
+                self.waiting.add_request(session)
         session.status = RequestStatus.WAITING
+        # Stopped with this chunk already queued: update_from_output enqueues it.
+        if session.resume_needs_rewind:
+            self._rewind_session(session)
 
         if self.log_stats:
             session.record_event(EngineCoreEventType.QUEUED)
@@ -2381,6 +2586,8 @@ class Scheduler(SchedulerInterface):
         # to avoid expensive operations inside the loop.
         stopped_running_reqs: set[Request] = set()
         stopped_preempted_reqs: set[Request] = set()
+        # Stopped resumable requests to re-enqueue, in output order.
+        continuing_reqs: list[Request] = []
         for req_id, num_tokens_scheduled in num_scheduled_tokens.items():
             assert num_tokens_scheduled > 0
             request = self.requests.get(req_id)
@@ -2470,6 +2677,7 @@ class Scheduler(SchedulerInterface):
             status_before_stop = request.status
 
             # Check for stop and update request status.
+            num_returned = len(new_token_ids)
             if new_token_ids:
                 new_token_ids, stopped = self._update_request_with_output(
                     request, new_token_ids, is_stale=output_is_stale
@@ -2532,6 +2740,9 @@ class Scheduler(SchedulerInterface):
                 # Capture finish_reason BEFORE _handle_stopped_request, which may
                 # reset the status to WAITING for streaming requests that continue.
                 finish_reason = request.get_finished_reason()
+                self._check_stopped_frontier(
+                    request, num_returned - len(new_token_ids), output_is_stale
+                )
                 finished = self._handle_stopped_request(request)
                 if finished:
                     kv_transfer_params, ec_transfer_params = self._free_request(request)
@@ -2546,6 +2757,8 @@ class Scheduler(SchedulerInterface):
                         kv_transfer_params["remote_prefill_cached_tokens"] = (
                             prefill_stats.num_cached_tokens
                         )
+                else:
+                    continuing_reqs.append(request)
 
                 if status_before_stop == RequestStatus.RUNNING:
                     stopped_running_reqs.add(request)
@@ -2597,7 +2810,8 @@ class Scheduler(SchedulerInterface):
                 assert not prompt_logprobs_tensors
                 assert prompt_token_id_logprobs is None
 
-        # Remove the stopped requests from the running and waiting queues.
+        # Remove stopped requests from their queues, then enqueue the ones
+        # that continue, so each ends up in exactly one queue.
         if stopped_running_reqs:
             self.running = remove_all(self.running, stopped_running_reqs)
         if stopped_preempted_reqs:
@@ -2605,11 +2819,15 @@ class Scheduler(SchedulerInterface):
             self.waiting.remove_requests(stopped_preempted_reqs)
             self.kv_holding_waiting.remove_requests(stopped_preempted_reqs)
             self.deferred_waiting.difference_update(stopped_preempted_reqs)
+        for request in continuing_reqs:
+            self._enqueue_waiting_request(request)
 
         error_req_ids = set(self.grammar_compile_error_reqs)
         self.grammar_compile_error_reqs.clear()
         error_req_ids.update(self.encoder_cache_mismatch_reqs)
         self.encoder_cache_mismatch_reqs.clear()
+        error_req_ids.update(self.kv_capacity_error_reqs)
+        self.kv_capacity_error_reqs.clear()
         if failed_kv_load_req_ids and not self.recompute_kv_load_failures:
             error_req_ids.update(failed_kv_load_req_ids)
         if self.ec_connector is not None:
@@ -2627,6 +2845,7 @@ class Scheduler(SchedulerInterface):
                         request_id=request.request_id,
                         new_token_ids=[],
                         finish_reason=request.get_finished_reason(),
+                        stop_reason=request.stop_reason,
                         events=request.take_events(),
                         trace_headers=request.trace_headers,
                     )
@@ -2769,6 +2988,95 @@ class Scheduler(SchedulerInterface):
         else:
             self.waiting.add_request(request)
 
+    def _check_stopped_frontier(
+        self, request: Request, num_trimmed: int, is_stale: bool
+    ) -> None:
+        """At a stop, before the session fold: check the prefix-cache keys and
+        mark a resumable session whose private state may be past the kept
+        history for a rewind (``_rewind_session``).
+
+        A stale stop arrives after a preemption: the request then holds no
+        blocks and resumes with a full prefill from computed 0 (the scheduler
+        does not re-admit it while deliverable stale output is in flight), so
+        it is already rewound.
+        """
+        # The stop tuple, for diagnosing stop races (debug log only).
+        logger.debug(
+            "stopped frontier: req=%s trimmed=%d stale=%s resumable=%s "
+            "computed=%d placeholders=%d in_flight=%d tokens=%d",
+            request.request_id, num_trimmed, is_stale, request.resumable,
+            request.num_computed_tokens, request.num_output_placeholders,
+            request.num_in_flight_tokens, request.num_tokens,
+        )
+        if is_stale or not (num_trimmed or request.resumable):
+            return
+        if self.num_sampled_tokens_per_step:
+            # Not for diffusion: canvas positions are no autoregressive frontier.
+            frontier = request.num_computed_tokens - request.num_output_placeholders
+            self._assert_no_key_past(request, frontier)
+        if not (request.resumable and self.resume_state_is_private):
+            return
+        if (
+            # The runner committed the trimmed accepted drafts.
+            num_trimmed > 0
+            # An already dispatched step (async scheduling, PP batch queue)
+            # verifies and commits past the stop, trim or not.
+            or request.num_in_flight_tokens > 0
+            # Non-last PP stages commit a step's state pp_size steps later.
+            or self.use_pp
+        ):
+            request.resume_needs_rewind = True
+
+    def _assert_no_key_past(self, request: Request, frontier: int) -> None:
+        """No prefix-cache key of this request covers a position past
+        ``frontier``, the kept history. Trimmed and in-flight tokens are never
+        appended, so no hash can name them; a key past the frontier would let
+        another request (or this session's rewind) load state that includes
+        discarded tokens. Only the blocks that can reach past it are checked.
+        """
+        if not self.kv_cache_manager.enable_caching:
+            return
+        req_id = request.request_id
+        for manager in self.kv_cache_manager.coordinator.single_type_managers:
+            blocks = manager.req_to_blocks.get(req_id)
+            if not blocks:
+                continue
+            block_size = manager.block_size
+            for idx in range(max(frontier // block_size - 1, 0), len(blocks)):
+                block = blocks[idx]
+                if block.is_null or block.block_hash is None:
+                    continue
+                key_end = block.block_hash_num_tokens
+                if key_end is None:
+                    key_end = (idx + 1) * block_size
+                assert key_end <= frontier, (
+                    f"request {req_id}: prefix-cache key ends at {key_end}, "
+                    f"past the kept frontier {frontier}"
+                )
+
+    def _rewind_session(self, session: Request) -> None:
+        """Re-admit a stopped session from its newest prefix-cache checkpoint.
+
+        Its private recurrent/ring state may include tokens the fold discarded
+        (a stop-trimmed accepted draft, or the stop token and drafts of an
+        already dispatched step), so it is not read again. As for a
+        preemption: free the blocks (fenced by ``_free_request_blocks``),
+        reset the worker slot (a preempted id frees the runner slot, whose
+        generation bump drops late PP-deferred commits of the old turn) and
+        resume from computed 0 with prefix-cache reads on. The hit lands on
+        the newest published checkpoint at or below the kept history (no key
+        names a discarded token, ``_assert_no_key_past``), and only the tail
+        is prefilled.
+        """
+        session.resume_needs_rewind = False
+        if self.aux_output_connector is not None:
+            self.aux_output_connector.request_finished(session)
+        self._free_request_blocks(session)
+        self.encoder_cache_manager.free(session)
+        self._inflight_prefills.discard(session)
+        self.reset_preempted_req_ids.add(session.request_id)
+        session.num_computed_tokens = 0
+
     def _handle_stopped_request(self, request: Request) -> bool:
         """Return True if finished (can be False for resumable requests)."""
         if not request.resumable:
@@ -2794,13 +3102,13 @@ class Scheduler(SchedulerInterface):
             request.status = RequestStatus.WAITING_FOR_STREAMING_REQ
             self.num_waiting_for_streaming_input += 1
 
-        self._enqueue_waiting_request(request)
+        # Port of vllm#58778: update_from_output enqueues it.
         return False
 
     def _update_request_with_output(
         self, request: Request, new_token_ids: list[int], is_stale: bool = False
     ) -> tuple[list[int], bool]:
-        # is_stale is only used by the AsyncScheduler override.
+        # Port of vllm#58668.
         # Append generated tokens and check for stop. Note that if
         # a request is still being prefilled, we expect the model runner
         # to return empty token ids for the request.
@@ -2812,6 +3120,10 @@ class Scheduler(SchedulerInterface):
             # This must be called before we make the EngineCoreOutput.
             stopped = check_stop(request, self.max_model_len)
             if stopped:
+                # num_computed_tokens covers all new tokens but the last one.
+                # Keep that true after trimming: resumable requests resume from it.
+                if not is_stale:
+                    request.num_computed_tokens -= len(new_token_ids) - num_new
                 del new_token_ids[num_new:]  # Trim new tokens if needed.
                 break
         return new_token_ids, stopped
@@ -2871,7 +3183,8 @@ class Scheduler(SchedulerInterface):
                 continue
 
             # Add newly generated spec token ids to the request.
-            request.spec_token_ids = self.structured_output_manager.validate_tokens(
+            # Keep the first invalid draft.
+            request.spec_token_ids = self.structured_output_manager.trim_spec_tokens(
                 request, spec_token_ids
             )
 
@@ -2898,8 +3211,9 @@ class Scheduler(SchedulerInterface):
             # Trim drafts to scheduled number of spec tokens
             # (needed for chunked prefill case for example).
             del spec_token_ids[orig_num_spec_tokens:]
-            # Filter out spec tokens which do not adhere to the grammar.
-            spec_token_ids = self.structured_output_manager.validate_tokens(
+            # Drop the drafts after the
+            # first grammar-invalid one; that one is kept so it is rejected.
+            spec_token_ids = self.structured_output_manager.trim_spec_tokens(
                 request, spec_token_ids
             )
             # Pad to original number of spec tokens.
@@ -3175,8 +3489,32 @@ class Scheduler(SchedulerInterface):
             # persistent batch in the model runner.
             self.prev_step_scheduled_req_ids.clear()
 
+        # Stop old-epoch publication before the
+        # allocator reset. Evicting keys preserves physical DMA quarantine.
+        tier_reset = self.connector is not None and kv_host_tier.is_active(
+            self.vllm_config
+        )
+        connector_reset = True
+        if tier_reset:
+            # A completed receive is normally hashed when its waiter resumes.
+            # Old-epoch receives must instead recompute, even if their worker
+            # output was already queued before it received the epoch bump.
+            for request in self.requests.values():
+                if request.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
+                    request.num_computed_tokens = 0
+                    self.failed_recving_kv_req_ids.add(request.request_id)
+            # The host tier is reset even when reset_connector is False: its
+            # directory is keyed by the same block hashes this reset unkeys,
+            # and old-epoch host copies must never be served afterwards.
+            connector_reset = self.reset_connector_cache()
+            pool = self.kv_cache_manager.block_pool
+            pool.evict_blocks({
+                block.block_id for block in pool.blocks
+                if block.block_hash is not None
+            })
         reset_successful = self.kv_cache_manager.reset_prefix_cache()
-        if reset_running_requests and not reset_successful:
+        # in-flight leases drain asynchronously.
+        if reset_running_requests and not reset_successful and not tier_reset:
             raise RuntimeError(
                 "Failed to reset KV cache even when all the running requests are "
                 "preempted and moved to the waiting queue. This is likely due to "
@@ -3184,7 +3522,10 @@ class Scheduler(SchedulerInterface):
                 "which is not supported yet."
             )
 
-        if reset_connector:
+        # The shared directory always resets together.
+        if tier_reset:
+            reset_successful = connector_reset and reset_successful
+        elif reset_connector:
             reset_successful = self.reset_connector_cache() and reset_successful
 
         if reset_successful and self.aux_output_connector is not None:

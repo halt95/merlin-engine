@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by the Merlin project; see NOTICE.
 """Low-level CUDA/HIP memory helpers: pinning and batch DMA transfers."""
 
 import ctypes
@@ -31,6 +32,31 @@ def pin_tensor(tensor: torch.Tensor) -> None:
     err = torch.cuda.cudart().cudaHostRegister(tensor.data_ptr(), tensor.nbytes, 0)
     if err.value != 0:
         raise RuntimeError(f"cudaHostRegister failed: {err}")
+
+
+def lock_host_memory(tensor: torch.Tensor) -> bool:
+    """mlock a CPU tensor's pages (Linux only).
+
+    Keeps a host arena resident the way cudaHostRegister does, without
+    registering it with CUDA, i.e. without mapping it into the GPU's virtual
+    address space. Returns False where mlock is unavailable or refused
+    (RLIMIT_MEMLOCK without CAP_IPC_LOCK); the host-RAM KV tier then refuses
+    to start rather than run on swappable memory. An empty tensor has no
+    pages to lock (True).
+    """
+    import sys
+
+    if tensor.nbytes == 0:
+        return True
+    if not sys.platform.startswith("linux"):
+        return False
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        libc.mlock.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+        libc.mlock.restype = ctypes.c_int
+        return libc.mlock(ctypes.c_void_p(tensor.data_ptr()), tensor.nbytes) == 0
+    except (OSError, AttributeError):
+        return False
 
 
 class _CUmemLocation(ctypes.Structure):

@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by the Merlin project; see NOTICE.
 
 import copy
 import json
@@ -236,13 +237,20 @@ class GuidanceGrammar(StructuredOutputGrammar):
         Returns True if the parser was advanced successfully.
         Returns False if the parser failed to advance.
         """
-        if self.ll_tokenizer.eos_token in tokens:
-            if self.ll_matcher.is_stopped() and not self.terminated:
-                self.rollback_lag = 1
-            self.terminated = True
-
-        if self.ll_matcher.is_stopped():
+        # All or nothing: a False
+        # return leaves the matcher and the terminated flag unchanged
+        # (consume_tokens left the matcher in an error state on a rejected
+        # draft). Tokens after the first EOS are ignored, as in xgrammar
+        # (ignore_eos can keep a step going past it).
+        if self.terminated:
             return True
+        eos_token = self.ll_tokenizer.eos_token
+        eos_index = next(
+            (index for index, token in enumerate(tokens) if token == eos_token),
+            None,
+        )
+        if eos_index is not None:
+            tokens = tokens[: eos_index + 1]
 
         # TODO - Add jump decoding support in the future:
         # self.ll_matcher.compute_ff_bytes() - this should always work
@@ -251,11 +259,31 @@ class GuidanceGrammar(StructuredOutputGrammar):
         # For conversion between the two, see
         # https://github.com/guidance-ai/llguidance/blob/main/docs/fast_forward.md
 
-        r = self.ll_matcher.consume_tokens(tokens)
+        num_tokens = self.ll_matcher.try_consume_tokens(tokens)
+        if num_tokens != len(tokens):
+            if (
+                eos_index is not None
+                and num_tokens == eos_index
+                and self.ll_matcher.is_stopped()
+                and self.ll_matcher.is_accepting()
+            ):
+                # The matcher stopped in an accepting state and leaves the
+                # EOS token unconsumed.
+                self.rollback_lag = 1
+                self.terminated = True
+                self.check_error()
+                return True
+            if num_tokens > 0:
+                self.ll_matcher.rollback(num_tokens)
+            self.check_error()
+            return False
+
+        if eos_index is not None:
+            self.terminated = True
 
         self.check_error()
 
-        return r
+        return True
 
     def validate_tokens(self, tokens: list[int]) -> list[int]:
         """Checks if the list of tokens are accepted by the parser in sequence.

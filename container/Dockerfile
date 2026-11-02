@@ -1,11 +1,13 @@
-# Merlin 3.0.0: build this checkout on vLLM 0.32.0.
+# Merlin 3.0.1: build this checkout on vLLM 0.32.0.
 # unqualified until qualified on hardware
-# Build from the repository root: docker build -f container/Dockerfile -t merlin-engine:3.0.0 .
+# Build from the repository root, using the source ref as the image tag:
+#   SOURCE_REF=merlin-v3.0.1
+#   docker build -f container/Dockerfile --build-arg SOURCE_REF="$SOURCE_REF" -t "merlin-engine:$SOURCE_REF" .
 # Base index digest: Docker Hub library/python, 3.13-slim-trixie, read 2026-10-15.
 FROM python:3.13-slim-trixie@sha256:70729b46c69b4f1e97c4822c1af3df53a1476cf5ddc6c087c0c10bc3a5678c2f
 ARG UV_VERSION=0.12.13
 ARG SOURCE_URL=https://github.com/halt95/merlin-engine.git
-ARG SOURCE_REF=merlin-v3.0.0
+ARG SOURCE_REF=merlin-v3.0.1
 ARG MAX_JOBS=4
 ARG TORCH_CUDA_ARCH_LIST="8.0;8.6;8.9"
 ENV DEBIAN_FRONTEND=noninteractive PIP_NO_CACHE_DIR=1 UV_PYTHON_DOWNLOADS=never \

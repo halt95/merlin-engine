@@ -1,6 +1,6 @@
 # Topology selector
 
-For Merlin 3.0.0, built on vLLM 0.32.0. The controls below describe the selector and launcher;
+For Merlin 3.0.1, built on vLLM 0.32.0. The controls below describe the selector and launcher;
 synthetic-topology coverage does not qualify performance on NVLink or other unmeasured hardware.
 
 > **Opt-in in v2.2.0.** The selector runs only when you set `AUTO_TOPO=1` (or `AUTO_TOPO=strict`). With `AUTO_TOPO`

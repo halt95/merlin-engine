@@ -72,8 +72,9 @@ from vllm.v1.kv_cache_interface import (
 )
 
 from ..common.qsa_cache import QSAForwardMetadata
-from . import model
 from .indexer_qsa import QSAIndexer
+# Separate calibration namespaces.
+from .mtp_kv_scales import qsa_kv_scale_entries
 from .ops.qsa import qsa_e4m3_uses_native_cast
 
 logger = init_logger(__name__)
@@ -91,8 +92,8 @@ if _qsa_clip_raw and not (math.isfinite(_qsa_clip_interval) and _qsa_clip_interv
         f"{_QSA_CLIP_ENV} must be a finite positive number of seconds, got {_qsa_clip_raw!r}"
     )
 _qsa_clip_counters: dict[str, torch.Tensor] = {}
-# Reader fix: the reader must never block on the compute
-# stream; see guard_telemetry.NonBlockingReader.
+# The reader must never block on the compute stream; see
+# guard_telemetry.NonBlockingReader.
 from vllm.v1.worker.guard_telemetry import (  # noqa: E402
     NonBlockingReader as _NonBlockingReader,
 )
@@ -162,8 +163,8 @@ def _qsa_clip_start_reader() -> None:
             name="qsa-clip-reader",
             daemon=True,
         ).start()
-    # The leading "QSA clip counter armed (read interval Ns)" is the token a log scan greps
-    # (v2.2.0 logged it from the first forward); keep it verbatim when editing this line.
+    # Log readers match the leading "QSA clip counter armed (read interval Ns)";
+    # keep it verbatim when editing this line.
     logger.info(
         "QSA clip counter armed (read interval %.0fs); reader started after capture "
         "(%d layer(s) registered)",
@@ -212,11 +213,12 @@ def _is_qsa_fp8_cache_dtype(cache_dtype: str) -> bool:
 
 
 def _validated_qsa_fp8_dtype(cache_dtype: str) -> torch.dtype | None:
-    """Return the platform E4M3 dtype after enforcing the validated HW gate.
+    """Return the platform E4M3 dtype after enforcing the supported HW gate.
 
-    SM86 reads E4M3 through the Merlin byte decoder; SM89+ takes upstream's
-    native float8 path (vllm#55557), which does not compile on SM86. Anything
-    else (SM80, SM87, ROCm) is refused.
+    SM80/SM86 use the byte decoder; SM89+ uses FP8
+    (vllm#55557). On SM80 the FP8 cache is used only when an FP8 KV cache
+    dtype is requested; it has not been tested on SM80 hardware.
+    SM87, ROCm and other unsupported capabilities remain refused.
     """
     if not _is_qsa_fp8_cache_dtype(cache_dtype):
         return None
@@ -228,15 +230,15 @@ def _validated_qsa_fp8_dtype(cache_dtype: str) -> torch.dtype | None:
 
     capability = current_platform.get_device_capability()
     if capability is None or (
-        capability.to_int() != 86 and not qsa_e4m3_uses_native_cast()
+        capability.to_int() not in (80, 86) and not qsa_e4m3_uses_native_cast()
     ):
         cap_str = (
             capability.as_version_str() if capability is not None else "unknown"
         )
         raise ValueError(
-            "Qwen4Exp QSA E4M3 KV cache needs SM86 (byte decoder) or SM89+ "
+            "Qwen4Exp QSA E4M3 KV cache needs SM80/SM86 (byte decoder) or SM89+ "
             f"(native FP8), but {current_platform.get_device_name()} has "
-            f"compute capability {cap_str}. Re-run with --kv-cache-dtype bfloat16."
+            f"compute capability {cap_str}."
         )
     return current_platform.fp8_dtype()
 
@@ -611,6 +613,9 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         # gate next to Q, even when an inherited config default says otherwise.
         self.attn_output_gate = True
 
+        # deferred: model.py imports this module at top level.
+        from . import model
+
         self.qkv_proj = QKVParallelLinear(
             self.hidden_size,
             self.head_dim,
@@ -711,12 +716,22 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             and not (fp8_layer and _qsa_clip_interval > 0.0)
         )
         self.fuse_indexer_projection = vllm_config.lora_config is None
+        # Port of vllm#62318: without a
+        # quant config here (BF16, or ModelOpt FP4, which keeps attention in
+        # BF16) the fused layer is unquantized. Otherwise the indexer shares
+        # the q/k/v GEMM only if it uses the same quant method.
+        fused_quant_config = model.without_modelopt_fp4(quant_config)
+        projection_method = type(self.qkv_proj.quant_method)
+        if fused_quant_config is not None and projection_method is not type(
+            self.indexer.index_qk_proj.quant_method
+        ):
+            self.fuse_indexer_projection = False
         if self.fuse_indexer_projection:
             self.index_qk_size = self.indexer.index_qk_proj.output_size
             self.qkv_proj = Qwen4ExpQSAQKVIndexerLinear(
                 self.qkv_proj,
                 self.index_qk_size,
-                model.without_modelopt_fp4(quant_config),
+                fused_quant_config,
             )
             del self.indexer.index_qk_proj
 
@@ -896,6 +911,7 @@ def load_qsa_static_kv_scales(
     *,
     strict: bool = True,
     expected_layer_names: Collection[str] | None = None,
+    mtp: bool = False,
 ) -> list[str]:
     """Load static scalar QSA K/V scales into already-loaded model layers.
 
@@ -929,6 +945,8 @@ def load_qsa_static_kv_scales(
     raw = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(raw, dict):
         raise ValueError(f"{path} must contain a JSON object keyed by layer name")
+    # Targets ignore the optional mtp object.
+    raw = qsa_kv_scale_entries(raw, path, mtp=mtp)
 
     if isinstance(layers, nn.Module):
         qsa_layers = {

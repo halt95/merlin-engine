@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright 2026 halt95 (Merlin modifications)
 """CPU dispatch and warmup coverage for QSA sparse attention."""
 
 #: Device capabilities (major * 10 + minor) with their own upstream tuning

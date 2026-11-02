@@ -1,14 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Persistent, cudagraph-safe counters for the bounds-guard instrumentation series.
+# SPDX-FileCopyrightText: Copyright 2026 halt95 (Merlin modifications)
+"""Persistent, cudagraph-safe counters for the bounds guards.
 
-Every guard in the series MASKS an out-of-range access so the SM cannot fault
+Every bounds guard MASKS an out-of-range access so the SM cannot fault
 on it, and records that it did. A guard that masks silently turns a crash into
 a wrong answer and tells nobody, so the recording is not optional.
 
-DESIGN -- follows the QSA KV-clip counter (models/qwen4_exp/nvidia/qsa.py
-:144-152, :205-225), the one instrument in this tree that already survives FULL
-cudagraph replay:
+DESIGN -- follows the QSA KV-clip counter (vllm/models/qwen4_exp/nvidia/qsa.py),
+the one instrument in this tree that already survives FULL cudagraph replay:
 
   * counters are PERSISTENT int64 GPU tensors, allocated eagerly by prealloc()
     from the model runner constructor, so nothing is allocated inside a capture
@@ -19,12 +18,11 @@ cudagraph replay:
   * that thread is started only AFTER warmup and cudagraph capture, from
     gpu_worker beside enable_gpu_sync_check(). See start_reader().
 
-The first design allocated a fresh counter per launch and read it back
-inline with .tolist(). That was wrong twice over: the D2H aborts cudagraph
-capture at startup, and under replay the Python host code never runs, so the
-counter was simultaneously re-zeroed every step and never read. Guards 2, 3 and
-4 sit inside the captured forward (QSA declares AttentionCGSupport.UNIFORM_BATCH,
-nvidia/qsa.py:286), which is exactly where it mattered.
+A counter allocated per launch and read back inline would not work: the
+D2H aborts cudagraph capture at startup, and under replay the Python host code
+never runs, so the counter would be re-zeroed every step and never read.
+Guards 2, 3 and 4 sit inside the captured forward (QSA declares
+AttentionCGSupport.UNIFORM_BATCH).
 
 NEGATIVE VALUES. Slots 1 and 2 are written with tl.atomic_max into a zeroed
 buffer, so a negative row or index would be lost. Every recorded value is
@@ -39,25 +37,22 @@ MODES -- VLLM_E2_GUARD_MODE:
          a masked fault that silently returns a wrong answer is worse for a
          serving product than a loud stop. Read check_pending below before
          using it -- the raise is late and it is local to one rank.
-         Targeted repro boots.
   warn   (DEFAULT) log only -- EXCEPT for the sites in
          _ALWAYS_FATAL_SITES, which arm the raise whatever the mode says,
          because their masked value has already been written somewhere durable.
          USE THIS FOR LONG STRESS BOOTS.
-  (off, an earlier default that started no reader, was removed; "off" is
-  now a boot error like any other unknown mode.)
+  Any other value, "off" included, is a boot error.
 
 WHICH RUNNER. prealloc() is called from GPUModelRunner.__init__ and
 check_pending() from its execute_model, both in vllm/v1/worker/gpu/ -- the V2
 runner. On a V1 runner the counters are allocated lazily by the first guarded
 launch instead (correct, but possibly on a capturing stream) and NOTHING calls
 check_pending, so MODE=raise degrades to MODE=warn and _ALWAYS_FATAL_SITES
-never stops anything. The guards themselves still mask and count on both. Any
-release note for this series has to say so.
+never stops anything. The guards themselves still mask and count on both.
 
 IDLE QUIESCE (always on). A reader that copies every
 _INTERVAL forever keeps every idle GPU out of its idle P-state (P2 at boost
-clocks instead of P8: ~364 W across 4x RTX 3090). So the worker wraps
+clocks instead of P8). So the worker wraps
 its GPU entry points (execute_model, sample_tokens, execute_dummy_batch) in
 engine_call, which keeps a call generation and an open-call count, and the
 reader runs a completion-driven state machine instead of a timer:
@@ -156,7 +151,6 @@ import threading
 import time
 from datetime import timedelta
 
-import numpy as np
 import torch
 
 from vllm.logger import init_logger
@@ -174,18 +168,6 @@ SLOTS_PER_SITE = 3
 # Largest value the bias encoding can carry without overflowing the int64 slot.
 GUARD_MAX_ENCODABLE = (1 << 63) - 1 - GUARD_BIAS
 GUARD_MIN_ENCODABLE = -GUARD_BIAS + 1
-
-
-def encode_slot(value: int) -> int:
-    """Producer side of the bias encoding, in Python (for the limits tests).
-
-    The guarded kernels inline `(value + _GUARD_BIAS).to(tl.int64)` and store
-    it with `tl.atomic_max`; this is the same arithmetic, exposed so the
-    encoding's limits can be tested without Triton and without a GPU. It is
-    NOT called by the kernels -- a Python function is not readable from a
-    @triton.jit body, which is why _GUARD_BIAS is a tl.constexpr there.
-    """
-    return int(value) + GUARD_BIAS
 
 
 def decode_slot(biased: int) -> int | None:
@@ -238,18 +220,6 @@ NUM_SITES = 12
 RING_RECORD_POS_BITS = 32
 RING_RECORD_REQ_BITS = 16
 RING_RECORD_LAYER_BITS = 14
-
-
-def encode_ring_record(layer_id: int, request_row: int, position: int) -> int:
-    """Python twin of the kernel's packing (tests; the kernel inlines it)."""
-    layer = (int(layer_id) + 1) & ((1 << RING_RECORD_LAYER_BITS) - 1)
-    row = int(request_row) & ((1 << RING_RECORD_REQ_BITS) - 1)
-    pos = int(position) & ((1 << RING_RECORD_POS_BITS) - 1)
-    return (
-        (layer << (RING_RECORD_REQ_BITS + RING_RECORD_POS_BITS))
-        | (row << RING_RECORD_POS_BITS)
-        | pos
-    )
 
 
 def decode_ring_record(biased: int) -> dict[str, int] | None:
@@ -364,8 +334,8 @@ _gate_gen = 0  # bumped by every arm and lifecycle reset
 # Serialises start_reader / enable_idle_gate / stop_reader (never taken by the
 # reader thread or on the step path).
 _life_lock = threading.RLock()
-# Serialises every counter read (cadence poll, idle drain, drain(), reset_for_test):
-# they share the pinned mirrors, events, _seen and _confirm_pending.
+# Serialises every counter read (cadence poll, idle drain, drain()): they share
+# the pinned mirrors, events, _seen and _confirm_pending.
 _io_lock = threading.Lock()
 # Observability and tests: reader-issued CUDA operations and transitions.
 _stats = {"polls": 0, "reads": 0, "fences": 0, "drains": 0, "parks": 0, "resumes": 0}
@@ -475,23 +445,6 @@ class NonBlockingReader:
                 out[key] = rows
         return out
 
-    def read_now(self, key: object) -> list:
-        """Blocking read for orderly shutdown / tests ONLY: copies through the
-        pinned mirror on the side stream and waits for THAT copy (never a
-        pageable copy, never a wait on the compute stream). Callers sync the
-        device first when they need the latest kernel writes."""
-        job = self._jobs[key]
-        tensor, host, event, _ = job
-        if host is None:
-            return tensor.tolist()
-        stream = self._streams[tensor.device]
-        with torch.cuda.device(tensor.device), torch.cuda.stream(stream):
-            host.copy_(tensor, non_blocking=True)
-            event.record(stream)
-        event.synchronize()
-        job[3] = False
-        return host.tolist()
-
     def read_settled(self, key: object, timeout: float, cancel=None) -> list | None:
         """Final read for the idle drain, called only once a fence has shown
         that every producer of this buffer is complete. Waits for any copy
@@ -528,16 +481,6 @@ class NonBlockingReader:
             return None
         job[3] = False
         return host.tolist()
-
-    def reset(self) -> None:
-        """Test helper: drop in-flight copies so a zeroed counter is not
-        reported from a stale mirror."""
-        for job in self._jobs.values():
-            if job[1] is not None:
-                if job[3]:
-                    job[2].synchronize()
-                job[1].zero_()
-            job[3] = False
 
 
 _nb_reader = NonBlockingReader()
@@ -1039,7 +982,7 @@ class _StepEvents:
     host.tolist() of a DMA-written pinned mirror), so mapped adds no new
     visibility assumption. The host never reads a counter for work in
     flight under this rule (it may see such writes early; nothing relies on
-    them) and never read-modify-writes one (reset_for_test synchronizes first).
+    them) and never read-modify-writes one.
 
     THE LIVE BUFFER: event N complete does NOT mean nothing
     writes the buffer -- call N+1's kernels may be running while the host loads
@@ -1048,8 +991,7 @@ class _StepEvents:
         only atomic_add positive amounts; maxima only atomic_max (biased, so
         never below 0); the ring record's slot 1 is written once by the first
         CAS from 0 and slot 2 once by that CAS's winner (atomic_xchg from 0).
-        reset_for_test is the only writer that lowers a value, and it
-        synchronizes the device first (tests only);
+        Nothing lowers a value once the buffer is live;
       * each host load is a naturally aligned 8-byte load (numpy / tolist on
         an int64 element), single-copy atomic on x86-64 (Intel SDM vol. 3
         8.1.1; AMD APM vol. 2 7.3.2), and each device update is one naturally
@@ -2158,8 +2100,7 @@ def check_pending() -> None:
     Called at the top of execute_model, ahead of anything that mutates state
     and ahead of any collective, so the step it lands on aborts cleanly.
 
-    TWO THINGS IT DOES NOT DO -- an earlier docstring claimed one of them and
-    was wrong:
+    TWO THINGS IT DOES NOT DO:
 
     1. It does NOT raise on the step that fired. The reader polls on a cadence:
        the count is armed ~1-2 VLLM_E2_GUARD_INTERVAL ticks after the hit,
@@ -2216,7 +2157,10 @@ def check_pending() -> None:
 
 
 def drain(
-    *, raise_on_fatal: bool = False, timeout: float | None = None
+    *,
+    raise_on_fatal: bool = False,
+    raise_on_unsettled: bool = True,
+    timeout: float | None = None,
 ) -> dict[str, list[int]]:
     """Synchronous final read of every counter, off the cadence (added
     later).
@@ -2228,7 +2172,9 @@ def drain(
     counters' producers, reports anything the reader has not, and returns the
     unbiased snapshot of the devices it read settled. With raise_on_fatal it
     raises for a hit at a site in _ALWAYS_FATAL_SITES or, under MODE=raise, at
-    any site (or for a device it could not read settled).
+    any site, and, unless raise_on_unsettled is False, for a device it could not
+    read settled (reader lost, or producers not complete by the deadline: a
+    busy or wedged device, which reports no hit of its own).
 
     It shares the reader's pinned mirrors, events and high-water marks, so stop
     the reader first (stop_reader(); the worker's shutdown does); every read is
@@ -2258,7 +2204,7 @@ def drain(
                 "counters were read when it went to sleep)"
             )
             return {}
-        return _drain_locked(raise_on_fatal, deadline)
+        return _drain_locked(raise_on_fatal, raise_on_unsettled, deadline)
     finally:
         _io_lock.release()
 
@@ -2344,9 +2290,10 @@ def _fatal_rows(device: torch.device, rows, tag: str = "") -> list[str]:
 
 
 def _drain_locked(
-    raise_on_fatal: bool, deadline: float = math.inf
+    raise_on_fatal: bool, raise_on_unsettled: bool, deadline: float = math.inf
 ) -> dict[str, list[int]]:
-    fatal: list[str] = []
+    fatal: list[str] = []  # site hits, the unsettled lower bounds included
+    unread: list[str] = []  # devices not read settled
     snap: dict[str, list[int]] = {}
     for device, buf in list(_buffers.items()):
         host = _host_views.get(device)
@@ -2362,7 +2309,7 @@ def _drain_locked(
                 rows = _nb_reader.read_settled(device, _remaining(deadline))
                 settled = rows is not None
         except Exception:  # noqa: BLE001
-            fatal.append(f"reader lost {device}")  # first; the log is best effort
+            unread.append(f"reader lost {device}")  # first; log is best effort
             try:
                 logger.exception(
                     "bounds-guard FINAL DRAIN INCOMPLETE: could not read %s", device
@@ -2371,7 +2318,7 @@ def _drain_locked(
                 pass
             continue
         if not settled:
-            fatal.append(f"drain incomplete on {device}")  # first; log best effort
+            unread.append(f"drain incomplete on {device}")  # first; log best effort
             try:
                 logger.error(
                     "bounds-guard FINAL DRAIN INCOMPLETE on %s: the counters' "
@@ -2391,15 +2338,21 @@ def _drain_locked(
         _report_rows(device, rows)
         _snap_rows(device, rows, snap)  # no second sync, no pageable copy
         fatal.extend(_fatal_rows(device, rows))
-    if fatal:
+    # Log readers key on this line, so an unread device with no hit gets it only where
+    # it is fatal; its FINAL DRAIN INCOMPLETE line above is logged either way.
+    # Real hits and unread devices are listed separately.
+    if fatal or (unread and raise_on_unsettled):
         logger.error(
-            "bounds-guard FINAL DRAIN: fatal-site hits %s (snapshot %s)",
+            "bounds-guard FINAL DRAIN: fatal-site hits %s; unread devices %s "
+            "(snapshot %s)",
             fatal,
+            unread,
             snap,
         )
         if raise_on_fatal:
             raise GuardFatalError(
-                f"bounds-guard FINAL DRAIN: fatal-site hits {fatal}"
+                f"bounds-guard FINAL DRAIN: fatal-site hits {fatal}; "
+                f"unread devices {unread}"
             )
     else:
         logger.info("bounds-guard FINAL DRAIN: no fatal-site hits (snapshot %s)", snap)
@@ -2417,32 +2370,3 @@ def snapshot() -> dict[str, list[int]]:
         rows = host.tolist() if host is not None else buf.tolist()
         _snap_rows(device, rows, out)
     return out
-
-
-def reset_for_test() -> None:
-    """Zero every counter, clear the reader's high-water marks, and disarm.
-
-    All three, or the next hit is invisible: the reader only reports a count
-    ABOVE what it last saw.
-    """
-    global _pending
-    with _io_lock:
-        _reset_locked()
-
-
-def _reset_locked() -> None:
-    global _pending
-    for device, buf in _buffers.items():
-        host = _host_views.get(device)
-        if host is not None:
-            if device.type == "cuda":
-                torch.cuda.synchronize(device)  # no kernel still writing
-            host.zero_()  # the same memory, written from the host
-        else:
-            buf.zero_()
-    _nb_reader.reset()
-    _confirm_pending.clear()
-    _seen.clear()
-    with _fatal_lock:
-        _fatal_hw.clear()
-    _pending = None

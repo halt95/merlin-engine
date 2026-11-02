@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright 2026 halt95 (Merlin modifications)
 """Console-script entry for ``merlin``.
 
 The launchers, profiles and model assets live in the Merlin-engine checkout, not in the wheel, so this entry point
@@ -36,6 +36,7 @@ def main() -> int:
     sys.path.insert(0, str(root / "tools" / "merlin"))
     import serve_cli
 
+    serve_cli.R.safe_stdio()
     return serve_cli.main()
 
 

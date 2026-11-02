@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by the Merlin project; see NOTICE.
 import hashlib
 import secrets
 from collections.abc import Awaitable
@@ -8,7 +9,15 @@ from starlette.datastructures import Headers
 from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Receive, Scope, Send
 
-GUARDED_PREFIX = ("/v1", "/v2", "/inference", "/cohere")
+GUARDED_PREFIX = (
+    "/v1",
+    "/v2",
+    "/inference",
+    "/cohere",
+    "/generative_scoring",
+    "/tokenize",
+    "/detokenize",
+)
 
 
 class AuthenticationMiddleware:

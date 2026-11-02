@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright 2026 halt95 (Merlin modifications)
 """Ring-row tag fix: worker side of the ring-row tag clear.
 
 The scheduler reports every newly claimed ring (``CircularBufferSpec``) block

@@ -55,12 +55,12 @@ import torch
 
 from vllm.merlin.envs import read_registered
 
-# the registry getter is the one reader of the
-# name; this module owns only the float parse.
+# The registry getter is the one reader of the name; this module owns only
+# the float parse.
 _SEG = float(read_registered("VLLM_E2_MEMSTATS") or 0)
 _DIR = os.environ.get("VLLM_E2_MEMSTATS_DIR", "")
 _started = []
-VERSION = "e2_memstats/5-boundary-current-host"
+VERSION = "e2_memstats/5"
 
 
 def _close_metrics(dev):

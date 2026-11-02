@@ -82,8 +82,11 @@ speed only.
 |---|---|---|
 | 10,199 | 1,829 tok/s | 5.58 |
 | 101,887 | 1,297 tok/s | 78.57 |
+| 261,888 | 860 tok/s | 304.6 |
 
-Prefill is one cold send per depth (8 tokens out).
+<sub>262K row added on 2026-10-22, after first publication, from the same runs.</sub>
+
+Prefill is one cold send per depth (8 tokens out); the 262K row is the exact-262K run's cold send 1.
 
 **Four cards**
 
@@ -91,8 +94,11 @@ Prefill is one cold send per depth (8 tokens out).
 |---|---|---|
 | 10,199 | 3,013 tok/s | 3.38 |
 | 101,887 | 2,295 tok/s | 44.40 |
+| 261,888 | 1,594 tok/s | 164.3 |
 
-Prefill is one cold send per depth (8 tokens out).
+<sub>262K row added on 2026-10-22, after first publication, from the same runs.</sub>
+
+Prefill is one cold send per depth (8 tokens out); the 262K row is the exact-262K run's cold send 1.
 
 ### Prefill over context depth
 

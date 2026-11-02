@@ -1,8 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright 2026 halt95 (Merlin modifications)
 """Model-independent RecoverSSM Python helpers: the activation predicate shared by
-layers, models and backends, and argument validation that raises ``ValueError``
-before any raw-pointer kernel launch."""
+layers, models and backends, checkpoint storage identity, and argument validation
+that raises ``ValueError`` before any raw-pointer kernel launch."""
+
+from typing import Any
+
+
+def recoverssm_binding_signature(checkpoints: Any) -> tuple:
+    """Storage identity of every layer's checkpoint: (data_ptr, shape, stride).
+
+    The context's address table (base addresses, block strides) is derived from
+    exactly these values. Tensor identity alone does not pin them: ``set_()``
+    (or an in-place resize) moves a tensor's storage while keeping the object."""
+    return tuple((t.data_ptr(), t.shape, t.stride()) for t in checkpoints)
 
 
 def recoverssm_require(cond: bool, msg: str, component: str = "RecoverSSM") -> None:
@@ -22,4 +33,4 @@ def uses_recoverssm(cache_config, num_speculative_tokens: int) -> bool:
     )
 
 
-__all__ = ["recoverssm_require", "uses_recoverssm"]
+__all__ = ["recoverssm_binding_signature", "recoverssm_require", "uses_recoverssm"]

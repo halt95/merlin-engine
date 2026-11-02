@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by the Merlin project; see NOTICE.
 """Rotary Positional Embeddings."""
 
 from typing import Any
@@ -268,6 +269,7 @@ def get_rope(
                 mrope_interleaved=rope_parameters.get("mrope_interleaved", False),
                 positions_factor=mrope_positions_factor,
                 scaling_factor=scaling_factor,
+                yarn_served_max_position=max_position,
                 **extra_kwargs,
             )
         else:
@@ -279,6 +281,7 @@ def get_rope(
                 is_neox_style,
                 scaling_factor,
                 dtype,
+                yarn_served_max_position=max_position,
                 **extra_kwargs,
             )
     elif scaling_type in ["deepseek_yarn", "deepseek_llama_scaling"]:

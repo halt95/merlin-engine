@@ -2,6 +2,10 @@
 Description=Flash-Next (Qwen3.8-Flash-Next-W4A16-Merlin, 925K KV pool on 4x RTX 3090)
 After=network-online.target
 Wants=network-online.target
+# a deterministic startup failure (bad checkpoint path, OOM at load) must stop retrying instead of relaunching every 10 s;
+# 3600 s so five ~4 min load-time failures (about 250 s apart) still fall inside one window
+StartLimitIntervalSec=3600
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -10,7 +14,8 @@ ExecStart=/bin/bash -c 'cd "$${TREE:?set TREE in the service environment file}" 
 # vLLM with MTP + cudagraphs does not always exit on SIGTERM; give the shutdown-timeout 60 a chance, then kill the group
 KillMode=control-group
 TimeoutStopSec=90
-Restart=on-failure
+# always, not on-failure: the API server exits 0 when the engine dies (uvicorn shuts down cleanly); systemctl stop never restarts
+Restart=always
 RestartSec=10
 LimitMEMLOCK=infinity
 LimitNOFILE=1048576

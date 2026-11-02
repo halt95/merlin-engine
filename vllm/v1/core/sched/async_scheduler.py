@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by the Merlin project; see NOTICE.
 
 import vllm.envs as envs
 from vllm.logger import init_logger
@@ -60,14 +61,17 @@ class AsyncScheduler(Scheduler):
         self, request: Request, new_token_ids: list[int], is_stale: bool = False
     ) -> tuple[list[int], bool]:
         status_before_update = request.status
+        # Port of vllm#58668.
+        # Tokens trimmed at a stop resolve their placeholders too.
+        num_new_tokens = len(new_token_ids)
         new_token_ids, stopped = super()._update_request_with_output(
-            request, new_token_ids
+            request, new_token_ids, is_stale
         )
 
         # Placeholders were zeroed at preemption; a stale delivery must not
         # decrement them (it would underflow).
         if not is_stale:
-            request.num_output_placeholders -= len(new_token_ids)
+            request.num_output_placeholders -= num_new_tokens
             assert request.num_output_placeholders >= 0
 
         # Cache the new tokens. Preempted requests should be skipped.

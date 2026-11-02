@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright 2026 halt95 (Merlin modifications)
 """Independent progress deadline for PLE transactions."""
 
 import math
@@ -61,7 +61,13 @@ class _PendingCompletion:
 
 
 class PleProgressMonitor:
-    """Bound host submission and the resulting ordered GPU completions."""
+    """Bound compilation/submission separately from ordered GPU completion.
+
+    Only a first-seen shape or explicit startup gets the host compile budget.
+    Warm serving submissions use the serving deadline. Once the release event
+    is recorded, the GPU gets its own budget, independent of host compilation.
+    Neither phase can wait forever.
+    """
 
     def __init__(
         self,
@@ -84,6 +90,7 @@ class PleProgressMonitor:
         self._condition = threading.Condition()
         self._submission: _Submission | None = None
         self._pending: deque[_PendingCompletion] = deque()
+        self._seen_num_tokens: set[int] = set()
         self._sequence = 0
         self._stopping = False
         self._thread = threading.Thread(
@@ -146,7 +153,6 @@ class PleProgressMonitor:
 
     def begin(self, *, startup: bool, num_tokens: int) -> int:
         now = time.monotonic()
-        budget = self._startup_deadline_s if startup else self._serving_deadline_s
         with self._condition:
             active = self._submission
             if active is not None:
@@ -161,10 +167,21 @@ class PleProgressMonitor:
                     started=active.started,
                     startup=True,
                     num_tokens=num_tokens,
-                    deadline=now + budget,
+                    deadline=active.deadline,
                     depth=active.depth + 1,
                 )
             else:
+                # begin_forward receives num_tokens_after_padding: the eager
+                # input size, or the FULL graph's validated captured copy size
+                # (_prepare_ple_forward checks that equality). Keep exact sizes:
+                # rounding into our own bucket could hide a cold specialization.
+                # Model/layer/dtype are fixed for this connector; request count
+                # is transport metadata, not the model's padded token dimension.
+                budget = (
+                    self._startup_deadline_s
+                    if startup or num_tokens not in self._seen_num_tokens
+                    else self._serving_deadline_s
+                )
                 self._sequence += 1
                 sequence = self._sequence
                 self._submission = _Submission(
@@ -175,6 +192,11 @@ class PleProgressMonitor:
                     deadline=now + budget,
                     depth=1,
                 )
+            # Admission consumes the one cold allowance (including dummy/capture
+            # shapes). Host submissions are serialized and failures are fatal;
+            # a later serving begin of this size follows its prior host submit.
+            # GPU completion is tracked separately and need not have finished.
+            self._seen_num_tokens.add(num_tokens)
             self._condition.notify_all()
             return sequence
 
@@ -192,7 +214,11 @@ class PleProgressMonitor:
                     started=active.started,
                     startup=active.startup,
                     num_tokens=active.num_tokens,
-                    deadline=active.deadline,
+                    deadline=time.monotonic() + (
+                        self._startup_deadline_s
+                        if active.startup
+                        else self._serving_deadline_s
+                    ),
                     event=event,
                 )
             )
@@ -222,11 +248,21 @@ class PleProgressMonitor:
             self._condition.notify_all()
         self._thread.join(timeout=1)
 
+    def _fail_if_running(self, **diagnostic: Any) -> None:
+        # Serialize failure with close(): a teardown query must not kill the
+        # worker after close has disarmed the monitor.
+        with self._condition:
+            if not self._stopping:
+                ple_fail_closed(**diagnostic)
+
     def _run(self) -> None:
         try:
             self._monitor()
         except BaseException as error:
-            ple_fail_closed(
+            with self._condition:
+                if self._stopping:
+                    return
+            self._fail_if_running(
                 where="progress-monitor-thread",
                 rank=self._rank,
                 layer=self._layer,
@@ -257,10 +293,12 @@ class PleProgressMonitor:
             now = time.monotonic()
             if pending is not None and now >= pending.deadline:
                 with self._condition:
+                    if self._stopping:
+                        return
                     if not self._pending or self._pending[0] is not pending:
                         continue
                 mode = "startup" if pending.startup else "serving"
-                ple_fail_closed(
+                self._fail_if_running(
                     where=(
                         f"progress-deadline:{mode}:gpu-completion:"
                         f"tokens={pending.num_tokens}"
@@ -273,10 +311,12 @@ class PleProgressMonitor:
 
             if submission is not None and now >= submission.deadline:
                 with self._condition:
+                    if self._stopping:
+                        return
                     if self._submission is not submission:
                         continue
                 mode = "startup" if submission.startup else "serving"
-                ple_fail_closed(
+                self._fail_if_running(
                     where=(
                         f"progress-deadline:{mode}:host-submission:"
                         f"tokens={submission.num_tokens}"

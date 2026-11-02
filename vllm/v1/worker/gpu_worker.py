@@ -273,6 +273,9 @@ class Worker(WorkerBase):
 
         self.use_v2_model_runner = vllm_config.use_v2_model_runner
         _refuse_guard_raise_on_v1(self.use_v2_model_runner)
+        from vllm.merlin import kv_host_tier
+
+        kv_host_tier.refuse_model_runner_v1(vllm_config)
         # PLE pull transport. A rank without a PLE layer keeps both None/False
         # and every PLE hook in this class is a no-op.
         self._ple_offload_worker_handle: Any | None = None
@@ -732,19 +735,42 @@ class Worker(WorkerBase):
             # Set random seed.
             set_random_seed(self.model_config.seed)
 
-            # Now take memory snapshot after NCCL is initialized
+            # Preserve the explicit-pin gate's original view, after allocator
+            # cleanup and external weights are ready, but before BLAS warmup.
             gc.collect()
             torch.accelerator.empty_cache()
-
-            # Weights from external model loader process
             external_weight_memory = get_model_loader(
                 self.load_config
             ).get_external_weight_memory(self.vllm_config)
+            memory_gate_snapshot = (
+                MemorySnapshot(device=self.device)
+                if self.cache_config.kv_cache_memory_bytes
+                else None
+            )
 
-            # take current memory snapshot after external weights are ready
+            # cuBLAS(Lt) asks CUDA for its handle memory directly. When torch's own
+            # cudaMalloc fails, torch frees its unused cache and retries, but a cuBLAS
+            # request never triggers that because torch doesn't see it. Profiling can
+            # grow torch's cache until the GPU is full, and the first cuBLAS call would
+            # then fail even though torch holds idle memory it could have given back.
+            # Create the handles now, before the snapshot, so they count as baseline
+            # like the NCCL buffers. mm uses cuBLAS; linear with a bias uses cuBLASLt.
+            x = torch.ones(16, 16, dtype=self.model_config.dtype, device=self.device)
+            torch.mm(x, x)
+            torch.nn.functional.linear(x, x, x[0])
+            del x
+
+            # Release temporary warmup allocations before the profiling snapshot.
+            gc.collect()
+            torch.accelerator.empty_cache()
             self.init_snapshot = init_snapshot = MemorySnapshot(device=self.device)
+            gate_snapshot = (
+                memory_gate_snapshot if memory_gate_snapshot is not None else init_snapshot
+            )
             self.requested_memory = request_memory(
-                init_snapshot, self.cache_config, external_weight_memory
+                gate_snapshot,
+                self.cache_config,
+                external_weight_memory,
             )
             logger.debug("worker init memory snapshot: %r", self.init_snapshot)
             logger.debug(
@@ -796,6 +822,9 @@ class Worker(WorkerBase):
     # FIXME(youkaichao & ywang96): Use TorchDispatchMode instead of memory pool
     # to hijack tensor allocation.
     def load_model(self, *, load_dummy_weights: bool = False) -> None:
+        # Record every boot compile.
+        from vllm.merlin import triton_preload
+        triton_preload.install_compile_recorder()
         with (
             self._maybe_get_memory_pool_context(tag="weights"),
             set_current_vllm_config(self.vllm_config),
@@ -1368,7 +1397,16 @@ class Worker(WorkerBase):
 
         # All warmup is done — start monitoring for unexpected JIT
         # compilations that would cause latency spikes during inference.
+        # Load the Mamba-hybrid
+        # fill/scatter num_accepted kernels first.
+        from vllm.merlin import triton_preload
+        triton_preload.warm_num_accepted_kernels(self.model_runner)
+        triton_preload.preload_boot_kernels()
         self._maybe_activate_jit_monitor()
+        # From here on, log Triton loads.
+        triton_preload.install_kernel_load_monitor(
+            warn=self.vllm_config.kernel_config.enable_jit_warmup)
+        triton_preload.install_quiesce_before_load()
 
         # Freeze the worker heap so the GC won't scan static objects
         # (model weights, KV caches, CUDA graphs) during inference.
@@ -1958,13 +1996,17 @@ class Worker(WorkerBase):
         try:
             if not guard_telemetry.stop_reader():
                 logger.error("guard telemetry reader did not stop; draining anyway")
-            # serialised with the reader by its I/O lock; bounded wait for it
+            # serialised with the reader by its I/O lock; bounded wait for it.
+            # Always-fatal sites fail the rank in every mode; a device
+            # not read settled by the deadline fails it only under MODE=raise.
             guard_telemetry.drain(
-                raise_on_fatal=guard_telemetry._MODE == "raise", timeout=10.0
+                raise_on_fatal=True,
+                raise_on_unsettled=guard_telemetry._MODE == "raise",
+                timeout=10.0,
             )
         except guard_telemetry.GuardFatalError as exc:
             guard_fatal = exc
-            logger.error("guard telemetry FINAL DRAIN fatal (MODE=raise): %s", exc)
+            logger.error("guard telemetry FINAL DRAIN fatal: %s", exc)
         except Exception:  # noqa: BLE001
             logger.exception("guard telemetry FINAL DRAIN failed")
 
@@ -1981,14 +2023,15 @@ class Worker(WorkerBase):
 
         self.elastic_ep_executor.shutdown()
 
-        if self._ple_offload_worker_handle is not None:
-            self._ple_offload_worker_handle.close()
-            self._ple_offload_worker_handle = None
-
         # Release GPU resources held by the model runner so that memory
         # can be reclaimed when running in-process
         if model_runner := getattr(self, "model_runner", None):
             model_runner.shutdown()
+
+        # Drain GPU consumers first.
+        if self._ple_offload_worker_handle is not None:
+            self._ple_offload_worker_handle.close()
+            self._ple_offload_worker_handle = None
 
         # Release kept-alive cumem pools while the pluggable allocator wrappers
         # and callbacks are still alive, so MemPool teardown is not deferred to

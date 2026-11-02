@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by the Merlin project; see NOTICE.
 """SimpleCPUOffloadConnector: minimal CPU KV cache offloading."""
 
 from collections.abc import Iterable
@@ -248,6 +249,13 @@ class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
             return self.worker_handler.build_connector_worker_meta()
         return None
 
+    def shutdown(self) -> None:
+        # ensure_kv_transfer_shutdown() calls this; the base class's no-op left
+        # the copy threads running and could free the host arenas while queued
+        # transfers still held their addresses.
+        if self.worker_handler is not None:
+            self.worker_handler.shutdown()
+
     # --- Scheduler-side methods ---
 
     def bind_gpu_block_pool(self, gpu_block_pool: "BlockPool") -> None:
@@ -310,6 +318,13 @@ class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
                 request, block_ids
             )
         return False, None
+
+    def has_pending_block_frees(self) -> bool:
+        # Finished requests leave the scheduler before store refs are released.
+        # Include queued stores, abandoned transfers, and held handoffs.
+        if self.scheduler_manager is not None:
+            return self.scheduler_manager.has_pending_stores()
+        return False
 
     def has_pending_push_work(self) -> bool:
         if self.scheduler_manager is not None:

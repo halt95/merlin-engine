@@ -1,0 +1,276 @@
+diff --git a/data/csrc/batch_prefill.cu b/data/csrc/batch_prefill.cu
+--- a/data/csrc/batch_prefill.cu
++++ b/data/csrc/batch_prefill.cu
+@@ -51,5 +51,7 @@
+     int64_t num_kv_heads, int64_t page_size, bool enable_cuda_graph, int64_t head_dim_qk,
+     int64_t head_dim_vo, bool causal, int64_t window_left, int64_t fixed_split_size,
+-    bool disable_split_kv, int64_t num_colocated_ctas = 0, int64_t uniform_q_len = 0) {
++    // merlin-hook: workload-verify-tile
++    bool disable_split_kv, int64_t num_colocated_ctas = 0, int64_t uniform_q_len = 0,
++    int64_t sm8x_smallq_mode = -1) {
+   size_t float_workspace_size_in_bytes =
+       float_workspace_buffer.size(0) * get_element_size(float_workspace_buffer);
+@@ -69,6 +71,8 @@
+       /*sizeof_dtype_o=*/2, window_left, fixed_split_size, disable_split_kv, num_colocated_ctas,
+       uniform_q_len, stream, /*kv_dtype_bytes=*/sizeof(DTypeKV),
+-      /*kv_dtype_tag=*/(std::is_same_v<DTypeKV, __nv_fp8_e4m3> ? kSm8xKVTagE4M3
+-                                                               : kSm8xKVTagOther));
++      // merlin-hook: workload-verify-tile
++      /*kv_dtype_tag=*/(std::is_same_v<DTypeKV, __nv_fp8_e4m3> ? kSm8xKVTagE4M3
++                                                               : kSm8xKVTagOther),
++      sm8x_smallq_mode);
+ 
+   TVM_FFI_ICHECK(status == cudaSuccess)
+@@ -83,5 +87,7 @@
+     int64_t page_size, bool enable_cuda_graph, int64_t head_dim_qk, int64_t head_dim_vo,
+     bool causal, int64_t window_left, int64_t fixed_split_size, bool disable_split_kv,
+-    int64_t num_colocated_ctas = 0, int64_t uniform_q_len = 0) {
++    // merlin-hook: workload-verify-tile
++    int64_t num_colocated_ctas = 0, int64_t uniform_q_len = 0,
++    int64_t sm8x_smallq_mode = -1) {
+   (void)kv_len_arr;
+   (void)causal;
+@@ -97,6 +103,8 @@
+       enable_cuda_graph, /*sizeof_dtype_o=*/2, window_left, fixed_split_size, disable_split_kv,
+       num_colocated_ctas, uniform_q_len, stream, /*kv_dtype_bytes=*/sizeof(DTypeKV),
+-      /*kv_dtype_tag=*/(std::is_same_v<DTypeKV, __nv_fp8_e4m3> ? kSm8xKVTagE4M3
+-                                                               : kSm8xKVTagOther));
++      // merlin-hook: workload-verify-tile
++      /*kv_dtype_tag=*/(std::is_same_v<DTypeKV, __nv_fp8_e4m3> ? kSm8xKVTagE4M3
++                                                               : kSm8xKVTagOther),
++      sm8x_smallq_mode);
+ 
+   TVM_FFI_ICHECK(status == cudaSuccess)
+diff --git a/data/csrc/batch_prefill_jit_binding.cu b/data/csrc/batch_prefill_jit_binding.cu
+--- a/data/csrc/batch_prefill_jit_binding.cu
++++ b/data/csrc/batch_prefill_jit_binding.cu
+@@ -26,5 +26,7 @@
+     int64_t num_kv_heads, int64_t page_size, bool enable_cuda_graph, int64_t head_dim_qk,
+     int64_t head_dim_vo, bool causal, int64_t window_left, int64_t fixed_split_size,
+-    bool disable_split_kv, int64_t num_colocated_ctas, int64_t uniform_q_len);
++    // merlin-hook: workload-verify-tile
++    bool disable_split_kv, int64_t num_colocated_ctas, int64_t uniform_q_len,
++    int64_t sm8x_smallq_mode);
+ 
+ Array<int64_t> BatchPrefillWithKVCacheWorkspaceSize(
+@@ -33,5 +35,6 @@
+     int64_t page_size, bool enable_cuda_graph, int64_t head_dim_qk, int64_t head_dim_vo,
+     bool causal, int64_t window_left, int64_t fixed_split_size, bool disable_split_kv,
+-    int64_t num_colocated_ctas, int64_t uniform_q_len);
++    // merlin-hook: workload-verify-tile
++    int64_t num_colocated_ctas, int64_t uniform_q_len, int64_t sm8x_smallq_mode);
+ 
+ void BatchPrefillWithRaggedKVCacheRun(TensorView float_workspace_buffer,
+diff --git a/data/include/flashinfer/attention/scheduler.cuh b/data/include/flashinfer/attention/scheduler.cuh
+--- a/data/include/flashinfer/attention/scheduler.cuh
++++ b/data/include/flashinfer/attention/scheduler.cuh
+@@ -549,5 +549,7 @@
+ // sm8x tile: opt-in small-q FP8 verify layout experiment (v4).
+ //
+-// Mode comes from FLASHINFER_SM8X_FP8_SMALLQ and is FROZEN for the process: it is read on the
++// merlin-hook: workload-verify-tile
++// An explicit plan mode (-1 = legacy, 0 = stock, 1 = cta32) takes precedence.
++// In legacy mode, FLASHINFER_SM8X_FP8_SMALLQ is FROZEN for the process: it is read on the
+ // first plan and every later plan re-reads it and raises if it changed, so a plan cache or a
+ // captured CUDA graph can never mix arms within one process. Values: unset/"0" (stock), "cta32",
+@@ -602,6 +604,13 @@
+                                                   int64_t uniform_q_len, uint32_t num_qo_heads,
+                                                   uint32_t num_kv_heads, uint32_t head_dim_vo,
+-                                                  uint32_t head_dim_qk, uint32_t kv_dtype_tag) {
+-  const Sm8xSmallQMode mode = Sm8xFrozenSmallQMode();
++                                                  // merlin-hook: workload-verify-tile
++                                                  uint32_t head_dim_qk, uint32_t kv_dtype_tag,
++                                                  int64_t smallq_mode = -1) {
++  if (smallq_mode < -1 || smallq_mode > 1) {
++    FLASHINFER_ERROR("smallq plan mode must be -1 (legacy), 0 (stock), or 1 (cta32)");
++  }
++  const Sm8xSmallQMode mode = smallq_mode == -1
++                                 ? Sm8xFrozenSmallQMode()
++                                 : static_cast<Sm8xSmallQMode>(smallq_mode);
+   if (mode == Sm8xSmallQMode::kStock) return mode;
+   const uint32_t qk = head_dim_qk ? head_dim_qk : head_dim_vo;
+@@ -667,5 +676,7 @@
+                                    int64_t uniform_q_len, uint32_t head_dim_qk = 0,
+                                    uint32_t kv_dtype_bytes = 2,
+-                                   uint32_t kv_dtype_tag = kSm8xKVTagOther) {
++                                   // merlin-hook: workload-verify-tile
++                                   uint32_t kv_dtype_tag = kSm8xKVTagOther,
++                                   int64_t smallq_mode = -1) {
+   std::vector<IdType> request_indices, qo_tile_indices, kv_tile_indices, merge_indptr, o_indptr;
+   merge_indptr.push_back(0);
+@@ -696,5 +707,6 @@
+   const Sm8xSmallQMode sm8x_mode =
+       Sm8xResolveSmallQMode(packed_qo_len_arr, uniform_q_len, num_qo_heads, num_kv_heads,
+-                               head_dim, head_dim_qk, kv_dtype_tag);
++                               // merlin-hook: workload-verify-tile
++                               head_dim, head_dim_qk, kv_dtype_tag, smallq_mode);
+   const uint32_t min_kv_chunk_size = std::max((128 / page_size), 1U);
+   uint32_t cta_tile_q;
+@@ -912,5 +924,7 @@
+                                  // splits by #colocated decode CTAs
+     int64_t uniform_q_len, cudaStream_t stream, uint32_t kv_dtype_bytes = 2,
+-    uint32_t kv_dtype_tag = kSm8xKVTagOther) {
++    // merlin-hook: workload-verify-tile
++    uint32_t kv_dtype_tag = kSm8xKVTagOther,
++    int64_t smallq_mode = -1) {
+   (void)sizeof_dtype_o;
+   if (num_qo_heads % num_kv_heads != 0) {
+@@ -937,5 +951,6 @@
+                              num_kv_heads, head_dim_vo, page_size, max_batch_size_if_split,
+                              enable_cuda_graph, window_left, fixed_split_size, disable_split_kv,
+-                             uniform_q_len, head_dim_qk, kv_dtype_bytes, kv_dtype_tag);
++                             // merlin-hook: workload-verify-tile
++                             uniform_q_len, head_dim_qk, kv_dtype_bytes, kv_dtype_tag, smallq_mode);
+ 
+   plan_info.cta_tile_q = cta_tile_q;
+@@ -1047,5 +1062,7 @@
+                                int64_t uniform_q_len, cudaStream_t stream,
+                                uint32_t kv_dtype_bytes = 2,
+-                               uint32_t kv_dtype_tag = kSm8xKVTagOther) {
++                               // merlin-hook: workload-verify-tile
++                               uint32_t kv_dtype_tag = kSm8xKVTagOther,
++                               int64_t smallq_mode = -1) {
+   size_t used_float_workspace_size = 0;
+   size_t used_int_workspace_size = 0;
+@@ -1056,5 +1073,6 @@
+                                head_dim_vo, page_size, enable_cuda_graph, sizeof_dtype_o,
+                                window_left, fixed_split_size, disable_split_kv, num_colocated_ctas,
+-                               uniform_q_len, stream, kv_dtype_bytes, kv_dtype_tag);
++                               // merlin-hook: workload-verify-tile
++                               uniform_q_len, stream, kv_dtype_bytes, kv_dtype_tag, smallq_mode);
+ }
+ 
+@@ -1066,5 +1084,7 @@
+     bool enable_cuda_graph, uint32_t sizeof_dtype_o, int32_t window_left, int32_t fixed_split_size,
+     bool disable_split_kv, int64_t num_colocated_ctas, int64_t uniform_q_len, cudaStream_t stream,
+-    uint32_t kv_dtype_bytes = 2, uint32_t kv_dtype_tag = kSm8xKVTagOther) {
++    // merlin-hook: workload-verify-tile
++    uint32_t kv_dtype_bytes = 2, uint32_t kv_dtype_tag = kSm8xKVTagOther,
++    int64_t smallq_mode = -1) {
+   PrefillPlanInfo plan_info;
+   return PrefillPlanImpl<false>(float_workspace_size_in_bytes, int_workspace_size_in_bytes,
+@@ -1076,5 +1096,6 @@
+                                 sizeof_dtype_o, window_left, fixed_split_size, disable_split_kv,
+                                 num_colocated_ctas, uniform_q_len, stream, kv_dtype_bytes,
+-                                kv_dtype_tag);
++                                // merlin-hook: workload-verify-tile
++                                kv_dtype_tag, smallq_mode);
+ }
+ 
+diff --git a/prefill.py b/prefill.py
+--- a/prefill.py
++++ b/prefill.py
+@@ -525,4 +525,22 @@
+ 
+ 
++# merlin-hook: workload-verify-tile
++def _sm8x_smallq_plan_adapter(func, arity):
++    if func is None:
++        return None
++
++    def call(*args, sm8x_smallq_mode=-1):
++        if type(sm8x_smallq_mode) is not int or sm8x_smallq_mode not in (-1, 0, 1):
++            raise ValueError("sm8x_smallq_mode must be -1, 0, or 1")
++        # 0.7.0.post1 FA2 has 20 plan / 18 workspace arguments before this patch.
++        if len(args) == arity:
++            return func(*args, sm8x_smallq_mode)
++        if sm8x_smallq_mode != -1:
++            raise ValueError("explicit small-q mode requires the FA2 planner")
++        return func(*args)
++
++    return call
++
++
+ @functools.cache
+ def get_batch_prefill_module(backend, *args):
+@@ -994,6 +1012,7 @@
+ 
+     return SimpleNamespace(
+-        plan=plan_func,
+-        workspace_size=workspace_size_func,
++        # merlin-hook: workload-verify-tile
++        plan=_sm8x_smallq_plan_adapter(plan_func, 20),
++        workspace_size=_sm8x_smallq_plan_adapter(workspace_size_func, 18),
+         ragged_run=ragged_run,
+         paged_run=paged_run,
+@@ -1146,6 +1165,7 @@
+     # Cuda Graph or torch.compile. So, we don't provide a torch library for plan.
+     return SimpleNamespace(
+-        plan=plan_func,
+-        workspace_size=workspace_size_func,
++        # merlin-hook: workload-verify-tile
++        plan=_sm8x_smallq_plan_adapter(plan_func, 20),
++        workspace_size=_sm8x_smallq_plan_adapter(workspace_size_func, 18),
+         ragged_run=ragged_run,
+         paged_run=paged_run,
+diff --git a/decode.py b/decode.py
+--- a/decode.py
++++ b/decode.py
+@@ -791,4 +791,17 @@
+ 
+ 
++# merlin-hook: workload-verify-tile
++def _sm8x_smallq_plan_kwargs(wrapper):
++    mode = getattr(wrapper, "sm8x_smallq_mode", -1)
++    if type(mode) is not int or mode not in (-1, 0, 1):
++        raise ValueError("sm8x_smallq_mode must be -1, 0, or 1")
++    if wrapper.is_cuda_graph_enabled:
++        frozen = getattr(wrapper, "_sm8x_smallq_planned_mode", mode)
++        if frozen != mode:
++            raise ValueError("small-q mode is frozen per CUDA-graph wrapper")
++        wrapper._sm8x_smallq_planned_mode = mode
++    return {} if mode == -1 else {"sm8x_smallq_mode": mode}
++
++
+ class BatchDecodeWithPagedKVCacheWrapper:
+     r"""Wrapper class for decode attention with paged kv-cache (first proposed in
+@@ -857,4 +870,7 @@
+     """
+ 
++    # merlin-hook: workload-verify-tile
++    sm8x_smallq_plan_api = 1
++
+     @flashinfer_api
+     def __init__(
+@@ -1343,5 +1359,8 @@
+                 f"workspace_size is not available for decode backend {backend!r}"
+             )
+-        float_workspace_size, int_workspace_size = module.workspace_size(*args)
++        # merlin-hook: workload-verify-tile
++        float_workspace_size, int_workspace_size = module.workspace_size(
++            *args, **_sm8x_smallq_plan_kwargs(self)
++        )
+         return int(float_workspace_size), int(int_workspace_size)
+ 
+@@ -1994,6 +2013,7 @@
+                 args.append(0)  # num_colocated_ctas
+                 args.append(q_len_per_req if q_len_per_req > 1 else 0)  # uniform_q_len
+-            self._plan_info = self._cached_module.plan(
+-                *args,
++            # merlin-hook: workload-verify-tile
++            self._plan_info = self._cached_module.plan(
++                *args, **_sm8x_smallq_plan_kwargs(self)
+             )
+         else:
+@@ -4154,6 +4174,7 @@
+                         q_len_per_req if q_len_per_req > 1 else 0
+                     )  # uniform_q_len
+-                self._plan_info = self._cached_module.plan(
+-                    *args,
++                # merlin-hook: workload-verify-tile
++                self._plan_info = self._cached_module.plan(
++                    *args, **_sm8x_smallq_plan_kwargs(self)
+                 )
+             except Exception as e:
+diff --git a/jit/attention/modules.py b/jit/attention/modules.py
+--- a/jit/attention/modules.py
++++ b/jit/attention/modules.py
+@@ -410,5 +410,7 @@
+         # port of this tile (e.g. one without that start) can never be reused for this one. Bump it
+         # for every semantic change of the patched sources.
+-        + ("_sm8x_smallq_070_v1" if backend not in ("fa3", "trtllm-gen") else "")
++        # merlin-hook: workload-verify-tile
++        # ABI revision 2: explicit plan mode; never load a revision-1 module.
++        + ("_sm8x_smallq_070_v2" if backend not in ("fa3", "trtllm-gen") else "")
+     )
+ 

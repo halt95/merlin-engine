@@ -49,6 +49,8 @@ class InputProcessor:
         mm_registry: MultiModalRegistry = MULTIMODAL_REGISTRY,
     ) -> None:
         self.vllm_config = vllm_config
+        # Read once; the property re-reads envs.
+        self._use_v2_model_runner = vllm_config.use_v2_model_runner
         self.prompt_logprobs_budget = prompt_logprobs_budget_from_config(vllm_config)
         self.model_config = model_config = vllm_config.model_config
         self.cache_config = vllm_config.cache_config
@@ -503,6 +505,9 @@ class InputProcessor:
                 sampling_params.update_from_tokenizer(self.tokenizer)
             if sampling_params.trace_decode_token_ids:
                 self._normalize_trace_replay_params(sampling_params, prompt_len)
+            # Check final counts, including generation-config EOS and tokenized variants.
+            if self._use_v2_model_runner:
+                sampling_params._validate_sampler_caps()
         else:
             pooling_params = params.clone()
 

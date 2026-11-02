@@ -6,7 +6,7 @@
 > None is a new 0.32 measurement. For Merlin 3.0.0, built on vLLM 0.32.0, see the
 > [2026-10-20 bench card](../benchmarks/2026-10-20/BENCH-CARD.md).
 
-Earlier release notes, moved here from the [README](../README.md). The current release is Merlin 3.0.0 (recipe VERSION 3.0.0); the notes of v3.0.0 and of the v2.5.x releases are in
+Earlier release notes, moved here from the [README](../README.md). The current release is Merlin 3.0.1; the notes of v3.0.0 and of the v2.5.x releases are in
 [CHANGELOG.md](../CHANGELOG.md); v2.5.3 and v2.5.2 are public releases of the package repository (tags `v2.5.3`, `v2.5.2`).
 
 ## The releases in brief (v3.0.0, v2.5.1, v2.2.0, v2.0.1, v2)
@@ -256,7 +256,7 @@ TREE=./vllm-v2 VENV=./venv-v2 HOST=0.0.0.0 scripts/serve-v2.sh /path/to/Qwen3.8-
 
 Four known deltas between the gate command and the shipped one:
 
-- the gate ran with `--enable-log-requests --enable-request-id-headers` (request logging on; the served entry has it
+- the check ran with `--enable-log-requests --enable-request-id-headers` (request logging on; the served entry has it
   off; no throughput effect is claimed either way);
 - the served entry adds `--override-generation-config` (T=1.0 / top-p 0.95 / top-k 20) and
   `--default-chat-template-kwargs` (thinking on, low effort), which the gate did not pass (it sent T=0 with a seed per

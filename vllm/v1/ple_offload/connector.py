@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright 2026 halt95 (Merlin modifications)
 """Exchange PLE data between a GPU worker and the CPU-offload process."""
 
 import os
@@ -21,6 +21,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.ple_offload_layer import (
     CpuGpuSemaphore,
     PleOffloadLayer,
+    _cuda_check,
 )
 from vllm.v1.ple_offload.fatal import notify_parent_fatal, ple_fail_closed
 from vllm.v1.ple_offload.progress import PleProgressMonitor
@@ -108,14 +109,6 @@ class _PendingPleOffloadRequest:
     eligible: bool = False
     transaction_id: str | None = None
     correlation_id: str | None = None
-
-
-def _cuda_check(result: Any, operation: str) -> Any:
-    """Check the ``(CUresult, ...)`` tuple returned by cuda-python calls."""
-    error = result[0] if isinstance(result, tuple) else result
-    if error.value != 0:
-        raise RuntimeError(f"{operation} failed: {error}")
-    return result
 
 
 class PleOffloadConnector:
@@ -325,18 +318,6 @@ class PleOffloadConnector:
             self._pinned_input_buffers.append(buffer)
         if not buffer.is_pinned():
             raise RuntimeError("CUDA did not page-lock a PLE host buffer")
-
-    def _unpin_input_buffers(self) -> None:
-        """Release CUDA registrations after the request thread has stopped."""
-        for buffer in reversed(self._pinned_input_buffers):
-            try:
-                _cuda_check(
-                    cuda_driver.cuMemHostUnregister(buffer.data_ptr()),
-                    "cuMemHostUnregister(PLE input buffer)",
-                )
-            except RuntimeError:
-                logger.exception("Failed to unregister a PLE input buffer")
-        self._pinned_input_buffers.clear()
 
     def _serialize_registration(self, vllm_config: VllmConfig) -> Any:
         """Build and serialise the registration (may move shared storages)."""
@@ -731,8 +712,8 @@ class PleOffloadConnector:
         stream = torch.cuda.current_stream(self.device)
         for layer in self._layers.values():
             layer.release_offloaded_output(stream)
-        # Retain the serving deadline until the model stream has actually
-        # executed every reset above. The monitor thread is the sole query site.
+        # Start the GPU completion budget after host submission (including cold
+        # compilation). The monitor thread is the sole event query site.
         completion_event = torch.cuda.Event()
         completion_event.record(stream)
         self._progress.track_completion(completion_event)
@@ -757,6 +738,9 @@ class PleOffloadConnector:
 
     def close(self) -> None:
         """Stop transport and unlink names, retaining host mappings."""
+        # The runner has drained the GPU while the producer is still alive.
+        # Disarm before teardown can race a final event query or deadline.
+        self._progress.close()
         request_thread = self._request_thread
         if request_thread is not None and request_thread.is_alive():
             try:
@@ -766,7 +750,6 @@ class PleOffloadConnector:
             request_thread.join(timeout=5)
         if request_thread is not None and request_thread.is_alive():
             logger.error("PLE request thread did not stop; deferring resource cleanup")
-            self._progress.close()
             return
         self._request_thread = None
 
@@ -783,6 +766,4 @@ class PleOffloadConnector:
         if self._zmq_ctx is not None:
             self._zmq_ctx.term()
             self._zmq_ctx = None
-        self._progress.close()
-
         self.release_host_storage()

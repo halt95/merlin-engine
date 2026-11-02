@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by the Merlin project; see NOTICE.
 """Prometheus metrics for SimpleCPUOffloadConnector.
 
 The stats payload uses the same self-describing wire format as the
@@ -39,6 +40,8 @@ OUTCOME_TO_FIELD = {
     "dropped_not_hashed": "dropped_not_hashed",
     "skipped_already_cached": "skipped_already_cached",
     "skipped_in_flight": "skipped_in_flight",
+    # a hand-off for a group the tier never offloads.
+    "dropped_skipped_group": "dropped_skipped_group",
 }
 
 INFO_LABELS = ["backend", "page_cache", "lazy_offload", "capacity_blocks"]

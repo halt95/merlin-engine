@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by the Merlin project; see NOTICE.
 
 import importlib
 from collections.abc import Callable
@@ -241,6 +242,13 @@ KVConnectorFactory.register_connector(
     "SimpleCPUOffloadConnector",
     "vllm.distributed.kv_transfer.kv_connector.v1.simple_cpu_offload_connector",
     "SimpleCPUOffloadConnector",
+)
+# The host-RAM KV tier (MERLIN_KV_HOST_TIER_GIB),
+# a write-back SimpleCPUOffload built by vllm/merlin/kv_host_tier.py.
+KVConnectorFactory.register_connector(
+    "MerlinKVHostTierConnector",
+    "vllm.distributed.kv_transfer.kv_connector.v1.merlin_kv_host_tier_connector",
+    "MerlinKVHostTierConnector",
 )
 KVConnectorFactory.register_connector(
     "HF3FSKVConnector",

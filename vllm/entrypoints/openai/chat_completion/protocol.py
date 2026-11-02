@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by the Merlin project; see NOTICE.
 
 # Adapted from
 # https://github.com/lm-sys/FastChat/blob/168ccc29d3f7edc50823016105c024fe2282732a/fastchat/protocol/openai_api_protocol.py
@@ -608,8 +609,9 @@ class ChatCompletionRequest(OpenAIBaseModel):
         `True` constrains from the first generated token; `None` lets the
         engine check the prompt with its own reasoning parser.
         """
-        if not self.include_reasoning:
-            return True
+        # The result never depends on
+        # include_reasoning: hiding reasoning from the client must not start
+        # the content grammar before the reasoning ends.
         if self._grammar_from_parser:
             # The Mistral grammar already includes an optional `think?`
             # rule that handles both reasoning and non-reasoning outputs.

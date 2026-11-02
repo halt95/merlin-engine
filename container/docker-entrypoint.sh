@@ -22,7 +22,7 @@ export VLLM_CACHE_ROOT="${VLLM_CACHE_ROOT:-$CACHE_ROOT}"
 if [ "$family" = flash ]; then
   # MODEL_NAME only when supplied: the launcher's default names (flash-next-v2 flash-next flash-mtp flash-next-mtp,
   # or the checkpoint's own) stay the same inside and outside the container
-  if ! "$VENV/bin/python" -c 'import json,sys; c=json.load(open(sys.argv[1])); sys.exit(0 if c.get("text_config",{}).get("ple_embedding_dtype")=="float8_e4m3fn" else 1)' "$CKPT/config.json"; then
+  if ! "$VENV/bin/python" -c 'import json,sys; c=json.load(open(sys.argv[1], encoding="utf-8")); sys.exit(0 if c.get("text_config",{}).get("ple_embedding_dtype")=="float8_e4m3fn" else 1)' "$CKPT/config.json"; then
     if [ -w "$CKPT" ] && [ -w "$CKPT/config.json" ]; then
       "$VENV/bin/python" "$REPO/models/flash-next/make-e1-config.py" "$CKPT"
     else
@@ -35,7 +35,8 @@ else
     echo "27B/ThinkingCap launchers take environment settings rather than extra vLLM arguments" >&2
     exit 2
   }
-  export MODEL="$CKPT" SERVED="${SERVED:-$recipe}"
+  # SERVED only when supplied: the launcher's default name (qwen38-27b for both recipes) stays the same as on bare metal
+  export MODEL="$CKPT"
 fi
 if ! command -v nvidia-smi >/dev/null 2>&1 || ! nvidia-smi -L >/dev/null 2>&1; then
   echo "WARNING: no NVIDIA GPU visible; use --gpus all and configure nvidia-container-toolkit on the host" >&2

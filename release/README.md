@@ -1,6 +1,6 @@
-# Merlin 3.0.0 install and release tooling
+# Merlin 3.0.1 install and release tooling
 
-Merlin 3.0.0 builds this checkout on **vLLM 0.32.0**. All recipes under
+Merlin 3.0.1 builds this checkout on **vLLM 0.32.0**. All recipes under
 [`models/`](../models/README.md) share one environment installer and dependency
 lock. Engine bundles and per-model engine patch series are historical artifacts.
 
@@ -15,6 +15,7 @@ CPython 3.13 / Linux x86_64 (manylinux_2_28). Install with `--require-hashes`.
 | [`requirements-0.32.lock`](requirements-0.32.lock) | Exact serving, CUDA toolkit and build-tool pins, including torch 2.13.0, triton 3.7.1, FlashInfer 0.7.0.post1, humming-kernels 0.1.17 and instanttensor 0.2.2. Every package carries artifact SHA-256 hashes; the closure resolves on CPython 3.13 / Linux x86_64. Excludes vllm itself and flashinfer-jit-cache. |
 | [`build-wheel.sh`](build-wheel.sh), [`wheel.py`](wheel.py), `merlin-wheel.sha256` | The engine wheel: one build for sm_80, sm_86 and sm_89 from a clean HEAD against the release lock, with build-host paths mapped out and audited (`wheel.py audit`). `merlin-wheel.sha256` names the one wheel a checkout accepts; `install-env.sh` refuses any other wheel, and one whose commit's native sources differ from the checkout's. |
 | [`apply-flashinfer-patch.sh`](apply-flashinfer-patch.sh), [`check-tile-proof.sh`](check-tile-proof.sh), [`patches/flashinfer-0.7.0.post1/`](patches/flashinfer-0.7.0.post1/README.md) | Version-specific 0.7.0.post1 small-query FP8 verify tile. Checks pristine/patched hashes, serializes idempotent application and uses JIT suffix `_sm8x_smallq_070_v1`. Installation leaves the knob off; launchers select it with `FLASHINFER_SM8X_FP8_SMALLQ=cta32`. The proof checker requires a current-boot selection line for every TP rank after a completed MTP request; it does not prove numerical correctness. |
+| [`apply-flashinfer-workload-patch.py`](apply-flashinfer-workload-patch.py) | Opt-in, 27B only, default off: with `MERLIN_FLASHINFER_WORKLOAD_TILE=1`, `install-env.sh` applies FlashInfer patch 0002 (workload-aware tile) after 0001; see the [patch notes](patches/flashinfer-0.7.0.post1/README.md) |
 | [`make_manifest.py`](make_manifest.py) | Generates `PACKAGE-MANIFEST.md` and `SHA256SUMS` from all staged Git blobs and modes, including each recipe's checkpoint checksum list. Generate these on the final release tree after cleanup; downloaded checkpoint bytes are verified separately. |
 
 Use Linux x86_64, Python 3.13 headers, uv, Git with full source history,
@@ -32,7 +33,7 @@ The lock is complete: 222 exact pins with SHA-256 hashes, resolved with uv, and
 a dry-run `--require-hashes` install resolves. From the repository root:
 
 ```bash
-curl -LO https://github.com/halt95/merlin-engine/releases/download/merlin-v3.0.0/vllm-0.32.0+merlin.7002f56537-cp313-cp313-linux_x86_64.whl
+curl -LO https://github.com/halt95/merlin-engine/releases/download/merlin-v3.0.1/vllm-0.32.0+merlin.7002f56537-cp313-cp313-linux_x86_64.whl
 MERLIN_WHEEL="$PWD/vllm-0.32.0+merlin.7002f56537-cp313-cp313-linux_x86_64.whl"   bash release/install-env.sh "$PWD/venv"
 bash release/install-env.sh --verify "$PWD/venv"
 ```
@@ -40,7 +41,7 @@ bash release/install-env.sh --verify "$PWD/venv"
 Without `MERLIN_WHEEL` the installer compiles the engine (about 1.5 hours on 8 cores).
 `release/build-wheel.sh` builds the wheel itself.
 
-A fresh install from the release wheel was verified on the reference host and on
+A fresh install from the release wheel on this lock was verified on the reference host and on
 a second host with 4× RTX 4090 (2026-10-20); the container image is not yet qualified. A tile
 hash check or import check does not replace a successful model request and the
 separate live tile proof. See [install-0.32.md](install-0.32.md) for the full

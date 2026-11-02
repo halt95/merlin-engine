@@ -36,7 +36,9 @@ from vllm.distributed.parallel_state import (
 )
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
-from vllm.v1.worker import guard_telemetry
+from vllm.merlin.flashinfer_smallq import (
+    plan_identity,
+)
 from vllm.model_executor.layers.ple_offload_layer import (
     observe_ple_copy_geometry,
 )
@@ -48,6 +50,7 @@ from vllm.utils.torch_utils import current_stream
 from vllm.v1.hisparse.binding import release_hisparse_profiling_cache
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.spec_decode.dynamic.utils import build_dynamic_sd_schedule_lookup
+from vllm.v1.worker import guard_telemetry
 from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
 from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.cp_utils import prepare_dcp_local_seq_lens
@@ -85,6 +88,7 @@ class BatchExecutionDescriptor:
     num_active_loras: int = 0
     # Number of microbatches the batch is split into (DBO). 1 means no splitting.
     num_ubatches: int = 1
+    flashinfer_smallq: tuple = ()
 
 
 def make_cudagraph_stats(
@@ -493,7 +497,13 @@ class CudaGraphManager:
                         if desc.cg_mode == CUDAGraphMode.PIECEWISE:
                             forward_fn(CUDAGraphMode.PIECEWISE)
                             continue
-                        assert desc not in self.graphs, (
+                        identity = getattr(
+                            forward_fn, "_merlin_flashinfer_smallq", ()
+                        )
+                        graph_desc = desc
+                        if identity:
+                            graph_desc = replace(desc, flashinfer_smallq=identity)
+                        assert graph_desc not in self.graphs, (
                             f"Graph already captured for {desc}"
                         )
                         graph = torch.cuda.CUDAGraph()
@@ -522,7 +532,7 @@ class CudaGraphManager:
                             torch.accelerator.synchronize()
                             free_after = torch.accelerator.get_memory_info()[0]
                             self._capture_mem_samples.append(free_before - free_after)
-                        self.graphs[desc] = graph
+                        self.graphs[graph_desc] = graph
                         compilation_counter.num_cudagraph_captured += 1
 
         self._graphs_captured = True
@@ -637,12 +647,18 @@ class CudaGraphManager:
             num_ubatches=num_ubatches,
         )
 
-    def run_fullgraph(self, desc: BatchExecutionDescriptor):
+    def has_fullgraph(self, desc: BatchExecutionDescriptor, identity: tuple) -> bool:
+        return all(mode != 0 for _, _, mode in identity) and (
+            replace(desc, flashinfer_smallq=identity) in self.graphs
+        )
+
+    def run_fullgraph(self, desc: BatchExecutionDescriptor, identity: tuple = ()):
         """Replay a captured FULL cudagraph."""
         assert desc.cg_mode == CUDAGraphMode.FULL, (
             f"Expected FULL mode, got {desc.cg_mode}"
         )
-        assert desc in self.graphs, f"No cudagraph for {desc}"
+        graph_desc = replace(desc, flashinfer_smallq=identity) if identity else desc
+        assert graph_desc in self.graphs, f"No cudagraph for {graph_desc}"
         if (
             desc in self._ple_full_copy_geometry
             and not self._allow_ple_full_graph
@@ -657,7 +673,7 @@ class CudaGraphManager:
         get_offloader().sync_prev_onload()
         # bounds-guard producer coverage: a replay inherits this stream
         guard_telemetry.check_replay_stream()
-        self.graphs[desc].replay()
+        self.graphs[graph_desc].replay()
 
     def init_breakable_cg_runner(self, model: nn.Module) -> None:
         if self.breakable_cg_runner is None:
@@ -882,15 +898,20 @@ class ModelCudaGraphManager(CudaGraphManager):
 
                 store_capture_output(num_tokens, model_output)
 
+            if (
+                envs.MERLIN_FLASHINFER_WORKLOAD_TILE
+                and desc.cg_mode == CUDAGraphMode.FULL
+            ):
+                forward_fn._merlin_flashinfer_smallq = plan_identity(attn_metadata)
             return forward_fn
 
         super().capture(create_forward_fn, progress_bar_desc)
 
     def run_fullgraph(
-        self, desc: BatchExecutionDescriptor
+        self, desc: BatchExecutionDescriptor, identity: tuple = ()
     ) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]] | IntermediateTensors:
         """Replay a captured FULL cudagraph and return hidden states."""
-        super().run_fullgraph(desc)
+        super().run_fullgraph(desc, identity)
         if not self.is_last_pp_rank:
             assert self.intermediate_tensors is not None
             return self.intermediate_tensors[: desc.num_tokens]

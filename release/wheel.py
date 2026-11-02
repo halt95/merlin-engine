@@ -157,7 +157,7 @@ def read_native(native: Path) -> dict[str, str]:
             f"{native} is missing; it records the native source tree ids the wheel was built from"
         )
     ids: dict[str, str] = {}
-    for n, line in enumerate(native.read_text().splitlines(), 1):
+    for n, line in enumerate(native.read_text(encoding="utf-8").splitlines(), 1):
         if not line.strip():
             continue
         fields = line.split()
@@ -197,12 +197,12 @@ def check_native(engine: Path, native: Path, commit: str) -> None:
 
 
 def verify(wheel: Path, record: Path, engine: Path) -> str:
-    if not record.is_file() or not record.read_text().strip():
+    if not record.is_file() or not record.read_text(encoding="utf-8").strip():
         raise WheelError(
             f"{record} records no release wheel for this checkout; "
             "build from source instead"
         )
-    fields = record.read_text().split()
+    fields = record.read_text(encoding="utf-8").split()
     if len(fields) != 2 or not re.fullmatch(r"[0-9a-f]{64}", fields[0]):
         raise WheelError(f"{record} must hold one '<sha256>  <filename>' line")
     want, name = fields

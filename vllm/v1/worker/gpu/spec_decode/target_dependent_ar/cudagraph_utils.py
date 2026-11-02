@@ -1,11 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by the Merlin project; see NOTICE.
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 
 import torch
 
+from vllm import envs
 from vllm.config.compilation import CUDAGraphMode
+from vllm.merlin.flashinfer_smallq import (
+    plan_identity,
+)
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.spec_decode.dynamic.utils import build_dynamic_sd_schedule_lookup
 from vllm.v1.worker.gpu.block_table import BlockTables
@@ -104,7 +109,7 @@ class SpeculatorCudaGraphManager(CudaGraphManager):
                     if isinstance(desc, SpeculatorBatchDescriptor)
                     else self.vllm_config.num_speculative_tokens
                 )
-            return lambda cg_mode: forward_fn(
+            run = lambda cg_mode: forward_fn(
                 num_reqs,
                 num_tokens,
                 attn_metadata,
@@ -113,5 +118,11 @@ class SpeculatorCudaGraphManager(CudaGraphManager):
                 cg_mode,
                 **forward_kwargs,
             )
+            if (
+                envs.MERLIN_FLASHINFER_WORKLOAD_TILE
+                and desc.cg_mode == CUDAGraphMode.FULL
+            ):
+                run._merlin_flashinfer_smallq = plan_identity(attn_metadata)
+            return run
 
         super().capture(create_forward_fn, progress_bar_desc)

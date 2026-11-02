@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright 2026 halt95 (Merlin modifications)
 """Fork startup guards that fail closed on a graph profile we never qualified.
 
 These run at model construction, on every rank, for the target model and for
@@ -8,7 +8,7 @@ the MTP drafter, before profiling or capture.
 Compile-profile guard: this tree restores torch.compile on the
 NVIDIA Qwen4Exp path (reverting vLLM #55272) and removes Qwen4Exp from
 ``DEFAULT_BREAKABLE_CUDAGRAPH_ARCHITECTURES``. The ONE qualified profile is the
-v2.0.1 production identity:
+production one:
 
   * ``VLLM_USE_BREAKABLE_CUDAGRAPH`` explicitly pinned to exactly ``0``, and
     resolved OFF;
@@ -18,7 +18,7 @@ v2.0.1 production identity:
     (:data:`REQUIRED_SPLITTING_OPS`);
   * a live ``@support_torch_compile`` submodule
     (:func:`assert_compiled_submodule`), which is the property
-    ``vllm/v1/worker/gpu/cudagraph_utils.py:605`` actually tests at capture.
+    ``has_compiled_submodule`` (vllm/v1/worker/gpu/cudagraph_utils.py) tests at capture.
 
 Anything else -- eager, NONE + FULL, FULL_DECODE_ONLY, breakable PIECEWISE --
 fails loud. There is no opt-out switch; the offline calibration harness
@@ -55,7 +55,7 @@ REQUIRED_SPLITTING_OPS = (
     "vllm::ple_offload_wait_copy",
 )
 
-#: Upstream v0.30.0 auto-enabled breakable cudagraphs for these; this tree
+#: Upstream auto-enables breakable cudagraphs for these; this tree
 #: does not (vllm/config/vllm.py). Kept to name the mechanism in messages.
 OUR_AUTO_BREAKABLE_ARCHITECTURES = frozenset(flashnext_family.archs())
 
@@ -63,7 +63,7 @@ OUR_AUTO_BREAKABLE_ARCHITECTURES = frozenset(flashnext_family.archs())
 def _upstream_truth(raw: str | None) -> bool:
     """Upstream's exact semantics for the breakable switch.
 
-    ``envs.py:937`` is ``os.environ.get(..., "0") == "1"``. Nothing else is on.
+    vllm/envs.py reads it as ``os.environ.get(..., "0") == "1"``. Nothing else is on.
     """
     return raw == "1"
 
@@ -93,7 +93,6 @@ def _profile(
     For ``role="draft"`` the architectures are the DRAFT model's
     (``speculative_config.draft_model_config``): the drafter is constructed
     with the target's VllmConfig, whose model_config names the target.
-    A draft line used to log the target architecture; it now reports the draft model's.
     The graph profile is the engine's single CompilationConfig for both roles.
     """
     model_config = getattr(vllm_config, "model_config", None)
@@ -196,8 +195,8 @@ def assert_graph_profile_is_executable(vllm_config, *, role: str = "target") -> 
 def assert_compiled_submodule(module, vllm_config, *, role: str = "target") -> None:
     """Require a live ``@support_torch_compile`` wrapper on ``module``.
 
-    This is the property ``has_compiled_submodule()`` checks before PIECEWISE
-    capture (``gpu/cudagraph_utils.py:132``, ``:605``). Checking it at
+    This is the property ``has_compiled_submodule()`` (gpu/cudagraph_utils.py)
+    checks before PIECEWISE capture. Checking it at
     construction turns a mid-capture failure into a startup one.
     """
     from vllm.compilation.wrapper import TorchCompileWithNoGuardsWrapper
@@ -214,7 +213,8 @@ def assert_compiled_submodule(module, vllm_config, *, role: str = "target") -> N
     )
     raise RuntimeError(
         f"e2-guard[{role}]: {detail}: no live torch.compile wrapper, so "
-        "PIECEWISE capture would raise at gpu/cudagraph_utils.py:605. The "
+        "PIECEWISE capture would raise in has_compiled_submodule "
+        "(gpu/cudagraph_utils.py). The "
         "@support_torch_compile decorator (compile-profile guard) is missing or disabled."
     )
 
@@ -229,11 +229,15 @@ EXPECTED_RESOLVED_MODES = {
     "draft.prefill_cudagraph_manager": REQUIRED_CUDAGRAPH_MODE_NAME,
     "draft.decode_cudagraph_manager": "FULL_DECODE_ONLY",
     "draft.cudagraph_manager": "FULL_DECODE_ONLY",
+    # DFlash/DFlash2 (DFlashSpeculator.init_cudagraph_manager): FULL decode
+    # graphs, or NONE when the draft attention cannot run full graphs.
+    "draft.query_cudagraph_manager": "FULL_DECODE_ONLY",
 }
 _DRAFT_MANAGER_ATTRS = (
     "prefill_cudagraph_manager",
     "decode_cudagraph_manager",
     "cudagraph_manager",
+    "query_cudagraph_manager",
 )
 
 
@@ -311,7 +315,7 @@ def check_upstream_uva_env_against_pull() -> None:
     if raw == "1":
         raise RuntimeError(
             f"e2-guard: PLE pull transport and {UPSTREAM_UVA_ENV}=1. On "
-            f"vLLM v0.30.0 {UPSTREAM_UVA_ENV} is UPSTREAM's switch for the "
+            f"upstream vLLM {UPSTREAM_UVA_ENV} is UPSTREAM's switch for the "
             "pinned-host UVA PLE backend (default on), not the E2 pull "
             "transport, so this launch asks for both transports at once. Unset "
             f"{UPSTREAM_UVA_ENV} or export {UPSTREAM_UVA_ENV}=0 "

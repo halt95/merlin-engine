@@ -1420,14 +1420,45 @@ class SpeculativeConfig:
                         f"Unsupported speculative method: '{self.method}'"
                     )
 
-                if self.method in ("eagle", "eagle3"):
+                # Port of vllm#63432: MTP,
+                # DFlash and DSpark drafts share the target's positions too,
+                # and a YaRN --hf-overrides dict never reaches the draft
+                # config; nested configs (Qwen3.5, Qwen4Exp) keep the value
+                # in hf_text_config.
+                if self.use_eagle():
                     # EAGLE drafts share the target's positional space; a
                     # draft checkpoint with a smaller max_position_embeddings
                     # than the target under-sizes its rotary cache (#48894).
                     SpeculativeConfig._maybe_override_draft_max_position_embeddings(
-                        self.draft_model_config.hf_config,
+                        self.draft_model_config.hf_text_config,
                         self.target_model_config.max_model_len,
                     )
+                    # The draft's
+                    # max_model_len was derived from the checkpoint before the
+                    # raise; the V1 runner stops drafting past it, the V2
+                    # runner never checks it. Keep MTP/DFlash/DSpark in step,
+                    # capped at the table the draft rope actually builds.
+                    draft_text = self.draft_model_config.hf_text_config
+                    draft_mpe = getattr(draft_text, "max_position_embeddings", None)
+                    draft_len = self.draft_model_config.max_model_len
+                    cap = SpeculativeConfig._draft_rope_capacity(
+                        draft_text, draft_mpe, self.target_model_config.max_model_len
+                    )
+                    if (
+                        self.method in ("mtp", "dflash", "dspark")
+                        and isinstance(draft_len, int)
+                        and cap is not None
+                        and draft_len < cap
+                    ):
+                        self.draft_model_config.max_model_len = cap
+                        logger.info(
+                            "Draft max_model_len raised from %d to %d to match "
+                            "the target window (%s draft, rope as in its "
+                            "checkpoint).",
+                            draft_len,
+                            cap,
+                            self.method,
+                        )
 
                 # Replace hf_config for EAGLE draft_model
                 if self.method in ("eagle", "eagle3", "dflash"):
@@ -1737,6 +1768,31 @@ class SpeculativeConfig:
             target_max_model_len,
         )
         draft_hf_config.max_position_embeddings = target_max_model_len
+
+    @staticmethod
+    def _draft_rope_capacity(
+        draft_text_config: Any,
+        draft_max_position_embeddings: Any,
+        target_max_model_len: int,
+    ) -> int | None:
+        """Positions the draft's rope table holds, capped at the target window.
+
+        The table follows max_position_embeddings (yarn floors on it too),
+        except the DeepSeek YaRN variants, which build original x factor rows.
+        None when the length is not an int (no rope window to follow).
+        """
+        if not isinstance(draft_max_position_embeddings, int):
+            return None
+        cap = min(draft_max_position_embeddings, target_max_model_len)
+        rope_parameters = getattr(draft_text_config, "rope_parameters", None)
+        if isinstance(rope_parameters, Mapping):
+            rope_type = rope_parameters.get("rope_type")
+            if rope_type in ("deepseek_yarn", "deepseek_llama_scaling"):
+                built = rope_parameters.get("original_max_position_embeddings", 0) * (
+                    rope_parameters.get("factor") or 1
+                )
+                cap = min(cap, int(built))
+        return cap
 
     @staticmethod
     def _verify_and_get_draft_tp(

@@ -13,7 +13,7 @@ Recipe for Merlin 3.0.0 on **vLLM 0.32.0**, with the shared installer and tile t
 
 - Unified engine and 0.32 CLI launchers: `--attention-backend FLASHINFER`, `--mamba-cache-mode align`, and
   **FGPC ON** with `--enable-mamba-shared-prefix-checkpoint` for TP2, TP4 and ThinkingCap wrappers.
-- KV pool TP2 remains **826,689 tokens**. TP4 serves RecoverSSM on with the shipped TP4 geometry (block 1024, chunk 4096, LPT 832, pin 17,923,833,856 B = 2,011 blocks): **2,012,105 tokens** (7.68 × 262K), all correctness gates passed, and the 2026-10-20 release bench card measured decode 252.4 / 235.4 / 224.0 tok/s at 32K / 131K / 259K (thinking on); the RecoverSSM-off TP4 line (1,974,072 tokens) is retired.
+- KV pool TP2 remains **826,689 tokens**. TP4 serves RecoverSSM on with the shipped TP4 geometry (block 1024, chunk 4096, LPT 832, pin 17,923,833,856 B = 2,011 blocks): **2,012,105 tokens** (7.68 × 262K), all correctness checks passed, and the 2026-10-20 release bench card measured decode 252.4 / 235.4 / 224.0 tok/s at 32K / 131K / 259K (thinking on); the RecoverSSM-off TP4 line (1,974,072 tokens) is retired.
 - Ported FlashInfer **0.7.0.post1** verify tile: TP2 ITL at 4K / 32K / 131K **19.99 / 21.41 / 25.27 ms**;
   TP4 **15.83 / 16.62 / 18.37 ms** (RecoverSSM-off line), reclaiming 0.30 depth parity.
 - GSM8K-200 tile on, TP2: **192 / 193 / 191**, mean **192.0/200**, against v1.3.0's **196/200**:
@@ -65,7 +65,7 @@ identical). Install as before, from tag `v1.3.1`.
 
 Released 2026-10-12. Dual and quad card only. The single card profile is parked for this release: no single card serve
 script ships. The single card profile was gated as v1.1.0 (below) but not published; it returns in a later release.
-Release gate 2026-10-08 to 2026-10-09 (UTC); bench cards: [`benchmarks/2026-10-12/BENCH-CARD.md`](benchmarks/2026-10-12/BENCH-CARD.md)
+Release check 2026-10-08 to 2026-10-09 (UTC); bench cards: [`benchmarks/2026-10-12/BENCH-CARD.md`](benchmarks/2026-10-12/BENCH-CARD.md)
 and, for the ThinkingCap profile, [`benchmarks/2026-10-12/ThinkingCap-BENCH-CARD.md`](../thinkingcap/benchmarks/2026-10-12/ThinkingCap-BENCH-CARD.md).
 To run it: [Quick start](README.md#quick-start), or [Build and serve](docs/reference.md#build-and-serve) for the detail.
 
@@ -77,7 +77,7 @@ To run it: [Quick start](README.md#quick-start), or [Build and serve](docs/refer
   reasoning fine-tune on the same engine and pins, at `xhigh` reasoning effort by default; its weights are under the
   PolyForm Small Business License 1.0.0 plus BottleCap AI's personal-use permission.
 - **Faster decode at depth.** The FlashInfer 32-row verify tile and MTP K=4 by default: single-stream thinking decode at
-  4K / 32K / 128K / 255K is 206 / 198 / 172 / 144 tok/s on dual card and 258 / 249 / 238 / 226 on quad card (release gate,
+  4K / 32K / 128K / 255K is 206 / 198 / 172 / 144 tok/s on dual card and 258 / 249 / 238 / 226 on quad card (release check,
   2026-10-08 to 2026-10-09 (UTC)).
 - **Sessions stay resident.** Dual card runs RecoverSSM with an 826,689-token pool (three 262K or six 131K sessions, 0
   preemptions); quad card a 1,974,072-token pool (seven 262K sessions, 0 preemptions).
@@ -91,7 +91,7 @@ To run it: [Quick start](README.md#quick-start), or [Build and serve](docs/refer
 
 - Engine: Merlin engine v2.5.2 (the Flash-Next v2.5.1 base, vLLM 0.30.0 plus the Flash-Next fork commits, plus the guard
   fix below) plus the 27B series 0001-0011 (`patches/merlin-engine-v2.5.2/`), replacing stock vLLM 0.30.0 plus
-  `patches/vllm-0.30.0/`. The guard fix was series patch 0012 at the release gate; the final `vllm/` tree is identical:
+  `patches/vllm-0.30.0/`. The guard fix was series patch 0012 at the release check; the final `vllm/` tree is identical:
   - 0001 uniform multi-token decode on Ampere (port of part of [upstream uniform multi-token decode](https://github.com/vllm-project/vllm/pull/47979));
   - 0002 FlashInfer decode-plan cache;
   - 0003 host-resident embedding table, one `VLLM_HOST_EMBED_TABLE` knob (unset = on for the dense Qwen3.5 family only;
@@ -136,11 +136,11 @@ To run it: [Quick start](README.md#quick-start), or [Build and serve](docs/refer
     three 262K or six 131K sessions resident, 0 preemptions.
   - TP=4 (`serve/serve-tp4.sh`): `--enable-mamba-fine-grained-prefix-cache` (no RecoverSSM); `--max-num-seqs 24
     --max-num-batched-tokens 2048` (were 32 / 4096); `KV_BYTES` 18,231,050,240 = 2,470 whole blocks of 7,380,992 B (block 848
-    tokens): 1,974,072 tokens (floor(blocks × 262,144 / D), D = 328), 7.53×; seven 262K sessions resident, 0 preemptions, prefix-cache hit 88.6 % on the 8-conversation load at the release gate.
+    tokens): 1,974,072 tokens (floor(blocks × 262,144 / D), D = 328), 7.53×; seven 262K sessions resident, 0 preemptions, prefix-cache hit 88.6 % on the 8-conversation load at the release check.
   - Unchanged: fp16 SSM state (`--mamba-ssm-cache-dtype float16`), `expandable_segments`, `--disable-custom-all-reduce`,
     `LPT=832`, the chat template. The old KV pins (14,534,914,979 and 17,832,100,834) are replaced.
 - Single-stream decode, thinking on, K=4 (effort low, 256-token generations), tok/s at 4K / 32K / 128K / 255K (the 255K rung targets 261,120 tokens; 259,587 as sent):
-  TP=2 206 / 198 / 172 / 144, TP=4 258 / 249 / 238 / 226 (release gate, 2026-10-08 to 2026-10-09 (UTC)). The gate
+  TP=2 206 / 198 / 172 / 144, TP=4 258 / 249 / 238 / 226 (release check, 2026-10-08 to 2026-10-09 (UTC)). The gate
   measured the shipped profile (tile on, K=4) only.
 - Checkpoint: `tokenizer.json` is replaced by the upstream Qwen3.8-27B file (sha256 `0997f410…`; the previous file lacked
   `\p{M}` in its pre-tokenizer); `release/checkpoint.sha256` lists it. No weights changed. transformers is pinned to 5.18.0

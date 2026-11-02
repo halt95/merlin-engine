@@ -1,0 +1,11 @@
+# SHA-256 of the 9 files of the Flash-Next family INT6 g32 PLE pack (41600199680 table bytes);
+# built by models/flash-next/make-ple-int6-pack.py; run 'sha256sum -c' inside the pack folder.
+c363e5a783ca48dcb410aaf1a4a572163fa93a092c9faa2ac5b80e7503e34834  model-pleint6-00001-of-00008.safetensors
+beaabd03a3c87dad13ff78e34a0bd317aa12a0e268a3fb388e2c68cbe7e4faec  model-pleint6-00002-of-00008.safetensors
+ed86f2595a7942c0f306ce7b2d03ac6fa4541880fd3bb79734e86b49726d0e0a  model-pleint6-00003-of-00008.safetensors
+21cbd98c57d6882049c66c647dedd6e96f67e26ac2e34363081fe13ed418e941  model-pleint6-00004-of-00008.safetensors
+6cba6b02ba59d8551f358ca9b6f4a54530bb90bf5f97287773b22207cb9c6efb  model-pleint6-00005-of-00008.safetensors
+0a2fb23e93fc4953e2af48baba13a52a16d1e49f611f99a1fcb46c79002164f0  model-pleint6-00006-of-00008.safetensors
+3e71174f6a7757aee5dd6d0a3101ddf742681040d139b9b193a4f330c9d36267  model-pleint6-00007-of-00008.safetensors
+2bef795cd1f7f2c326e7932d533594b6acf671ffc58090e7629bdcdc307d4c9a  model-pleint6-00008-of-00008.safetensors
+621e46a56ff1be8ceaccbe193f891ac87ed9f24bf1a8e7c09fc8179830a65bd3  ple-int6-pack.json

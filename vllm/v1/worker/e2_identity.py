@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright 2026 halt95 (Merlin modifications)
 """Per-rank launch-identity log line (log-only; changes no behaviour).
 
 After model loading -- and after the PLE offload placeholders are armed -- every

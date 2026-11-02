@@ -32,6 +32,53 @@ retain stock behavior. The value is frozen on the first plan, so restart to chan
 it. The byte-identical patch also retains `cta16` as a q_len-4 experimental
 discriminator; release launchers use `cta32`.
 
+## Opt-in: workload-aware tile (default off)
+
+[0002-workload-smallq-plan-mode.patch](0002-workload-smallq-plan-mode.patch) applies
+on top of 0001 and lets the 27B V2 builder choose the tile per plan: cta32 for a
+proven pure verify batch, stock beside prefill. **The default install does not
+apply it**: `release/install-env.sh` and `release/apply-flashinfer-patch.sh` above
+install and verify 0001 only, byte for byte as before.
+
+```bash
+MERLIN_FLASHINFER_WORKLOAD_TILE=1 FLASHINFER_WHEEL=/path/to/flashinfer_python-0.7.0.post1-py3-none-any.whl \
+  release/install-env.sh /path/to/new-venv
+MERLIN_FLASHINFER_WORKLOAD_TILE=1 release/install-env.sh --verify /path/to/venv
+```
+
+- `release/apply-flashinfer-workload-patch.py` (run with the venv's Python) installs
+  the ordered series 0001+0002 from the pinned wheel, SHA-256
+  `c7adf826568d61fc1b7d3aadd4cae387a35a138bfc08e2deca2f34ecfa280716`. Without a wheel
+  argument or `FLASHINFER_WHEEL` it downloads that exact wheel from PyPI. It accepts
+  only complete pristine, v1 or v2 trees of the eight touched files, checks import
+  origin, version and JIT-cache exclusions, and serializes with the same lock as
+  the default helper. Edited or mixed trees fail closed.
+- `--verify` is offline: it compares the eight installed files with the embedded
+  v2 SHA-256 table and changes nothing. A venv that no release installer has
+  patched fails with a clear message.
+- v2 FA2 modules use the JIT suffix `_sm8x_smallq_070_v2`, so the first boot after
+  switching series cold-JITs them. To go back to the default, reinstall
+  flashinfer-python 0.7.0.post1 (or build a new venv) and run the default install.
+
+Serving: `MERLIN_FLASHINFER_WORKLOAD_TILE=1` (registered in `vllm/merlin/envs.py`,
+default 0) only changes anything when `FLASHINFER_SM8X_FP8_SMALLQ=cta32`. Then the
+V2 builder plans cta32 only when the per-request query lengths and the original
+scheduler flags prove pure uniform verify, and stock otherwise. With any other
+process switch value the legacy path applies unchanged (unset, empty or `0` stock;
+`cta16` the q_len-4 discriminator), with ordinary FULL graphs. The knob refuses the
+V1 runner, ubatching/DBO, and a FlashInfer without patch 0002. With the knob unset
+or 0 the engine's wrapper keys, graph keys and compile-cache factors are the same
+as without the knob. Restart between configurations; never change either switch in a
+serving process.
+
+Mode -1 preserves legacy planning. Explicit mode 0/1 is carried in the FA2
+plan/workspace ABI, decode-wrapper and plan-cache identity, and V2 FULL-graph
+identity. Mode 0 uses an eager wrapper and cannot replay FULL graphs. PIECEWISE
+keys are unchanged: attention runs eagerly outside those graphs. Each rank logs
+`[flashinfer-workload-tile] <event> count=N` for the first and every 1000th plan
+per mode, FULL fallback and new mode-keyed wrapper. The native build and serving are
+qualified by GPU tests, not by shipped CI.
+
 After a generation request with speculative decoding finishes, check the current
 server boot's planner proof for every TP rank (q_len 5 is the default):
 

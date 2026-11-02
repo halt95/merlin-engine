@@ -1,11 +1,11 @@
-# Model recipes for Merlin 3.0.0
+# Model recipes for Merlin 3.0.1
 
 Each directory contains a model launcher, KV-scale sidecar, checkpoint checksums,
 licences, benchmark cards and documentation. The repository root contains the
 engine, based on **vLLM 0.32.0**. Checkpoints remain on Hugging Face; shared
 installation and build instructions are in [release/](../release/README.md).
 
-| Recipe | VERSION | Hugging Face checkpoint | Hardware | Launcher | Merlin 3.0.0 status |
+| Recipe | VERSION | Hugging Face checkpoint | Hardware | Launcher | Status |
 |---|---|---|---|---|---|
 | [flash-next/](flash-next/README.md) | 3.0.0 | [Flash-Next](https://huggingface.co/halt95/Qwen3.8-Flash-Next-W4A16-Merlin) | 4× RTX 3090 (sm_86), peer-to-peer | [serve.sh](flash-next/serve.sh) | 0.32 CLI, 8,388,608-pixel image cap, shared-prefix checkpointing off; measured 924,993-token KV pool. |
 | [swift1.5/](swift1.5/README.md) | 3.0.0 | [Swift1.5](https://huggingface.co/halt95/Swift1.5-Qwen3.8-Flash-Next-W4A16-Merlin) | 4× RTX 3090 recipe | [serve.sh](swift1.5/serve.sh) | Generated 0.32 recipe with checkpoint-specific scales and medium reasoning by default; full-vocabulary MTP head (`DRAFT_HEAD` default `bf16`), shared-prefix checkpointing off, 8 MP default. A qualification run validated this generated launcher on 2026-10-16; the 3.0.0 release bench card passed it: tested on the reference host. |
@@ -15,7 +15,8 @@ installation and build instructions are in [release/](../release/README.md).
 | [nemotron-super-vl/](nemotron-super-vl/README.md) | 3.0.0 | [Super VL](https://huggingface.co/halt95/Nemotron-3.5-Super-VL-120B-A12B-W4A16-Merlin) | 4× RTX 3090 (sm_86), peer-to-peer | [serve.sh](nemotron-super-vl/serve.sh) | New in 3.0.0, **tested on the reference host** (release bench card): TP2×PP2+EP, RecoverSSM, MTP K=3, FP8 KV pinned at a provisional 2.50 GiB per card (1,856,367-token pool at the shipped 1M default: one 1M session or 5 × 262K resident). |
 | [ornith1.5/](ornith1.5/README.md) | 3.0.0 | [Ornith 1.5](https://huggingface.co/halt95/Ornith-1.5-122B-A10B-W4A16-Merlin) | 4× RTX 3090 (sm_86), with or without peer-to-peer | [serve.sh](ornith1.5/serve.sh) | New in 3.0.0, **tested on the reference host** (`ornith-quad-3090`); the no-P2P row `ornith-quad-3090-nop2p` is tested on a 4× RTX 3090 host without P2P. Ornith's own chat template and sampling; uniform verify on; 3 × 262K resident |
 
-Every recipe is version 3.0.0 in Merlin 3.0.0. A hardware recipe is not a claim of validation on every GPU
+Recipe versions stay at 3.0.0 in Merlin 3.0.1 (the VERSION files are unchanged); the recipe changes are in the
+[changelog](../docs/CHANGELOG.md). A hardware recipe is not a claim of validation on every GPU
 with the same memory capacity. Swift-family pools of 924,993 tokens were measured on both generated launchers (2026-10-16); session-residency targets inherited from
 0.30 are not new 0.32 measurements.
 

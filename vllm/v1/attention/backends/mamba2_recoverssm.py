@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright 2026 halt95 (Merlin modifications)
 """Mamba-2 attention metadata for RecoverSSM speculative decode (NemotronH, Nemotron
 3.5 Super VL).
 
@@ -24,6 +24,9 @@ from typing import Any
 import torch
 
 from vllm.logger import init_logger
+from vllm.model_executor.layers.mamba.recoverssm_utils import (
+    recoverssm_binding_signature as _binding_signature,
+)
 from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.attention.backends.mamba2_attn import (
     Mamba2AttentionBackend,
@@ -118,11 +121,6 @@ class Mamba2RecoverSSMMetadata(Mamba2AttentionMetadata, RecoverSSMMetadata):
         return replace(
             self, recoverssm_commit=clone_commit_tensors(c, self.num_spec_decodes)
         )
-
-
-def _binding_signature(checkpoints: Any) -> tuple:
-    """Storage identity of every layer's checkpoint: (data_ptr, shape, stride)."""
-    return tuple((t.data_ptr(), t.shape, t.stride()) for t in checkpoints)
 
 
 def _check_context_binding(

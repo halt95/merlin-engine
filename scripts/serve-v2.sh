@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Deprecated entry point (the v2 launcher name): forwards to models/flash-next/serve.sh with the same arguments and
-# environment. Removed in the release after Merlin 3.0.0.
+# environment. Kept through Merlin 3.0.x; to be removed in a later release.
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 echo "note: scripts/serve-v2.sh is deprecated; forwarding to models/flash-next/serve.sh" >&2
 exec bash "$here/models/flash-next/serve.sh" "$@"

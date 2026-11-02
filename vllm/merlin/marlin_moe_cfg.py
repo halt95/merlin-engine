@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright 2026 halt95 (Merlin modifications)
 """Runtime override of the Marlin MoE block-size x thread-config.
 
 ``fused_marlin_moe`` picks ``block_size_m`` with a fixed heuristic and lets the
@@ -46,9 +46,9 @@ the engine's choice is certifiable from here. The classes are:
   identity is an empirical property of the shape, not of the code.
 * ``non-exact``  switching to or from ``bm=8`` (different M layout).
 
-Every rule must carry an ``ack``: ``bitwise`` states that the
-microbench (``benchmarks/kernels/bench_marlin_moe_cfg.py``) showed
-``torch.equal`` for this shape set; ``nonexact`` accepts differing bits. A
+Every rule must carry an ``ack``: ``bitwise`` states that a
+microbench (the default and the rule's kernel tuple run on the same inputs
+for each shape) showed ``torch.equal`` for this shape set; ``nonexact`` accepts differing bits. A
 rule with no ack, or a ``bm=8`` rule without ``ack=nonexact``, is a boot error.
 A ``non-exact`` outcome at run time under a bare ``bitwise`` ack (baseline was
 8, or the rule moves to 8) skips the rule with a warning. Active rules log a
@@ -367,15 +367,6 @@ _SHAPE_LOG_CAP = 64
 _shape_decisions: dict[tuple[int, ...], str] = {}
 
 
-def shape_decisions() -> dict[tuple[int, ...], str]:
-    """(M, E, topk, K, N) -> the decision actually applied for that shape
-    (``rule#i class=...``, ``skipped[...]`` notes, or ``engine-default``), the
-    same note the INFO line logs, so a skipped rule is never reported under the
-    rule's label. The first ``_SHAPE_LOG_CAP`` distinct shapes are kept and
-    logged; later new shapes are neither stored nor logged."""
-    return dict(_shape_decisions)
-
-
 def _record_shape(shape: tuple[int, ...], outcome: str, skipped: list[str]) -> None:
     note = outcome + (" after " + "; ".join(skipped) if skipped else "")
     if _shape_decisions.get(shape) == note:
@@ -433,8 +424,9 @@ def select_override(
     first GEMM is ``size_n = w13_shards * N, size_k = K``, the second
     ``size_n = K, size_k = N``).
 
-    ``rules`` is for tests; production leaves it ``None`` and the parsed env
-    value is used. With the env unset this returns ``None`` immediately.
+    ``rules`` overrides the rule table; production leaves it ``None`` and the
+    parsed env value is used. With the env unset this returns ``None``
+    immediately.
     """
     if rules is None:
         if not enabled():

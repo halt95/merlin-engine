@@ -1,4 +1,4 @@
-# Swift 1.5 reference · Merlin 3.0.0
+# Swift 1.5 reference · Merlin 3.0.1
 
 This reference describes the generated 0.32 recipe. See the [README](../README.md#qualification-status) for the qualification boundary and [changelog](../CHANGELOG.md) for earlier releases. The current engine base is vLLM 0.32.0; the generated launcher passed its qualification run (2026-10-16) and the 2026-10-20 release bench card (after the 2026-10-17 pre-release bench run), and is tested on the reference host.
 
@@ -18,7 +18,7 @@ The generator source is `tools/merlin/registry.py`, with profile `fn-swift1.5-qu
 | `HOST` / `PORT` | `127.0.0.1` / `8000` |
 | `KV_BYTES` | `4100000000` per card, passed through `--kv-cache-memory-bytes` |
 | `IMG_CAP_PX` | `8388608` pixels per image |
-| `REDUCED_DRAFT_VOCAB` | `0` only; `1` is unavailable: no reduced-vocabulary table ships or is qualified for Swift |
+| `REDUCED_DRAFT_VOCAB`, `DRAFT_VOCAB` | Removed in 3.0.1: setting either stops the launch (an empty value, or `REDUCED_DRAFT_VOCAB=0`, is accepted) |
 | `WARM` | `1` enables the generated kernel warmup configuration; `0` disables it |
 | `GUARD` | `warn` unless inherited; validated as `raise` or `warn` |
 | `COUNTERS` | `0`; `1` enables logging-only exact/clip counters |
@@ -29,7 +29,7 @@ The checkpoint directory is the required first argument. Extra vLLM arguments co
 
 ## Container
 
-The repository-wide [container recipe](../../../container/README.md) has its own qualification gate. No Swift container build or GPU-serving result is claimed here. The old per-package image and installer remain historical material in the [v2.5.1-swift1.5 tag](https://github.com/halt95/Swift1.5-qwen38-flash-next-3090s/tree/v2.5.1-swift1.5).
+The repository-wide [container recipe](../../../container/README.md) has its own qualification check. No Swift container build or GPU-serving result is claimed here. The old per-package image and installer remain historical material in the [v2.5.1-swift1.5 tag](https://github.com/halt95/Swift1.5-qwen38-flash-next-3090s/tree/v2.5.1-swift1.5).
 
 ## Check it's working
 
@@ -42,7 +42,8 @@ The launcher qualification exercised the generated launcher's boot, pool, vision
 - An error requesting `ENGINE=` or `scripts/serve-v2.5.sh` identifies an archived launcher. Use this checkout's generated `models/swift1.5/serve.sh`.
 - A missing scale sidecar requires checking `SCALES`; a relative override is relative to the current working directory.
 - A missing `config.json` or checksum failure requires checking the downloaded checkpoint and pinned revision.
-- `REDUCED_DRAFT_VOCAB=1` is rejected for Swift (no reduced table ships or is qualified); keep `0`.
+- `REDUCED_DRAFT_VOCAB` or `DRAFT_VOCAB` set in the environment stops the launch (removed in 3.0.1; an empty value, or
+  `REDUCED_DRAFT_VOCAB=0`, is accepted); unset them.
 - Empty answer content with `finish_reason: "length"` may mean the output cap ended inside reasoning; increase the cap or lower/disable reasoning per request.
 
 ## Hardware
@@ -57,8 +58,8 @@ The profile pins 4.1e9 bytes of FP8 E4M3 KV per card, uses 4,096-token blocks an
 
 | Piece | Generated 0.32 recipe |
 |---|---|
-| Engine | Merlin 3.0.0 at repository root; vLLM 0.32.0 base |
-| MTP | K=3, full-vocabulary head (`DRAFT_HEAD`, default bf16); no reduced draft table ships or is qualified (`REDUCED_DRAFT_VOCAB=1` unavailable) |
+| Engine | Merlin 3.0.1 at repository root; vLLM 0.32.0 base |
+| MTP | K=3, full-vocabulary head (`DRAFT_HEAD`, default bf16); reduced draft vocabulary removed in 3.0.1 |
 | KV scales | [Swift-specific sidecar](../scales/kv_scales-swift-e4m3.json) |
 | Caching | Prefix caching, align mode, RecoverSSM; FGPC off |
 | Images/tools | Up to 42 images, 8,388,608-pixel default per image; Qwen3 coder and reasoning parsers |

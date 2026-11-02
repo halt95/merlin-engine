@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by the Merlin project; see NOTICE.
 
 import enum
 import time
@@ -182,6 +183,10 @@ class Request:
 
         self.spec_token_ids: list[int] = []
         self.num_computed_tokens = 0
+        # Set when a resumable session stopped with its private recurrent or
+        # ring state possibly past the kept history; the next chunk then
+        # re-admits it from a prefix-cache checkpoint (Scheduler._rewind_session).
+        self.resume_needs_rewind = False
         self.cache_salt: str | None = cache_salt
 
         # Multi-modal related

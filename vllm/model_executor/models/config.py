@@ -1034,27 +1034,30 @@ class Qwen4ExpForConditionalGenerationConfig(Qwen3_5ForConditionalGenerationConf
                 0,
                 parallel_config.pipeline_parallel_size,
             )
+            # ple_placement names the partition that fits.
+            from vllm.merlin.ple_placement import ple_rank0_refusal
+
             ple_idx = [int(i) - 1 for i in text_config.ple_layer_ids]
             if min(ple_idx) < rank0_start or max(ple_idx) >= rank0_end:
-                raise NotImplementedError(
-                    "Qwen4Exp N-gram PLE embedding requires every PLE layer to "
-                    f"live on pipeline rank 0 (layers {rank0_start}.."
-                    f"{rank0_end - 1}), but PLE layers are at {ple_idx}. Give "
-                    "rank 0 more layers via VLLM_PP_LAYER_PARTITION, or run "
-                    "with PP=1."
-                )
+                raise NotImplementedError(ple_rank0_refusal(
+                    int(text_config.num_hidden_layers), ple_idx,
+                    parallel_config.pipeline_parallel_size, rank0_start, rank0_end,
+                ))
         multimodal_config = vllm_config.model_config.multimodal_config
         if multimodal_config is not None and multimodal_config.language_model_only:
             _strip_qwen4_exp_mrope(vllm_config.model_config)
         spec_config = vllm_config.speculative_config
+        # DFlash (incoai's DFlash2 drafter) reads the target's aux hidden-state
+        # taps (Qwen4ExpModel EagleModelMixin), PP-relayed.
         if spec_config is not None and spec_config.method not in {
             "mtp",
             "ngram",
             "ngram_gpu",
+            "dflash",
         }:
             raise NotImplementedError(
                 "Qwen4Exp speculative decoding supports only its native MTP "
-                "checkpoint and linear n-gram proposers"
+                "checkpoint, the DFlash drafter and linear n-gram proposers"
             )
 
 

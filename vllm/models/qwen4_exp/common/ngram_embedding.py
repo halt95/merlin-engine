@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by the Merlin project; see NOTICE.
 """Shared Qwen4Exp n-gram embedding storage with device and pinned-host backends.
 
 Both the NVIDIA and AMD Qwen4Exp implementations use these classes so the (large)
@@ -320,12 +321,15 @@ class Qwen4ExpPLEFp8EmbeddingMethod(Qwen4ExpPLEEmbeddingMethod):
             weight_loader,
             scale_dtype=torch.float32,
         )
+        # a dummy load (--load-format dummy) must
+        # pass the positive-scale check below, not draw a random +-1e-3 scale.
+        set_weight_attrs(weight_scale, {"dummy_weight_value": 1.0})
         layer.register_parameter("weight_scale", weight_scale)
 
     def process_weights_after_loading(self, layer: nn.Module) -> None:
         """Reject FP8 PLE checkpoints without a global scale."""
-        sentinel = torch.finfo(torch.float32).min
-        if torch.any(layer.weight_scale == sentinel):
+        scale = layer.weight_scale
+        if not bool((torch.isfinite(scale) & (scale > 0)).all()):
             raise ValueError("FP8 PLE checkpoint is missing its global scale")
 
     def dequantize(

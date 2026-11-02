@@ -86,9 +86,6 @@ class Fa2DecodeSchedule:
     chunk_pages: int  # c, kv_chunk_size in pages (the plan stores c * page_size)
     chunks: tuple[int, ...]  # n_i per request
 
-    def kv_chunk_size_tokens(self, page_size: int) -> int:
-        return self.chunk_pages * page_size
-
 
 def fa2_decode_schedule(
     pages: np.ndarray,

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright 2026 halt95 (Merlin modifications)
 """Base class for PLE layers that support cross-process CPU offload.
 
 Synchronization between the offload process and the GPU main stream is
@@ -101,14 +101,6 @@ class CpuGpuSemaphore:
     def __init__(self, device: torch.device) -> None:
         self._flag_tensor = torch.zeros(1, dtype=torch.int32, device=device)
         self._flag_ptr: int | None = None
-
-    @classmethod
-    def from_ipc_tensor(cls, flag_tensor: torch.Tensor) -> "CpuGpuSemaphore":
-        """Construct a semaphore from a CUDA tensor received through IPC."""
-        semaphore = cls.__new__(cls)
-        semaphore._flag_tensor = flag_tensor
-        semaphore._flag_ptr = None
-        return semaphore
 
     @classmethod
     def from_host_mapped(
@@ -436,4 +428,3 @@ class PleOffloadLayer(nn.Module, ABC):
         """Mark the cross-process output buffer reusable on ``stream``."""
         if self._is_cpu_offloaded:
             self._sem.reset(stream)
-

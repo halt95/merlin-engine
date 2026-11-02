@@ -3,11 +3,26 @@
 Release notes of the Flash-Next recipe, newest first. See the [README](README.md) for current serving status
 and [reference](docs/reference.md) for configuration and evidence boundaries.
 
+## Merlin 3.0.1
+
+- **DFlash2, opt-in:** `--spec dflash2` on `merlin serve` or `./setup.sh`; `SPEC=dflash2` for a direct
+  recipe launch. Only the three Flash-Next-family 4 x 3090 P2P rows have qualified geometry.
+  Decode measured +5–18 % versus MTP, with a 789,668-token KV pool (3 x 262K, not 6 x 131K).
+  Setup downloads and verifies the drafter; serving requires it at `DFLASH2_MODEL` or
+  `~/models/flash-next-dflash2`. MTP remains the default.
+- **Host-RAM KV tier, opt-in:** `--kv-ram-cache SIZE` caches evicted prefix KV blocks for restore
+  instead of recompute; it adds no GPU context or simultaneous-session capacity. SIZE is GiB per server,
+  split into whole GiB per TP x PP rank, and needs additional host RAM with locked memory allowed.
+  On the reference 4 x RTX 3090 host a 262K restore took 1.2–1.4 s, against about 56 s to recompute. The cache is off by default and experimental in 3.0.1. See the
+  [3.0.1 options](docs/reference.md#merlin-301-options) for controls and limits.
+- **Reduced draft vocabulary removed.** The `REDUCED_DRAFT_VOCAB` / `DRAFT_VOCAB` switches, the bundled table and its
+  builder are gone; setting either switch stops the launch (an empty value, or `REDUCED_DRAFT_VOCAB=0`, is accepted). `DRAFT_HEAD` still sets the draft head's precision.
+
 ## Merlin 3.0.0
 
 The Flash-Next recipe is **built on vLLM 0.32.0** in the shared Merlin engine repository.
 
-- **No reduced draft vocabulary by default.** Merlin 3.0.0 does not carry the reduced draft vocabulary of the v3.0.0 bundle (40,960-id table plus INT4 draft head, below). The launcher scores the full vocabulary; `DRAFT_HEAD=bf16|int8|int4` sets the draft lm_head precision independently of any table (shipped default `bf16`, the v2.5.x drafter; `DRAFT_HEAD=int8` measured 6.5–7.2 % lower ms per output token than BF16 at 32K/131K/258K with the same MTP acceptance in the 2026-10-17 A/B and is planned as the default in the next release). `REDUCED_DRAFT_VOCAB=1` is unavailable in this release: no reduced table ships, and the launcher accepts only `DRAFT_VOCAB=<path>` to the table whose sha256 is pinned in the registry, which is not distributed.
+- **No reduced draft vocabulary by default.** Merlin 3.0.0 does not carry the reduced draft vocabulary of the v3.0.0 bundle (40,960-id table plus INT4 draft head, below). The launcher scores the full vocabulary; `DRAFT_HEAD=bf16|int8|int4` sets the draft lm_head precision independently of any table (shipped default `bf16`, the v2.5.x drafter; `DRAFT_HEAD=int8` measured 6.5–7.2 % lower ms per output token than BF16 at 32K/131K/258K with the same MTP acceptance in the 2026-10-17 A/B and is a candidate default for a later release; 3.0.1 keeps `bf16`). No reduced table shipped in 3.0.0, and the switch was removed in 3.0.1.
 
 - **Concurrent decode, 4× RTX 3090, pre-release vLLM 0.32 build, 2026-10-15:** six 126,976-token sessions, 574.5 tok/s aggregate,
   10.78 ms/tok per agent, cold prefill 5,423 tok/s, 0 preemption.
@@ -39,8 +54,8 @@ claim that every older result was originally measured on v3.0.0.
 
 v3.0.0 was built and gated on 2026-10-10 but never published or tagged on GitHub.
 
-v3.0.0 = stock vLLM v0.30.0 + 98 commits (v2.5.1's 97 and one for v3.0.0; `release/v3/patches`, the bundle and the combined
-diff built for release). Same checkpoint. Release gate on the reference host (2026-10-10; 16 of 17 items PASS, and the
+v3.0.0 = stock vLLM v0.30.0 + 98 commits (v2.5.1's 97 and one for v3.0.0; the patch series, the bundle and the combined
+diff were built for that release and are not files in this checkout). Same checkpoint. Release check on the reference host (2026-10-10; 16 of 17 items PASS, and the
 VRAM-headroom item passed on a warm-against-warm re-run): single-stream decode 186–206 tok/s with thinking on, +17.5 to
 +19.7 % per depth against v2.5.1's release ladder and +12.8 % against v2.5.1 booted the same day; the 924,993-token pool
 holds 3 × 262K or 6 × 131K resident with 0 preemptions; GSM8K-200 198/200 (v2.5.1 198/200 on the same items); the 262K
@@ -53,7 +68,7 @@ needle found exactly;
 - **Reduced-vocabulary INT4 draft head, on by default.** The MTP drafter scores a 40,960-id draft vocabulary
   (`assets/draft-vocab.pt`, checked against its sha256 by `scripts/serve.sh`) through an INT4 draft-only head; the target
   verifies every draft, so output is unchanged. `REDUCED_DRAFT_VOCAB=0` serves the v2.5.1 drafter; `DRAFT_VOCAB=<path>`
-  points at another copy of the same table. The release gate measures the shipped configuration as a whole; it does not isolate the draft head's decode effect.
+  points at another copy of the same table. The release check measures the shipped configuration as a whole; it does not isolate the draft head's decode effect.
 - **Idle power.** The bounds-guard reader parks once the engine drains (`VLLM_E2_GUARD_IDLE=1`, the default), so idle
   cards can drop to P8. The launcher keeps an inherited guard mode and interval, validates them, and warns when the
   mode resolves to `off`.
@@ -75,7 +90,6 @@ needle found exactly;
   pre-v3 `build-v2.5.sh` is v2.5.1 source and is refused by `scripts/serve.sh`; build v3.0.0 with `scripts/build.sh`.
 - Credits for v3.0.0: brandon-nuttall (local-argmax mixin), a community idle-power report and contribution.
 
-See `release/v3/PACKAGE-MANIFEST.md` for the package inventory.
 
 ## v2.5.3
 
@@ -90,9 +104,9 @@ asset).
 [halt95/Swift1.5-Huihui-Qwen3.8-Flash-Next-W4A16-Merlin](https://huggingface.co/halt95/Swift1.5-Huihui-Qwen3.8-Flash-Next-W4A16-Merlin),
 the Swift 1.5 W4A16 checkpoint with huihui-ai's abliteration transplanted onto its 96 dense output projections (routed
 experts unchanged). Treat it as a model that does not refuse: on StrongREJECT it refused 29 of the 278 prompts it
-finished answering (10.4 %, one judged run; 35 cut off). Quality gate against Swift 1.5 in the same run (on v2.5.1):
+finished answering (10.4 %, one judged run; 35 cut off). Quality check against Swift 1.5 in the same run (on v2.5.1):
 GSM8K 96.29 % vs 95.98 %, agent-turn tokens 0.86× (95 % CI includes parity). It ships Qwen's upstream `tokenizer.json`
-(the gate ran with Swift 1.5's earlier file; smoke-tested since). New files:
+(the check ran with Swift 1.5's earlier file; smoke-tested since). New files:
 `scripts/serve-huihui.sh` (serve-v2.5.sh with this checkpoint's KV-scale sidecar, served names and `xhigh` default),
 `scales/qsa_kv_scales_swift_huihui_dense.json`, `release/checkpoint-huihui.sha256`, `licenses/Huihui-LICENSE` and
 `licenses/Huihui-NOTICE`, and its bench card

@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by the Merlin project; see NOTICE.
 
 import math
 import os
@@ -26,6 +27,8 @@ from transformers.utils import CONFIG_NAME as HF_CONFIG_NAME
 
 from vllm import envs
 from vllm.logger import init_logger
+# Flash-Next model-type aliases for HF AutoConfig.
+from vllm.merlin.flashnext_config import register_config_aliases
 from vllm.transformers_utils.repo_utils import is_mistral_model_repo
 from vllm.transformers_utils.utils import (
     parse_safetensors_file_metadata,
@@ -131,6 +134,9 @@ _CONFIG_REGISTRY: dict[str, type[PreTrainedConfig]] = LazyConfigDict(
     inkling_mm_model="InklingMMConfig",
     inkling_model="InklingModelConfig",
 )
+
+# Register before AutoConfig / nested configs can resolve aliases.
+register_config_aliases(_CONFIG_REGISTRY)
 
 _SPECULATIVE_DECODING_CONFIGS: set[str] = {"eagle", "speculators", "medusa"}
 

@@ -15,7 +15,10 @@ UV_MIN_VERSION="0.8.0"  # `uv python install --no-bin` and `uv python find` as u
 UV_URL="https://github.com/astral-sh/uv/releases/download/${UV_VERSION}/uv-x86_64-unknown-linux-gnu.tar.gz"
 PYTHON_VERSION="3.13"
 
-say() { printf '%s\n' "$*"; }
+PRINTED=0
+say() { printf '%s\n' "$*"; PRINTED=1; }
+# One blank line between the lines above and setup_cli.py's own output (only when this script printed any).
+handover_gap() { [ "$PRINTED" = 0 ] || printf '\n'; }
 die() { printf 'setup: %s\n' "$*" >&2; exit 1; }
 
 case "$(uname -s)/$(uname -m)" in
@@ -65,20 +68,22 @@ for cand in "$(command -v uv || true)" "$MERLIN_DIR/bin/uv"; do
   if [ -n "$cand" ] && [ -x "$cand" ] && uv_ok "$cand"; then UV="$cand"; break; fi
 done
 if [ -z "$UV" ]; then
-  size="$(curl -sIL "$UV_URL" | tr -d '\r' | awk 'tolower($1)=="content-length:"{s=$2} END{print s+0}')"
+  size="$(curl -sIL "$UV_URL" | tr -d '\r' | awk 'tolower($1)=="content-length:"{s=$2} END{print s+0}')" \
+    || die "cannot reach $UV_URL (offline/proxy?)"
   if [ "$size" -gt 0 ] 2>/dev/null; then size="$((size / 1024 / 1024)) MB"; else size="size unknown"; fi
   if [ "$DRY_RUN" = 1 ]; then
     say "setup: dry run: would fetch uv $UV_VERSION ($size) -> .merlin/bin/uv and Python $PYTHON_VERSION (about 35 MB) -> .merlin/python"
     say "       $UV_URL"
     if PY="$(system_py)"; then
       say "setup: dry run continues on $PY (a real run uses the fetched Python $PYTHON_VERSION)"
+      handover_gap
       exec "$PY" -I "$REPO/tools/merlin/setup_cli.py" "$@"
     fi
     say "setup: no python3 (3.10+) on PATH, so the dry run stops here; a real run fetches the two above and then checks the host before any other download."
     exit 0
   fi
   say "setup: fetching uv $UV_VERSION ($size) -> .merlin/bin/uv"
-  say "       $UV_URL"
+  say "       from github.com/astral-sh/uv release $UV_VERSION (sha256 checked before use)"
   mkdir -p "$MERLIN_DIR/bin"; chmod 700 "$MERLIN_DIR"
   tmp="$(mktemp -d "$MERLIN_DIR/uv.XXXXXX")"
   curl -fL -# --retry 3 -C - -o "$tmp/uv.tar.gz" "$UV_URL" || die "could not download uv from $UV_URL (no network? put uv >= $UV_MIN_VERSION on PATH and run again)"
@@ -108,6 +113,7 @@ if [ -z "$PY" ] || [ ! -x "$PY" ]; then
     say "setup: dry run: would fetch Python $PYTHON_VERSION with uv (about 35 MB) -> .merlin/python"
     if SPY="$(system_py)"; then
       say "setup: dry run continues on $SPY"
+      handover_gap
       exec "$SPY" -I "$REPO/tools/merlin/setup_cli.py" "$@"
     fi
     say "setup: no python3 (3.10+) on PATH, so the dry run stops here."
@@ -129,4 +135,5 @@ else
   ln -sfn "$PY" "$MERLIN_DIR/bin/python3"
   export PATH="$MERLIN_DIR/bin:$PATH"
 fi
+handover_gap
 exec "$PY" -I "$REPO/tools/merlin/setup_cli.py" "$@"

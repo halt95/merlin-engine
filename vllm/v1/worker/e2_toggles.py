@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright 2026 halt95 (Merlin modifications)
 """Per-rank determinism-toggle line (log-only; changes no behaviour).
 
 Why this exists: the effective state of the
@@ -56,14 +56,13 @@ WHAT EACH SECTION IS
 WHEN. Once per worker, after ``compile_or_warm_up_model`` has run the MRV2
 kernel warmup and cudagraph capture (``arm()``), i.e. after this process's
 first persistent_topk and Marlin MoE launches -- NOT at the counter reader's
-first read: an integration boot logged its first counter line BEFORE
-the first tie-policy line in the engine log, because the
-first ``maybe_log`` runs at the head of the warmup's first execute step, before
-that step's forward. When the cpp-cache ops exist and a static is still
-uninitialised at ``arm()``, the line is deferred to the head of the first
-execute step where every static is filled, and forced out at shutdown
-otherwise (with ``uninit`` values, which a log check fails). It does not depend on
-``MERLIN_TOPK_EXACT_COUNTERS_LOG``: it fires with the counter log off.
+first read: the first ``maybe_log`` runs at the head of the warmup's first
+execute step, before that step's forward. When the cpp-cache ops exist and a
+static is still uninitialised at ``arm()``, the line is deferred to the head of
+the first execute step where every static is filled, and forced out at shutdown
+otherwise (with ``uninit`` values, which readers must treat as a failure). It
+does not depend on ``MERLIN_TOPK_EXACT_COUNTERS_LOG``: it fires with the counter
+log off.
 
 WHAT THIS DOES NOT PROVE. Without the cpp-cache ops the C++ state is not
 read: ``effective:`` then states the compiled constants of this source tree,
@@ -355,11 +354,6 @@ _emitted = False
 _deferral_noted = False
 
 
-def _reset_for_tests() -> None:
-    global _armed, _emitted, _deferral_noted
-    _armed = _emitted = _deferral_noted = False
-
-
 def arm(**kwargs) -> str:
     """Once per worker, at the end of compile_or_warm_up_model (warmup and
     capture done): emit now, unless a C++ static is still uninitialised."""
@@ -396,7 +390,7 @@ def maybe_emit(
         if pending and not force:
             if not _deferral_noted:
                 _deferral_noted = True
-                # Deliberately not 'e2-toggles[': a log check counts those.
+                # Deliberately not 'e2-toggles[': log readers count those.
                 logger.info(
                     "e2-toggles deferred on %s: C++ cache not initialised for %s",
                     tag,

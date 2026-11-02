@@ -3,13 +3,14 @@
 # unqualified until qualified on hardware
 services:
   merlin:
-    image: merlin-engine:3.0.0
+    image: merlin-engine:${SOURCE_REF:-merlin-v3.0.1}
     pull_policy: build
     platform: linux/amd64
     build:
       context: ..
       dockerfile: container/Dockerfile
       args:
+        SOURCE_REF: "${SOURCE_REF:-merlin-v3.0.1}"
         MAX_JOBS: "${MAX_JOBS:-4}"
         TORCH_CUDA_ARCH_LIST: "8.0;8.6;8.9"
     deploy:

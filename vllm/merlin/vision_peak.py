@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright 2026 halt95 (Merlin modifications)
 """Opt-in lower-peak eager path for the Qwen3 vision tower.
 
 ``VLLM_MERLIN_VISION_PEAK=1`` runs the upstream modules in the upstream order

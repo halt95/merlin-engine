@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright 2026 halt95 (Merlin modifications)
 """Weight-only quantized copy of a vocab-parallel lm_head for draft steps.
 
 The speculator swaps this in as the draft model's ``lm_head``; the target keeps

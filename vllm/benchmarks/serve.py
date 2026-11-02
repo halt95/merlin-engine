@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by the Merlin project; see NOTICE.
 r"""Benchmark online serving throughput.
 
 On the server side, run one of the following commands
@@ -56,6 +57,9 @@ from vllm.benchmarks.lib.utils import (
     convert_to_pytorch_benchmark_format,
     redact_sensitive_namespace,
     write_to_json,
+)
+from vllm.merlin.bench_tokens import (
+    add_event_tokens,
 )
 from vllm.tokenizers import TokenizerLike, get_tokenizer
 from vllm.utils.argparse_utils import FlexibleArgumentParser
@@ -703,10 +707,11 @@ def calculate_metrics(
                 token_times.append(current_time)
 
             # Add tokens to second buckets
-            for token_time in token_times:
-                second_bucket = int(token_time - min_start_time)
-                if 0 <= second_bucket < duration_seconds:
-                    tokens_per_second[second_bucket] += 1
+            # An MTP/spec-decode event carries
+            # several tokens; weight each event by output_tokens / events
+            add_event_tokens(
+                tokens_per_second, token_times, output.output_tokens, min_start_time
+            )
 
             # Track concurrent requests for each second this request was active
             request_start_second = int(output.start_time - min_start_time)

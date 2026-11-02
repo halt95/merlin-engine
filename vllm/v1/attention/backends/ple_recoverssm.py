@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright 2026 halt95 (Merlin modifications)
 """RecoverSSM protocol for the Qwen4Exp PLE short-conv layer.
 
 When the GDN layers run RecoverSSM, the runner resets the shared num_accepted_tokens to

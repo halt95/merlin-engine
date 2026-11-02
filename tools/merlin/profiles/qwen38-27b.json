@@ -3,6 +3,7 @@
  "model": "27b",
  "labels": {
   "tested": "tested on the reference host",
+  "testing": "🟡 testing: full-model runs passed on cloud-hosted hardware; kernel parity qualification still to run",
   "untested": "untested / community-validated",
   "parked": "parked, not in this release"
  },
@@ -54,12 +55,12 @@
     "pool_tokens": 271506,
     "fit_262k": 1,
     "fit_131k": 2,
-    "basis": "KV pin = 290 whole blocks of 33,423,360 B (17 attention layers x 960 tokens x 2,048 B). The 0.32 engine reports 271,506 tokens for this pin (2026-10-21): one 262K session or two 131K sessions resident. Measured at this row's release gate (2026-10-21).",
+    "basis": "KV pin = 290 whole blocks of 33,423,360 B (17 attention layers x 960 tokens x 2,048 B). The 0.32 engine reports 271,506 tokens for this pin (2026-10-21): one 262K session or two 131K sessions resident. Measured at this row's release check (2026-10-21).",
     "kv_blocks": 290
    },
    "p2p": "Not needed (one card).",
    "evidence": [
-    "Single-card recipe gated as 27B v1.1.0 on the reference host at a 1,048,576-pixel image cap (KV pin 290 blocks), then parked in v1.3.x; re-expressed for the 0.32 engine as models/qwen38-27b/serve-1card.sh.",
+    "Single-card recipe qualified as 27B v1.1.0 on the reference host at a 1,048,576-pixel image cap (KV pin 290 blocks), then parked in v1.3.x; re-expressed for the 0.32 engine as models/qwen38-27b/serve-1card.sh.",
     "2026-10-21, 0.32 engine, KV pin 9,692,774,400 B (pool 271,506 tokens: one 262K or two 131K sessions): without the single-card settings the card runs out of memory at 3 MP (27 MiB free). With them, 4 MP passes at one and two sequences and after a 262K needle with 563 MiB (a second 3090 host) / 558 MiB (reference host) minimum free, sampled every 100 ms (bar 524 MiB), 6 of 6 rounds; text identity vs the base launch, seeded-image identity and the 262K needle OK; GSM8K-200 194/200. 8 MP stays short (483 / 478 MiB).",
     "The in-place vision rotary is bit-identical to the copying path on an RTX 3090 (production geometry, 6 of 6 cases)."
    ],
@@ -120,9 +121,9 @@
     "basis": "Launcher header (883 whole blocks per card): three 262K or six 131K sessions resident, at K=4.",
     "kv_blocks": 883
    },
-   "p2p": "Required for the tested numbers: the launcher sets VLLM_SKIP_P2P_CHECK=1 NCCL_P2P_LEVEL=SYS and says to drop them on cards without P2P. No non-P2P host has been run (README, known limitations).",
+   "p2p": "Required for the tested numbers: P2P=on (this row's default) sets VLLM_SKIP_P2P_CHECK=1 NCCL_P2P_LEVEL=SYS. Without peer-to-peer, merlin serve picks 27b-tp2-3090-nop2p, or run this row with P2P=off. Bench numbers are measured with the Zagitta gpu-unlock kernel module plus P2P (3.0.1 on). RTX 3090s without P2P have no run on this release; the no-P2P passes were on cloud-hosted machines (see this row's evidence and 27b-tp2-3090-nop2p).",
    "evidence": [
-    "Qualified on the reference host: 4 x RTX 3090 at 220 W, PCIe Gen4 x16, with peer-to-peer (27B v1.3.1 release gate)."
+    "Qualified on the reference host: 4 x RTX 3090 at 220 W, PCIe Gen4 x16, with peer-to-peer (27B v1.3.1 release)."
    ],
    "notes": [
     "Pins and sequence caps are the K=4 figures of v1.3.1; the older K=3 numbers (794,351 tokens, seqs 32) belong to v1.0.x.",
@@ -180,7 +181,7 @@
    },
    "p2p": "For hosts without peer-to-peer: the launcher runs P2P=off (NCCL through host memory, NCCL_P2P_DISABLE=1). For many users at once, one-card servers (--tp 1 --instances N) measured faster without P2P.",
    "evidence": [
-    "None on RTX 3090s without P2P. The TP2 layout ran without P2P on other hardware: 2 x CMP 170HX 64 GB (27b-tp2-sm80-64g, 2026-10-18: needles exact at 32K-262K, GSM8K-50 48/50) and 4 x CMP 170HX as two TP2 servers (523 tok/s for eight 16K agents)."
+    "None on RTX 3090s without P2P on this release. On the older v1.3.0 engine (not 3.0.x), 2 x RTX 3090 (cloud-hosted, 2026-10-09) with P2P off (NCCL_P2P_DISABLE=1, PCIe 3.0 x16) ran the TP2 layout: 262K 3-needle 3/3, 255K thinking-on decode 81.5 tok/s, GSM8K 97/100. The TP2 layout ran without P2P on other hardware: 2 x CMP 170HX 64 GB (27b-tp2-sm80-64g, 2026-10-18: needles exact at 32K-262K, GSM8K-50 48/50) and 4 x CMP 170HX as two TP2 servers (523 tok/s for eight 16K agents)."
    ],
    "notes": [
     "Pins and sequence caps are the K=4 figures of v1.3.1; the older K=3 numbers (794,351 tokens, seqs 32) belong to v1.0.x.",
@@ -229,7 +230,13 @@
      30,
      35,
      40
-    ]
+    ],
+    "kv_tier_seqs": {
+     "max_num_seqs": 32,
+     "min_gib_per_rank": 12,
+     "status": "tested",
+     "basis": "Experimental, merlin serve --swarm: 32 sequences with the KV RAM cache at >= 12 GiB per rank (48g on four ranks), the size qualified on the reference host (27B TP4 with P2P: 32 agents, 253 turns, 0 errors, aggregate 187 tok/s, TTFT p50 16.2 s / p99 77.9 s, no preemption; 48 agents collapsed). The cache alone does not raise the cap: the row keeps its 3.0.0 cap of 24."
+    }
    },
    "capacity": {
     "estimate": false,
@@ -241,13 +248,13 @@
    },
    "p2p": "Required for the tested numbers (four-way P2P); same environment lines as TP2.",
    "evidence": [
-    "Qualified on the reference host: 4 x RTX 3090 at 220 W, PCIe Gen4 x16, with peer-to-peer (27B v1.3.1 release gate).",
+    "Qualified on the reference host: 4 x RTX 3090 at 220 W, PCIe Gen4 x16, with peer-to-peer (27B v1.3.1 release).",
     "Merlin 3.0.0 release bench card (2026-10-20, release wheel, RecoverSSM on; models/qwen38-27b/benchmarks/2026-10-20, four cards): pool 2,012,105, decode 252.4 / 235.4 / 224.0 tok/s at 32K / 131K / 259K (thinking on), 7 x 262K and 14 x 131K resident with 0 preemptions, 8 agents 752 tok/s, GSM8K-200 197/200, needles 5/5 at 131K and 12/12 at 262K; 8 MP image headroom at chunk 4096: 862 MiB lowest free (one image, two at once, four in one prompt).",
-    "Supporting: the pre-release bench run (2026-10-17, RecoverSSM on): 27B pair PASS, decode 198.7 / 172.6 / 157.7 tok/s at 32K / 131K / 258K; ThinkingCap gate PASS, 32/32 checks."
+    "Supporting: the pre-release bench run (2026-10-17, RecoverSSM on): 27B pair PASS, decode 198.7 / 172.6 / 157.7 tok/s at 32K / 131K / 258K; ThinkingCap check PASS, 32/32 checks."
    ],
    "notes": [
     "ThinkingCap serves on this row too (merlin serve 27b-thinkingcap; models/thinkingcap/serve*.sh): the same shape, pin and reasoning effort (medium).",
-    "RecoverSSM: the TP4 launcher serves --use-replayssm with --mamba-cache-mode align on Model Runner V2, block 1024 (--block-size) and chunk 4096 (--max-num-batched-tokens); the 1024-token block and 2,011-block pin are RecoverSSM-on K=4 figures (prefill +0.9 % against the RecoverSSM-off layout; all correctness gates passed)."
+    "RecoverSSM: the TP4 launcher serves --use-replayssm with --mamba-cache-mode align on Model Runner V2, block 1024 (--block-size) and chunk 4096 (--max-num-batched-tokens); the 1024-token block and 2,011-block pin are RecoverSSM-on K=4 figures (prefill +0.9 % against the RecoverSSM-off layout; all correctness checks passed)."
    ],
    "launch_shape": "tp4"
   },
@@ -293,7 +300,13 @@
     "provisional": [
      "image_headroom_8mp"
     ],
-    "provisional_basis": "measured on 4x RTX 3090 with P2P (862 MiB minimum free with 8 MP images at the shipped chunk 4096 with RecoverSSM on, 2026-10-20 release bench card); not yet measured without P2P"
+    "provisional_basis": "measured on 4x RTX 3090 with P2P (862 MiB minimum free with 8 MP images at the shipped chunk 4096 with RecoverSSM on, 2026-10-20 release bench card); not yet measured without P2P",
+    "kv_tier_seqs": {
+     "max_num_seqs": 32,
+     "min_gib_per_rank": 12,
+     "status": "untested",
+     "basis": "Experimental, merlin serve --swarm: the same 32-sequence swarm cap as 27b-tp4-3090. Boot-checked with --swarm on 4 x RTX 3090 without P2P, 2026-11-01: booted at 32 sequences with 48g and a 32-session burst with 0 errors (no 262K restore in that check). Untested like the row: no full qualification run."
+    }
    },
    "capacity": {
     "estimate": true,
@@ -305,11 +318,11 @@
    },
    "p2p": "For hosts without peer-to-peer: the launcher runs P2P=off (NCCL through host memory, NCCL_P2P_DISABLE=1). For many users at once, one-card servers (--tp 1 --instances N) measured faster without P2P.",
    "evidence": [
-    "None on RTX 3090s without P2P. The TP4 layout and this pin ran with P2P off on other hardware: 4 x RTX 4090 (27b-tp4-sm89-24g on the release wheel, 2026-10-20: every gate passed, pool 2,012,105 tokens, 7 x 262K resident) and 4 x CMP 170HX 64 GB (27b-tp4-sm80-64g, 2026-10-18: needles exact, GSM8K-50 48/50)."
+    "No full run on RTX 3090s without P2P; boot-checked with --swarm on 4 x RTX 3090 without P2P, 2026-11-01 (32 sequences, 48g, a 32-session burst with 0 errors). The TP4 layout and this pin ran with P2P off on other hardware: 4 x RTX 4090 (27b-tp4-sm89-24g on the release wheel, 2026-10-20: every check passed, pool 2,012,105 tokens, 7 x 262K resident) and 4 x CMP 170HX 64 GB (27b-tp4-sm80-64g, 2026-10-18: needles exact, GSM8K-50 48/50)."
    ],
    "notes": [
     "ThinkingCap serves on this row too (merlin serve 27b-thinkingcap; models/thinkingcap/serve*.sh): the same shape, pin and reasoning effort (medium).",
-    "RecoverSSM: the TP4 launcher serves --use-replayssm with --mamba-cache-mode align on Model Runner V2, block 1024 (--block-size) and chunk 4096 (--max-num-batched-tokens); the 1024-token block and 2,011-block pin are RecoverSSM-on K=4 figures (prefill +0.9 % against the RecoverSSM-off layout; all correctness gates passed)."
+    "RecoverSSM: the TP4 launcher serves --use-replayssm with --mamba-cache-mode align on Model Runner V2, block 1024 (--block-size) and chunk 4096 (--max-num-batched-tokens); the 1024-token block and 2,011-block pin are RecoverSSM-on K=4 figures (prefill +0.9 % against the RecoverSSM-off layout; all correctness checks passed)."
    ],
    "launch_shape": "tp4"
   },
@@ -363,12 +376,12 @@
    },
    "p2p": "Not needed (one card).",
    "evidence": [
-    "4 x RTX 4090, measured 2026-10-18: 262K prefill ran out of memory at max_num_batched_tokens 1024 (GPU 0 at 23.50 of 23.52 GiB); the row now ships 512. Not re-run at 512."
+    "4 x RTX 4090, measured 2026-10-18: 262K prefill ran out of memory at max_num_batched_tokens 1024 (GPU 0 at 23.50 of 23.52 GiB); the row now ships 512. At 512 a diagnosis run on the same card passed the 262K and 131K needles (269.5 s / 90.9 s); the full lane was not re-run."
    ],
    "notes": [
     "Vision tower weights live in host RAM (--cpu-offload-gb 1 --cpu-offload-params visual); one image per prompt, capped at 4,194,304 pixels (4 MP; MAX_PIXELS) with VLLM_MERLIN_VISION_PEAK=1. One card keeps the 262K KV pin and takes 4 MP, not the 8 MP of the multi-card layouts.",
     "Single-card image headroom, all on by default and output-identical: a 96 MiB FlashInfer workspace (VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE=100663296), the MTP drafter sharing it (MERLIN_SHARE_DRAFT_WORKSPACE=1) and the vision rotary applied in place in the QKV buffer (VLLM_MERLIN_VISION_ROTARY_INPLACE=1); each env variable overrides.",
-    "Run headless on the card. The KV pin and the 4 MP free-memory headroom are PROVISIONAL; the gate samples min free every 100 ms and the pool is never cut to make 4 MP fit: a failing gate is reported as a blocker.",
+    "Run headless on the card. The KV pin and the 4 MP free-memory headroom are PROVISIONAL; the check samples min free every 100 ms and the pool is never cut to make 4 MP fit: a failing check is reported as a blocker.",
     "MTP K=4 (fixed), RecoverSSM on (--use-replayssm), prefix caching + retention on.",
     "sm_89 row: untested / community-validated. Same single-card settings and 4 MP cap as the 3090 row; on a 24 GiB card the headroom is as thin as on the 3090, and the 32 and 48 GB classes only add margin."
    ],
@@ -377,14 +390,17 @@
   {
    "id": "27b-tp2-sm89-24g",
    "title": "Qwen3.8-27B on 2 x RTX 4090 24 GB (sm_89, TP2), the 27b-tp2-3090 pins",
-   "status": "untested",
+   "status": "testing",
    "match": {
     "arch": [
      "sm_89"
     ],
     "cards": 2,
     "vram_gib": 24,
-    "p2p": "any"
+    "p2p": "any",
+    "testing_gpu_names": [
+     "RTX 4090$"
+    ]
    },
    "launcher": {
     "path": null,
@@ -418,12 +434,13 @@
     "pool_tokens": 826689,
     "fit_262k": 3,
     "fit_131k": 6,
-    "basis": "Same KV pin as 27b-tp2-3090 (per-card bytes unchanged), so the pool is that row's by construction; cards with more VRAM than 24 GiB leave the extra as headroom (image peak, transients), not as a larger pool. Not measured on sm_89. Launcher header (883 whole blocks per card): three 262K or six 131K sessions resident, at K=4.",
+    "basis": "Same KV pin as 27b-tp2-3090 (per-card bytes unchanged), so the pool is that row's by construction; cards with more VRAM than 24 GiB leave the extra as headroom (image peak, transients), not as a larger pool. Pool 826,689 measured on cloud-hosted 4 x RTX 4090 (2026-10-18). Launcher header (883 whole blocks per card): three 262K or six 131K sessions resident, at K=4.",
     "kv_blocks": 883
    },
-   "p2p": "Not required: the launcher takes P2P=on|off; consumer Ada has no peer access by default, so preflight and merlin serve pass P2P=off (NCCL through host memory, custom all-reduce already off). No multi-card 27B run without P2P exists.",
+   "p2p": "Not required: the launcher takes P2P=on|off; consumer Ada has no peer access by default, so preflight and merlin serve pass P2P=off (NCCL through host memory, custom all-reduce already off).",
    "evidence": [
-    "4 x RTX 4090, measured 2026-10-18: 27b-tp2-sm89-24g, P2P off, pool 826,689 tokens, needles 262K-32K 4/4 exact, coherence 3/3, image correct (817 MiB minimum free); ThinkingCap on the same row also passed."
+    "4 x RTX 4090, measured 2026-10-18: 27b-tp2-sm89-24g, P2P off, pool 826,689 tokens, needles 262K-32K 4/4 exact, coherence 3/3, image correct (817 MiB minimum free); ThinkingCap on the same row also passed.",
+    "Testing: the runs above were on cloud-hosted hardware; kernel parity qualification is still to run."
    ],
    "notes": [
     "Pins and sequence caps are the K=4 figures of v1.3.1; the older K=3 numbers (794,351 tokens, seqs 32) belong to v1.0.x.",
@@ -436,14 +453,17 @@
   {
    "id": "27b-tp4-sm89-24g",
    "title": "Qwen3.8-27B on 4 x RTX 4090 24 GB (sm_89, TP4), the 27b-tp4-3090 pins",
-   "status": "untested",
+   "status": "testing",
    "match": {
     "arch": [
      "sm_89"
     ],
     "cards": 4,
     "vram_gib": 24,
-    "p2p": "any"
+    "p2p": "any",
+    "testing_gpu_names": [
+     "RTX 4090$"
+    ]
    },
    "launcher": {
     "path": null,
@@ -482,17 +502,17 @@
     "pool_tokens": 2012105,
     "fit_262k": 7,
     "fit_131k": 14,
-    "basis": "Same KV pin as 27b-tp4-3090 (per-card bytes unchanged), so the pool is that row's by construction; cards with more VRAM than 24 GiB leave the extra as headroom (image peak, transients), not as a larger pool. Not measured on sm_89. TP4 geometry (release bench card PASS): 2,011 whole blocks per card of 8,912,896 B (17 attention layers x 1,024 tokens x 512 B) = 17,923,833,856 B; vLLM logged 2,012,105 tokens (floor(blocks x 262,144 / D), D = 262), 7.68 x 262K; 7 x 262K or 14 x 131K resident (15 x 134 = 2,010 would use every usable block).",
+    "basis": "Same KV pin as 27b-tp4-3090 (per-card bytes unchanged), so the pool is that row's by construction; cards with more VRAM than 24 GiB leave the extra as headroom (image peak, transients), not as a larger pool. Pool 2,012,105 measured on cloud-hosted 4 x RTX 4090 (2026-10-18 and 2026-10-20). TP4 geometry (release bench card PASS): 2,011 whole blocks per card of 8,912,896 B (17 attention layers x 1,024 tokens x 512 B) = 17,923,833,856 B; vLLM logged 2,012,105 tokens (floor(blocks x 262,144 / D), D = 262), 7.68 x 262K; 7 x 262K or 14 x 131K resident (15 x 134 = 2,010 would use every usable block).",
     "kv_blocks": 2011
    },
-   "p2p": "Not required: the launcher takes P2P=on|off; consumer Ada has no peer access by default, so preflight and merlin serve pass P2P=off (NCCL through host memory, custom all-reduce already off). No multi-card 27B run without P2P exists.",
+   "p2p": "Not required: the launcher takes P2P=on|off; consumer Ada has no peer access by default, so preflight and merlin serve pass P2P=off (NCCL through host memory, custom all-reduce already off).",
    "evidence": [
     "4 x RTX 4090, measured 2026-10-18: 27b-tp4-sm89-24g, P2P off, pool 2,012,105 tokens, needles 4/4 exact.",
-    "4 x RTX 4090 on the release wheel, measured 2026-10-20: pool 2,012,105, needles 4/4 exact, 7 x 262K, 15 x 131K and 24 x 32K resident and exact, image pass (779 MiB minimum free). The row stays untested until it is qualified on our own test hardware."
+    "4 x RTX 4090 on the release wheel, measured 2026-10-20: pool 2,012,105, needles 4/4 exact, 7 x 262K, 15 x 131K and 24 x 32K resident and exact, image pass (779 MiB minimum free). Testing: the runs above were on cloud-hosted hardware; kernel parity qualification is still to run."
    ],
    "notes": [
     "ThinkingCap serves on this row too (merlin serve 27b-thinkingcap; models/thinkingcap/serve*.sh): the same shape, pin and reasoning effort (medium).",
-    "RecoverSSM: the TP4 launcher serves --use-replayssm with --mamba-cache-mode align on Model Runner V2, block 1024 (--block-size) and chunk 4096 (--max-num-batched-tokens); the 1024-token block and 2,011-block pin are RecoverSSM-on K=4 figures (prefill +0.9 % against the RecoverSSM-off layout; all correctness gates passed).",
+    "RecoverSSM: the TP4 launcher serves --use-replayssm with --mamba-cache-mode align on Model Runner V2, block 1024 (--block-size) and chunk 4096 (--max-num-batched-tokens); the 1024-token block and 2,011-block pin are RecoverSSM-on K=4 figures (prefill +0.9 % against the RecoverSSM-off layout; all correctness checks passed).",
     "sm_89 row: untested / community-validated. The 8 MP image floor is unchanged and never lowered; on a 24 GiB card the headroom is as thin as on the 3090 (TP2 stress minimum 506-806 MiB), and the 32 and 48 GB classes only add margin."
    ],
    "launch_shape": "tp4"
@@ -553,7 +573,7 @@
    "notes": [
     "Vision tower weights live in host RAM (--cpu-offload-gb 1 --cpu-offload-params visual); one image per prompt, capped at 4,194,304 pixels (4 MP; MAX_PIXELS) with VLLM_MERLIN_VISION_PEAK=1. One card keeps the 262K KV pin and takes 4 MP, not the 8 MP of the multi-card layouts.",
     "Single-card image headroom, all on by default and output-identical: a 96 MiB FlashInfer workspace (VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE=100663296), the MTP drafter sharing it (MERLIN_SHARE_DRAFT_WORKSPACE=1) and the vision rotary applied in place in the QKV buffer (VLLM_MERLIN_VISION_ROTARY_INPLACE=1); each env variable overrides.",
-    "Run headless on the card. The KV pin and the 4 MP free-memory headroom are PROVISIONAL; the gate samples min free every 100 ms and the pool is never cut to make 4 MP fit: a failing gate is reported as a blocker.",
+    "Run headless on the card. The KV pin and the 4 MP free-memory headroom are PROVISIONAL; the check samples min free every 100 ms and the pool is never cut to make 4 MP fit: a failing check is reported as a blocker.",
     "MTP K=4 (fixed), RecoverSSM on (--use-replayssm), prefix caching + retention on.",
     "sm_89 row: untested / community-validated. Same single-card settings and 4 MP cap as the 3090 row; on a 24 GiB card the headroom is as thin as on the 3090, and the 32 and 48 GB classes only add margin."
    ],
@@ -607,7 +627,7 @@
     "basis": "Same KV pin as 27b-tp2-3090 (per-card bytes unchanged), so the pool is that row's by construction; cards with more VRAM than 24 GiB leave the extra as headroom (image peak, transients), not as a larger pool. Not measured on sm_89. Launcher header (883 whole blocks per card): three 262K or six 131K sessions resident, at K=4.",
     "kv_blocks": 883
    },
-   "p2p": "Not required: the launcher takes P2P=on|off; consumer Ada has no peer access by default, so preflight and merlin serve pass P2P=off (NCCL through host memory, custom all-reduce already off). No multi-card 27B run without P2P exists.",
+   "p2p": "Not required: the launcher takes P2P=on|off; consumer Ada has no peer access by default, so preflight and merlin serve pass P2P=off (NCCL through host memory, custom all-reduce already off).",
    "evidence": [
     "None on 32 GB Ada cards; the 24 GB pin ran on 4 x RTX 4090 24 GB (measured 2026-10-18)."
    ],
@@ -672,13 +692,13 @@
     "basis": "Same KV pin as 27b-tp4-3090 (per-card bytes unchanged), so the pool is that row's by construction; cards with more VRAM than 24 GiB leave the extra as headroom (image peak, transients), not as a larger pool. Not measured on sm_89. TP4 geometry (release bench card PASS): 2,011 whole blocks per card of 8,912,896 B (17 attention layers x 1,024 tokens x 512 B) = 17,923,833,856 B; vLLM logged 2,012,105 tokens (floor(blocks x 262,144 / D), D = 262), 7.68 x 262K; 7 x 262K or 14 x 131K resident (15 x 134 = 2,010 would use every usable block).",
     "kv_blocks": 2011
    },
-   "p2p": "Not required: the launcher takes P2P=on|off; consumer Ada has no peer access by default, so preflight and merlin serve pass P2P=off (NCCL through host memory, custom all-reduce already off). No multi-card 27B run without P2P exists.",
+   "p2p": "Not required: the launcher takes P2P=on|off; consumer Ada has no peer access by default, so preflight and merlin serve pass P2P=off (NCCL through host memory, custom all-reduce already off).",
    "evidence": [
     "None on 32 GB Ada cards; the 24 GB pin ran on 4 x RTX 4090 24 GB (measured 2026-10-18)."
    ],
    "notes": [
     "ThinkingCap serves on this row too (merlin serve 27b-thinkingcap; models/thinkingcap/serve*.sh): the same shape, pin and reasoning effort (medium).",
-    "RecoverSSM: the TP4 launcher serves --use-replayssm with --mamba-cache-mode align on Model Runner V2, block 1024 (--block-size) and chunk 4096 (--max-num-batched-tokens); the 1024-token block and 2,011-block pin are RecoverSSM-on K=4 figures (prefill +0.9 % against the RecoverSSM-off layout; all correctness gates passed).",
+    "RecoverSSM: the TP4 launcher serves --use-replayssm with --mamba-cache-mode align on Model Runner V2, block 1024 (--block-size) and chunk 4096 (--max-num-batched-tokens); the 1024-token block and 2,011-block pin are RecoverSSM-on K=4 figures (prefill +0.9 % against the RecoverSSM-off layout; all correctness checks passed).",
     "sm_89 row: untested / community-validated. The 8 MP image floor is unchanged and never lowered; on a 24 GiB card the headroom is as thin as on the 3090 (TP2 stress minimum 506-806 MiB), and the 32 and 48 GB classes only add margin."
    ],
    "launch_shape": "tp4"
@@ -739,7 +759,7 @@
    "notes": [
     "Vision tower weights live in host RAM (--cpu-offload-gb 1 --cpu-offload-params visual); one image per prompt, capped at 4,194,304 pixels (4 MP; MAX_PIXELS) with VLLM_MERLIN_VISION_PEAK=1. One card keeps the 262K KV pin and takes 4 MP, not the 8 MP of the multi-card layouts.",
     "Single-card image headroom, all on by default and output-identical: a 96 MiB FlashInfer workspace (VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE=100663296), the MTP drafter sharing it (MERLIN_SHARE_DRAFT_WORKSPACE=1) and the vision rotary applied in place in the QKV buffer (VLLM_MERLIN_VISION_ROTARY_INPLACE=1); each env variable overrides.",
-    "Run headless on the card. The KV pin and the 4 MP free-memory headroom are PROVISIONAL; the gate samples min free every 100 ms and the pool is never cut to make 4 MP fit: a failing gate is reported as a blocker.",
+    "Run headless on the card. The KV pin and the 4 MP free-memory headroom are PROVISIONAL; the check samples min free every 100 ms and the pool is never cut to make 4 MP fit: a failing check is reported as a blocker.",
     "MTP K=4 (fixed), RecoverSSM on (--use-replayssm), prefix caching + retention on.",
     "sm_89 row: untested / community-validated. Same single-card settings and 4 MP cap as the 3090 row; on a 24 GiB card the headroom is as thin as on the 3090, and the 32 and 48 GB classes only add margin."
    ],
@@ -793,7 +813,7 @@
     "basis": "Same KV pin as 27b-tp2-3090 (per-card bytes unchanged), so the pool is that row's by construction; cards with more VRAM than 24 GiB leave the extra as headroom (image peak, transients), not as a larger pool. Not measured on sm_89. Launcher header (883 whole blocks per card): three 262K or six 131K sessions resident, at K=4.",
     "kv_blocks": 883
    },
-   "p2p": "Not required: the launcher takes P2P=on|off; consumer Ada has no peer access by default, so preflight and merlin serve pass P2P=off (NCCL through host memory, custom all-reduce already off). No multi-card 27B run without P2P exists.",
+   "p2p": "Not required: the launcher takes P2P=on|off; consumer Ada has no peer access by default, so preflight and merlin serve pass P2P=off (NCCL through host memory, custom all-reduce already off).",
    "evidence": [
     "None on 48 GB Ada cards; the 24 GB pin ran on 4 x RTX 4090 24 GB (measured 2026-10-18)."
    ],
@@ -858,13 +878,13 @@
     "basis": "Same KV pin as 27b-tp4-3090 (per-card bytes unchanged), so the pool is that row's by construction; cards with more VRAM than 24 GiB leave the extra as headroom (image peak, transients), not as a larger pool. Not measured on sm_89. TP4 geometry (release bench card PASS): 2,011 whole blocks per card of 8,912,896 B (17 attention layers x 1,024 tokens x 512 B) = 17,923,833,856 B; vLLM logged 2,012,105 tokens (floor(blocks x 262,144 / D), D = 262), 7.68 x 262K; 7 x 262K or 14 x 131K resident (15 x 134 = 2,010 would use every usable block).",
     "kv_blocks": 2011
    },
-   "p2p": "Not required: the launcher takes P2P=on|off; consumer Ada has no peer access by default, so preflight and merlin serve pass P2P=off (NCCL through host memory, custom all-reduce already off). No multi-card 27B run without P2P exists.",
+   "p2p": "Not required: the launcher takes P2P=on|off; consumer Ada has no peer access by default, so preflight and merlin serve pass P2P=off (NCCL through host memory, custom all-reduce already off).",
    "evidence": [
     "None on 48 GB Ada cards; the 24 GB pin ran on 4 x RTX 4090 24 GB (measured 2026-10-18)."
    ],
    "notes": [
     "ThinkingCap serves on this row too (merlin serve 27b-thinkingcap; models/thinkingcap/serve*.sh): the same shape, pin and reasoning effort (medium).",
-    "RecoverSSM: the TP4 launcher serves --use-replayssm with --mamba-cache-mode align on Model Runner V2, block 1024 (--block-size) and chunk 4096 (--max-num-batched-tokens); the 1024-token block and 2,011-block pin are RecoverSSM-on K=4 figures (prefill +0.9 % against the RecoverSSM-off layout; all correctness gates passed).",
+    "RecoverSSM: the TP4 launcher serves --use-replayssm with --mamba-cache-mode align on Model Runner V2, block 1024 (--block-size) and chunk 4096 (--max-num-batched-tokens); the 1024-token block and 2,011-block pin are RecoverSSM-on K=4 figures (prefill +0.9 % against the RecoverSSM-off layout; all correctness checks passed).",
     "sm_89 row: untested / community-validated. The 8 MP image floor is unchanged and never lowered; on a 24 GiB card the headroom is as thin as on the 3090 (TP2 stress minimum 506-806 MiB), and the 32 and 48 GB classes only add margin."
    ],
    "launch_shape": "tp4"
@@ -924,7 +944,7 @@
    "notes": [
     "Vision tower weights live in host RAM (--cpu-offload-gb 1 --cpu-offload-params visual); one image per prompt, capped at 4,194,304 pixels (4 MP; MAX_PIXELS) with VLLM_MERLIN_VISION_PEAK=1. One card keeps the 262K KV pin and takes 4 MP, not the 8 MP of the multi-card layouts.",
     "Single-card image headroom, all on by default and output-identical: a 96 MiB FlashInfer workspace (VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE=100663296), the MTP drafter sharing it (MERLIN_SHARE_DRAFT_WORKSPACE=1) and the vision rotary applied in place in the QKV buffer (VLLM_MERLIN_VISION_ROTARY_INPLACE=1); each env variable overrides.",
-    "Run headless on the card. The KV pin and the 4 MP free-memory headroom are PROVISIONAL; the gate samples min free every 100 ms and the pool is never cut to make 4 MP fit: a failing gate is reported as a blocker.",
+    "Run headless on the card. The KV pin and the 4 MP free-memory headroom are PROVISIONAL; the check samples min free every 100 ms and the pool is never cut to make 4 MP fit: a failing check is reported as a blocker.",
     "MTP K=4 (fixed), RecoverSSM on (--use-replayssm), prefix caching + retention on.",
     "sm_86 48 GB row: untested / community-validated; the KV pin is a estimate (KV_BYTES overrides it)."
    ],
@@ -1050,7 +1070,7 @@
    ],
    "notes": [
     "ThinkingCap serves on this row too (merlin serve 27b-thinkingcap; models/thinkingcap/serve*.sh): the same shape, pin and reasoning effort (medium).",
-    "RecoverSSM: the TP4 launcher serves --use-replayssm with --mamba-cache-mode align on Model Runner V2, block 1024 (--block-size) and chunk 4096 (--max-num-batched-tokens); the 1024-token block is the RecoverSSM-on K=4 figure; this row's pin is the 4,786-block estimate (prefill +0.9 % against the RecoverSSM-off layout; all correctness gates passed).",
+    "RecoverSSM: the TP4 launcher serves --use-replayssm with --mamba-cache-mode align on Model Runner V2, block 1024 (--block-size) and chunk 4096 (--max-num-batched-tokens); the 1024-token block is the RecoverSSM-on K=4 figure; this row's pin is the 4,786-block estimate (prefill +0.9 % against the RecoverSSM-off layout; all correctness checks passed).",
     "sm_86 48 GB row: untested / community-validated; the KV pin is a estimate (KV_BYTES overrides it)."
    ],
    "launch_shape": "tp4"
@@ -1110,7 +1130,7 @@
    "notes": [
     "Vision tower weights live in host RAM (--cpu-offload-gb 1 --cpu-offload-params visual); one image per prompt, capped at 4,194,304 pixels (4 MP; MAX_PIXELS) with VLLM_MERLIN_VISION_PEAK=1. One card keeps the 262K KV pin and takes 4 MP, not the 8 MP of the multi-card layouts.",
     "Single-card image headroom, all on by default and output-identical: a 96 MiB FlashInfer workspace (VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE=100663296), the MTP drafter sharing it (MERLIN_SHARE_DRAFT_WORKSPACE=1) and the vision rotary applied in place in the QKV buffer (VLLM_MERLIN_VISION_ROTARY_INPLACE=1); each env variable overrides.",
-    "Run headless on the card. The KV pin and the 4 MP free-memory headroom are PROVISIONAL; the gate samples min free every 100 ms and the pool is never cut to make 4 MP fit: a failing gate is reported as a blocker.",
+    "Run headless on the card. The KV pin and the 4 MP free-memory headroom are PROVISIONAL; the check samples min free every 100 ms and the pool is never cut to make 4 MP fit: a failing check is reported as a blocker.",
     "MTP K=4 (fixed), RecoverSSM on (--use-replayssm), prefix caching + retention on.",
     "sm_80 24 GB row: untested / community-validated; the KV pin is a estimate (KV_BYTES overrides it)."
    ],
@@ -1236,7 +1256,7 @@
    ],
    "notes": [
     "ThinkingCap serves on this row too (merlin serve 27b-thinkingcap; models/thinkingcap/serve*.sh): the same shape, pin and reasoning effort (medium).",
-    "RecoverSSM: the TP4 launcher serves --use-replayssm with --mamba-cache-mode align on Model Runner V2, block 1024 (--block-size) and chunk 4096 (--max-num-batched-tokens); the 1024-token block is the RecoverSSM-on K=4 figure; this row's pin is the 2,011-block estimate (prefill +0.9 % against the RecoverSSM-off layout; all correctness gates passed).",
+    "RecoverSSM: the TP4 launcher serves --use-replayssm with --mamba-cache-mode align on Model Runner V2, block 1024 (--block-size) and chunk 4096 (--max-num-batched-tokens); the 1024-token block is the RecoverSSM-on K=4 figure; this row's pin is the 2,011-block estimate (prefill +0.9 % against the RecoverSSM-off layout; all correctness checks passed).",
     "sm_80 24 GB row: untested / community-validated; the KV pin is a estimate (KV_BYTES overrides it)."
    ],
    "launch_shape": "tp4"
@@ -1296,7 +1316,7 @@
    "notes": [
     "Vision tower weights live in host RAM (--cpu-offload-gb 1 --cpu-offload-params visual); one image per prompt, capped at 4,194,304 pixels (4 MP; MAX_PIXELS) with VLLM_MERLIN_VISION_PEAK=1. One card keeps the 262K KV pin and takes 4 MP, not the 8 MP of the multi-card layouts.",
     "Single-card image headroom, all on by default and output-identical: a 96 MiB FlashInfer workspace (VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE=100663296), the MTP drafter sharing it (MERLIN_SHARE_DRAFT_WORKSPACE=1) and the vision rotary applied in place in the QKV buffer (VLLM_MERLIN_VISION_ROTARY_INPLACE=1); each env variable overrides.",
-    "Run headless on the card. The KV pin and the 4 MP free-memory headroom are PROVISIONAL; the gate samples min free every 100 ms and the pool is never cut to make 4 MP fit: a failing gate is reported as a blocker.",
+    "Run headless on the card. The KV pin and the 4 MP free-memory headroom are PROVISIONAL; the check samples min free every 100 ms and the pool is never cut to make 4 MP fit: a failing check is reported as a blocker.",
     "MTP K=4 (fixed), RecoverSSM on (--use-replayssm), prefix caching + retention on.",
     "sm_80 32 GB row: untested / community-validated; the KV pin is a estimate (KV_BYTES overrides it)."
    ],
@@ -1422,7 +1442,7 @@
    ],
    "notes": [
     "ThinkingCap serves on this row too (merlin serve 27b-thinkingcap; models/thinkingcap/serve*.sh): the same shape, pin and reasoning effort (medium).",
-    "RecoverSSM: the TP4 launcher serves --use-replayssm with --mamba-cache-mode align on Model Runner V2, block 1024 (--block-size) and chunk 4096 (--max-num-batched-tokens); the 1024-token block is the RecoverSSM-on K=4 figure; this row's pin is the 2,936-block estimate (prefill +0.9 % against the RecoverSSM-off layout; all correctness gates passed).",
+    "RecoverSSM: the TP4 launcher serves --use-replayssm with --mamba-cache-mode align on Model Runner V2, block 1024 (--block-size) and chunk 4096 (--max-num-batched-tokens); the 1024-token block is the RecoverSSM-on K=4 figure; this row's pin is the 2,936-block estimate (prefill +0.9 % against the RecoverSSM-off layout; all correctness checks passed).",
     "sm_80 32 GB row: untested / community-validated; the KV pin is a estimate (KV_BYTES overrides it)."
    ],
    "launch_shape": "tp4"
@@ -1482,7 +1502,7 @@
    "notes": [
     "Vision tower weights live in host RAM (--cpu-offload-gb 1 --cpu-offload-params visual); one image per prompt, capped at 4,194,304 pixels (4 MP; MAX_PIXELS) with VLLM_MERLIN_VISION_PEAK=1. One card keeps the 262K KV pin and takes 4 MP, not the 8 MP of the multi-card layouts.",
     "Single-card image headroom, all on by default and output-identical: a 96 MiB FlashInfer workspace (VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE=100663296), the MTP drafter sharing it (MERLIN_SHARE_DRAFT_WORKSPACE=1) and the vision rotary applied in place in the QKV buffer (VLLM_MERLIN_VISION_ROTARY_INPLACE=1); each env variable overrides.",
-    "Run headless on the card. The KV pin and the 4 MP free-memory headroom are PROVISIONAL; the gate samples min free every 100 ms and the pool is never cut to make 4 MP fit: a failing gate is reported as a blocker.",
+    "Run headless on the card. The KV pin and the 4 MP free-memory headroom are PROVISIONAL; the check samples min free every 100 ms and the pool is never cut to make 4 MP fit: a failing check is reported as a blocker.",
     "MTP K=4 (fixed), RecoverSSM on (--use-replayssm), prefix caching + retention on.",
     "sm_80 40 GB row: untested / community-validated; the KV pin is a estimate (KV_BYTES overrides it)."
    ],
@@ -1608,7 +1628,7 @@
    ],
    "notes": [
     "ThinkingCap serves on this row too (merlin serve 27b-thinkingcap; models/thinkingcap/serve*.sh): the same shape, pin and reasoning effort (medium).",
-    "RecoverSSM: the TP4 launcher serves --use-replayssm with --mamba-cache-mode align on Model Runner V2, block 1024 (--block-size) and chunk 4096 (--max-num-batched-tokens); the 1024-token block is the RecoverSSM-on K=4 figure; this row's pin is the 3,861-block estimate (prefill +0.9 % against the RecoverSSM-off layout; all correctness gates passed).",
+    "RecoverSSM: the TP4 launcher serves --use-replayssm with --mamba-cache-mode align on Model Runner V2, block 1024 (--block-size) and chunk 4096 (--max-num-batched-tokens); the 1024-token block is the RecoverSSM-on K=4 figure; this row's pin is the 3,861-block estimate (prefill +0.9 % against the RecoverSSM-off layout; all correctness checks passed).",
     "sm_80 40 GB row: untested / community-validated; the KV pin is a estimate (KV_BYTES overrides it)."
    ],
    "launch_shape": "tp4"
@@ -1616,14 +1636,17 @@
   {
    "id": "27b-tp1-sm80-64g",
    "title": "Qwen3.8-27B on 1 x CMP 170HX 64 GB (sm_80, TP1), estimated pin",
-   "status": "untested",
+   "status": "testing",
    "match": {
     "arch": [
      "sm_80"
     ],
     "cards": 1,
     "vram_gib": 64,
-    "p2p": "any"
+    "p2p": "any",
+    "testing_gpu_names": [
+     "CMP 170HX"
+    ]
    },
    "launcher": {
     "path": null,
@@ -1659,16 +1682,18 @@
     "fit_262k": 5,
     "fit_131k": 10,
     "kv_blocks": 1523,
-    "basis": "Estimate: usable 61.44 GiB = 64 GiB x 0.96; weights + overhead per card 14.01 GiB (what the 27b-tp1-3090 pin leaves out of 23.04 GiB); 1,523 whole blocks of 33,423,360 B (960 tokens, fp8_e4m3 KV) = 50,903,777,280 B; pool = floor(1,523 x 262,144 / 280) = 1,425,876 tokens = 5 x 262K or 10 x 131K resident (D = 280 / 143 blocks per session + 1 null). Not measured on this card."
+    "basis": "Estimate: usable 61.44 GiB = 64 GiB x 0.96; weights + overhead per card 14.01 GiB (what the 27b-tp1-3090 pin leaves out of 23.04 GiB); 1,523 whole blocks of 33,423,360 B (960 tokens, fp8_e4m3 KV) = 50,903,777,280 B; pool = floor(1,523 x 262,144 / 280) = 1,425,876 tokens = 5 x 262K or 10 x 131K resident (D = 280 / 143 blocks per session + 1 null). Booted to 1,425,876 tokens on cloud-hosted 4 x CMP 170HX 64 GB (2026-10-18)."
    },
    "p2p": "Not needed (one card).",
    "evidence": [
-    "4 x CMP 170HX 64 GB, measured 2026-10-18: 27b-tp1-sm80-64g, fp8_e4m3 KV on sm_80, pool 1,425,876 tokens, needles 262K-32K 4/4 exact, GSM8K-50 48/50."
+    "4 x CMP 170HX 64 GB, measured 2026-10-18: 27b-tp1-sm80-64g, fp8_e4m3 KV on sm_80, pool 1,425,876 tokens, needles 262K-32K 4/4 exact, GSM8K-50 48/50.",
+    "Cloud-hosted 4 x CMP 170HX 64 GB, measured 2026-10-19 (4 x TP1, one server per card): 8 MP image pass (1,646 MiB minimum free), GSM8K-50 c8 0.96; 8 agents x 16K: 873 tok/s aggregate decode.",
+    "Testing: the runs above were on cloud-hosted hardware; kernel parity qualification is still to run."
    ],
    "notes": [
     "Vision tower weights live in host RAM (--cpu-offload-gb 1 --cpu-offload-params visual); one image per prompt, capped at 4,194,304 pixels (4 MP; MAX_PIXELS) with VLLM_MERLIN_VISION_PEAK=1. One card keeps the 262K KV pin and takes 4 MP, not the 8 MP of the multi-card layouts.",
     "Single-card image headroom, all on by default and output-identical: a 96 MiB FlashInfer workspace (VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE=100663296), the MTP drafter sharing it (MERLIN_SHARE_DRAFT_WORKSPACE=1) and the vision rotary applied in place in the QKV buffer (VLLM_MERLIN_VISION_ROTARY_INPLACE=1); each env variable overrides.",
-    "Run headless on the card. The KV pin and the 4 MP free-memory headroom are PROVISIONAL; the gate samples min free every 100 ms and the pool is never cut to make 4 MP fit: a failing gate is reported as a blocker.",
+    "Run headless on the card. The KV pin and the 4 MP free-memory headroom are PROVISIONAL; the check samples min free every 100 ms and the pool is never cut to make 4 MP fit: a failing check is reported as a blocker.",
     "MTP K=4 (fixed), RecoverSSM on (--use-replayssm), prefix caching + retention on.",
     "sm_80 64 GB row: untested / community-validated; the KV pin is a estimate (KV_BYTES overrides it)."
    ],
@@ -1677,14 +1702,17 @@
   {
    "id": "27b-tp2-sm80-64g",
    "title": "Qwen3.8-27B on 2 x CMP 170HX 64 GB (sm_80, TP2), estimated pin",
-   "status": "untested",
+   "status": "testing",
    "match": {
     "arch": [
      "sm_80"
     ],
     "cards": 2,
     "vram_gib": 64,
-    "p2p": "any"
+    "p2p": "any",
+    "testing_gpu_names": [
+     "CMP 170HX"
+    ]
    },
    "launcher": {
     "path": null,
@@ -1722,11 +1750,13 @@
     "fit_262k": 11,
     "fit_131k": 23,
     "kv_blocks": 3350,
-    "basis": "Estimate: usable 61.44 GiB = 64 GiB x 0.96; weights + overhead per card 9.30 GiB (what the 27b-tp2-3090 pin leaves out of 23.04 GiB); 3,350 whole blocks of 16,711,680 B (960 tokens, fp8_e4m3 KV) = 55,984,128,000 B; pool = floor(3,350 x 262,144 / 280) = 3,136,365 tokens = 11 x 262K or 23 x 131K resident (D = 280 / 143 blocks per session + 1 null). Not measured on this card."
+    "basis": "Estimate: usable 61.44 GiB = 64 GiB x 0.96; weights + overhead per card 9.30 GiB (what the 27b-tp2-3090 pin leaves out of 23.04 GiB); 3,350 whole blocks of 16,711,680 B (960 tokens, fp8_e4m3 KV) = 55,984,128,000 B; pool = floor(3,350 x 262,144 / 280) = 3,136,365 tokens = 11 x 262K or 23 x 131K resident (D = 280 / 143 blocks per session + 1 null). Booted to 3,136,365 tokens on cloud-hosted 4 x CMP 170HX 64 GB (2026-10-18 and 2026-10-19)."
    },
    "p2p": "Not required: the launcher takes P2P=on|off from merlin serve / preflight.",
    "evidence": [
-    "4 x CMP 170HX 64 GB, measured 2026-10-18: 27b-tp2-sm80-64g, P2P off, fp8_e4m3 KV on sm_80, pool 3,136,365 tokens, needles 262K-32K 4/4 exact, 8 x 131K 8/8, GSM8K-50 48/50."
+    "4 x CMP 170HX 64 GB, measured 2026-10-18: 27b-tp2-sm80-64g, P2P off, fp8_e4m3 KV on sm_80, pool 3,136,365 tokens, needles 262K-32K 4/4 exact, 8 x 131K 8/8, GSM8K-50 48/50.",
+    "Cloud-hosted 4 x CMP 170HX 64 GB, measured 2026-10-19 (GPUs 2,3): pool 3,136,365, 11 x 262K 11/11 and 16 x 131K 16/16 exact, needles, coherence and 8 MP image pass (2,748 MiB minimum free), GSM8K-50 c8 0.96.",
+    "Testing: the runs above were on cloud-hosted hardware; kernel parity qualification is still to run."
    ],
    "notes": [
     "Sequence cap is the 131K-session fit of the pool; the older K=3 numbers (794,351 tokens, seqs 32) belong to v1.0.x.",
@@ -1739,14 +1769,17 @@
   {
    "id": "27b-tp4-sm80-64g",
    "title": "Qwen3.8-27B on 4 x CMP 170HX 64 GB (sm_80, TP4), estimated pin",
-   "status": "untested",
+   "status": "testing",
    "match": {
     "arch": [
      "sm_80"
     ],
     "cards": 4,
     "vram_gib": 64,
-    "p2p": "any"
+    "p2p": "any",
+    "testing_gpu_names": [
+     "CMP 170HX"
+    ]
    },
    "launcher": {
     "path": null,
@@ -1786,15 +1819,17 @@
     "fit_262k": 25,
     "fit_131k": 49,
     "kv_blocks": 6637,
-    "basis": "Estimate: usable 61.44 GiB = 64 GiB x 0.96; weights + overhead per card 6.35 GiB (what the 27b-tp4-3090 pin leaves out of 23.04 GiB); 6,637 whole blocks of 8,912,896 B (1024 tokens, fp8_e4m3 KV) = 59,154,890,752 B; pool = floor(6,637 x 262,144 / 262) = 6,640,647 tokens = 25 x 262K or 49 x 131K resident (D = 262 / 134 blocks per session + 1 null). Not measured on this card."
+    "basis": "Estimate: usable 61.44 GiB = 64 GiB x 0.96; weights + overhead per card 6.35 GiB (what the 27b-tp4-3090 pin leaves out of 23.04 GiB); 6,637 whole blocks of 8,912,896 B (1024 tokens, fp8_e4m3 KV) = 59,154,890,752 B; pool = floor(6,637 x 262,144 / 262) = 6,640,647 tokens = 25 x 262K or 49 x 131K resident (D = 262 / 134 blocks per session + 1 null). Booted to 6,640,647 tokens on cloud-hosted 4 x CMP 170HX 64 GB (2026-10-18 and 2026-10-19)."
    },
    "p2p": "Not required: the launcher takes P2P=on|off from merlin serve / preflight.",
    "evidence": [
-    "4 x CMP 170HX 64 GB, measured 2026-10-18: 27b-tp4-sm80-64g, fp8_e4m3 KV, pool 6,640,647 tokens, needles 262K-32K 4/4 exact, 3 x 262K 3/3 (budget-capped), GSM8K-50 48/50."
+    "4 x CMP 170HX 64 GB, measured 2026-10-18: 27b-tp4-sm80-64g, fp8_e4m3 KV, pool 6,640,647 tokens, needles 262K-32K 4/4 exact, 3 x 262K 3/3 (budget-capped), GSM8K-50 48/50.",
+    "Cloud-hosted 4 x CMP 170HX 64 GB, measured 2026-10-19: pool 6,640,647, 262K needle exact, 8 MP image pass (2,798 MiB minimum free), GSM8K-50 c8 0.96, 14 x 131K design point with 0 errors.",
+    "Testing: the runs above were on cloud-hosted hardware; kernel parity qualification is still to run."
    ],
    "notes": [
     "ThinkingCap serves on this row too (merlin serve 27b-thinkingcap; models/thinkingcap/serve*.sh): the same shape, pin and reasoning effort (medium).",
-    "RecoverSSM: the TP4 launcher serves --use-replayssm with --mamba-cache-mode align on Model Runner V2, block 1024 (--block-size) and chunk 4096 (--max-num-batched-tokens); the 1024-token block is the RecoverSSM-on K=4 figure; this row's pin is the 6,637-block estimate (prefill +0.9 % against the RecoverSSM-off layout; all correctness gates passed).",
+    "RecoverSSM: the TP4 launcher serves --use-replayssm with --mamba-cache-mode align on Model Runner V2, block 1024 (--block-size) and chunk 4096 (--max-num-batched-tokens); the 1024-token block is the RecoverSSM-on K=4 figure; this row's pin is the 6,637-block estimate (prefill +0.9 % against the RecoverSSM-off layout; all correctness checks passed).",
     "sm_80 64 GB row: untested / community-validated; the KV pin is a estimate (KV_BYTES overrides it)."
    ],
    "launch_shape": "tp4"
@@ -1854,7 +1889,7 @@
    "notes": [
     "Vision tower weights live in host RAM (--cpu-offload-gb 1 --cpu-offload-params visual); one image per prompt, capped at 4,194,304 pixels (4 MP; MAX_PIXELS) with VLLM_MERLIN_VISION_PEAK=1. One card keeps the 262K KV pin and takes 4 MP, not the 8 MP of the multi-card layouts.",
     "Single-card image headroom, all on by default and output-identical: a 96 MiB FlashInfer workspace (VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE=100663296), the MTP drafter sharing it (MERLIN_SHARE_DRAFT_WORKSPACE=1) and the vision rotary applied in place in the QKV buffer (VLLM_MERLIN_VISION_ROTARY_INPLACE=1); each env variable overrides.",
-    "Run headless on the card. The KV pin and the 4 MP free-memory headroom are PROVISIONAL; the gate samples min free every 100 ms and the pool is never cut to make 4 MP fit: a failing gate is reported as a blocker.",
+    "Run headless on the card. The KV pin and the 4 MP free-memory headroom are PROVISIONAL; the check samples min free every 100 ms and the pool is never cut to make 4 MP fit: a failing check is reported as a blocker.",
     "MTP K=4 (fixed), RecoverSSM on (--use-replayssm), prefix caching + retention on.",
     "sm_80 80 GB row: untested / community-validated; the KV pin is a estimate (KV_BYTES overrides it)."
    ],
@@ -1980,7 +2015,7 @@
    ],
    "notes": [
     "ThinkingCap serves on this row too (merlin serve 27b-thinkingcap; models/thinkingcap/serve*.sh): the same shape, pin and reasoning effort (medium).",
-    "RecoverSSM: the TP4 launcher serves --use-replayssm with --mamba-cache-mode align on Model Runner V2, block 1024 (--block-size) and chunk 4096 (--max-num-batched-tokens); the 1024-token block is the RecoverSSM-on K=4 figure; this row's pin is the 8,487-block estimate (prefill +0.9 % against the RecoverSSM-off layout; all correctness gates passed).",
+    "RecoverSSM: the TP4 launcher serves --use-replayssm with --mamba-cache-mode align on Model Runner V2, block 1024 (--block-size) and chunk 4096 (--max-num-batched-tokens); the 1024-token block is the RecoverSSM-on K=4 figure; this row's pin is the 8,487-block estimate (prefill +0.9 % against the RecoverSSM-off layout; all correctness checks passed).",
     "sm_80 80 GB row: untested / community-validated; the KV pin is a estimate (KV_BYTES overrides it)."
    ],
    "launch_shape": "tp4"

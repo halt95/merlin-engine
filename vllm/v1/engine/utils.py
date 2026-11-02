@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by the Merlin project; see NOTICE.
 
 import contextlib
 import os
@@ -270,6 +271,8 @@ class CoreEngineProcManager:
 
         from vllm.v1.engine.core import EngineCoreProc
 
+        # One proof of clean SIGTERM/SIGINT per core.
+        self._shutdown_complete = [context.Event() for _ in range(local_engine_count)]
         self.processes: list[BaseProcess] = []
         local_dp_ranks = []
         for index in range(local_engine_count):
@@ -283,7 +286,12 @@ class CoreEngineProcManager:
                     target=EngineCoreProc.run_engine_core,
                     name=f"EngineCore_DP{global_index}" if is_dp else "EngineCore",
                     kwargs=common_kwargs
-                    | {"dp_rank": global_index, "local_dp_rank": local_index},
+                    # Inherited by fork/spawn alike.
+                    | {
+                        "dp_rank": global_index,
+                        "local_dp_rank": local_index,
+                        "shutdown_complete": self._shutdown_complete[index],
+                    },
                 )
             )
 
@@ -364,6 +372,15 @@ class CoreEngineProcManager:
                 break
 
         self.shutdown()
+
+    # No signal, failed teardown or kill stays fatal.
+    def is_clean_shutdown(self) -> bool:
+        return bool(self.processes) and all(
+            proc.exitcode == 0 and complete.is_set()
+            for proc, complete in zip(
+                self.processes, self._shutdown_complete, strict=True
+            )
+        )
 
     def sentinels(self) -> list:
         return [proc.sentinel for proc in self.processes]

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright 2026 halt95 (Merlin modifications)
 """Copy-on-write block copies as row copies, with no gather temporary.
 
 ``copy_kv_cache_blocks_inplace`` copied with ``blocks[dst] = blocks[src]``,

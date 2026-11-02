@@ -1,20 +1,20 @@
 #!/usr/bin/env bash
 # Provision a Debian 13 LXC created by lxc/pve-create.sh. Run inside it as root.
-# Builds the Merlin 3.0.0 checkout (vLLM 0.32.0) with release/install-env.sh.
+# Builds the Merlin checkout (vLLM 0.32.0) with release/install-env.sh.
 # Prepare uv and the Rust toolchain selected by rust-toolchain.toml first.
 # The release dependency hash lock is complete (222 exact pins with SHA-256 hashes).
 # The installer rejects a modified lock containing unresolved markers. No legacy engine bundle or compiled-artifact download is used.
 # Re-runs verify an existing installation; failed/partial venvs require a fresh
 # venv before retrying. Needs network for apt, source and build dependencies.
-# For reuse, set TILE_PROOF_LOG to this installation's current-boot log after a
-# completed tile-enabled MTP request; TILE_PROOF_QLEN defaults to 4, TILE_PROOF_TP to 2.
+# The live tile proof (release/check-tile-proof.sh) is 27B-only; a Flash-Next boot never emits it, so reuse is
+# gated by install-env.sh --verify alone.
 #
 # NVIDIA_RUN=/models/NVIDIA-Linux-x86_64-<host-version>.run bash provision.sh
 # NVIDIA userspace must match the host kernel module. The installer below uses
 # --no-kernel-module; peer-to-peer support remains a host-driver property.
 set -euo pipefail
 REPO_URL="${REPO_URL:-https://github.com/halt95/merlin-engine.git}"
-REPO_REF="${REPO_REF:-merlin-v3.0.0}"
+REPO_REF="${REPO_REF:-merlin-v3.0.1}"
 APP="${APP:-/opt/flash-next}"
 VENV="${VENV:-/opt/venv}"
 [ "$(id -u)" = 0 ] || { echo "run provision.sh as root" >&2; exit 1; }
@@ -56,9 +56,7 @@ want="$(git rev-parse --verify "$REPO_REF^{commit}")"
 [ -f release/requirements-0.32.lock ] || {
   echo "this checkout lacks the 0.32 dependency lock required by release/install-env.sh" >&2; exit 1;
 }
-REUSED_ENV=1
 if [ ! -e "$VENV" ] && [ ! -L "$VENV" ]; then
-  REUSED_ENV=0
   for tool in uv cargo rustc; do
     command -v "$tool" >/dev/null || {
       echo "source installation requires $tool; prepare uv and the repository's Rust toolchain first" >&2
@@ -70,10 +68,6 @@ fi
 # Every path verifies source identity, every lock pin, dependency consistency,
 # exact installed tile hashes and native products before service enablement.
 bash release/install-env.sh --verify "$VENV" "$APP"
-if [ "$REUSED_ENV" = 1 ]; then
-  : "${TILE_PROOF_LOG:?reuse requires TILE_PROOF_LOG from the current boot of this installation after a tile-enabled MTP request}"
-  bash release/check-tile-proof.sh "$TILE_PROOF_LOG" "${TILE_PROOF_QLEN:-4}" --tp "${TILE_PROOF_TP:-2}"
-fi
 "$VENV/bin/python" models/flash-next/make-e1-config.py "$CKPT"
 install -m 0644 models/flash-next/lxc/flash-next.service /etc/systemd/system/flash-next.service
 # Preserve the user's settings while replacing every old TREE/VENV assignment.
@@ -98,7 +92,7 @@ def quote(value):
 if config.is_symlink():
     sys.exit("service config must be a regular file")
 previous = config.stat() if config.exists() else None
-text = config.read_text() if previous else (
+text = config.read_text(encoding="utf-8") if previous else (
     f"CKPT={quote(checkpoint)}\n"
     "HOST=127.0.0.1\nPORT=8000\nCACHE_ROOT=/cache\n"
     "# To serve other hosts, set HOST=0.0.0.0 together with VLLM_API_KEY (bearer authentication).\n"
@@ -110,7 +104,7 @@ lines = [
 lines.extend((f"TREE={quote(app)}", f"VENV={quote(venv)}"))
 fd, temporary = tempfile.mkstemp(prefix=".flash-next-", dir=config.parent)
 try:
-    with os.fdopen(fd, "w") as stream:
+    with os.fdopen(fd, "w", encoding="utf-8") as stream:
         os.fchmod(stream.fileno(), stat.S_IMODE(previous.st_mode) if previous else 0o600)
         if previous:
             os.fchown(stream.fileno(), previous.st_uid, previous.st_gid)

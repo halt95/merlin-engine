@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright 2026 halt95 (Merlin modifications)
 """RecoverSSM commit context for Mamba-2 layers (NemotronH / Nemotron Super VL).
 
 Holds, per attention group, the raw address tables of every layer's conv state,
@@ -12,13 +12,13 @@ stored when reached, then the final state; either may alias the source). It foll
 the GDN commit path; the metadata/builder (``Mamba2RecoverSSMMetadata``)
 calls ``commit`` exactly as the GDN metadata does."""
 
-import os
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
 
 import torch
 
+from vllm.merlin.envs import read_registered
 from vllm.model_executor.layers.mamba.ops.recoverssm import (
     compact_conv_state_kernel,
     prepare_commit_plan_kernel,
@@ -33,9 +33,8 @@ from vllm.model_executor.layers.mamba.recoverssm_utils import recoverssm_require
 from vllm.triton_utils import triton
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 
-
 # Debug only: assert the source-block ownership invariant on every commit (host sync).
-_CHECK_OWNERSHIP = os.environ.get("VLLM_RECOVERSSM_CHECK_OWNERSHIP", "0") == "1"
+_CHECK_OWNERSHIP = bool(read_registered("VLLM_RECOVERSSM_CHECK_OWNERSHIP"))
 
 
 def _require(cond: bool, msg: str) -> None:

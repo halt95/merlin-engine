@@ -28,9 +28,9 @@ from vllm.triton_utils import HAS_TRITON, tl, triton
 def qsa_e4m3_uses_native_cast() -> bool:
     """True on SM89+: E4M3 K/V take upstream's native float8 cast (vllm#55557).
 
-    SM86 has no fp8e4nv in Triton, so E4M3 there is read as bytes by
-    ``_decode_e4m3_to_bf16`` (the Merlin path). The QSA owner admits E4M3 only
-    on SM86 or SM89+.
+    SM80/SM86 read E4M3 as bytes (no fp8e4nv).
+    ``_decode_e4m3_to_bf16`` is the Merlin reader; E4M3 is admitted only
+    on SM80/SM86 or SM89+.
     """
     capability = current_platform.get_device_capability()
     return capability is not None and capability.to_int() >= 89
@@ -961,6 +961,9 @@ def warmup_qsa_sparse_paged_attention(
                 grid=(num_rows, num_query_heads),
             )
         warmed.append((block_n, num_splits, warps))
+    # Load the binaries now, not mid-forward.
+    from vllm.merlin.triton_preload import preload_qsa_sparse_kernels
+    preload_qsa_sparse_kernels(warmed)
     return tuple(warmed)
 
 

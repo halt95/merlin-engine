@@ -10,7 +10,6 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from vllm import envs
 from vllm.config import VllmConfig, get_layers_from_vllm_config
 from vllm.config.compilation import CUDAGraphMode
 from vllm.distributed.eplb.eplb_state import EplbState
@@ -38,12 +37,6 @@ from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
 from vllm.v1.worker.gpu.spec_decode.acceptance_estimator import (
     OnlineAcceptanceEstimator,
 )
-from vllm.v1.worker.gpu.spec_decode.draft_truncation import (
-    FLAG_NAME,
-    check_draft_under_topk_support,
-    stage_draft_top_k_top_p,
-    truncate_draft_logits_top_k_top_p,
-)
 from vllm.v1.worker.gpu.spec_decode.step_keyed_rng import (
     check_step_keyed_rng_draft_support,
     resolve_step_keyed_rng,
@@ -53,7 +46,6 @@ from vllm.v1.worker.utils import AttentionGroup
 if TYPE_CHECKING:
     from vllm.v1.watermarking.gpu_sampler import GPUWatermarkSampler
     from vllm.v1.worker.gpu.pcp_manager import PCPManager
-    from vllm.v1.worker.gpu.sample.states import SamplingStates
 
 logger = init_logger(__name__)
 
@@ -166,7 +158,6 @@ def _release_replaced_draft_head(
 
 
 class DraftModelSpeculator(BaseSpeculator):
-    supports_draft_under_topk: bool = False
     supports_step_keyed_rng: bool = False
 
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
@@ -271,7 +262,6 @@ class DraftModelSpeculator(BaseSpeculator):
                 watermark_config.deduplicate_contexts_max_history,
             )
 
-        self._init_draft_under_topk(device)
         self._init_step_keyed_rng()
 
         self.supports_mm_inputs = False
@@ -279,38 +269,6 @@ class DraftModelSpeculator(BaseSpeculator):
         # Whether every draft attention builder can refresh its decode metadata
         # in place, so the refresh can be recorded in the draft CUDA graph.
         self.supports_decode_metadata_update = False
-
-    def _init_draft_under_topk(self, device: torch.device) -> None:
-        # Sample the draft under its own top-k/top-p set. Static: read once
-        # here, before any graph is captured, and never re-read.
-        requested = envs.VLLM_SPEC_DRAFT_UNDER_TARGET_TOPK
-        if requested:
-            check_draft_under_topk_support(
-                speculator_name=type(self).__name__,
-                supported=self.supports_draft_under_topk,
-                has_watermarker=self.draft_watermarker is not None,
-                rejection_sample_method=self.speculative_config.rejection_sample_method,
-            )
-            if self.draft_logits is None:
-                logger.warning(
-                    "VLLM_SPEC_DRAFT_UNDER_TARGET_TOPK=1 needs "
-                    "draft_sample_method='probabilistic'; ignored."
-                )
-        self.draft_under_target_topk = requested and self.draft_logits is not None
-        self._draft_top_k: torch.Tensor | None = None
-        self._draft_top_p: torch.Tensor | None = None
-        # Set by prepare_draft_sampling, consumed by the next propose().
-        self._draft_sampling_prepared = False
-        if self.draft_under_target_topk:
-            self._draft_top_k = torch.full(
-                (self.max_num_reqs,),
-                self.vocab_size,
-                dtype=torch.int32,
-                device=device,
-            )
-            self._draft_top_p = torch.ones(
-                self.max_num_reqs, dtype=torch.float32, device=device
-            )
 
     def _init_step_keyed_rng(self) -> None:
         # Key the draft noise by round under block verification. Static:
@@ -612,42 +570,6 @@ class DraftModelSpeculator(BaseSpeculator):
     ) -> torch.Tensor:
         return self.model.get_top_tokens(hidden_states)
 
-    def prepare_draft_sampling(
-        self,
-        sampling_states: "SamplingStates",
-        input_batch: InputBatch,
-        *,
-        dummy_run: bool = False,
-    ) -> None:
-        """Stage this step's per-request top-k/top-p into the persistent buffers.
-
-        The runner calls this right before every `propose()` (real and dummy),
-        eagerly and outside any captured region. It reads the live values
-        through the public `SamplingStates.get_top_k_top_p` and retains no
-        reference to them; the draft graphs only ever see the fixed buffers.
-        """
-        if not self.draft_under_target_topk:
-            return
-        assert self._draft_top_k is not None and self._draft_top_p is not None
-        if sampling_states.vocab_size < self.vocab_size:
-            # The "no top-k" sentinel is the sampler's vocab size; a narrower
-            # sampler would make every row look truncated in draft coordinates.
-            raise ValueError(
-                f"{FLAG_NAME}=1 needs the sampler vocab "
-                f"({sampling_states.vocab_size}) to cover the draft vocab "
-                f"({self.vocab_size})."
-            )
-        stage_draft_top_k_top_p(
-            self._draft_top_k,
-            self._draft_top_p,
-            sampling_states,
-            input_batch.idx_mapping,
-            input_batch.idx_mapping_np,
-            input_batch.num_reqs,
-            dummy_run=dummy_run,
-        )
-        self._draft_sampling_prepared = True
-
     def sample_draft(
         self,
         hidden_states: torch.Tensor,
@@ -664,15 +586,6 @@ class DraftModelSpeculator(BaseSpeculator):
 
         logits = self.compute_draft_logits(hidden_states, spec_step_idx)
         if draft_logits is not None:
-            if self.draft_under_target_topk:
-                assert self._draft_top_k is not None and self._draft_top_p is not None
-                logits = truncate_draft_logits_top_k_top_p(
-                    logits,
-                    idx_mapping,
-                    temperature,
-                    self._draft_top_k,
-                    self._draft_top_p,
-                )
             sampler = (
                 gumbel_sample
                 if self.draft_watermarker is None
@@ -756,16 +669,6 @@ class DraftModelSpeculator(BaseSpeculator):
         # for simplicity and performance.
         # While this may slightly degrade the acceptance rate, it does not
         # affect the output distribution after rejection sampling.
-        # (VLLM_SPEC_DRAFT_UNDER_TARGET_TOPK=1 opts in to top-k/top-p in
-        # sample_draft from the runner-prepared buffers.)
-        if self.draft_under_target_topk:
-            if not self._draft_sampling_prepared:
-                raise RuntimeError(
-                    "VLLM_SPEC_DRAFT_UNDER_TARGET_TOPK=1 but "
-                    "prepare_draft_sampling() was not called before this "
-                    "propose(): the draft would truncate against stale values."
-                )
-            self._draft_sampling_prepared = False
         self.temperature.copy_(temperature)
         self.seeds.copy_(seeds)
         # idx_mapping == -1 marks a row the drafter must not act on: sampling

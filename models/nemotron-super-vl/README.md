@@ -9,9 +9,8 @@ The Qwen recipes' Froggeric template does not apply to this launcher.
 parallelism, Mamba-2 RecoverSSM, MTP speculative decoding and prefix caching, behind one OpenAI-compatible endpoint.**
 
 > **Status: tested on the reference host (registry profile `svl-quad-3090`).** The 3.0.0 release bench card passed this
-> recipe on the reference host (2026-10-20; its agents, GSM8K and needle results are from a 2026-10-17 pre-release build). The KV pin below has not had a sustained-load test yet.
-
-![Nemotron Super VL Merlin 3.0.0 at a glance](docs/images/svl-merlin-3.0.0-summary.png)
+> recipe on the reference host (2026-10-20; its agents, GSM8K and needle results are from a 2026-10-17 pre-release build), and the 3.0.1 card re-measured decode,
+> prefill, agents and GSM8K at medium (2026-11-02). The KV pin below has not had a sustained-load test yet.
 
 ```bash
 MODEL=~/models/nemotron-super-vl PORT=8100 bash models/nemotron-super-vl/serve.sh
@@ -25,18 +24,18 @@ Extra arguments go to `vllm serve` after the launcher's own flags (later flags w
 Token embeddings: with `VLLM_HOST_EMBED_TABLE` unset, the target and MTP `embed_tokens` tables sit in pinned host RAM (V2 model
 runner; about 1 GiB of bf16 per full table, split across tensor-parallel ranks). `VLLM_HOST_EMBED_TABLE=0` keeps them on the GPU.
 
-## Merlin 3.0.0 bench card (2026-10-20)
+## Merlin 3.0.1 bench card (2026-11-02)
 
-Maintainer measurements on 4× RTX 3090 (220 W, PCIe Gen4 with P2P) with the Merlin 3.0.0 release wheel, one fresh `merlin serve` boot per configuration, 2026-10-20, except the agents and GSM8K rows (a 2026-10-17 pre-release build); method and every cell in the [bench card](benchmarks/2026-10-20/BENCH-CARD.md). Decode is one stream with thinking on (tok/s after the first streamed token); prefill is one cold request.
+Maintainer measurements on 4× RTX 3090 (220 W, PCIe Gen4) with P2P (the aikitoria patched driver) and the Zagitta [gpu-unlock](https://github.com/Zagitta/gpu-unlock) kernel module, one fresh `merlin serve` boot per configuration, 2026-11-01 to 2026-11-02; method and every cell in the [bench card](benchmarks/2026-11-02/BENCH-CARD.md). Decode is one stream with thinking on at reasoning effort medium, the server default (tok/s after the first streamed token); prefill is one cold request. With thinking on, a 512-token agent follow-up may end inside the reasoning, and reasoning tokens count. One GSM8K answer at medium hit the 8,192-token cap with no answer and counts as wrong. Thinking-off GSM8K is from a 2026-10-17 pre-release build. Rows marked (3.0.0 run) were not re-run for 3.0.1; they and the rest of the 3.0.0 figures are on the [3.0.0 bench card](benchmarks/2026-10-20/BENCH-CARD.md).
 
 | Measurement | Super VL |
 |---|---|
-| Decode, 4K / 131K / 262K prompt | 97 / 101 / 91 tok/s |
-| Cold prefill, 10K / 100K prompt | 3,737 / 3,744 tok/s |
-| Sessions held at once | 5 × 262K and 9 × 131K (the engine's sequence limit), every session resident (re-sent prompts ≥ 99.91 % cached), peak KV 95.0 %, 0 preemptions |
-| 8 MP image | correct; the processor downscales it to its native ~3.4 MP cap; lowest free memory 686 MiB on any card |
-| Agents at once (8 × 16K conversations), total | 429 tok/s (pre-release engine build of 2026-10-17) |
-| GSM8K-200 (5-shot, thinking off) | 195/200 (pre-release engine build of 2026-10-17) |
+| Decode, 4K / 131K / 262K prompt | 103 / 102 / 93 tok/s |
+| Cold prefill, 10K / 100K / 262K prompt | 4,545 / 4,689 / 3,916 tok/s |
+| Agents at once (8 × 16K conversations), total, thinking on / off | 432 / 432 tok/s |
+| GSM8K-200 (5-shot), correct of 200, thinking on at medium / thinking off | 197 / 195 |
+| Sessions held at once (3.0.0 run) | 5 × 262K and 9 × 131K (the engine's sequence limit), every session resident (re-sent prompts ≥ 99.91 % cached), peak KV 95.0 %, 0 preemptions |
+| 8 MP image (3.0.0 run) | correct; the processor downscales it to its native ~3.4 MP cap; lowest free memory 686 MiB on any card |
 | KV pool | 1,392,275 tokens (at a 262K context length; the shipped 1M default allocates 1,856,367) |
 
 ## The recipe

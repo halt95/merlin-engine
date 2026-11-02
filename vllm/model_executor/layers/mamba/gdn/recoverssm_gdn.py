@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright 2026 halt95 (Merlin modifications)
 """RecoverSSM for Gated DeltaNet (Qwen-style GDN): speculative verify from one
 checkpoint without per-draft state snapshots, and accepted-state recovery after
 sampling.

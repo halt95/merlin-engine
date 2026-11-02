@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright 2026 halt95 (Merlin modifications)
 """RecoverSSM for Mamba-2 (NemotronH / Nemotron Super VL): speculative verify from one
 read-only fp32 checkpoint and accepted-state recovery after sampling.
 

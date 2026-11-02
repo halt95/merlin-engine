@@ -13,7 +13,7 @@ The maintainer will assess reports and coordinate a fix and disclosure where app
 
 ## Versions
 
-Merlin 3.0.0 is the current release-preparation line. Security fixes target the latest public Merlin release; older v2.x recipe packages have no separate maintenance guarantee. Upgrade to the latest release and review its changelog. A release-candidate upstream base does not imply that every later upstream advisory has been fixed in Merlin.
+Merlin 3.0.1 is the current release. Security fixes target the latest public Merlin release; older v2.x recipe packages have no separate maintenance guarantee. Upgrade to the latest release and review its changelog. A release-candidate upstream base does not imply that every later upstream advisory has been fixed in Merlin.
 
 ## Deployment assumptions
 

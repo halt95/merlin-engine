@@ -23,6 +23,7 @@ from pydantic import ConfigDict, Field, model_validator
 
 import vllm.envs as envs
 from vllm import flashnext_family
+from vllm.merlin import kv_host_tier
 from vllm.logger import enable_trace_function_call, init_logger
 from vllm.transformers_utils.runai_utils import is_runai_obj_uri
 from vllm.triton_utils import HAS_TRITON
@@ -567,7 +568,10 @@ class VllmConfig:
             vllm_factors.append(self.kernel_config.compute_hash())
         else:
             vllm_factors.append(None)
-        if self.kv_transfer_config:
+        # The tier hashes like no connector.
+        if self.kv_transfer_config and not kv_host_tier.hashes_like_no_connector(
+            self
+        ):
             vllm_factors.append(self.kv_transfer_config.compute_hash())
         else:
             vllm_factors.append("None")
@@ -1249,6 +1253,12 @@ class VllmConfig:
         ):
             return
         if self.model_config is not None and (self.model_config.enable_cumem_allocator):
+            return
+        # The tier pins and registers nothing: it
+        # copies GPU KV by virtual address (cuMemcpyBatchAsync) to a pageable,
+        # unregistered host arena, so a VMM remap behind a live tensor's VA is
+        # invisible to it. The launcher always sets expandable_segments.
+        if kv_host_tier.is_active(self):
             return
 
         raise ValueError(
@@ -2166,6 +2176,7 @@ class VllmConfig:
         # Resolve kv_offloading-derived connector name into kv_transfer_config
         # before the HMA check below, which inspects the connector class.
         self._post_init_kv_transfer_config()
+        kv_host_tier.post_init(self)
         self._verify_aux_output_compatibility()
 
         # Hybrid KV cache manager (HMA) runtime rules:
@@ -3526,6 +3537,7 @@ class VllmConfig:
         if (
             self.kv_transfer_config is not None
             and self.kv_transfer_config.is_kv_transfer_instance
+            and not kv_host_tier.recoverssm_allows(self)
         ):
             raise ValueError(
                 "--use-replayssm is incompatible with KV connectors "

@@ -1,5 +1,35 @@
 # Changelog
 
+## Merlin 3.0.1
+
+The engine-side subset; the full 3.0.1 list is in the [main changelog](../CHANGELOG.md#merlin-301).
+
+### Flash-Next opt-ins
+
+- **DFlash2:** `merlin serve <model> <dir> --spec dflash2` or `./setup.sh --spec dflash2`
+  selects the drafter on the three Flash-Next-family 4 x 3090 P2P rows with qualified geometry.
+  Setup downloads and verifies it; serving takes `DFLASH2_MODEL` or `~/models/flash-next-dflash2`.
+  Decode measured +5–18 % versus MTP, but the 789,668-token GPU KV pool holds 3 x 262K sessions,
+  not 6 x 131K. Other rows and the 27B, Super VL and Ornith families refuse it. MTP remains the default.
+- **Host-RAM KV cache:** `--kv-ram-cache SIZE` on setup or serve restores evicted prefix KV blocks
+  from RAM instead of recomputing them. It adds no GPU context or simultaneous-session capacity.
+  SIZE is GiB per server, split into whole GiB per TP x PP rank, in addition to the server's host-RAM
+  budget; locked memory must be allowed. The tier is off by default and experimental in 3.0.1 on the Flash-Next
+  family (MTP drafter only) and on the 27B and ThinkingCap (RecoverSSM path only). Ornith 1.5 accepts it, untested ⚫;
+  Super VL refuses it. On the reference 4 x RTX 3090 host a 262K restore took 1.2–1.4 s, against about 56 s to recompute. Known limits: a 262K session evicted during heavy
+  prefill may be recomputed instead of restored (output identical), and host memory grows in steps over the first
+  262K requests while the request history fills (bounded: about 70 MiB on Flash-Next, 280 MiB on the 27B).
+
+See the [Flash-Next controls and limits](../../models/flash-next/docs/reference.md#merlin-301-options).
+
+### Install and deployment diagnostics
+
+- Container image tags use the same `SOURCE_REF` that the build verifies. Direct Docker examples,
+  like Compose, publish the API on host loopback.
+- A failed uv size probe in `setup.sh` reports the URL and an offline/proxy hint before exiting.
+- PLE offload warns when either pull-speed control is disabled, including direct `vllm serve` runs
+  that omit the launcher's `VLLM_E2_PLE_FAST_IDS=1` and `VLLM_E2_PLE_EARLY_REQUEST=1`.
+
 ## Merlin 3.0.0
 
 **Built on vLLM 0.32.0** (upstream commit `5df63a7203`). Merlin 3.0.0 is the public release after v2.5.3.
@@ -115,7 +145,7 @@
 - Carries fixes for the padded QSA guard sentinel, DCP/EAGLE prefix-cache keys, RecoverSSM pipeline broadcast, PLE boot and table-format validation, PLE event lifetime/watchdog notification and prefill logits lifetime. Main includes the PLE crash fix, the constant QSA logits workspace and the FlashInfer staging fence; the three fixes passed verification on the reference host (for the staging fence, one stress generator was corrected and the run repeated).
 - Changes sequence-parallel startup refusal to a warning. SP remains default-off and has layout-equivalent rounding differences.
 - Adds generated 0.32 Swift/Huihui launchers with checkpoint-specific KV scales. A qualification run validated the generated Swift and Huihui launchers on 2026-10-16, measured with the BF16 draft head, the shipped default. Swift and Huihui then passed their Merlin 3.0.0 release bench cards (2026-10-20; Swift also the 2026-10-17 pre-release bench run); both are tested on the reference host. Swift's 27 T=0 outputs matched the Flash-Next quad despite argv differences; Huihui was checked on its own boot, image, and GSM8K run.
-- Scores the **full vocabulary** in every Flash-Next MTP drafter; no reduced draft vocabulary is on by default (the reduced-vocabulary table is not shipped, so `REDUCED_DRAFT_VOCAB=1` is unavailable). The draft lm_head precision is one launcher knob, `DRAFT_HEAD=bf16|int8|int4`, independent of any vocabulary table; the shipped default is a single constant per launcher, `bf16`, the v2.5.x drafter. `DRAFT_HEAD=int8` is available: the 2026-10-17 BF16/INT8/INT4 A/B on the vanilla checkpoint measured it at 6.5–7.2 % lower ms per output token than BF16 at 32K/131K/258K with the same MTP acceptance, and it is planned as the default in the next release.
+- Scores the **full vocabulary** in every Flash-Next MTP drafter; no reduced draft vocabulary is on by default (the reduced-vocabulary table is not shipped; the switch was removed in 3.0.1). The draft lm_head precision is one launcher knob, `DRAFT_HEAD=bf16|int8|int4`, independent of any vocabulary table; the shipped default is a single constant per launcher, `bf16`, the v2.5.x drafter. `DRAFT_HEAD=int8` is available: the 2026-10-17 BF16/INT8/INT4 A/B on the vanilla checkpoint measured it at 6.5–7.2 % lower ms per output token than BF16 at 32K/131K/258K with the same MTP acceptance, and it is a candidate default for a later release (3.0.1 keeps `bf16`).
 - **`use_local_argmax_reduction` works with the Flash-Next MTP drafter.** `Qwen4ExpMTP` (nvidia and amd) mixes in `LocalArgmaxMixin`, so the flag no longer stops the engine at start-up. Contributed by [brandon-nuttall](https://github.com/brandon-nuttall) in [a pull request to qwen38-flash-next-3090s](https://github.com/halt95/qwen38-flash-next-3090s/pull/1). It is off in every shipped profile: it needs `"draft_sample_method":"greedy"`, which changes how draft tokens are picked, and on the contributor's 7 x 3090 + 1 x 3090 Ti TP2 x PP4 rig it gave +10-20 % 8-way aggregate decode and -8 to -10 % single stream at 4K. On the reference 4 x 3090 Flash-Next layout it gave no gain: 8-way aggregate 459 tok/s with greedy drafting and local argmax, 462 with greedy drafting alone, 483 with the shipped profile.
 - Builds target sm_80, sm_86 and sm_89. Reference-host qualification is on RTX 3090; other GPU architectures and eight-card layouts remain untested / community-validated.
 
@@ -123,7 +153,7 @@
 - **Super VL (Nemotron) ships with RecoverSSM** on the Mamba-2 path; its first-boot front end no longer opens a CUDA context on GPU 0 (the image preprocessor runs eagerly), which returns ~260 MiB to rank 0.
 - **Cache-thrash fixes on by default** for hybrid models: cost-aware admission (`VLLM_E2_SCHED_MISS_DEFER_S`, default 120 s) and session-coherent yields. Measured on Flash-Next under 8×131K and 12×80K oversubscription: follow-up reuse 74.7 % and 82.1 %.
 - **Cold requests behind cached follow-ups:** a cold request is held back behind waiting prefix-cache hits only when admitting its whole prompt would need a waiting request's pin released or would evict cached blocks a waiting request still needs; otherwise it is admitted at once. A prefix-cache reset that cannot complete keeps the retained follow-up prefixes.
-- **Every Qwen recipe serves Froggeric's fixed Qwen3.8 template (v22.5)**: Flash-Next, Swift and Huihui now use the template 27B and ThinkingCap already shipped. It accepts system messages after the first turn, so `/v1/messages` keeps coding agents' per-turn notes in place instead of merging them into the leading prompt, which broke the prefix cache ([reported against Flash-Next](https://github.com/halt95/qwen38-flash-next-3090s/issues/5)). `CHAT_TEMPLATE=<path>` serves another template; `CHAT_TEMPLATE=` serves the checkpoint's own.
+- **Every Qwen recipe serves Froggeric's fixed Qwen3.8 template (v22.5)**: Flash-Next, Swift and Huihui now use the template 27B and ThinkingCap already shipped. It accepts system messages after the first turn, so `/v1/messages` keeps coding agents' per-turn notes in place instead of merging them into the leading prompt, which broke the prefix cache (reported against Flash-Next). `CHAT_TEMPLATE=<path>` serves another template; `CHAT_TEMPLATE=` serves the checkpoint's own.
 - **Checkpoint-local FP8 KV scales:** a Flash-Next-family checkpoint that ships `qsa_kv_scales.json` beside its weights is served with its own scales (`SCALES=` still overrides), so a new variant of a supported family runs on this release with `merlin serve flash-next <dir>` and no repository update.
 - **27B shared-prefix checkpoints (FGPC)** are reworked as evict-first soft junction checkpoints, one per prefix, with no extra blocks held at rest; 27B prefix-hit counts are unchanged.
 
@@ -155,7 +185,7 @@ Swift1.5's 2026-10-15 window left 902 MiB free on stage 0; its generated launche
 
 The release-candidate engine and then the merged release-candidate engine were temperature-0 token- and logprob-identical to the pre-release reference on four configurations, with 28/28 documents plus four controls per configuration. A fresh install (2026-10-21) and a from-source build (2026-10-22) then passed on the reference host; the container image is not yet qualified.
 
-Native 262K configurations retain their intended numerics; YaRN-extended configurations change numerics versus the 0.30 releases. Layout changes and SP can change rounding. Prefix-cache thrash under oversubscription and the upstream JSON-form tool-call parser limitation remain. Two-card Flash-Next is not implemented (it would need a host-RAM expert tier); single-card 27B is tested on the reference host (2026-10-21: 4 MP images, one 262K or two 131K sessions).
+Native 262K configurations retain their intended numerics. No shipped profile enables YaRN; a YaRN extension set by hand changes numerics versus the 0.30 releases, and past 262K it needs the 3.0.1 drafter fix. Layout changes and SP can change rounding. Prefix-cache thrash under oversubscription and the upstream JSON-form tool-call parser limitation remain. Two-card Flash-Next is not implemented (it would need a host-RAM expert tier); single-card 27B is tested on the reference host (2026-10-21: 4 MP images, one 262K or two 131K sessions).
 
 ### Earlier releases
 

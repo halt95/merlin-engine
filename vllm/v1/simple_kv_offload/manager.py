@@ -1,8 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by the Merlin project; see NOTICE.
 """Scheduler-side manager for SimpleCPUOffloadConnector."""
 
 import contextlib
+import time
 from collections.abc import Iterable
 from dataclasses import dataclass, field, fields, replace
 from enum import Enum, auto
@@ -18,6 +20,18 @@ from vllm.distributed.kv_events import (
 )
 from vllm.distributed.kv_transfer.kv_connector.utils import yield_req_data
 from vllm.logger import init_logger
+from vllm.merlin import (
+    kv_commit_acks,
+    kv_host_tier,
+    kv_host_tier_hooks,
+    kv_host_tier_lifecycle,
+    kv_host_tier_plans,
+    kv_host_tier_retention,
+    kv_host_tier_runtime,
+    kv_host_tier_units,
+    kv_host_tier_writeback,
+    kv_restore_dependencies,
+)
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_coordinator import (
@@ -34,6 +48,7 @@ from vllm.v1.core.kv_cache_utils import (
     maybe_convert_block_hash,
     resolve_block_hashes,
     resolve_dcp_kv_block_size,
+    sliding_window_context_kv_is_causal,
     to_event_extra_keys,
 )
 from vllm.v1.core.sched.output import SchedulerOutput
@@ -85,6 +100,10 @@ class TransferMeta:
     gpu_block_ids: list[int]
     cpu_block_ids: list[int]
     block_meta: list[dict[BlockHashWithGroupId, BlockStoreMeta]] | None = None
+    # Store keys at issue (TierRuntime.snapshot).
+    gpu_block_keys: list[Any] | None = None
+    # old-epoch completions only release leases.
+    cache_epoch: int = 0
 
 
 @dataclass
@@ -93,6 +112,10 @@ class LoadRequestState:
     transfer_meta: TransferMeta
     load_event: int | None = None
     finished: bool = False
+    # a rejected load has no blocks to transfer.
+    failed: bool = False
+    lease: kv_host_tier_lifecycle.RestoreLease | None = None
+    issued_at: float | None = None
 
 
 # NOTE: This per-request state is only used in eager mode.
@@ -136,6 +159,35 @@ class BoundaryStoreStats:
     skipped_in_flight: int = 0
     dropped_null_block: int = 0
     dropped_not_hashed: int = 0
+    # A hand-off for a group the tier never offloads (not prefix-cacheable,
+    # see prefix_cacheable_group_ids). Only Mamba "align" managers produce
+    # hand-offs, so this stays 0; it guards the skip set, e.g. the slot-packed
+    # QSA ring of the side-cache layout, whose ids are ring slots, not pool
+    # blocks.
+    dropped_skipped_group: int = 0
+
+
+@dataclass
+class TierStats:
+    """Cumulative host-tier counters for the periodic tier log line.
+
+    ``loaded_tokens`` are tokens accepted from the host tier (scheduler side,
+    at allocation). Reset by ``reset()``.
+    """
+
+    lookups: int = 0
+    hit_lookups: int = 0
+    hit_tokens: int = 0
+    loaded_tokens: int = 0
+    loaded_blocks: int = 0
+    stored_blocks: int = 0
+
+
+# Seconds between "SimpleCPU tier:" INFO lines (only when something changed).
+TIER_LOG_INTERVAL_S = 60.0
+# Log at least this often even when nothing changed, so a
+# frozen tier is a visible flat line in an offline replay, not a gap.
+TIER_LOG_FORCE_S = 300.0
 
 
 class SimpleCPUOffloadScheduler:
@@ -169,6 +221,9 @@ class SimpleCPUOffloadScheduler:
         assert self.block_size % self.hash_block_size == 0
         # Derive a CPU KVCacheConfig from the GPU config and build a coordinator
         assert kv_cache_config is not None
+        # Before any host memory is sized.
+        if kv_host_tier.is_active(vllm_config):
+            kv_host_tier.refuse_prefix_replay(kv_cache_config)
         self.cpu_kv_cache_config = self._derive_cpu_config(
             kv_cache_config, offload_capacity
         )
@@ -191,12 +246,23 @@ class SimpleCPUOffloadScheduler:
                 self.fa_gidx = g_idx
                 break
         assert 0 <= self.fa_gidx < len(self.cpu_kv_cache_config.kv_cache_groups)
+        # Recurrent state is overwritten in place.
+        self._state_group_ids = frozenset(
+            g_idx
+            for g_idx, g in enumerate(self.cpu_kv_cache_config.kv_cache_groups)
+            if isinstance(g.kv_cache_spec, MambaSpec)
+        )
         logger.info(
             "SimpleCPUOffloadScheduler: Allocating %d offload blocks "
             "(%.2f GB, mode=%s, backend=%s)",
             self.num_cpu_blocks,
             offload_capacity / (1024**3),
-            "lazy" if lazy_offload else "eager",
+            # The tier is write-back, not eager.
+            "write-back"
+            if not lazy_offload and kv_host_tier.is_active(vllm_config)
+            else "lazy"
+            if lazy_offload
+            else "eager",
             "disk" if disk_capacity_bytes > 0 else "cpu",
         )
 
@@ -217,7 +283,26 @@ class SimpleCPUOffloadScheduler:
             hash_block_size=self.hash_block_size,
             allow_partial_hash_hits=not lazy_offload,
             num_prefill_lookahead=vllm_config.num_prefill_lookahead_tokens,
+            causal_sliding_window_kv=sliding_window_context_kv_is_causal(
+                vllm_config.speculative_config
+            ),
         )
+        # The tier uses resolved lookup dependencies.
+        if kv_host_tier.is_active(vllm_config):
+            min_rows = kv_host_tier.min_tier_rows(self.cpu_kv_cache_config)
+            data_rows = self.num_cpu_blocks - 1  # the pool reserves its null row
+            if data_rows < min_rows:
+                raise RuntimeError(
+                    f"host-RAM KV tier has {data_rows} host rows per rank; "
+                    f"one 262K restore unit needs {min_rows}. Increase "
+                    f"{kv_host_tier.KNOB} or set it to 0 to disable the tier."
+                )
+            kv_host_tier.warn_if_below_restore_unit(
+                kv_cache_config,
+                cpu_capacity_bytes,
+                vllm_config.parallel_config.world_size,
+                coordinator=self.cpu_coordinator,
+            )
         self.group_block_sizes = self.cpu_coordinator.group_block_sizes
         # FA group's own resolved block_size; divides scheduler_block_size (the
         # LCM) but is NOT assumed to equal it.
@@ -270,11 +355,96 @@ class SimpleCPUOffloadScheduler:
         # Interval stats state drained by get_stats()
         self._boundary_stats_snapshot = BoundaryStoreStats()
         self._interval_load_blocks_completed = 0
+        # Commit readiness is rank- and writer-specific, independent of PP depth.
+        self.commit_acks = kv_commit_acks.SchedulerCommitAcks(
+            vllm_config.parallel_config.world_size
+        )
+        self._sched_step = 0
+        self._masked_pruned = 0
+        # Lifecycle hooks (the copy
+        # scheduler); None until ``install_tier_hooks``.
+        self.tier_hooks: Any = None
+        self.tier_stats = TierStats()
+        self._tier_log_last = time.monotonic()
+        self._tier_log_logged: TierStats | None = None
+        self._wb_log_logged: Any = None
+        self._tier_log_forced = time.monotonic()
+        # The tier runtime (store keys, load
+        # checks and failures, metrics); None for every other SimpleCPUOffload
+        # user.
+        self.tier_runtime: kv_host_tier_runtime.TierRuntime | None = (
+            kv_host_tier_runtime.TierRuntime(
+                self.cpu_block_pool,
+                self.num_cpu_blocks,
+                self.fa_gidx,
+                self.fa_block_size,
+            )
+            if not lazy_offload and kv_host_tier.is_active(vllm_config)
+            else None
+        )
+        # The tier is write-back: victims are
+        # copied from the GPU free-queue head, never at compute time;
+        # positional eager selection is not used.
+        self.writeback: kv_host_tier_writeback.WriteBack | None = None
+        if self.tier_runtime is not None:
+            # The metrics ledger
+            # needs the hash grid to round reusable tokens to boundaries.
+            kv_host_tier_hooks.bind_tier_geometry(self, kv_cache_config)
+            reserve, align = kv_host_tier_writeback.derive_reserve(
+                kv_cache_config,
+                vllm_config.scheduler_config.max_num_batched_tokens,
+                self.cp_world_size,
+            )
+            self.writeback = kv_host_tier_writeback.WriteBack(
+                self.cpu_block_pool,
+                self.prefix_cacheable_group_ids,
+                reserve,
+                align,
+                vllm_config.parallel_config.world_size,
+            )
+            logger.info(
+                "host-RAM KV tier: write-back, reserve R=%d blocks (+%d per "
+                "running request), host LRU, "
+                "copy credits P=%d, escape after %d steps",
+                reserve,
+                align,
+                self.writeback.credits_cap,
+                self.writeback.escape_after,
+            )
+            # The walker's counters
+            # feed the per-interval series line (SERIES_FIELDS_V3).
+            self.tier_runtime.series_sources.append(
+                lambda: vars(self.writeback.counters)
+            )
 
         # For TP/PP: track partial store completions across steps.
         # Events must be reported by all world_size workers before considered complete.
         self._expected_worker_count = vllm_config.parallel_config.world_size
         self._store_event_pending_counts: dict[int, int] = {}
+        # per-rank load transaction acks, keyed
+        # (epoch, load event, batch).
+        self._load_acks: dict[
+            tuple[int, int, int], kv_host_tier_lifecycle.TxnAcks
+        ] = {}
+        self._load_resolved: dict[tuple[int, int, int], None] = {}
+        self.store_txn_failures = 0
+        self.load_txn_failures = 0
+        self.load_stale_epoch_completions = 0
+        self.txn_report_mismatches = 0
+        if self.tier_runtime is not None:
+            self._census()
+        # Monotonic epochs and transaction ownership.
+        self.cache_epoch = 0
+        self._promotions: dict[tuple, str] = {}
+        self._promotion_waiters: dict[tuple, set[str]] = {}
+        self._ready_promotions: dict[str, LoadRequestState] = {}
+        self._store_issued_at: dict[int, float] = {}
+        # PrefixHitPlan admission.
+        self.tier_plans: kv_host_tier_plans.TierPlans | None = (
+            kv_host_tier_plans.TierPlans(self) if self.tier_runtime is not None else None
+        )
+        if self.tier_plans is not None:
+            self.tier_runtime.extra_counters = self.tier_plans.log_counters
 
     @staticmethod
     def _derive_cpu_config(
@@ -300,6 +470,7 @@ class SimpleCPUOffloadScheduler:
                 layer_stride=t.layer_stride,
                 block_stride=t.block_stride,
                 offset=t.offset,
+                slots_per_block=t.slots_per_block,
             )
             for t in gpu_config.kv_cache_tensors
         ]
@@ -334,6 +505,69 @@ class SimpleCPUOffloadScheduler:
         """Bind GPU block pool so that we can touch blocks during stores.
         Called by Scheduler after kv_cache_manager is ready."""
         self._gpu_block_pool = gpu_block_pool
+        # Unified tier: GPU block state + units.
+        if self.tier_runtime is not None and gpu_block_pool.tier is None:
+            self.tier_runtime.units = kv_host_tier_units.mount(
+                gpu_block_pool,
+                self.cpu_block_pool,
+                self.cpu_kv_cache_config,
+                self.prefix_cacheable_group_ids,
+                self.group_block_sizes,
+                self.hash_block_size,
+                # The lookup's EAGLE groups.
+                self.cpu_coordinator.eagle_group_ids,
+                # Its resolved fine lookup.
+                kv_restore_dependencies.fine_grained_group_ids(
+                    self.cpu_coordinator
+                ),
+            )
+        # write-back engine on the tier state.
+        if self.writeback is not None:
+            self.writeback.bind(gpu_block_pool, self.tier_runtime.units)
+            # Admitted restores are bounded by a restores-in-flight
+            # cap (the retention account is gone).
+            if self.tier_runtime.units is not None:
+                self.tier_runtime.units.restores_in_flight = (
+                    kv_host_tier_retention.RestoresInFlight(
+                        kv_host_tier_writeback.n_restore()
+                    )
+                )
+        if self.tier_runtime is not None:
+            self._census()
+
+    def bind_kv_cache_manager(self, kv_cache_manager: Any) -> None:
+        """Install the write-back admission gate."""
+        if self.writeback is not None:
+            kv_cache_manager.admission_gate = self.writeback.admit
+            kv_cache_manager.running_headroom_hook = self.writeback.account_running
+            kv_cache_manager.head_need_hook = self.writeback.note_head
+        if self.tier_plans is not None:
+            self.tier_plans.bind(kv_cache_manager)
+        # The copy scheduler gets
+        # the KVCacheManager (grace pins, SessionYield order) and the host
+        # row bytes per rank for its byte credits; it then becomes the
+        # lifecycle hook target. None without a unit table.
+        if self.writeback is not None:
+            row_bytes = kv_host_tier.host_block_bytes(self.cpu_kv_cache_config)
+            self.writeback.row_bytes = row_bytes
+            if self.tier_runtime is not None:
+                # The same row size for the series' D2H GB/s per rank.
+                self.tier_runtime.row_bytes = row_bytes
+            cq = self.writeback.bind_manager(kv_cache_manager)
+            if cq is not None:
+                self.install_tier_hooks(cq)
+        # lifecycle: the KVCacheManager's grace
+        # take/release reach the copy scheduler (adds the step). Tier only.
+        if self.tier_runtime is not None:
+            kv_cache_manager.tier_hooks = kv_host_tier_hooks.KVCMLifecycleAdapter(self)
+
+    # Lifecycle plumbing (``kv_host_tier_hooks``): the
+    # copy scheduler registers itself here; no-ops until it does.
+    def install_tier_hooks(self, hooks: Any) -> None:
+        self.tier_hooks = hooks
+
+    def tier_preempted(self, request: "Request") -> None:
+        kv_host_tier_hooks.notify_preempted(self, request)
 
     def get_num_new_matched_tokens(
         self, request: "Request", num_computed_tokens: int
@@ -349,6 +583,11 @@ class SimpleCPUOffloadScheduler:
         if request.skip_reading_prefix_cache:
             return 0, False
 
+        self.tier_stats.lookups += 1
+        if self.tier_runtime is not None:
+            self.tier_runtime.on_lookup(
+                request.request_id, request.num_tokens - 1 - num_computed_tokens
+            )
         if num_computed_tokens % self.block_size != 0:
             # Transfers are whole-block copies, so an external suffix cannot
             # start in the middle of a destination block. When the GPU-side
@@ -387,8 +626,169 @@ class SimpleCPUOffloadScheduler:
                 hit_length,
                 num_computed_tokens,
             )
+            self.tier_stats.hit_lookups += 1
+            self.tier_stats.hit_tokens += hit_length
             return hit_length, True
         return 0, False
+
+    def _prune_masked_rows(self) -> None:
+        """Every 256 steps drop masked (producer, step) rows no live GPU
+        content carries any more."""
+        if self._sched_step - self._masked_pruned < 256:
+            return
+        self._masked_pruned = self._sched_step
+        pool = self._gpu_block_pool
+        tier = pool.tier if pool is not None else None
+        by_producer = tier._by_producer if tier is not None else {}
+        self.commit_acks.prune(lambda row: row in by_producer)
+
+    def _retire_ready_promotions(self) -> None:
+        pool = self._gpu_block_pool
+        if pool is None:
+            return
+        for req_id, state in list(self._ready_promotions.items()):
+            lease = state.lease
+            assert lease is not None
+            valid = (
+                lease.epoch == self.cache_epoch
+                and lease.sources_valid(self.cpu_block_pool)
+            )
+            published = lease.published(pool)
+            if valid and state.finished and not published:
+                lease.publish_cancelled(
+                    pool,
+                    state.request.num_computed_tokens,
+                    self._state_group_ids,
+                )
+                published = True
+            if valid and not published and self._promotion_waiters.get(lease.key):
+                continue
+            self._ready_promotions.pop(req_id)
+            self._promotions.pop(lease.key, None)
+            self._promotion_waiters.pop(lease.key, None)
+            self._release_transfer_refs(state.transfer_meta)
+            # Soft promotion (units.on_host_released)
+            # also for a coalesced restore retired here.
+            if self.tier_runtime is not None and self.tier_runtime.units is not None:
+                self.tier_runtime.units.on_host_released(
+                    state.transfer_meta.cpu_block_ids
+                )
+
+    def _check_transfer_age(self) -> None:
+        if self.tier_runtime is None:
+            return
+        now = time.monotonic()
+        issued = list(self._store_issued_at.values()) + [
+            state.issued_at
+            for state in (
+                *self._reqs_to_load.values(),
+                *self._abandoned_reqs_to_load.values(),
+                *self._ready_promotions.values(),
+            )
+            if state.issued_at is not None
+        ]
+        if any(
+            now - start > kv_host_tier_lifecycle.TRANSFER_TIMEOUT_S
+            for start in issued
+        ):
+            # No completion means no proof of quiescence. Keep all leases.
+            raise RuntimeError("host-tier transfer timed out; storage quarantined")
+
+    def _census(self):
+        census = self.tier_runtime.census
+        gpu = self._gpu_block_pool
+        # With the census off only the scheduler reference is bound.
+        if (census.scheduler is not self or
+                (census.enabled and gpu is not None and
+                 getattr(gpu.evict_groups, "census", None) is not census)):
+            census.bind(self)
+        return census
+
+    def get_tier_stats(self) -> TierStats:
+        return replace(self.tier_stats)
+
+    def _cached_blocks_by_group(self) -> list[int]:
+        """CPU blocks currently holding a cached hash, per KV cache group."""
+        counts = [0] * len(self.cpu_kv_cache_config.kv_cache_groups)
+        for blk in self.cpu_block_pool.blocks:
+            bhash = blk.block_hash
+            if bhash is not None and not blk.is_null:
+                counts[get_group_id(bhash)] += 1
+        return counts
+
+    def _maybe_log_tier(self, now: float | None = None) -> None:
+        """One INFO line per TIER_LOG_INTERVAL_S while the counters move.
+
+        For log readers: occupancy per group (density), host-tier
+        tokens (prefill by source), boundary-store drops and the grid-skip
+        cost. Cumulative counters; take deltas between lines.
+        """
+        now = time.monotonic() if now is None else now
+        if now - self._tier_log_last < TIER_LOG_INTERVAL_S:
+            return
+        self._tier_log_last = now
+        stats = self.tier_stats
+        census = (self.tier_runtime.snapshot_counters()
+                  if self.tier_runtime is not None else None)
+        # plan/backing/txn counters move too.
+        plans = self.tier_plans.log_counters() if self.tier_plans else None
+        # write-back counters move (demote
+        # misses, drops, credits) without TierStats / census / plans moving;
+        # they are part of the change test, and a forced line every
+        # TIER_LOG_FORCE_S keeps a frozen tier visible in a replay.
+        wbc = (self.writeback.snapshot_counters()
+               if self.writeback is not None else None)
+        if (stats == self._tier_log_logged and
+                census == getattr(self, "_census_log_logged", None)
+                and plans == getattr(self, "_plans_log_logged", None)
+                and wbc == self._wb_log_logged
+                and now - self._tier_log_forced < TIER_LOG_FORCE_S):
+            return
+        self._tier_log_forced = now
+        self._wb_log_logged = wbc
+        self._plans_log_logged = plans
+        self._tier_log_logged = replace(stats)
+        self._census_log_logged = census
+        by_group = self._cached_blocks_by_group()
+        b = self.boundary_store_stats
+        logger.info(
+            "SimpleCPU tier: cpu_blocks used=%d/%d cached_by_group=%s "
+            "fa_group=%d fa_block_size=%d "
+            "lookups=%d hit_lookups=%d hit_tokens=%d loaded_tokens=%d "
+            "loaded_blocks=%d stored_blocks=%d boundary_stored=%d "
+            "boundary_dropped_cpu_full=%d census=%s",
+            # The pool's block 0 is the null block, never free and never used.
+            self.num_cpu_blocks - 1 - self.cpu_block_pool.get_num_free_blocks(),
+            self.num_cpu_blocks - 1,
+            by_group,
+            self.fa_gidx,
+            self.fa_block_size,
+            stats.lookups,
+            stats.hit_lookups,
+            stats.hit_tokens,
+            stats.loaded_tokens,
+            stats.loaded_blocks,
+            stats.stored_blocks,
+            b.stored,
+            b.dropped_cpu_full,
+            vars(census) if census is not None else {},
+        )
+        # write-back counters.
+        if wbc is not None:
+            logger.info(
+                "SimpleCPU tier write-back: %s",
+                " ".join(
+                    f"{f.name}={getattr(wbc, f.name)}"
+                    for f in fields(kv_host_tier_writeback.WritebackCounters)
+                ),
+            )
+        # Plan admission, union benefit,
+        # backing provenance, transactions, name=int.
+        if plans is not None:
+            logger.info(
+                "SimpleCPU tier plans: %s",
+                " ".join(f"{name}={value}" for name, value in plans.items()),
+            )
 
     # TODO(yifan): this API now only matches the suffix part of the prefix cache. A more
     # general API should scan blocks in both GPU and CPU block pool in a single pass.
@@ -405,17 +805,31 @@ class SimpleCPUOffloadScheduler:
         # Store tracking (eager mode only). Register the request;
         # block IDs are accumulated from scheduler_output in
         # _prepare_eager_store_specs via yield_req_data.
-        if not self._lazy_mode and req_id not in self._reqs_to_store:
+        # write-back keeps no per-request store state.
+        if (
+            not self._lazy_mode
+            and self.writeback is None
+            and req_id not in self._reqs_to_store
+        ):
             self._reqs_to_store[req_id] = StoreRequestState(
                 request=request,
                 block_ids=tuple([] for _ in range(num_groups)),
                 num_stored_blocks=[0] * num_groups,
             )
 
+        # a plan admission builds its load
+        # from the plan's slots.
+        if self.tier_plans is not None and self.tier_plans.on_admitted(
+            request, blocks
+        ):
+            return
         # Pop the CPU hit cached by get_num_new_matched_tokens(). The
         # found blocks were pinned there to survive LRU eviction in the window
         # between get_num_new_matched_tokens() and this matching call.
         pending = self._pending_cpu_hits.pop(req_id, None)
+        if self.tier_runtime is not None:
+            self._census().admission(req_id, num_external_tokens, pending)
+            self.tier_runtime.on_admission(req_id, num_external_tokens)
 
         if num_external_tokens == 0:
             if pending is not None:
@@ -496,19 +910,37 @@ class SimpleCPUOffloadScheduler:
 
         # Touch GPU blocks to prevent freeing during async load
         assert self._gpu_block_pool is not None
+        if self.tier_runtime is not None:
+            self.tier_runtime.check_load_destinations(
+                self._gpu_block_pool, gpu_block_ids, req_id
+            )
         self._gpu_block_pool.touch(
             [self._gpu_block_pool.blocks[bid] for bid in gpu_block_ids]
         )
 
         assert self._reqs_to_load.get(req_id) is None
         self._reqs_to_load[req_id] = LoadRequestState(
-            request=request, transfer_meta=TransferMeta(gpu_block_ids, cpu_block_ids)
+            request=request,
+            transfer_meta=TransferMeta(
+                gpu_block_ids, cpu_block_ids, cache_epoch=self.cache_epoch
+            ),
         )
+        self.tier_stats.loaded_tokens += num_external_tokens
+        self.tier_stats.loaded_blocks += len(cpu_block_ids)
 
     def build_connector_meta(
         self,
         scheduler_output: SchedulerOutput,
     ) -> SimpleCPUOffloadMetadata:
+        self._retire_ready_promotions()
+        self._check_transfer_age()
+        self._sched_step += 1
+        if self.tier_runtime is not None:
+            self._census().step(scheduler_output)
+        self._maybe_log_tier()
+        gpu_tier = self._gpu_block_pool.tier if self._gpu_block_pool else None
+        if gpu_tier is not None:
+            gpu_tier.advance_step(self._sched_step + 1)
         # --- Stores ---
         store_event = -1
         store_gpu, store_cpu, store_req_ids, store_meta = self.prepare_store_specs(
@@ -525,9 +957,18 @@ class SimpleCPUOffloadScheduler:
         if store_gpu:
             store_event = self._store_event_counter
             self._store_event_counter += 1
+            self._store_issued_at[store_event] = time.monotonic()
             self._store_event_to_blocks[store_event] = TransferMeta(
-                store_gpu, store_cpu, store_meta
+                store_gpu, store_cpu, store_meta, cache_epoch=self.cache_epoch
             )
+            if self.tier_runtime is not None:
+                assert self._gpu_block_pool is not None
+                self._store_event_to_blocks[store_event].gpu_block_keys = (
+                    self.tier_runtime.snapshot(self._gpu_block_pool, store_gpu)
+                )
+            # One store event = one demotion txn.
+            if self.writeback is not None:
+                self.writeback.issue(store_event, store_gpu)
             if store_req_ids:  # For eager mode only, track req->blocks mapping
                 self._store_event_to_reqs[store_event] = store_req_ids
                 for req_id in store_req_ids:
@@ -540,24 +981,72 @@ class SimpleCPUOffloadScheduler:
         load_gpu: list[int] = []
         load_cpu: list[int] = []
         load_req_ids: list[str] = []
+        # Per request (gpu, cpu) of this tick.
+        load_parts: list[tuple[list[int], list[int]]] = []
+        failed_recving: set[str] = set()
+        if self.tier_plans is not None:
+            self.tier_plans.begin_tick()
         for req_id, load_state in self._reqs_to_load.items():
             if load_state.load_event is not None:
                 continue
+            # Publish once; -1 means no DMA.
+            if load_state.failed:
+                load_state.load_event = -1
+                failed_recving.add(req_id)
+                continue
             assert load_state.transfer_meta is not None
+            # Plan restores issue in
+            # credit-bounded batches; the manifest stays leased throughout.
+            batch = (
+                self.tier_plans.next_batch(req_id)
+                if self.tier_plans is not None
+                else None
+            )
+            if batch is not None:
+                if not batch[0]:
+                    continue
+                load_gpu.extend(batch[0])
+                load_cpu.extend(batch[1])
+                load_req_ids.append(req_id)
+                load_parts.append(batch)
+                continue
             load_gpu.extend(load_state.transfer_meta.gpu_block_ids)
             load_cpu.extend(load_state.transfer_meta.cpu_block_ids)
             load_req_ids.append(req_id)
-        if load_req_ids:
+            load_parts.append((
+                list(load_state.transfer_meta.gpu_block_ids),
+                list(load_state.transfer_meta.cpu_block_ids),
+            ))
+        # With the tier, one load event (one
+        # per-rank load transaction) per request: a copy failure fails and
+        # un-keys only that request's restore.
+        load_transfers: list[tuple[int, list[int], list[int]]] = []
+        if load_req_ids and self.tier_runtime is not None:
+            for req_id, (gpu, cpu) in zip(load_req_ids, load_parts):
+                event = self._load_event_counter
+                self._load_event_counter += 1
+                self._reqs_to_load[req_id].load_event = event
+                self._reqs_to_load[req_id].issued_at = time.monotonic()
+                self._load_event_to_reqs[event] = [req_id]
+                load_transfers.append((event, gpu, cpu))
+            load_event = load_transfers[0][0]
+        elif load_req_ids:
             load_event = self._load_event_counter
             self._load_event_counter += 1
             for req_id in load_req_ids:
                 self._reqs_to_load[req_id].load_event = load_event
+                self._reqs_to_load[req_id].issued_at = time.monotonic()
             self._load_event_to_reqs[load_event] = load_req_ids
+        # The credit account counts H2D.
+        if self.tier_plans is not None:
+            self.tier_plans.end_tick()
 
         result = SimpleCPUOffloadMetadata(
             load_event=load_event,
             load_gpu_blocks=load_gpu,
             load_cpu_blocks=load_cpu,
+            # Several events this tick.
+            load_transfers=load_transfers if len(load_transfers) > 1 else [],
             load_event_to_reqs={
                 event_idx: list(req_ids)
                 for event_idx, req_ids in self._load_event_to_reqs.items()
@@ -565,7 +1054,16 @@ class SimpleCPUOffloadScheduler:
             store_event=store_event,
             store_gpu_blocks=store_gpu,
             store_cpu_blocks=store_cpu,
-            need_flush=bool(scheduler_output.preempted_req_ids),
+            # Transfer leases replace the
+            # synchronize-all flush (the worker already skips it).
+            need_flush=bool(scheduler_output.preempted_req_ids)
+            and self.tier_runtime is None,
+            failed_recving=failed_recving,
+            scheduled_step=self._sched_step,
+            acked_step=self.acked,
+            # Every DMA address owns a transfer ref.
+            transfer_leases=self.tier_runtime is not None,
+            cache_epoch=self.cache_epoch,
         )
         return result
 
@@ -578,10 +1076,70 @@ class SimpleCPUOffloadScheduler:
         list[dict[BlockHashWithGroupId, BlockStoreMeta]] | None,
     ]:
         """Prepare store specs for the store event."""
+        if self.writeback is not None:
+            return self._prepare_writeback_store_specs(scheduler_output)
         if self._lazy_mode:
             return self._prepare_lazy_store_specs()
         else:
             return self._prepare_eager_store_specs(scheduler_output)
+
+    def _prepare_writeback_store_specs(
+        self, scheduler_output: SchedulerOutput
+    ) -> tuple[
+        list[int],
+        list[int],
+        list[str],
+        list[dict[BlockHashWithGroupId, BlockStoreMeta]] | None,
+    ]:
+        """Write-back victims from the GPU free-queue head. Boundary hand-offs
+        and positional blocks are not copy triggers: a retained checkpoint is
+        demoted with its unit once it is a victim.
+        """
+        wb = self.writeback
+        assert wb is not None
+        loads = (*self._reqs_to_load.values(), *self._abandoned_reqs_to_load.values())
+        wb.counters.promote_pins = sum(
+            len(s.transfer_meta.cpu_block_ids)
+            for s in loads
+            if s.transfer_meta is not None
+        )
+        wb.promote_dma = sum(
+            # a plan load's issued batch.
+            self.tier_plans.dma_blocks(s)
+            if self.tier_plans is not None
+            else len(s.transfer_meta.cpu_block_ids)
+            for s in loads
+            if s.transfer_meta is not None
+            and s.load_event is not None
+            and s.load_event >= 0
+        )
+        # Staged members of assembling units are retained too.
+        # One credit stays free for a
+        # waiting restore batch.
+        wb.promote_reserved = (
+            self.tier_plans.waiting_for_credit() if self.tier_plans is not None else 0
+        )
+        # Quarantine: abandoned loads (reset) and cancelled loads whose DMA is
+        # still in flight; both hold only the pairs
+        # their outstanding batch can still write.
+        wb.account_quarantine(self._quarantined_pairs())
+        picked = wb.select(
+            self._sched_step, len(scheduler_output.num_scheduled_tokens)
+        )
+        if not picked:
+            return [], [], [], None
+        gpu_ids = [b.block_id for b in picked]
+        # The destinations are the rows the walker
+        # reserved (a started unit's own reservation, or the exact idle rows
+        # of a lone victim), each held with the one ref this transfer owns.
+        cpu_blocks = wb.host_rows
+        assert cpu_blocks is not None and len(cpu_blocks) == len(picked)
+        assert all(b.ref_cnt == 1 and b.block_hash is None for b in cpu_blocks)
+        cpu_ids = [b.block_id for b in cpu_blocks]
+        # Payload-less events, as hand-off stores emit: the block's own hashes
+        # are registered (and emitted) at completion.
+        meta = [{} for _ in gpu_ids] if self.enable_kv_cache_events else None
+        return gpu_ids, cpu_ids, [], meta
 
     def _prepare_lazy_store_specs(
         self,
@@ -699,8 +1257,12 @@ class SimpleCPUOffloadScheduler:
             scheduled_for_req = False
             # ``boundary_tokens`` is not needed here: the cache key comes from
             # the handed-off block itself, not from the offered boundary.
-            for _, gpu_block_id, _ in entries:
+            for group_id, gpu_block_id, _ in entries:
                 stats.published += 1
+                if group_id not in self.prefix_cacheable_group_ids:
+                    # Checked before the id is used as a pool index.
+                    stats.dropped_skipped_group += 1
+                    continue
                 gpu_block = gpu_block_pool.blocks[gpu_block_id]
                 admission = self._classify_store_candidate(gpu_block)
                 if admission is _StoreAdmission.NULL_BLOCK:
@@ -807,6 +1369,30 @@ class SimpleCPUOffloadScheduler:
         # same event. Completion tracking is set-based, so keep one request ID.
         req_ids = list(dict.fromkeys(req_ids))
         return merged_gpu_block_ids, merged_cpu_block_ids, req_ids, merged_block_meta
+
+    # Shared with allocator/union readiness checks.
+    @property
+    def acked(self) -> int:
+        return self.commit_acks.acked
+
+    def _sync_tier_readiness(
+        self, new_masked: set[tuple[str, int]], frontier_reported: bool = True
+    ) -> None:
+        """Feed rank acks into the GPU pool's content readiness (the
+        ``BlockTierState``): masked dispositions first, then the frontier.
+        Content a masked commit should have written is never valid, so its
+        GPU blocks are un-hashed (never served, never demoted)."""
+        pool = self._gpu_block_pool
+        tier = pool.tier if pool is not None else None
+        if tier is None:
+            return
+        stale: set[int] = set()
+        for producer, step in new_masked:
+            stale.update(tier.mark_masked(producer, step))
+        if stale:
+            pool.evict_blocks(stale)
+        if frontier_reported:
+            tier.set_acked_step(self.commit_acks.acked)
 
     def _cached_gpu_block(
         self, resolved_hashes: "BlockHashList", block_idx: int, group_id: int
@@ -1010,17 +1596,67 @@ class SimpleCPUOffloadScheduler:
         per-event worker counts. We accumulate across steps and process
         a store event only when all workers have reported completion.
         """
+        # per-rank load transaction reports.
+        meta = connector_output.kv_connector_worker_meta
+        if self.tier_runtime is not None and isinstance(
+            meta, SimpleCPUOffloadWorkerMetadata
+        ):
+            for key, reports in meta.load_reports.items():
+                self.report_load_txn(
+                    key, [(r, ok, quiet) for r, (ok, quiet) in reports.items()]
+                )
+
         # --- Load completions ---
+        # a failed restore: un-key its host
+        # blocks before cleanup; the scheduler recomputes the request.
+        failed_recving = connector_output.failed_recving or ()
         for req_id in list(connector_output.finished_recving or []):
+            # a batch of a plan restore
+            # landed; the receive finishes with its last batch.
+            state = self._reqs_to_load.get(req_id)
+            if (
+                self.tier_plans is not None
+                and state is not None
+                and self.tier_plans.withhold_receive(
+                    req_id, state, req_id in failed_recving
+                )
+            ):
+                connector_output.finished_recving.discard(req_id)
+                continue
+            if self.tier_runtime is not None:
+                self._tier_load_finished(req_id, req_id in failed_recving)
             completed_blocks = self._cleanup_load_request(req_id)
             if completed_blocks:
                 self._interval_load_blocks_completed += completed_blocks
 
-        # --- Store completions ---
-        meta = connector_output.kv_connector_worker_meta
+        # --- Store completions --- 
         if not isinstance(meta, SimpleCPUOffloadWorkerMetadata):
             return
-        for event_idx, count in meta.completed_store_events.items():
+        # Cumulative observations per rank.
+        if self.tier_runtime is not None:
+            self._census().worker.update(getattr(meta, "census", {}))
+        # Install masked rows before readiness.
+        new_masked = meta.masked_rows - self.commit_acks.masked_rows
+        self.commit_acks.update(meta.committed_steps, meta.masked_rows)
+        self._sync_tier_readiness(new_masked, bool(meta.committed_steps))
+        # Bound the masked-row set.
+        self._prune_masked_rows()
+        wb = self.writeback
+        # Events that only carry rank reports.
+        events = dict(meta.completed_store_events)
+        if wb is not None:
+            for _, event_idx, _ in meta.store_reports:
+                events.setdefault(event_idx, 0)
+        for event_idx, count in events.items():
+            # Demotion txns count ranks, not
+            # reports, so a repeated report never completes a txn early.
+            if wb is not None and wb.owns(event_idx):
+                self._report_store_txn(event_idx, meta)
+                continue
+            # a settled or unknown demotion txn
+            # (duplicate report) never reaches the report-count path.
+            if wb is not None:
+                continue
             total = self._store_event_pending_counts.get(event_idx, 0) + count
             if total >= self._expected_worker_count:
                 self._store_event_pending_counts.pop(event_idx, None)
@@ -1028,13 +1664,184 @@ class SimpleCPUOffloadScheduler:
             else:
                 self._store_event_pending_counts[event_idx] = total
 
-    def _process_store_event(self, event_idx: int) -> None:
-        """Process a fully-completed store event."""
+    def _report_store_txn(
+        self, event_idx: int, meta: SimpleCPUOffloadWorkerMetadata
+    ) -> None:
+        """Apply one step's per-rank reports to a demotion transaction.
+
+        COMMIT publishes; UNWIND (a rank failed, all quiescent) publishes
+        nothing: the sources stay GPU-resident as before the demote and the
+        staged host blocks are released. PENDING keeps every pin (a failed or
+        unprovable rank stays quarantined until it proves quiescence or the
+        age bound fails the engine stop)."""
+        wb = self.writeback
+        assert wb is not None
+        transfer = self._store_event_to_blocks.get(
+            event_idx
+        ) or self._abandoned_store_event_to_blocks.get(event_idx)
+        reports: list[tuple[int, bool, bool]] = []
+        dropped = 0
+        for (epoch, txn, _batch), ranks in meta.store_reports.items():
+            if txn != event_idx:
+                continue
+            if transfer is not None and epoch != transfer.cache_epoch:
+                # A report from another cache epoch proves nothing here.
+                self.txn_report_mismatches += 1
+                dropped += 1
+                continue
+            reports.extend((r, ok, quiet) for r, (ok, quiet) in ranks.items())
+        legacy = meta.store_ack_ranks.get(event_idx)
+        if legacy is not None:
+            reports.extend((r, True, True) for r in legacy)
+        if not reports:
+            if event_idx in meta.completed_store_events and not dropped:
+                raise RuntimeError(
+                    f"host-RAM KV tier: store event {event_idx} completed "
+                    "without rank acks"
+                )
+            return
+        state = wb.report(event_idx, reports)
+        if state is kv_host_tier_lifecycle.TxnState.COMMIT:
+            self._process_store_event(event_idx)
+        elif state is kv_host_tier_lifecycle.TxnState.UNWIND:
+            self.store_txn_failures += 1
+            wb.failed_txns += 1
+            logger.warning(
+                "host-RAM KV tier: demotion txn %d failed on rank(s) %s; "
+                "nothing is published, sources stay GPU-resident",
+                event_idx,
+                sorted(r for r, ok, _ in reports if not ok),
+            )
+            self._process_store_event(event_idx, failed=True)
+
+    def report_load_txn(
+        self,
+        key: tuple[int, int, int],
+        reports: "Iterable[tuple[int, bool, bool]]",
+    ) -> kv_host_tier_lifecycle.TxnState | None:
+        """Per-rank reports ``(rank, success, quiescent)`` of one load
+        (promotion) transaction ``key = (epoch, load event, batch)``.
+
+        The transaction resolves when every rank reported quiescent: COMMIT
+        completes its requests; UNWIND (a rank failed, or the report belongs
+        to an older cache epoch) fails them so they recompute from the last
+        good boundary, drops the host blocks the load read and releases the
+        lease. PENDING changes nothing. Returns None for a transaction that
+        already resolved (a duplicate report is a no-op)."""
+        if key in self._load_resolved:
+            return None
+        epoch, event, batch = key
+        acks = self._load_acks.get(key)
+        if acks is None:
+            acks = kv_host_tier_lifecycle.TxnAcks(
+                epoch, event, batch, self._expected_worker_count
+            )
+            self._load_acks[key] = acks
+        for rank, success, quiescent in reports:
+            acks.report(rank, success, quiescent)
+        state = acks.state
+        if state is kv_host_tier_lifecycle.TxnState.PENDING:
+            return state
+        del self._load_acks[key]
+        self._load_resolved[key] = None
+        while len(self._load_resolved) > 8192:
+            self._load_resolved.pop(next(iter(self._load_resolved)))
+        # A transport failure is an UNWIND only. A load that succeeded for an
+        # older cache epoch is invalidated (no publication; its requests take
+        # the failed-receive cleanup) but is not a transport failure.
+        unwound = state is kv_host_tier_lifecycle.TxnState.UNWIND
+        failed = unwound or epoch != self.cache_epoch
+        if unwound:
+            self.load_txn_failures += 1
+        elif failed:
+            self.load_stale_epoch_completions += 1
+        for req_id in list(self._load_event_to_reqs.get(event, ())):
+            # a non-final credit batch of a
+            # plan restore committed: the next batch issues, the receive goes on.
+            state = self._reqs_to_load.get(req_id)
+            if (
+                self.tier_plans is not None
+                and state is not None
+                and self.tier_plans.batch_committed(req_id, state, event, failed)
+            ):
+                continue
+            if self.tier_runtime is not None:
+                self._tier_load_finished(req_id, failed, stale=failed and not unwound)
+            completed = self._cleanup_load_request(req_id)
+            if completed:
+                self._interval_load_blocks_completed += completed
+        return state
+
+    def load_txn_key(self, req_id: str) -> tuple[int, int, int] | None:
+        """The (epoch, load event, batch) key a request's issued promotion is
+        acked under, or None before it was issued (or when it needs no DMA)."""
+        state = self._reqs_to_load.get(req_id) or self._abandoned_reqs_to_load.get(
+            req_id
+        )
+        if state is None or state.load_event is None or state.load_event < 0:
+            return None
+        return (state.transfer_meta.cache_epoch, state.load_event, 0)
+
+    def _tier_load_finished(
+        self, req_id: str, failed: bool, *, stale: bool = False
+    ) -> None:
+        assert self.tier_runtime is not None
+        if failed:
+            state = self._reqs_to_load.get(req_id) or self._abandoned_reqs_to_load.get(
+                req_id
+            )
+            if state is not None and state.transfer_meta is not None:
+                # Never publish a failed promotion.
+                state.failed = True
+                # a plan restore un-keys only
+                # the host blocks its issued batches read.
+                read = (
+                    self.tier_plans.read_sources(req_id)
+                    if self.tier_plans is not None
+                    else None
+                )
+                self.tier_runtime.invalidate_failed_load(
+                    req_id,
+                    state.transfer_meta.cpu_block_ids if read is None else read,
+                    stale=stale,
+                )
+        self._census().load_done(req_id, failed and not stale, cancelled=stale)
+        self.tier_runtime.on_load_done(req_id)
+
+    # ``failed``: a rank reported the copy failed.
+    def _process_store_event(self, event_idx: int, failed: bool = False) -> None:
+        """Process a fully-completed store event (``failed``: a rank reported
+        the copy failed, so nothing is published)."""
+        self._store_issued_at.pop(event_idx, None)
         transfer = self._store_event_to_blocks.pop(event_idx, None)
+        # a txn from an older cache epoch never
+        # publishes (reset() also moves it to the abandoned map).
+        txn = self.writeback.take_txn(event_idx) if self.writeback else None
+        # One stale path for both epoch fences
+        # (the manager's cache epoch and the demotion txn's).
+        if transfer is not None and (
+            failed
+            or transfer.cache_epoch != self.cache_epoch
+            or (txn is not None and not self.writeback.is_current(txn))
+        ):
+            if failed and not self._lazy_mode:
+                self._in_flight_store_gpu_blocks.difference_update(
+                    transfer.gpu_block_ids
+                )
+            self._abandoned_store_event_to_blocks[event_idx] = transfer
+            transfer = None
         if transfer is None:
             transfer = self._abandoned_store_event_to_blocks.pop(event_idx, None)
             if transfer is None:
                 return  # guard stale events from before a reset() call
+            # Demotion sources are released by
+            # their tickets (end_demote), never twice.
+            if txn is not None:
+                self.cpu_block_pool.free_blocks(
+                    self.cpu_block_pool.blocks[bid] for bid in transfer.cpu_block_ids
+                )
+                self.writeback.release_stale(txn)
+                return
             self._release_transfer_refs(transfer)
             return
 
@@ -1045,6 +1852,8 @@ class SimpleCPUOffloadScheduler:
             transfer.gpu_block_ids,
             transfer.cpu_block_ids,
             transfer.block_meta,
+            gpu_block_keys=transfer.gpu_block_keys,
+            demote_txn=txn,
         )
         logger.debug(
             "Store event %d completed: cached %d blocks to CPU",
@@ -1067,29 +1876,74 @@ class SimpleCPUOffloadScheduler:
         gpu_block_ids: list[int],
         cpu_block_ids: list[int],
         block_meta: list[dict[BlockHashWithGroupId, BlockStoreMeta]] | None = None,
+        gpu_block_keys: list[Any] | None = None,
+        demote_txn: "kv_host_tier_writeback.DemoteTxn | None" = None,
     ) -> None:
         """Register copied blocks in the CPU prefix cache and release refs."""
         assert len(cpu_block_ids) == len(gpu_block_ids)
         assert block_meta is None or len(block_meta) == len(gpu_block_ids)
 
         cpu_blocks = [self.cpu_block_pool.blocks[bid] for bid in cpu_block_ids]
+        self.tier_stats.stored_blocks += len(cpu_blocks)
 
         assert self._gpu_block_pool is not None
+        # Whether each source's copy was published.
+        landed = [False] * len(gpu_block_ids)
         for i, (gpu_block_id, cpu_block) in enumerate(zip(gpu_block_ids, cpu_blocks)):
             gpu_block = self._gpu_block_pool.blocks[gpu_block_id]
+            # a demotion publishes only the content
+            # its copy read (same generation and key as at begin_demote).
+            if demote_txn is not None and not self.writeback.still_valid(
+                gpu_block_id
+            ):
+                continue
+            # Register under the keys the source
+            # held from issue to now, else discard (TierRuntime, item 1).
+            tier_keys = None
+            if gpu_block_keys is not None and self.tier_runtime is not None:
+                tier_keys = self.tier_runtime.keys_to_register(
+                    self._gpu_block_pool, gpu_block_id, gpu_block_keys[i]
+                )
+                if tier_keys is None:
+                    continue
+                landed[i] = True
             primary_hash = gpu_block.block_hash
             assert primary_hash is not None
+            was_keyed = cpu_block.block_hash is not None
             self.cpu_block_pool._insert_block_hash(
                 primary_hash,
                 cpu_block,
                 num_tokens=gpu_block.block_hash_num_tokens,
             )
+            if self.tier_runtime is not None:
+                self.tier_runtime.on_registered(cpu_block, was_keyed)
+                # The host copy is of the content the demotion read (design
+                # 2.2); a store outside a demotion proves no identity.
+                gpu_tier = self._gpu_block_pool.tier
+                if gpu_tier is not None:
+                    ticket = (
+                        self.writeback.in_flight.get(gpu_block_id)
+                        if demote_txn is not None and self.writeback is not None
+                        else None
+                    )
+                    gpu_tier.note_host_copy(
+                        cpu_block.block_id, ticket.cid if ticket is not None else 0
+                    )
             secondary_hashes = self._gpu_block_pool.cached_block_hashes_by_block.get(
                 gpu_block_id, ()
             )
+            if tier_keys is not None:
+                secondary_hashes = tier_keys
             for block_hash in secondary_hashes:
                 self.cpu_block_pool._insert_block_hash(
                     block_hash, cpu_block, num_tokens=None
+                )
+            # a newer generation supersedes the
+            # older same-key host copies, so a restore can only
+            # resolve the bytes a GPU hit would return.
+            if self._gpu_block_pool.tier is not None:
+                self._gpu_block_pool.tier.supersede_host_copies(
+                    self.cpu_block_pool, cpu_block, (primary_hash, *secondary_hashes)
                 )
             if self.enable_kv_cache_events:
                 meta_by_hash = block_meta[i] if block_meta is not None else {}
@@ -1155,11 +2009,29 @@ class SimpleCPUOffloadScheduler:
                         )
                     )
 
+        # a unit still assembling keeps its landed
+        # rows (one ref each) until it publishes or is lost.
+        if self.tier_runtime is not None and self.tier_runtime.units is not None:
+            self.tier_runtime.units.hold_unpublished(cpu_blocks)
         # Free CPU and GPU blocks' ref counts to turn them into prefix cache
         self.cpu_block_pool.free_blocks(cpu_blocks)
-        self._gpu_block_pool.free_blocks(
-            self._gpu_block_pool.blocks[bid] for bid in gpu_block_ids
-        )
+        # a published source is clean and goes to
+        # the free-queue front (it is the next reuse); a discarded one stays
+        # dirty (BlockTierState.end_demote).
+        if demote_txn is not None:
+            self.writeback.finish(demote_txn, landed)
+        else:
+            self._gpu_block_pool.free_blocks(
+                self._gpu_block_pool.blocks[bid] for bid in gpu_block_ids
+            )
+        # a unit's last member landed: publish it
+        # (a unit is a lookup source only once every member is on the
+        # host and acked by every rank; until then its rows are invisible).
+        if self.tier_runtime is not None and self.tier_runtime.units is not None:
+            units = self.tier_runtime.units
+            for uid in {u.uid for b in cpu_blocks for u in units.unit_of_block(b)}:
+                units.publish_unit(uid, self._sched_step)
+            units.on_host_registered(cpu_blocks)
 
     def _release_transfer_refs(self, transfer: TransferMeta) -> None:
         """Release transfer refs without making copied data cacheable."""
@@ -1176,6 +2048,10 @@ class SimpleCPUOffloadScheduler:
             self._pending_finished_stores
             or self._store_event_to_blocks
             or self._abandoned_store_event_to_blocks
+            # Idle and drain steps poll loads too.
+            or self._reqs_to_load
+            or self._abandoned_reqs_to_load
+            or self._ready_promotions
         )
 
     def request_finished(
@@ -1186,6 +2062,13 @@ class SimpleCPUOffloadScheduler:
         """Always returns (False, None). GPU blocks are protected by ref_cnt,
         so the scheduler can free blocks immediately."""
         req_id = request.request_id
+        if self.tier_runtime is not None:
+            self._census().gone(req_id)
+            self.tier_runtime.on_request_gone(req_id)
+        if self.writeback is not None:
+            self.writeback.forget_request(req_id)
+        if self.tier_plans is not None:
+            self.tier_plans.forget(req_id)
 
         # Release any temp CPU hit pin from get_num_new_matched_tokens()
         # if request is canceled or preempted before update_state_after_alloc()
@@ -1193,11 +2076,32 @@ class SimpleCPUOffloadScheduler:
         if pending is not None:
             self._free_pending_cpu_hit(pending)
 
+        # Dropping a follower never revokes DMA refs.
+        emptied = []
+        for key, waiters in self._promotion_waiters.items():
+            if req_id in waiters:
+                waiters.discard(req_id)
+                if not waiters:
+                    emptied.append(key)
+        if emptied and self.tier_plans is not None:
+            # The last follower of a finished leader is gone, so
+            # the staging kept for it is cut back to the outstanding batch.
+            for key in emptied:
+                self.tier_plans.release_for_key(key)
+        # Completion may precede request cleanup.
+        ready = self._ready_promotions.get(req_id)
+        if ready is not None:
+            ready.finished = True
+            self._retire_ready_promotions()
         # Handle load: defer cleanup if load is in-flight
         load_state = self._reqs_to_load.get(req_id)
         if load_state is not None:
             if load_state.load_event is not None:
                 load_state.finished = True  # Defer: load in-flight
+                # Quarantine only the
+                # batch in flight; release the rest now.
+                if self.tier_plans is not None:
+                    self.tier_plans.release_unoutstanding(req_id, load_state)
             else:
                 self._cleanup_load_request(req_id)
 
@@ -1212,12 +2116,50 @@ class SimpleCPUOffloadScheduler:
 
         return False, None
 
+    def _quarantined_pairs(self) -> int:
+        """Pairs a DMA can still write: the outstanding batch of cancelled
+        or abandoned loads. Staging a surviving follower keeps is retention,
+        not quarantine."""
+        total = 0
+        entries = (
+            *self._abandoned_reqs_to_load.items(),
+            *(
+                (rid, s) for rid, s in self._reqs_to_load.items()
+                if s.finished and s.load_event is not None and s.load_event >= 0
+            ),
+        )
+        for rid, s in entries:
+            if s.transfer_meta is None:
+                continue
+            total += (
+                self.tier_plans.dma_blocks(s)
+                if self.tier_plans is not None
+                else len(s.transfer_meta.cpu_block_ids)
+            )
+        return total
+
     def request_finished_all_groups(
         self,
         request: "Request",
         block_ids: tuple[list[int], ...],
     ) -> tuple[bool, dict[str, Any] | None]:
-        self._queue_finished_eager_store(request, block_ids)
+        if self.tier_runtime is not None:
+            self._census().remember(request)
+        # write-back: no finish-time flush; the
+        # freed blocks are demoted from the free-queue head when they are
+        # victims.
+        if self.writeback is None:
+            self._queue_finished_eager_store(request, block_ids)
+        # The request-history ledger
+        # (E's denominator) records the finished turn before the unit does.
+        if self.tier_runtime is not None:
+            self.tier_runtime.on_request_finished(request)
+        # The restore unit, rediscovered by key.
+        unit = None
+        if self.tier_runtime is not None and self.tier_runtime.units is not None:
+            unit = self.tier_runtime.units.record_finished(request)
+        # lifecycle: the finished turn to the copy scheduler.
+        kv_host_tier_hooks.notify_finished(self, request, unit)
         return self.request_finished(request, block_ids=[])
 
     def _queue_finished_eager_store(
@@ -1258,7 +2200,7 @@ class SimpleCPUOffloadScheduler:
     ) -> int | None:
         """Locate the full-attention prompt-tail block for a fine-grained hit.
 
-        Mirrors ``FullAttentionManager._cache_partial_tail_block``: only the
+        Mirrors ``FullAttentionManager._cache_prompt_tail_block``: only the
         final prompt hash boundary is eligible, and boundaries that land on a
         physical block edge are already covered by the positional scan.
 
@@ -1333,6 +2275,9 @@ class SimpleCPUOffloadScheduler:
             state = self._abandoned_reqs_to_load.pop(req_id, None)
         if state is None:
             return 0
+        # Publish before the refs drop.
+        if self.tier_plans is not None:
+            self.tier_plans.on_load_retired(req_id, state)
         # Remove from load event mapping (only this req, not whole event)
         if state.load_event is not None:
             reqs = self._load_event_to_reqs.get(state.load_event)
@@ -1342,12 +2287,33 @@ class SimpleCPUOffloadScheduler:
                 if not reqs:
                     self._load_event_to_reqs.pop(state.load_event, None)
 
+        # Keep a completed immutable promotion
+        # leased until normal cache publication, or publish it after cancellation.
+        if (
+            state.lease is not None
+            and not state.failed
+            and state.lease.epoch == self.cache_epoch
+            and state.load_event is not None
+            and state.load_event >= 0
+            and self._promotion_waiters.get(state.lease.key)
+        ):
+            self._ready_promotions[req_id] = state
+            self._retire_ready_promotions()
+            return len(state.transfer_meta.gpu_block_ids)
+        if state.lease is not None:
+            self._promotions.pop(state.lease.key, None)
+            self._promotion_waiters.pop(state.lease.key, None)
         if state.transfer_meta is not None:
             # Free CPU touch refs
             self.cpu_block_pool.free_blocks(
                 self.cpu_block_pool.blocks[bid]
                 for bid in state.transfer_meta.cpu_block_ids
             )
+            # Soft promotion (units.on_host_released).
+            if self.tier_runtime is not None and self.tier_runtime.units is not None:
+                self.tier_runtime.units.on_host_released(
+                    state.transfer_meta.cpu_block_ids
+                )
             # Free GPU touch refs
             assert self._gpu_block_pool is not None
             self._gpu_block_pool.free_blocks(
@@ -1392,11 +2358,31 @@ class SimpleCPUOffloadScheduler:
         the transfer finished, then release refs without caching abandoned
         store results.
         """
+        # Visibility changes before physical reuse.
+        self.cache_epoch += 1
+        self._promotions.clear()
+        self._promotion_waiters.clear()
+        if self.tier_plans is not None:
+            self.tier_plans.reset()
+        for state in self._ready_promotions.values():
+            self._release_transfer_refs(state.transfer_meta)
+        self._ready_promotions.clear()
+        if self.tier_runtime is not None:
+            self.tier_runtime.unkey_all_for_reset()
+        else:
+            self.cpu_block_pool.evict_blocks({
+                block.block_id for block in self.cpu_block_pool.blocks
+                if block.block_hash is not None
+            })
         for pending in self._pending_cpu_hits.values():
             self._free_pending_cpu_hit(pending)
         self._pending_cpu_hits.clear()
 
         self._abandoned_store_event_to_blocks.update(self._store_event_to_blocks)
+        # New epoch: in-flight demotions drain
+        # without publishing; their sources stay pinned until the DMA is done.
+        if self.writeback is not None:
+            self.writeback.reset()
         for transfer in self._pending_finished_stores:
             self._release_transfer_refs(transfer)
         self._pending_finished_stores.clear()
@@ -1413,6 +2399,10 @@ class SimpleCPUOffloadScheduler:
                 self._cleanup_load_request(req_id)
             else:
                 self._abandoned_reqs_to_load[req_id] = state
+                # Only the batch in flight
+                # stays quarantined.
+                if self.tier_plans is not None:
+                    self.tier_plans.release_unoutstanding(req_id, state)
 
         self._reqs_to_store.clear()
         self._store_event_to_reqs.clear()
@@ -1436,6 +2426,11 @@ class SimpleCPUOffloadScheduler:
         )
         self.boundary_store_stats = undrained
         self._boundary_stats_snapshot = BoundaryStoreStats()
+        self.tier_stats = TierStats()
+        self._tier_log_logged = None
+        self._wb_log_logged = None
+        if self.tier_runtime is not None:
+            self._census().reset()
         # NOTE: _load_event_counter / _store_event_counter are not
         # reset as they are monotonic and must stay ahead of the workers
         # high-water marks to avoid event index collisions
@@ -1443,4 +2438,6 @@ class SimpleCPUOffloadScheduler:
         if self._abandoned_store_event_to_blocks or self._abandoned_reqs_to_load:
             return False
 
+        # No host copy survives; GPU backing is
+        # revalidated on every query, so the twins are dirty again as is.
         return self.cpu_block_pool.reset_prefix_cache()

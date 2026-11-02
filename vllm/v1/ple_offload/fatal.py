@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright 2026 halt95 (Merlin modifications)
 """Fail-closed helpers for the PLE single-slot transport."""
 
 import functools
@@ -51,11 +51,10 @@ def notify_parent_fatal() -> None:
     The executor's only other signal is the process sentinel, which the kernel
     closes when the LAST task of the worker leaves -- after the address-space
     teardown, not at os._exit. On a rank whose GPU work is paired with a live
-    peer that teardown can wait for the peer's exit (in a rank-1 fault test, a
-    fail-closed fault on PP0_TP1 left its leader Z and unreapable for 300 s
-    while rank 0 waited on it in turn; the engine hung on the response
-    queue). One byte here wakes the monitor at once so the failure ladder ends
-    the peers, which is what frees the teardown. Nonblocking, never raises:
+    peer that teardown can wait for the peer's exit, while the peer waits on
+    this rank in turn, and the engine hangs on the response queue. One byte
+    here wakes the monitor at once so the failure ladder ends the peers,
+    which is what frees the teardown. Nonblocking, never raises:
     the caller os._exits right after, whatever happens here.
     """
     fd = _FATAL_NOTIFY_FD

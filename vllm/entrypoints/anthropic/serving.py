@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by the Merlin project; see NOTICE.
 # Adapted from
 # https://github.com/vllm-project/vllm/blob/main/vllm/entrypoints/openai/chat_completion/serving.py
 
@@ -564,6 +565,15 @@ class AnthropicServingMessages(OpenAIServingChat):
                         tool_reference.append(
                             {"type": "tool_reference", "name": ref_name}
                         )
+            # The served chat templates raise on a structured tool_reference
+            # part, so each reference is rendered as a text line in this tool
+            # message instead of a second structured tool message. The
+            # renderer's structured tool_reference path (chat_utils) stays for
+            # OpenAI-endpoint clients. With the list emptied here, the
+            # structured-message branch further down never runs for this
+            # endpoint; it is kept unchanged from upstream.
+            text_parts.extend(f"Tool reference: {r['name']}" for r in tool_reference)
+            tool_reference = []
             tool_text = "\n".join(text_parts)
 
         openai_messages.append(

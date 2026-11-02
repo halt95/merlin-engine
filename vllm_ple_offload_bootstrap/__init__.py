@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright 2026 halt95 (Merlin modifications)
 """Minimal PLE child bootstrap; intentionally imports no torch or vLLM."""
 
 import importlib.abc
@@ -14,13 +14,22 @@ from types import ModuleType
 from typing import Any
 
 _FAULT = None
-if os.environ.get("VLLM_PLE_TEST_FAULT") is not None:
-    from vllm_ple_test_fault import (
-        _FAULT as _FAULT,
-    )
-    from vllm_ple_test_fault import (
-        _block_on_harness_gate,
-    )
+# The same gate as vllm/v1/ple_offload/test_fault.py: unset, empty and "0" mean
+# off; any other value arms the test-only injector.
+if os.environ.get("VLLM_PLE_TEST_FAULT", "0").strip() not in ("", "0"):
+    try:
+        from vllm_ple_test_fault import (
+            _FAULT as _FAULT,
+        )
+        from vllm_ple_test_fault import (
+            _block_on_harness_gate,
+        )
+    except ImportError as exc:
+        raise RuntimeError(
+            "VLLM_PLE_TEST_FAULT is set but the test-only injector package "
+            "'vllm_ple_test_fault' is not importable (put tests/v1/ple_offload "
+            "on PYTHONPATH, or unset VLLM_PLE_TEST_FAULT / set it to 0)"
+        ) from exc
 
 
 def _send_partial_ready_frame(fd: int) -> tuple[int, int]:

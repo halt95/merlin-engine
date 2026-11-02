@@ -1,7 +1,6 @@
 // merlin-hook: csrc-topk-vendored
 // Upstream v0.32.0rc0 sampled top-k, ported into the Merlin op, in its own translation unit
-// (see merlin_sampled_topk_launch.h for why). Behaviour is the branch that used to be inlined in
-// launch_persistent_topk() in topk.cu.
+// (see merlin_sampled_topk_launch.h for why). launch_persistent_topk() in topk.cu launches it.
 
 #include "merlin/topk/merlin_sampled_topk_launch.h"
 

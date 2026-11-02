@@ -208,7 +208,10 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         divisor = int(config.make_ngram_vocab_size_divisible_by)
         padded_vocab_size = ((total_vocab_size + divisor - 1) // divisor) * divisor
         embedding_prefix = f"{prefix}.ngram_embedding"
-        embedding_quant_method = Qwen4ExpPLEEmbeddingMethod.from_quant_config(
+        # Select the PLE table format: a fork format (BF16, INT6 or INT8), else
+        # upstream's FP8 or unquantized method.
+        from .ple_formats import select_ple_embedding_method as _select_method
+        embedding_quant_method = _select_method(
             quant_config,
             embedding_prefix,
             getattr(config, "ple_embedding_dtype", None),
@@ -417,8 +420,8 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         """Device-table lookup through the compile-profile custom ops."""
         embedding = self.ngram_embedding
         if embedding.supports_prefetch:
-            # Unreachable: __init__ refuses the pinned-host (UVA) table. The
-            # v0.30 prefetch ops were not carried to the 0.32 prefetch API.
+            # Unreachable: __init__ refuses the pinned-host (UVA) table, and the
+            # fork has no prefetch compile ops for it.
             raise NotImplementedError(
                 "Qwen4Exp PLE compile ops do not cover the pinned-host table"
             )
@@ -516,7 +519,9 @@ class Qwen4ExpNGramEmbedding(nn.Module):
                     0,
                     min(shard_size, embedding.org_vocab_size - checkpoint_start),
                 )
-                expected_shape = (expected_rows, embedding.embedding_dim)
+                # The table's own row width
+                # (== embedding_dim for FP8 / BF16; 130 / 162 B for INT6 / INT8 rows)
+                expected_shape = (expected_rows, embedding.weight.shape[1])
                 if tuple(loaded_weight.shape) != expected_shape:
                     raise ValueError(
                         f"Shape mismatch for PLE embedding shard {shard_index}: "

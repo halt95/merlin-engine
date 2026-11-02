@@ -1,3 +1,4 @@
+<!-- Modified by the Merlin project; see NOTICE. -->
 
 # Distributed KV cache transfer
 
@@ -22,7 +23,7 @@ NOTE: If you want to not only transfer KV caches, but adjust the model execution
 
 ## Disaggregated prefilling
 
-Example usage can be found in [this directory](../../../examples/disaggregated).
+Example usage is in upstream vLLM v0.32.0 (`examples/disaggregated/`); this release does not ship it.
 
 Here is the diagram of how we run disaggregated prefilling.
 

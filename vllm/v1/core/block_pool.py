@@ -30,6 +30,8 @@ from vllm.v1.core.kv_cache_utils import (
 )
 from vllm.v1.core.cache_thrash import EvictGroups
 from vllm.v1.request import Request
+# The GPU pool's host-tier block state.
+from vllm.v1.core.kv_tier_state import BlockTierState
 
 logger = init_logger(__name__)
 
@@ -60,6 +62,15 @@ class BlockHashToBlockMap:
         self._cache: dict[
             BlockHashWithGroupId, KVCacheBlock | dict[int, KVCacheBlock]
         ] = {}
+
+    def get_blocks(self, key: BlockHashWithGroupId) -> tuple[KVCacheBlock, ...]:
+        """Read every duplicate so lookup can select a ready publication."""
+        blocks = self._cache.get(key)
+        if blocks is None:
+            return ()
+        if isinstance(blocks, KVCacheBlock):
+            return (blocks,)
+        return tuple(blocks.values())
 
     def get_one_block(self, key: BlockHashWithGroupId) -> KVCacheBlock | None:
         """Gets any block with the given block hash key."""
@@ -170,6 +181,10 @@ class BlockPool:
         self.medium = medium
         self.enable_caching = enable_caching
         self.hash_block_size = hash_block_size
+        # Every key inserted (a KeyLog, set
+        # by the host tier): a cached prefix plan is re-resolved only when a
+        # key of its own request appeared.
+        self.key_log = None
         # All kv-cache blocks.
         self.blocks: list[KVCacheBlock] = [
             KVCacheBlock(idx, pool=self) for idx in range(num_gpu_blocks)
@@ -193,6 +208,9 @@ class BlockPool:
         self.kv_event_queue: list[KVCacheEvent] = []
 
         self.metrics_collector = metrics_collector
+        # GPU-side state of the host tier
+        # (vllm/v1/core/kv_tier_state.py); None without the tier.
+        self.tier: BlockTierState | None = None
         # Callbacks for blocks released with ``unpin_blocks`` whose contents
         # are still being read until the pool reuses them.
         self._reuse_watchers: dict[int, Callable[[KVCacheBlock], None]] = {}
@@ -300,6 +318,8 @@ class BlockPool:
                 blk,
                 num_tokens=num_hash_tokens,
             )
+            if self.tier is not None:
+                self.tier.on_published(blk, request)
             if new_hashes is not None:
                 new_hashes.append(maybe_convert_block_hash(block_hash))
 
@@ -524,6 +544,8 @@ class BlockPool:
             block,
             num_tokens=num_hash_blocks * self.hash_block_size,
         )
+        if self.tier is not None:
+            self.tier.on_published(block, request)
         if self.enable_kv_cache_events and not already_cached:
             parent_hash, block_start = self._get_partial_block_parent_hash_and_start(
                 request, num_tokens
@@ -564,6 +586,28 @@ class BlockPool:
                 )
             )
         return block_hash_with_group_id
+
+    def is_partial_block_cached(
+        self,
+        request: Request,
+        block: KVCacheBlock,
+        num_tokens: int,
+        kv_cache_group_id: int,
+    ) -> bool:
+        """Whether ``cache_partial_block`` with these arguments would be a
+        no-op: ``block`` already carries the partial entry at ``num_tokens``
+        (as its primary hash or an alias)."""
+        if block.is_null:
+            return False
+        block_hash_with_group_id = make_block_hash_with_group_id(
+            self._get_partial_block_hash(request, num_tokens), kv_cache_group_id
+        )
+        return (
+            block.block_hash == block_hash_with_group_id
+            or self.cached_block_hash_to_block.contain(
+                block_hash_with_group_id, block.block_id
+            )
+        )
 
     def _get_partial_block_hash(
         self,
@@ -610,6 +654,8 @@ class BlockPool:
                 is not None
             ):
                 removed_hashes.append(block_hash)
+        if self.tier is not None:
+            self.tier.on_unhashed(block, removed_hashes)
         block.reset_hash()
         return removed_hashes
 
@@ -649,6 +695,23 @@ class BlockPool:
                 block_hash_with_group_id
             )
         self.cached_block_hash_to_block.insert(block_hash_with_group_id, block)
+        if self.key_log is not None:
+            self.key_log.append(block_hash_with_group_id)
+
+    def publish_restored(
+        self,
+        block_hash_with_group_id: BlockHashWithGroupId,
+        block: KVCacheBlock,
+        num_tokens: int | None,
+        host_block_id: int | None = None,
+    ) -> None:
+        """Key a block whose bytes a completed host restore wrote, read from
+        host block ``host_block_id`` (its content id is inherited). Unlike a
+        request's publication it has no producing step: the content is final
+        on every rank (the copy was quiesced) and is stamped ready."""
+        self._insert_block_hash(block_hash_with_group_id, block, num_tokens)
+        if self.tier is not None:
+            self.tier.on_restored(block, host_block_id)
 
     def move_block_hashes(
         self,
@@ -667,6 +730,8 @@ class BlockPool:
         for block_hash in self._remove_cached_block_hashes(src_block):
             # `num_tokens` only applies to the first (primary) insertion.
             self._insert_block_hash(block_hash, dst_block, num_tokens=num_tokens)
+        if self.tier is not None:
+            self.tier.on_moved(src_block, dst_block)
 
     def get_new_blocks(self, num_blocks: int) -> list[KVCacheBlock]:
         """Get new blocks from the free block pool.
@@ -683,9 +748,7 @@ class BlockPool:
         if num_blocks > self.get_num_free_blocks():
             raise ValueError(f"Cannot get {num_blocks} free blocks from the pool")
 
-        ret: list[KVCacheBlock] = self.evict_groups.pop_free_blocks(
-            num_blocks
-        )
+        ret: list[KVCacheBlock] = self.evict_groups.pop_free_blocks(num_blocks)
 
         if self._reuse_watchers:
             self._notify_reuse(ret)
@@ -693,6 +756,8 @@ class BlockPool:
         # In order to only iterate the list once, we duplicated code a bit
         if self.enable_caching:
             for block in ret:
+                if self.tier is not None:
+                    self.tier.on_reclaim(block)
                 self._maybe_evict_cached_block(block)
                 assert block.ref_cnt == 0
                 block.ref_cnt += 1
@@ -765,16 +830,18 @@ class BlockPool:
             blocks: A list of blocks to touch.
 
         """
+        leaving: list[KVCacheBlock] = []
         for block in blocks:
             # ref_cnt=0 means this block is in the free list (i.e. eviction
             # candidate), so remove it.
             if block.ref_cnt == 0 and not block.is_null:
                 self.free_block_queue.remove(block)
-                if self.evict_groups:
-                    self.evict_groups.leave(block)
+                leaving.append(block)
             block.ref_cnt += 1
             if self.metrics_collector:
                 self.metrics_collector.on_block_accessed(block)
+        if leaving and self.evict_groups:
+            self.evict_groups.leave_many(leaving)
 
     def is_block_writable(self, block: KVCacheBlock) -> bool:
         """Return whether a block can be mutated by its sole owner."""
@@ -812,6 +879,26 @@ class BlockPool:
         self.free_block_queue.append_n(blocks_to_evict_last)
         for pool, blocks in other_pools.items():
             pool.free_blocks(blocks)
+
+    def free_blocks_to_front(self, ordered_blocks: Iterable[KVCacheBlock]) -> None:
+        """Release references like ``free_blocks``, but every block that
+        reaches ref 0 goes to the front of the free queue with its hashes
+        kept, in the given order (the first is reused first). A demotion
+        source whose host copy just landed is the cheapest reuse there is."""
+        released: list[KVCacheBlock] = []
+        for block in ordered_blocks:
+            assert block.pool is None or block.pool is self
+            block.ref_cnt -= 1
+            if block.ref_cnt == 0 and not block.is_null:
+                released.append(block)
+        self.free_block_queue.prepend_n(released)
+        if self.tier is not None:
+            self.tier.on_front_requeued(len(released))
+
+    def is_block_ready(self, block: KVCacheBlock) -> bool:
+        """Whether ``block``'s content is final on every rank (always True
+        without the tier: stream order is the only fence then)."""
+        return self.tier is None or self.tier.is_ready(block)
 
     def evict_blocks(self, block_ids: set[int]) -> None:
         """Evict blocks from the prefix cache by their block IDs.
@@ -864,6 +951,8 @@ class BlockPool:
         # Remove all hashes from all blocks.
         for block in self.blocks:
             block.reset_hash()
+        if self.tier is not None:
+            self.tier.on_reset()
 
         if self.metrics_collector:
             self.metrics_collector.reset()

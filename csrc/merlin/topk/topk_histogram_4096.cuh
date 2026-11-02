@@ -66,7 +66,7 @@ __device__ __forceinline__ void load_float4_predicated(const float* ptr,
   v3 = __uint_as_float(r3);
 }
 
-// converts the float32 score to a 32-bit ordered unsigned integer — the full
+// converts the float32 score to a 32-bit ordered unsigned integer -- the full
 // precision key for radix sorting
 __device__ __forceinline__ auto convert_to_uint32_v2(float x) -> uint32_t {
   uint32_t bits = __float_as_uint(x);
@@ -84,7 +84,7 @@ __device__ __forceinline__ uint32_t extract_coarse_bin_N(float x) {
   return key >> (16 - kBits);
 }
 
-// running sum within each warp — thread 0 gets its own value, thread 1 gets
+// running sum within each warp -- thread 0 gets its own value, thread 1 gets
 // thread 0 + thread 1, thread 2 gets threads 0+1+2, etc.
 __device__ __forceinline__ uint32_t warp_inclusive_sum(uint32_t lane,
                                                        uint32_t v) {
@@ -309,7 +309,7 @@ __device__ void tie_handle_large(const Tie* ties, uint32_t num_ties,
 
 // ============================================================================
 // Register-based single-CTA fast path for seq_len <= 16384
-// 4 float4 per thread × 1024 threads = 16384 elements max
+// 4 float4 per thread x 1024 threads = 16384 elements max
 // Uses 4096-bin (12-bit) histogram for better precision
 // ============================================================================
 

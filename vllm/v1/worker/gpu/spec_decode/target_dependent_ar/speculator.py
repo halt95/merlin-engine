@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Modified by the Merlin project; see NOTICE.
+from dataclasses import replace
 from typing import Any
 
 import torch
@@ -12,6 +13,10 @@ from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
+from vllm.merlin.flashinfer_smallq import (
+    note_event,
+    plan_identity,
+)
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backends.draft_bounded_plan import draft_seq_len_bounds
 from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
@@ -34,10 +39,6 @@ class TargetDependentARSpeculator(DraftModelSpeculator):
     hidden states (and, for Gemma4, its KV cache) at each draft step.
     """
 
-    # propose() stages through _copy_request_inputs and every draft
-    # sample (prefill, individual and fused decode) goes through sample_draft,
-    # so the runner-prepared top-k/top-p buffers reach all of them.
-    supports_draft_under_topk = True
     # Every draft sample (prefill, individual and fused decode) passes
     # self.current_draft_step, a persistent device scalar that the prefill-input
     # kernel zeroes and fill_(step) advances, while sample_src_positions moves
@@ -328,11 +329,27 @@ class TargetDependentARSpeculator(DraftModelSpeculator):
 
         self._prepare_eplb_forward(num_tokens)
 
+        smallq_identity = ()
+        if (
+            envs.MERLIN_FLASHINFER_WORKLOAD_TILE
+            and prefill_batch_desc.cg_mode == CUDAGraphMode.FULL
+        ):
+            smallq_identity = plan_identity(attn_metadata)
+            assert self.prefill_cudagraph_manager is not None
+            if not self.prefill_cudagraph_manager.has_fullgraph(
+                prefill_batch_desc, smallq_identity
+            ):
+                prefill_batch_desc = replace(
+                    prefill_batch_desc, cg_mode=CUDAGraphMode.NONE
+                )
+                note_event("draft-prefill FULL fallback to NONE", logger.info)
         self.on_prefill_begin(num_reqs)
         if prefill_batch_desc.cg_mode == CUDAGraphMode.FULL:
             # Replay the full graph for draft prefill.
             assert self.prefill_cudagraph_manager is not None
-            self.prefill_cudagraph_manager.run_fullgraph(prefill_batch_desc)
+            self.prefill_cudagraph_manager.run_fullgraph(
+                prefill_batch_desc, identity=smallq_identity
+            )
         else:
             # The target model's attention metadata and slot mappings
             # can directly be used for draft prefill, because of the

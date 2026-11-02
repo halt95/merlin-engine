@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Merlin 3.0.0: shim for the one launcher, tools/merlin/launch.py --profile 27b-tp2-3090 --checkpoint 27b-thinkingcap.
+# Shim for the one Merlin launcher, tools/merlin/launch.py --profile 27b-tp2-3090 --checkpoint 27b-thinkingcap.
 # ThinkingCap on two cards: the 27B TP2 shape with the ThinkingCap checkpoint (reasoning effort medium by default; a THINKING you set yourself wins).
 #   MODEL=/path/to/thinkingcap-checkpoint PORT=8100 bash models/thinkingcap/serve.sh
 set -euo pipefail

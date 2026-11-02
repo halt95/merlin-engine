@@ -1,23 +1,20 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright 2026 halt95 (Merlin modifications)
 """Offline FP8 K/V scale calibration for the Qwen4Exp QSA attention layers.
 
-Replaces the in-product collector (``VLLM_QSA_KV_COLLECT``) and the guard
-opt-out it needed (``VLLM_E2_ALLOW_BREAKABLE``). Nothing here is imported by
-the engine: the harness boots a stock ``vllm serve`` with a small worker-side
+Nothing here is imported by the engine: the harness boots a stock ``vllm serve`` with a small worker-side
 hook injected through ``PYTHONPATH`` (a generated ``sitecustomize.py``), drives
 calibration traffic, then max-merges the per-rank dumps into a
 ``VLLM_QSA_KV_SCALES`` sidecar. Collection, traffic and merge run from this one
 tool, with the engine untouched:
 
 * the worker hook wraps ``Qwen4ExpQSAAttention._project_qkv_gate`` and keeps a
-  GPU-side running absmax of the pre-quantisation BF16 K and V per layer (the
-  tensors the old call site saw: ``key``/``value`` are views of ``k``/``v``);
+  GPU-side running absmax of the pre-quantisation BF16 K and V per layer
+  (``key``/``value`` are views of ``k``/``v``);
 * the worker hook replaces the graph-profile guards in ``vllm.v1.e2_guards``
   with no-ops (calibration is eager by design, so the qualified-profile guards
-  would refuse it). The PLE-mode guard is NOT touched, exactly as the old
-  opt-out never disarmed it;
+  would refuse it). The PLE-mode guard is NOT touched;
 * ``--enforce-eager`` is mandatory: the collector mutates state per step, which
   cudagraph capture would freeze.
 
@@ -29,8 +26,7 @@ Subcommands::
 
 ``serve`` replaces itself with ``vllm serve``; run it under ``setsid`` and
 SIGTERM the group after ``traffic``, then ``merge`` the dumps. Dump names are ``qsa_absmax_[pp<P>_]rank<R>.json`` (pp tag only
-when PP > 1), the names the old collector wrote, so merge checks and sidecars
-carry over. The engine never reads ``QSA_CALIBRATE_DIR``.
+when PP > 1), the names merge expects. The engine never reads ``QSA_CALIBRATE_DIR``.
 """
 
 from __future__ import annotations
@@ -60,7 +56,7 @@ LAYERS = {
     f"language_model.model.layers.{n}.self_attn.attn"
     for n in (3, 7, 11, 15, 19, 23, 27, 31, 35, 39, 43, 47)
 }
-DUMP_EVERY = 2000  # layer calls between periodic dumps (as the old collector)
+DUMP_EVERY = 2000  # layer calls between periodic dumps
 
 
 # ---------------------------------------------------------------- worker hook
@@ -175,9 +171,8 @@ def _hook_qsa(collector):
             orig_init(self, *args, **kwargs)
             # vLLM 0.32 (vllm#57097) may fuse the main QK-norm/RoPE/gate and the
             # K/V cache write into the indexer launch, so _project_qkv_gate never
-            # runs and the pre-quantisation K/V are never materialised. The
-            # in-product collector forced the separate kernels
-            # (`and not _qsa_collect_dir`); with it gone the harness does it.
+            # runs and the pre-quantisation K/V are never materialised, so the
+            # harness forces the separate kernels.
             # The flag is read live by the forward and by QSAIndexer.forward.
             self.use_fused_qsa_prepare = False
 
@@ -201,6 +196,7 @@ def cmd_serve(a, extra):
     dump = Path(a.dump_dir)
     if not dump.is_dir() or any(dump.iterdir()):
         sys.exit(f"--dump-dir must be an existing EMPTY dir: {dump}")
+    write_source(dump, a.model, a.max_model_len, extra)
     hookdir = Path(tempfile.mkdtemp(prefix="qsa-calib-hook-"))
     (hookdir / "sitecustomize.py").write_text(
         "import importlib.util as u\n"
@@ -233,6 +229,47 @@ def cmd_serve(a, extra):
     os.execvpe(cmd[0], cmd, env)
 
 
+SOURCE = "calib_source.json"  # serve writes it into the dump dir; merge turns it into the sidecar's provenance file
+
+
+def provenance_path(sidecar) -> Path:
+    """``<sidecar stem>.provenance.json`` next to the sidecar: the engine's loader takes layer entries only, so the
+    calibration source travels beside the scales, never inside them (the launcher reads it)."""
+    p = Path(sidecar)
+    return p.with_name(p.stem + ".provenance.json")
+
+
+def _config_rope_is_yarn(cfg: Path) -> bool:
+    """True when the checkpoint's own config.json already selects YaRN (rope_scaling / rope_parameters, top level or
+    text_config), so a boot without a YaRN override still serves YaRN."""
+    try:
+        conf = json.loads(cfg.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    for scope in (conf, conf.get("text_config") if isinstance(conf, dict) else None):
+        if not isinstance(scope, dict):
+            continue
+        for key in ("rope_scaling", "rope_parameters"):
+            rope = scope.get(key)
+            if isinstance(rope, dict) and "yarn" in (str(rope.get("rope_type", "")), str(rope.get("type", ""))):
+                return True
+    return False
+
+
+def write_source(dump: Path, model: str, max_model_len: int, extra: list[str]) -> None:
+    """What the dumps were calibrated on: the checkpoint's config.json hash and the RoPE the boot served."""
+    import hashlib
+
+    cfg = Path(model) / "config.json"
+    src = {
+        "model": str(Path(model).resolve()),
+        "config_sha256": hashlib.sha256(cfg.read_bytes()).hexdigest() if cfg.is_file() else None,
+        "max_model_len": max_model_len,
+        "rope": "yarn" if any("yarn" in x for x in extra) or _config_rope_is_yarn(cfg) else "native",
+    }
+    (dump / SOURCE).write_text(json.dumps(src, indent=1), encoding="utf-8")
+
+
 # -------------------------------------------------------------------- traffic
 def cmd_traffic(a, _extra):
     import base64
@@ -248,7 +285,7 @@ def cmd_traffic(a, _extra):
     base = f"http://127.0.0.1:{a.port}/v1"
     words = (
         "harbour dawn quiet boats rest still granite ledger crimson orbit velvet "
-        "thunder archive lantern mosaic quarry sable meridian copper glacier fable "
+        "thunder archive lantern mosaic quarry sable meridian copper glacier marble "
         "sextant bramble hollow zenith cinder plume rivet tundra ember lattice"
     ).split()
     rng = random.Random(1949)
@@ -342,7 +379,7 @@ def cmd_merge(a, _extra):
     stray = sorted(x.name for x in d_dir.iterdir() if x.name.endswith(".tmp"))
     if stray:
         die(f"unfinished dump temp files present: {stray}")
-    mark = float(Path(a.after).read_text().strip()) if a.after else None
+    mark = float(Path(a.after).read_text(encoding="utf-8").strip()) if a.after else None
     per_stage, merged = {}, {}
     for f in files:
         if mark is not None and os.path.getmtime(f) <= mark:
@@ -383,6 +420,14 @@ def cmd_merge(a, _extra):
         fh.write(json.dumps(sidecar, indent=1, allow_nan=False))
     if set(json.loads(out.read_text(encoding="utf-8"))) != LAYERS:
         die("re-read of the written sidecar failed")
+    src = d_dir / SOURCE
+    if src.is_file():
+        prov = dict(json.loads(src.read_text(encoding="utf-8")), margin=a.margin)
+        provenance_path(out).write_text(json.dumps(prov, indent=1), encoding="utf-8")
+        print(f"provenance: {provenance_path(out)}")
+    else:
+        print(f"note: no {SOURCE} in {d_dir} (dumps from an older serve): no provenance file; the launcher "
+              "cannot check these scales against the checkpoint")
     print(
         f"PASS merged {len(files)} dump files (stages {sorted(per_stage)}), "
         f"{len(sidecar)} layers, margin {a.margin}: {out}"

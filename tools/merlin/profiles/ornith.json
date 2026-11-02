@@ -3,6 +3,7 @@
  "model": "ornith",
  "labels": {
   "tested": "tested on the reference host",
+  "testing": "🟡 testing: full-model runs passed on cloud-hosted hardware; kernel parity qualification still to run",
   "untested": "untested / community-validated"
  },
  "reference": {

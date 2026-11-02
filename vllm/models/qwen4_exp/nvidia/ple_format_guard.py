@@ -17,12 +17,21 @@ from vllm.models.qwen4_exp.common.ngram_embedding import (
     Qwen4ExpPLEFp8EmbeddingMethod,
     Qwen4ExpPLEUnquantizedEmbeddingMethod,
 )
+from vllm.models.qwen4_exp.nvidia.ple_formats import (
+    Qwen4ExpPLEInt6G32EmbeddingMethod,
+    Qwen4ExpPLEInt8RowEmbeddingMethod,
+)
 
 #: The only valid (method, stored dtype) pairs. FP8 also needs its global scale,
 #: which ``Qwen4ExpPLEFp8EmbeddingMethod.process_weights_after_loading`` checks.
+#: The packed tables (INT6 g32, INT8 row) are checked on their interleaved
+#: U8 rows, after ``Qwen4ExpNGramEmbeddingPull.load_weights`` paired each shard's
+#: ``.codes`` / ``.scales`` (whose own dtypes and shapes the interleave checks).
 _VALID: tuple[tuple[type, frozenset[torch.dtype]], ...] = (
     (Qwen4ExpPLEUnquantizedEmbeddingMethod, frozenset({torch.bfloat16, torch.float16})),
     (Qwen4ExpPLEFp8EmbeddingMethod, frozenset({torch.float8_e4m3fn})),
+    (Qwen4ExpPLEInt6G32EmbeddingMethod, frozenset({torch.uint8})),
+    (Qwen4ExpPLEInt8RowEmbeddingMethod, frozenset({torch.uint8})),
 )
 
 

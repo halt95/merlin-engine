@@ -1,5 +1,8 @@
 # v2.5.2 card — 2026-10-12 (against v2.5.1: decode ladder, prefill, idle power)
 
+> **Historical switch.** `VLLM_E2_GUARD_IDLE` below belongs to the measured v2.x engines. It is no longer registered on
+> vLLM 0.32, where idle parking is built in; setting it does not restore polling. See the [current running notes](../../models/flash-next/docs/reference.md#running-notes).
+
 > **Provenance.** Maintainer measurements on the reference host (4× RTX 3090, 220 W, PCIe P2P, no NVLink; driver
 > 610.43.02), public Merlin checkpoint. The decode, prefill and after-ladder idle readings come from one ladder boot per
 > engine (10:19-10:54 UTC), each a fresh install through its own package launcher with defaults (`GUARD=warn`; v2.5.2 adds `VLLM_E2_GUARD_IDLE=1`). v2.5.1 = published source

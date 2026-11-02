@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright 2026 halt95 (Merlin modifications)
 """GDN attention metadata for RecoverSSM speculative decode (Qwen-style Gated DeltaNet).
 
 Wraps the generic GDN builder: every active decode row runs through the spec path (a
@@ -15,6 +15,9 @@ import torch
 
 import vllm.envs as envs
 from vllm.logger import init_logger
+from vllm.model_executor.layers.mamba.recoverssm_utils import (
+    recoverssm_binding_signature as _binding_signature,
+)
 from vllm.v1.attention.backend import AttentionCGSupport, CommonAttentionMetadata
 from vllm.v1.attention.backends.gdn_attn import (
     GDNAttentionBackend,
@@ -110,15 +113,6 @@ class GDNRecoverSSMMetadata(GDNAttentionMetadata, RecoverSSMMetadata):
             self,
             recoverssm_commit=clone_commit_tensors(c, self.num_spec_decodes),
         )
-
-
-def _binding_signature(checkpoints: Any) -> tuple:
-    """Storage identity of every layer's checkpoint: (data_ptr, shape, stride).
-
-    The context's address table (base addresses, block strides) is derived from
-    exactly these values. Tensor identity alone does not pin them: ``set_()``
-    (or an in-place resize) moves a tensor's storage while keeping the object."""
-    return tuple((t.data_ptr(), t.shape, t.stride()) for t in checkpoints)
 
 
 def _check_context_binding(

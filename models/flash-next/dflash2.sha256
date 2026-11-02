@@ -1,0 +1,5 @@
+# SHA-256 of the 2 serving files of incoai/Qwen3.8-Flash-Next-DFlash2 (Hugging Face revision a22a1744e85c17364dcc54a6a420af7135d4c7f6, 2026-10-19), the DFlash2 drafter of `--spec dflash2`;
+# run 'sha256sum -c' inside the drafter directory. Only what serving reads is listed: README.md, assets/, .gitattributes and patches/ (the card, its image and the capture patch) are downloaded but not checked.
+# Generated from the Hugging Face file metadata (model.safetensors: the LFS sha256; config.json: downloaded and hashed) and matched file for file against the reference-host copy that passed the DFlash2 gates (2026-10-23).
+2409575986f9ea24d455343eb469c0e6940def5edab1d1be503bb8eb4cc3b1b9  config.json
+d6723f2a359eaf33ec0c95f22ae8edda896774020c552296a85e1913b4d3186f  model.safetensors

@@ -1,7 +1,7 @@
 <!-- Modified by the Merlin project from the upstream vLLM README; see NOTICE. -->
 # Merlin engine
 
-Merlin is a vLLM fork tuned for NVIDIA Ampere and Ada (**sm_80, sm_86 and sm_89**) GPUs, with model recipes for Qwen3.8-Flash-Next and Qwen3.8-27B. **Merlin 3.0.0 is built on vLLM 0.32.0.** It combines the engine, launchers, checkpoint checksums and installation tooling in one repository. Model weights stay on Hugging Face.
+Merlin is a vLLM fork tuned for NVIDIA Ampere and Ada (**sm_80, sm_86 and sm_89**) GPUs, with model recipes for Qwen3.8-Flash-Next and Qwen3.8-27B. **Merlin 3.0.1 is built on vLLM 0.32.0.** It combines the engine, launchers, checkpoint checksums and installation tooling in one repository. Model weights stay on Hugging Face.
 
 The fork carries the sm_86 FP8 QSA attention reader, host-memory PLE embedding offload, RecoverSSM, prefix-cache retention, persistent top-k and guard telemetry. It serves an OpenAI-compatible API with vision, reasoning and tool calling. See the [upstream vLLM README](https://github.com/vllm-project/vllm/blob/v0.32.0/README.md) and [vLLM documentation](https://docs.vllm.ai/); Merlin changes are described in [CHANGELOG.md](../CHANGELOG.md) and [NOTICE](../../NOTICE).
 
@@ -17,7 +17,8 @@ The [models/ index](../../models/README.md) leads to each recipe's launchers, re
 | [Qwen3.8-27B](../../models/qwen38-27b/README.md) | 3.0.0 | [Qwen3.8-27B-W4A16-Merlin](https://huggingface.co/halt95/Qwen3.8-27B-W4A16-Merlin) | 2× RTX 3090 TP2 or 4× RTX 3090 TP4 |
 | [ThinkingCap](../../models/thinkingcap/README.md) | 3.0.0 | [ThinkingCap-Qwen3.8-27B-W4A16-Merlin](https://huggingface.co/halt95/ThinkingCap-Qwen3.8-27B-W4A16-Merlin) | Profile of the 27B recipe; separate weight licence |
 
-Every recipe is version 3.0.0 in Merlin 3.0.0; the previous public release is v2.5.3.
+Recipe versions stay at 3.0.0 in Merlin 3.0.1 (the VERSION files are unchanged); the recipe changes are in the
+[changelog](../CHANGELOG.md). The previous public release is Merlin 3.0.0.
 
 ## Install and serve
 
@@ -36,11 +37,11 @@ git clone https://github.com/halt95/merlin-engine.git && cd merlin-engine && ./s
 
 Ctrl+C stops the server; `./setup.sh` again starts it straight away with the saved answers; `git pull && ./setup.sh` updates the engine without re-downloading the model. `--yes --model 27b` answers nothing, `--dry-run` shows the plan, `--reconfigure` asks again; every option, the update flow, where things live and how to uninstall are in [docs/SETUP.md](../../docs/SETUP.md), and [docs/how-to-serve.md](../../docs/how-to-serve.md) walks through it end to end. Nothing is installed system-wide (uv and Python 3.13 live under `.merlin/`, the engine in `venv/`).
 
-**Manual route.** From the Merlin 3.0.0 checkout, install once with the shared [release/install-env.sh](../../release/install-env.sh), download a checkpoint, then serve it:
+**Manual route.** From the Merlin 3.0.1 checkout, install once with the shared [release/install-env.sh](../../release/install-env.sh), download a checkpoint, then serve it:
 
 ```bash
 # Run from the repository root.
-curl -LO https://github.com/halt95/merlin-engine/releases/download/merlin-v3.0.0/vllm-0.32.0+merlin.7002f56537-cp313-cp313-linux_x86_64.whl
+curl -LO https://github.com/halt95/merlin-engine/releases/download/merlin-v3.0.1/vllm-0.32.0+merlin.7002f56537-cp313-cp313-linux_x86_64.whl
 MERLIN_WHEEL="$PWD/vllm-0.32.0+merlin.7002f56537-cp313-cp313-linux_x86_64.whl" bash release/install-env.sh ./venv   # prebuilt engine for sm_80, sm_86 and sm_89, checked against release/merlin-wheel.sha256
 # without MERLIN_WHEEL the installer compiles the engine instead (about 1.5 hours on 8 cores)
 
@@ -66,11 +67,11 @@ Summary of the [hardware matrix](../../docs/merlin/hardware-matrix.md). A build 
 | Hardware and model | Layout | KV pool (tokens) | Evidence |
 |---|---|---|---|
 | 4× RTX 3090: Flash-Next / Nemotron Super VL / Ornith 1.5 | TP2 × PP2 + EP (partition 25/23; 46/42; 25/23) | 924,993 / 1,856,367 (1 × 1M) / 894,618 | 🟢 Tested on the reference host |
-| 4× RTX 3090 without P2P: Flash-Next; Ornith 1.5 | TP2 × PP2 (TP1 × PP4 alternative, partition 12/13/13/10); Ornith, same recipe with P2P off | PP4: ~506,083 (estimate); Ornith 977,838 | ⚫ Untested (Flash-Next); 🟢 Tested on a 4× RTX 3090 host without P2P, 2026-10-21 (Ornith) |
+| 4× RTX 3090 without P2P: Flash-Next; 27B TP4; Ornith 1.5 | TP2 × PP2 (the default); TP1 × PP4 by name (`--profile fn-quad-3090-nop2p-pp4`, partition 12/13/13/10: prefill +47-53 %, decode -14 %); Ornith, same recipe with P2P off | TP2 × PP2: ~924,993 (estimate); PP4: 906,581; Ornith 977,838 | ⚫ Untested (Flash-Next TP2 × PP2, 27B TP4; boot-checked with `--swarm` on 4× RTX 3090 without P2P, 2026-11-01); 🟢 Tested on the reference host with P2P off, 2026-10-19 (Flash-Next PP4); 🟢 Tested on a 4× RTX 3090 host without P2P, 2026-10-21 (Ornith) |
 | 8× RTX 3090, Flash-Next | TP2 × PP4; TP4 × PP2 alternative | Estimated; confirm at boot | ⚫ Untested |
 | 1× or 2× RTX 3090, 27B | TP1 (4 MP images) or TP2 | 271,506 / 826,689 | 🟢 Tested on the reference host |
 | 4× RTX 3090, 27B | TP4, RecoverSSM on | 2,012,105 | 🟢 Tested on the reference host |
-| sm_80 (A100, A30, CMP 170HX) and sm_89 (Lovelace) | Hardware-specific profiles | 4× CMP 170HX 64 GB Flash-Next (PP4 × TP1): 4,638,492; others unmeasured here | 🟢 Tested: 4× CMP 170HX 64 GB Flash-Next (measured 2026-10-19); ⚫ Untested: every other profile |
+| sm_80 (A100, A30, CMP 170HX) and sm_89 (Lovelace) | Hardware-specific profiles | 4× CMP 170HX 64 GB Flash-Next (PP4 × TP1): 4,638,492; others unmeasured here | 🟡 Testing (full-model runs on cloud-hosted cards): 4× RTX 4090 and CMP 170HX 64 GB rows (4× CMP 170HX 64 GB Flash-Next measured 2026-10-19); ⚫ Untested: every other profile |
 
 Flash-Next on two 24 GB cards is not implemented (it would need a host-RAM expert tier); single-card 27B is tested on the reference host (2026-10-21: 4 MP images, one 262K or two 131K sessions; 8 MP needs two or more cards). The generated Swift launcher passed its qualification run on 2026-10-16 and the Merlin 3.0.0 release bench card (2026-10-20, after the 2026-10-17 pre-release bench run): the Swift quad is tested on the reference host. The generated Huihui launcher passed its qualification run on 2026-10-16 and the Merlin 3.0.0 release bench card (2026-10-20): the Huihui quad is tested on the reference host. Swift's 27 T=0 outputs matched the Flash-Next quad despite argv differences; Huihui was checked on its own boot, image, and GSM8K run. Broader hardware and performance claims remain separately scoped.
 
@@ -87,7 +88,7 @@ Flash-Next cold prefill at that design point was **5,423 tok/s**. With MTP off, 
 
 On a vLLM 0.32 candidate build with the FlashInfer 0.7.0.post1 tile enabled, 27B inter-token latency at **4K / 32K / 131K** was **19.99 / 21.41 / 25.27 ms** on TP2 and **15.83 / 16.62 / 18.37 ms** on TP4. The tile-on GSM8K-200 mean was **192.0/200**. These values supersede the earlier untiled 0.32 measurements; they do not qualify the final release assembly.
 
-The Merlin 3.0.0 image cap is **8,388,608 pixels (8 MP)**. 27B TP2 serves images up to 8 MP. With the vision-peak option on (`VLLM_MERLIN_VISION_PEAK=1`, the TP2 launcher default), the 50-item TP2 stress sweep's worst minimum free was 806 MiB per card (2026-10-15), above the 524 MiB floor. A separate knob OFF/ON identity check matched tokens and logprobs on 6/6 prompts. Flash-Next (902 MiB) meets the target. 27B TP4 left 690 MiB free on the retired RecoverSSM-off pin; at the shipped chunk 4096 with RecoverSSM on, the 2026-10-20 bench card measured 862 MiB lowest free (one 8 MP image, two at once, and four in one prompt; 2 cards: 886 MiB), above the 524 MiB floor. Swift's 2026-10-15 window left 902 MiB free on stage 0; the generated Swift launcher passed the 2026-10-16 8 MP burst after 8K prefill with 544 MiB stage-0 minimum free, 20 MiB above the 524 MiB floor. The generated Huihui launcher independently passed the same gate with 902 MiB minimum free. The chunked vision encoder is inert at this cap; larger caps need separate qualification.
+The Merlin image cap is **8,388,608 pixels (8 MP)**. 27B TP2 serves images up to 8 MP. With the vision-peak option on (`VLLM_MERLIN_VISION_PEAK=1`, the TP2 launcher default), the 50-item TP2 stress sweep's worst minimum free was 806 MiB per card (2026-10-15), above the 524 MiB floor. A separate knob OFF/ON identity check matched tokens and logprobs on 6/6 prompts. Flash-Next (902 MiB) meets the target. 27B TP4 left 690 MiB free on the retired RecoverSSM-off pin; at the shipped chunk 4096 with RecoverSSM on, the 2026-10-20 bench card measured 862 MiB lowest free (one 8 MP image, two at once, and four in one prompt; 2 cards: 886 MiB), above the 524 MiB floor. Swift's 2026-10-15 window left 902 MiB free on stage 0; the generated Swift launcher passed the 2026-10-16 8 MP burst after 8K prefill with 544 MiB stage-0 minimum free, 20 MiB above the 524 MiB floor. The generated Huihui launcher independently passed the same gate with 902 MiB minimum free. The chunked vision encoder is inert at this cap; larger caps need separate qualification.
 
 ## Moving from qwen38-flash-next-3090s v2.5.x
 
@@ -97,7 +98,7 @@ The engine now lives at the repository root, and recipes live under `models/<mod
 git remote set-url origin https://github.com/halt95/merlin-engine.git
 ```
 
-Flash-Next FGPC stays off. The 27B keeps FGPC on under its 0.32 name, `--enable-mamba-shared-prefix-checkpoint`. The native context remains 262,144 tokens; YaRN-extended entries change numerics from the 0.30 releases. Sequence parallelism is off by default and can change output rounding. Oversubscribing the KV pool can still thrash prefix caching, and the upstream `qwen3_coder` parser can drop JSON-form `<tool_call>` blocks.
+Flash-Next FGPC stays off. The 27B keeps FGPC on under its 0.32 name, `--enable-mamba-shared-prefix-checkpoint`. The native context remains 262,144 tokens and no shipped profile enables YaRN. A YaRN extension is opt-in through `--hf-overrides` (recipe in [How to serve](../how-to-serve.md#longer-context-with-yarn-flash-next)), is tested at 393,216 tokens on Flash-Next only, and changes numerics from the 0.30 releases. Sequence parallelism is off by default and can change output rounding. Oversubscribing the KV pool can still thrash prefix caching, and the upstream `qwen3_coder` parser can drop JSON-form `<tool_call>` blocks.
 
 ## Licence and security
 

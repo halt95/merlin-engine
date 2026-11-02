@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright 2026 halt95 (Merlin modifications)
 """Dedicated CPU-offload process for PLE embedding layers.
 
 This module implements a standalone process that:
@@ -81,6 +81,25 @@ from vllm.v1.utils import record_function_or_nullcontext
 logger = init_logger(__name__)
 
 _PUBLISH_FENCE = threading.Lock()
+
+
+class _PleShutdownRequested(Exception):
+    """Internal cancellation; never report an orderly stop as a failure."""
+
+
+def _bind_private_ipc_socket(pull_socket: zmq.Socket, ipc_addr: str) -> None:
+    """Create the endpoint owner-only, with no bind-to-chmod exposure window.
+
+    Only the dedicated offload child calls this. Keep the configured address:
+    all local PP/TP/DP processes of this user must connect to the same socket.
+    """
+    if not ipc_addr.startswith("ipc://") or not os.path.isabs(ipc_addr[6:]):
+        raise ValueError("PLE requires an absolute filesystem IPC address")
+    previous_umask = os.umask(0o177)
+    try:
+        pull_socket.bind(ipc_addr)
+    finally:
+        os.umask(previous_umask)
 
 
 def _unlink_ipc_socket(ipc_addr: str) -> None:
@@ -677,12 +696,17 @@ class PleOffloadWorker:
             proc = subprocess.Popen(
                 [
                     sys.executable,
+                    # Omit the implicit cwd import path, retaining PYTHONPATH installs.
+                    "-P",
                     "-m",
                     "vllm_ple_offload_bootstrap",
                     str(child_control.fileno()),
                     str(child_death.fileno()),
                 ],
                 env=child_env,
+                # The owning GPU worker drains consumers before stopping us.
+                # Group SIGINT/SIGTERM must not tear down the producer early.
+                start_new_session=True,
                 close_fds=True,
                 pass_fds=(child_control.fileno(), child_death.fileno()),
             )
@@ -833,7 +857,7 @@ class PleOffloadWorker:
 
             zmq_context = zmq.Context()
             pull_socket = zmq_context.socket(zmq.PULL)
-            pull_socket.bind(ipc_addr)
+            _bind_private_ipc_socket(pull_socket, ipc_addr)
             owns_ipc_socket = True
             logger.info(
                 "Bound IPC address %s; waiting for %d GPU worker registration(s).",
@@ -843,7 +867,9 @@ class PleOffloadWorker:
 
             # READY means that the process can immediately serve requests. Wait
             # for every DP/TP worker to register before notifying the parent.
-            runner.accept_registrations(pull_socket, num_workers)
+            runner.accept_registrations(pull_socket, num_workers, shutdown_event)
+            if shutdown_event.is_set():
+                raise _PleShutdownRequested
             # Checked: the host-mapped pull design must not create a context.
             logger.info(
                 "PLE offload host-mapped pull: CUDA initialized in this process = %s",
@@ -859,6 +885,8 @@ class PleOffloadWorker:
             ready_writer = None  # type: ignore[assignment]
 
             runner.busy_loop(pull_socket, shutdown_event)
+        except _PleShutdownRequested:
+            logger.debug("PLE offload shutdown requested")
         except Exception as error:
             logger.exception("Unexpected failure in PLE offload worker.")
             if ready_writer is not None:
@@ -882,6 +910,21 @@ class PleOffloadRunner:
     """Own all discovered PLE tables and serve every local DP rank."""
 
     def __init__(self, vllm_config: VllmConfig) -> None:
+        disabled = [
+            name
+            for name in (
+                "VLLM_E2_PLE_FAST_IDS",
+                "VLLM_E2_PLE_EARLY_REQUEST",
+            )
+            if not getattr(envs, name)
+        ]
+        if disabled:
+            logger.warning(
+                "PLE offload is using the slower pull path: %s disabled. "
+                "Set VLLM_E2_PLE_FAST_IDS=1 and VLLM_E2_PLE_EARLY_REQUEST=1 "
+                "to match the Merlin launcher.",
+                ", ".join(disabled),
+            )
         self.vllm_config = vllm_config
         self._clamp_input_ids = (
             getattr(vllm_config, "speculative_config", None) is not None
@@ -1040,11 +1083,19 @@ class PleOffloadRunner:
         self,
         pull_socket: zmq.Socket,
         num_workers: int,
+        shutdown_event: threading.Event | None = None,
     ) -> None:
         """Receive every local DP/TP worker's IPC and shared-memory buffers."""
         logger.info("Waiting for %d GPU worker registration(s) ...", num_workers)
         registrations: list[PleOffloadRegistration] = []
         for index in range(num_workers):
+            while True:
+                if shutdown_event is not None and shutdown_event.is_set():
+                    raise _PleShutdownRequested
+                if pull_socket.poll(timeout=100, flags=zmq.POLLIN):
+                    break
+            if shutdown_event is not None and shutdown_event.is_set():
+                raise _PleShutdownRequested
             item = pickle.loads(pull_socket.recv())
             if not isinstance(item, PleOffloadRegistration):
                 raise RuntimeError(
@@ -1414,7 +1465,7 @@ class PleOffloadRunner:
         while int(flag[0]) != 0:
             spins += 1
             if self._shutdown_event is not None and self._shutdown_event.is_set():
-                raise RuntimeError("PLE offload shutting down while waiting for GPU")
+                raise _PleShutdownRequested
             if spins > 200:
                 time.sleep(0.0001)
                 waited = time.monotonic() - start

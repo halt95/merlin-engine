@@ -6,7 +6,10 @@
 # native-source tree ids must match release/merlin-wheel.native.
 # Verify an existing environment without serving or changing installed files:
 #   release/install-env.sh --verify <venv-path> [engine-source-path]
-# After serving a tile-enabled MTP request with this venv:
+# Opt-in: MERLIN_FLASHINFER_WORKLOAD_TILE=1 installs and verifies the FlashInfer
+# 0001+0002 series (workload-aware tile; FLASHINFER_WHEEL=<pinned wheel> keeps it offline).
+# Unset or 0 keeps the default 0001 tile exactly as before. Use the same value for --verify.
+# 27B only: after serving a tile-enabled MTP request with this venv:
 #   release/install-env.sh --check <venv-path> <server-log> [q_len] --tp N
 set -euo pipefail
 
@@ -43,6 +46,12 @@ fi
 
 WHEEL="${MERLIN_WHEEL:-}"
 [ -z "$WHEEL" ] || [ "$MODE" = install ] || die "MERLIN_WHEEL applies to an install only"
+# The engine parses the same knob strictly (vllm/merlin/envs.py): exactly 0 or 1, or unset.
+case "${MERLIN_FLASHINFER_WORKLOAD_TILE-0}" in
+  0) TILE_SERIES=v1 ;;
+  1) TILE_SERIES=v2 ;;
+  *) die "MERLIN_FLASHINFER_WORKLOAD_TILE must be exactly 0 or 1 (or unset)" ;;
+esac
 # A source build must never silently extract an unqualified upstream wheel.
 for v in VLLM_PRECOMPILED_WHEEL_LOCATION VLLM_USE_PRECOMPILED VLLM_USE_PRECOMPILED_RUST VLLM_DOCKER_BUILD_CONTEXT CMAKE_ARGS; do
   [ -z "${!v+x}" ] || die "$v is set; unset it to build from this checkout"
@@ -84,13 +93,13 @@ if [ -n "$WHEEL" ]; then
 wheel $(sha256sum "$WHEEL" | cut -d' ' -f1)  $(basename "$WHEEL")"
 fi
 
-command -v uv >/dev/null || die "uv is required"
 if [ "$MODE" = install ]; then
+  command -v uv >/dev/null || die "uv is required"
   [ ! -e "$VENV" ] && [ ! -L "$VENV" ] || die "$VENV already exists; choose a new venv path"
   # The native CUDA ops need GCC/G++ >= 13 and C++20 (the reference host uses GCC 14). Check before the long install.
   export CC="${CC:-cc}" CXX="${CXX:-c++}"
   export CUDAHOSTCXX="${CUDAHOSTCXX:-$CXX}"
-  for t in cc c++; do command -v "$t" >/dev/null || die "the install needs $t"; done
+  for t in "$CC" "$CXX"; do command -v "$t" >/dev/null || die "the install needs $t"; done
   [ -n "$WHEEL" ] || command -v cargo >/dev/null || die "source build needs cargo"
   for t in "$CC" "$CXX"; do
     v="$("$t" -dumpversion 2>/dev/null | cut -d. -f1)"
@@ -145,11 +154,19 @@ else:
 print("0.32.0 DEPENDENCY PINS OK")
 PY
 
+if [ "$TILE_SERIES" = v2 ]; then
+  # Opt-in series: authenticated 0001+0002 (v2); --verify is offline (embedded hashes).
+  WORKLOAD_PATCH="$REPO/release/apply-flashinfer-workload-patch.py"
+  if [ "$MODE" = install ]; then
+    "$PY" -I "$WORKLOAD_PATCH" ${FLASHINFER_WHEEL:+"$FLASHINFER_WHEEL"}
+  fi
+  "$PY" -I "$WORKLOAD_PATCH" --verify
+else
 if [ "$MODE" = install ]; then
   bash "$FLASHINFER_PATCH" "$VENV"
 fi
 # Verification must reject a missing or edited tile rather than apply it.
-"$PY" -I - <<'PY'
+"$PY" -I - <<'PY' || die "the default 0001 tile does not verify; a venv installed with the opt-in series verifies with MERLIN_FLASHINFER_WORKLOAD_TILE=1"
 import hashlib
 import sys
 import sysconfig
@@ -174,6 +191,7 @@ for name, digest in expected.items():
         sys.exit(f"installed FlashInfer tile is missing or changed: {path}")
 print("FLASHINFER TILE HASHES OK")
 PY
+fi
 
 if [ "$MODE" = install ]; then
   CU="$("$PY" -P -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')/nvidia/cu13"
@@ -185,9 +203,15 @@ if [ "$MODE" = install ]; then
     [ -e "$base" ] || ln -s "$(basename "$so")" "$base"
   done
   if [ -n "${CUDA_HOME:-}" ] && [ "$CUDA_HOME" != "$CU" ]; then
-    # An inherited toolkit replaces the locked one; only another CUDA 13 toolkit matches torch's CUDA 13.0 build.
-    rel="$("$CUDA_HOME/bin/nvcc" --version 2>/dev/null | sed -n 's/.*release \([0-9][0-9]*\)\..*/\1/p')"
-    [ "$rel" = 13 ] || die "CUDA_HOME=$CUDA_HOME is not a CUDA 13 toolkit (nvcc release: ${rel:-none}); unset CUDA_HOME to use the locked toolkit at $CU"
+    # An inherited toolkit replaces the locked one; only another CUDA 13 toolkit is accepted, and only 13.0 matches torch's
+    # cu130 build without a warning (a newer nvcc beside the 13.0 runtime headers can fail FlashInfer's CCCL version check).
+    # || true: a missing or failing nvcc must reach the refusal below, not end the script under pipefail
+    rel="$({ "$CUDA_HOME/bin/nvcc" --version 2>/dev/null || true; } | sed -n 's/.*release \([0-9][0-9]*\.[0-9][0-9]*\).*/\1/p')"
+    case "$rel" in
+      13.0) ;;
+      13.*) echo "install-env: WARN: CUDA_HOME=$CUDA_HOME is CUDA $rel; the locked toolkit and torch's cu130 build are 13.0, so this is untested and a mixed-version CCCL build failure is possible; unset CUDA_HOME to use the locked toolkit at $CU" >&2 ;;
+      *) die "CUDA_HOME=$CUDA_HOME is not a CUDA 13 toolkit (nvcc release: ${rel:-none}); unset CUDA_HOME to use the locked toolkit at $CU" ;;
+    esac
     echo "install-env: note: building with CUDA_HOME=$CUDA_HOME from the environment instead of the locked toolkit $CU" >&2
   fi
   export CUDA_HOME="${CUDA_HOME:-$CU}"
@@ -238,7 +262,35 @@ for name, module in (
         sys.exit(f"{name}: imported module disagrees with installed distribution")
 print(f"ENGINE IMPORT OK: {vllm.__version__} from {origin}")
 PY
-uv pip check --python "$PY"
+# Check dependency consistency without requiring uv in read-only modes.
+if [ "$MODE" = install ] || command -v uv >/dev/null; then
+  uv pip check --python "$PY"
+else
+  # uv-created venvs need not contain pip; use their Python and locked packaging.
+  "$PY" -I - <<'PY'
+import importlib.metadata as md
+import sys
+
+from packaging.requirements import Requirement
+from packaging.utils import canonicalize_name
+
+installed = {canonicalize_name(d.metadata["Name"]): d for d in md.distributions()}
+errors = []
+for dist in installed.values():
+    for raw in dist.requires or ():
+        req = Requirement(raw)
+        if req.marker and not req.marker.evaluate({"extra": ""}):
+            continue
+        dep = installed.get(canonicalize_name(req.name))
+        if dep is None:
+            errors.append(f"{dist.metadata['Name']} requires {req}, which is not installed")
+        elif req.specifier and not req.specifier.contains(dep.version, prereleases=True):
+            errors.append(f"{dist.metadata['Name']} requires {req}, but {dep.version} is installed")
+if errors:
+    sys.exit("\n".join(errors))
+print("DEPENDENCY CONSISTENCY OK (venv Python; uv unavailable)")
+PY
+fi
 
 if [ "$MODE" = install ]; then
   # Keep the launcher contract: hash the native and generated Python products.
@@ -279,13 +331,18 @@ else
 fi
 
 if [ "$MODE" = check ]; then
-  # Use a log from this installation's current boot, after an MTP request completes.
+  # Use a 27B log from this installation's current boot, after an MTP request completes.
+  echo "LIVE TILE PROOF: 27B only; for non-27B lanes (including Flash-Next), use --verify."
   bash "$TILE_PROOF" "$@"
-  echo "POST-INSTALL SELF-CHECK OK: checkout import and live tile proof"
+  echo "POST-INSTALL SELF-CHECK OK: checkout import and live 27B tile proof"
 elif [ "$MODE" = verify ]; then
   echo "ENVIRONMENT VERIFIED: source, dependency pins, patch and native products"
 else
   echo "ENGINE INSTALLED: TREE=$ENGINE VENV=$VENV"
-  echo "LIVE TILE PROOF PENDING: serve an MTP request with FLASHINFER_SM8X_FP8_SMALLQ=cta32,"
+  if [ "$TILE_SERIES" = v2 ]; then
+    echo "FLASHINFER: opt-in 0001+0002 series (v2); the workload tile is selected at serve time by MERLIN_FLASHINFER_WORKLOAD_TILE=1 with FLASHINFER_SM8X_FP8_SMALLQ=cta32."
+  fi
+  echo "LIVE TILE PROOF PENDING (27B only): serve an MTP request with FLASHINFER_SM8X_FP8_SMALLQ=cta32,"
   echo "then run $ENGINE/release/install-env.sh --check '$VENV' <server-log> [q_len] --tp N"
+  echo "Non-27B lanes (including Flash-Next): use --verify; this tile proof does not apply."
 fi

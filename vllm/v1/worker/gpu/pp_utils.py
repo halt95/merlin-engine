@@ -11,6 +11,8 @@ import torch
 
 import vllm.envs as envs
 from vllm.distributed.parallel_state import get_pp_group
+# Deferred writer's producing step and row identities.
+from vllm.merlin.kv_commit_acks import DeferredCommitAck
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.utils.torch_utils import async_tensor_h2d
@@ -37,6 +39,7 @@ class PendingRecv:
     # Model-state data the step's postprocess needs once the sampled tokens
     # arrive (RecoverSSM: the snapshot of the step's deferred commits).
     deferred_state: object | None = None
+    commit_ack: DeferredCommitAck | None = None
 
 
 def compute_need_sampled_mask(input_batch: InputBatch) -> np.ndarray | None:
@@ -144,10 +147,17 @@ class PPHandler:
         # finished. The post_update kernel skips the -1 entries.
         freed = self.req_idx_gen_np[slot.idx_mapping_np] != slot.gen_at_receive_np
         exclude_mask = freed | ~slot.need_sampled_mask
+        # Capture dispositions before all-excluded return.
+        if slot.commit_ack is not None:
+            slot.commit_ack.mask(freed & slot.need_sampled_mask)
         idx_mapping = slot.idx_mapping
         if exclude_mask.any():
             if exclude_mask.all():
                 # No states require update anymore.
+                # Forward must still be GPU-complete.
+                if slot.commit_ack is not None:
+                    self.main_stream.wait_event(slot.event)
+                    slot.commit_ack.finish()
                 return None
             # Filter excluded request indices.
             idx_mapping_np = np.where(exclude_mask, -1, slot.idx_mapping_np)
@@ -172,6 +182,7 @@ class PPHandler:
             num_rejected=slot.num_rejected,
             idx_mapping=idx_mapping,
             deferred_state=slot.deferred_state,
+            commit_ack=slot.commit_ack,
         )
 
     def attach_deferred_state(self, state: object | None) -> None:
@@ -206,12 +217,14 @@ class PPHandler:
         assert self.is_last_rank
         if compute_need_sampled_mask(input_batch) is None:
             return
+        # Port of vllm#64458: gather on the main stream,
+        # ordered with the draft writes; the main stream could otherwise
+        # overwrite draft_tokens before the broadcast stream reads them.
+        send = draft_tokens[input_batch.idx_mapping].contiguous()
         with torch.cuda.stream(self.broadcast_stream):
             self.broadcast_stream.wait_stream(self.main_stream)
-            send = draft_tokens[input_batch.idx_mapping].contiguous()
-            # Must record the idx_mapping tensor since it was allocated
-            # on the main stream.
-            input_batch.idx_mapping.record_stream(self.broadcast_stream)
+            # The payload is a main-stream tensor.
+            send.record_stream(self.broadcast_stream)
             torch.distributed.broadcast(
                 send, src=self.last_rank, group=self.broadcast_group
             )

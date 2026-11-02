@@ -17,7 +17,7 @@ merged = {}
 files = sorted(glob.glob(os.path.join(absdir, "absmax.*.json")))
 assert files, "no absmax files"
 for f in files:
-    for name, d in json.load(open(f)).items():
+    for name, d in json.load(open(f, encoding="utf-8")).items():
         m = merged.setdefault(name, {"k": 0.0, "v": 0.0, "calls": 0, "files": 0})
         m["k"] = max(m["k"], d["k_absmax"]); m["v"] = max(m["v"], d["v_absmax"]); m["calls"] += d["calls"]; m["files"] += 1
 print(f"{len(files)} absmax files, {len(merged)} attention layers")
@@ -56,13 +56,13 @@ for f in os.listdir(src):
     elif os.path.isfile(s):
         shutil.copy2(s, d)
 save_file(tensors, os.path.join(dst, "kv_scales.safetensors"), metadata={"format": "pt"})
-idx = json.load(open(os.path.join(src, "model.safetensors.index.json")))
+idx = json.load(open(os.path.join(src, "model.safetensors.index.json"), encoding="utf-8"))
 for k in tensors:
     idx["weight_map"][k] = "kv_scales.safetensors"
 idx["metadata"]["total_size"] = idx["metadata"].get("total_size", 0) + 4 * len(tensors)
-json.dump(idx, open(os.path.join(dst, "model.safetensors.index.json"), "w"), indent=2)
-cfg = json.load(open(os.path.join(src, "config.json")))
+json.dump(idx, open(os.path.join(dst, "model.safetensors.index.json"), "w", encoding="utf-8"), indent=2)
+cfg = json.load(open(os.path.join(src, "config.json"), encoding="utf-8"))
 cfg["quantization_config"]["kv_cache_scheme"] = {"dynamic": False, "num_bits": 8, "observer": "minmax", "observer_kwargs": {}, "strategy": "tensor", "symmetric": True, "type": "float"}
-json.dump(cfg, open(os.path.join(dst, "config.json"), "w"), indent=2)
+json.dump(cfg, open(os.path.join(dst, "config.json"), "w", encoding="utf-8"), indent=2)
 json.dump({r[0]: {"k_absmax": r[1], "v_absmax": r[2], "k_scale": r[3], "v_scale": r[4], "calls": r[5]} for r in report}, open(os.path.join(dst, "kv_scales_report.json"), "w"), indent=1)
 print("wrote", dst, len(tensors), "scale tensors")

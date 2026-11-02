@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by the Merlin project; see NOTICE.
 
 import torch
 
@@ -29,7 +30,11 @@ class YaRNScalingRotaryEmbedding(RotaryEmbedding):
         mscale_all_dim: float | None = None,
         attention_factor: float | None = None,
         truncate: bool = True,
+        # Floor the table on the
+        # served max_position (rows below are unchanged); 0 = original x factor.
+        yarn_served_max_position: int = 0,
     ) -> None:
+        self.yarn_cache_floor = yarn_served_max_position
         self.scaling_factor = scaling_factor
         self.beta_fast = beta_fast
         self.beta_slow = beta_slow
@@ -75,9 +80,12 @@ class YaRNScalingRotaryEmbedding(RotaryEmbedding):
 
     def _compute_cos_sin_cache(self) -> torch.Tensor:
         inv_freq = self._compute_inv_freq(self.scaling_factor)
-        t = torch.arange(
-            self.max_position_embeddings * self.scaling_factor, dtype=torch.float32
-        )
+        # One arange, floored on the
+        # served max_position (MRotaryEmbedding sets the floor x its factor).
+        rows = self.max_position_embeddings * self.scaling_factor
+        if self.yarn_cache_floor > rows:
+            rows = self.yarn_cache_floor
+        t = torch.arange(rows, dtype=torch.float32)
         freqs = torch.einsum("i,j -> ij", t, inv_freq)
         cos = freqs.cos() * self.mscale
         sin = freqs.sin() * self.mscale

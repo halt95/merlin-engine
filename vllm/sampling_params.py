@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by the Merlin project; see NOTICE.
 """Sampling parameters for text generation."""
 
 import copy
@@ -915,6 +916,57 @@ class SamplingParams(
         self._validate_structured_outputs(
             model_config, structured_outputs_config, tokenizer
         )
+
+    def _validate_sampler_caps(self) -> None:
+        """Validate V2 sampler limits after EOS merging and tokenization."""
+        if (
+            self.allowed_token_ids
+            or self.logit_bias
+            or (self.min_tokens > 0 and self.all_stop_token_ids)
+        ):
+            # Import lazily to avoid a sampling_params/worker import cycle.
+            from vllm.v1.worker.gpu.sample.logit_bias import (
+                MAX_NUM_ALLOWED_TOKEN_IDS,
+                MAX_NUM_LOGIT_BIAS_TOKENS,
+                MAX_NUM_STOP_TOKEN_IDS,
+            )
+
+            limits = (
+                (
+                    "allowed_token_ids",
+                    len(self.allowed_token_ids or ()),
+                    MAX_NUM_ALLOWED_TOKEN_IDS,
+                ),
+                (
+                    "logit_bias",
+                    len(self.logit_bias or ()),
+                    MAX_NUM_LOGIT_BIAS_TOKENS,
+                ),
+                (
+                    "stop_token_ids",
+                    len(self.all_stop_token_ids) if self.min_tokens > 0 else 0,
+                    MAX_NUM_STOP_TOKEN_IDS,
+                ),
+            )
+            for parameter, count, limit in limits:
+                if count > limit:
+                    raise VLLMValidationError(
+                        f"{parameter} contains {count} token IDs. "
+                        f"The Model Runner V2 limit is {limit}.",
+                        parameter=parameter,
+                        value=count,
+                    )
+
+        if self.bad_words_token_ids:
+            count = sum(len(word) for word in self.bad_words_token_ids)
+            limit = envs.VLLM_MAX_BAD_WORDS_TOTAL_TOKENS
+            if count > limit:
+                raise VLLMValidationError(
+                    f"Too many total bad word tokens: {count}. "
+                    f"The max is {limit}.",
+                    parameter="bad_words",
+                    value=count,
+                )
 
     def _validate_logprobs(self, model_config: ModelConfig) -> None:
         max_logprobs = model_config.max_logprobs

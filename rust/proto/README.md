@@ -1,9 +1,10 @@
+<!-- Modified by the Merlin project; see NOTICE. -->
 # gRPC protocol
 
 This directory is the canonical source for vLLM's gRPC schema.
 
-See [context parallel deployment](../../docs/serving/context_parallel_deployment.md)
-for effective attention block-size metadata in Python and `Control.GetServerInfo`.
+See the context parallel deployment guide in upstream vLLM v0.32.0
+(`docs/serving/context_parallel_deployment.md`; not shipped in this release) for effective attention block-size metadata in Python and `Control.GetServerInfo`.
 
 Schema updates are no longer published to the Buf Schema Registry. Rust consumers
 should use `vllm-proto` from crates.io; consumers in other languages can generate

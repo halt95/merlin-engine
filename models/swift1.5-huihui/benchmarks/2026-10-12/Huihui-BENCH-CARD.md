@@ -1,5 +1,8 @@
 # Swift1.5-Huihui bench card — 2026-10-12 (abliterated Swift 1.5 checkpoint; gate on v2.5.1, speed on v2.5.2)
 
+> **Historical switch.** `VLLM_E2_GUARD_IDLE` below belongs to the measured v2.x engines. It is no longer registered on
+> vLLM 0.32, where idle parking is built in; setting it does not restore polling. See the [current running notes](../../../flash-next/docs/reference.md#running-notes).
+
 > **Historical vLLM 0.30 evidence.** The results and commands below belong to the named v2.x engines. They do not qualify Merlin 3.0.0 or assert current speed/quality. Huihui inherits Swift's heavy results; current status: [Huihui README](../../README.md#qualification-status).
 
 > *File names in this record (`serve/serve.sh`, `scripts/...`, `release/...`, `patches/...`) are from the measurement time; current locations are in [models/README.md](../../../README.md).*

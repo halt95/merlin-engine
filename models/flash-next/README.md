@@ -38,25 +38,24 @@ T=0 tokens and logprobs without rerunning throughput:
 
 See the [0.32 measurement summary](benchmarks/2026-10-15/BENCH-CARD.md) for the evidence boundary.
 
-![Flash-Next Merlin 3.0.0 at a glance](docs/images/flashnext-merlin-3.0.0-summary.png)
 The cache-hit measurement has MTP off; it does not establish that result for the launcher's default MTP K=3.
 The concurrent decode workload is six **127K** sessions; six-131K residency was measured separately on 2026-10-20 (below).
 
-## Merlin 3.0.0 bench card (2026-10-20)
+## Merlin 3.0.1 bench card (2026-11-02)
 
-Maintainer measurements on 4× RTX 3090 (220 W, PCIe Gen4 with P2P) with the Merlin 3.0.0 release wheel, one fresh `merlin serve` boot per configuration, 2026-10-20, with the BF16 draft head that 3.0.0 ships; method and every cell in the [bench card](benchmarks/2026-10-20/BENCH-CARD.md). Decode is one stream with thinking on (tok/s after the first streamed token); prefill is one cold request.
+Maintainer measurements on 4× RTX 3090 (220 W, PCIe Gen4) with P2P (the aikitoria patched driver) and the Zagitta [gpu-unlock](https://github.com/Zagitta/gpu-unlock) kernel module, one fresh `merlin serve` boot per configuration, 2026-11-01 to 2026-11-02; method and every cell in the [bench card](benchmarks/2026-11-02/BENCH-CARD.md). Decode is one stream with thinking on at reasoning effort medium, the server default (tok/s after the first streamed token); prefill is one cold request. With thinking on, a 512-token agent follow-up may end inside the reasoning, and reasoning tokens count. Thinking-off GSM8K is from the 3.0.0 run. Rows marked (3.0.0 run) were not re-run for 3.0.1; they and the rest of the 3.0.0 figures are on the [3.0.0 bench card](benchmarks/2026-10-20/BENCH-CARD.md).
 
 | Measurement | Flash-Next |
 |---|---|
-| Decode, 4K / 131K / 262K prompt | 168 / 170 / 184 tok/s |
-| Cold prefill, 10K / 100K prompt | 5,660 / 6,051 tok/s |
-| Sessions held at once | 3 × 262K and 6 × 131K, every session resident (re-sent prompts ≥ 99.91 % cached), 0 preemptions |
-| 8 MP image, one and two requests at once | correct; lowest free memory on any card 1,028 MiB (one request) and 1,026 MiB (two at once) |
+| Decode, 4K / 131K / 262K prompt | 178 / 183 / 197 tok/s |
+| Cold prefill, 10K / 100K / 262K prompt | 6,628 / 7,064 / 6,803 tok/s |
+| Agents at once (8 × 16K conversations), total, thinking on / off | 677 / 664 tok/s |
+| GSM8K-200 (5-shot), correct of 200, thinking on at medium / thinking off | 197 / 199 |
+| Sessions held at once (3.0.0 run) | 3 × 262K and 6 × 131K, every session resident (re-sent prompts ≥ 99.91 % cached), 0 preemptions |
+| 8 MP image, one and two requests at once (3.0.0 run) | correct; lowest free memory on any card 1,028 MiB (one request) and 1,026 MiB (two at once) |
 | KV pool | 924,993 tokens |
-| Agents at once (8 × 16K conversations), total | 638 tok/s (BF16 draft head) |
-| GSM8K-200 (5-shot, thinking off) | 199/200 |
 
-## What's new in Merlin 3.0.0
+## What recipe 3.0.0 ships
 
 - **Engine:** built on vLLM 0.32.0, with the engine source and model recipes in this checkout.
 - **Vision:** 8 MP per image (`IMG_CAP_PX=8388608`) at the shipped KV pin
@@ -76,7 +75,8 @@ The measured hardware is four headless RTX 3090s with working PCIe peer-to-peer.
 performance have not been re-measured here on 0.32. Other cards that `tools/merlin/preflight.py` maps to a
 profile are **untested / community-validated**: RTX A5000, 3090 Ti and A10 (24 GB class, 3090 rows), A10G and L4 at
 22.5 GiB (AWS g5/g6, GCP g2: pin lowered to the reported VRAM, a quad holds one 262K session), RTX A6000 / A40 (48 GB)
-and the sm_80/sm_89 rows. 12 GB and 20 GB cards (RTX 3080 Ti, 3080 12 GB, RTX A4500) are refused. See the [hardware matrix](../../docs/merlin/hardware-matrix.md). Use the current repository-wide
+and the sm_80/sm_89 rows, except the 4 x RTX 4090 24 GB row and the 2- and 4-card CMP 170HX 64 GB rows: those are
+🟡 **testing** (full-model runs passed on cloud-hosted cards; kernel parity qualification is still to run). 12 GB and 20 GB cards (RTX 3080 Ti, 3080 12 GB, RTX A4500) are refused. See the [hardware matrix](../../docs/merlin/hardware-matrix.md). Use the current repository-wide
 [install status](../../release/README.md) for the toolchain and build route.
 
 The imported provisioning guidance allocated 96 GB host RAM and at least 1 GB `/dev/shm`.
@@ -103,6 +103,42 @@ The launcher requires the verified build-product marker from the installer. Wait
 No 0.32 boot-time estimate is claimed. The endpoint defaults to `127.0.0.1:8000`; set `VLLM_API_KEY`
 if exposing it with `HOST=0.0.0.0`.
 See [health checks](docs/reference.md#check-its-working) and [troubleshooting](docs/reference.md#troubleshooting).
+
+### Merlin 3.0.1 opt-ins
+
+MTP and the GPU KV pool remain the defaults. `merlin serve flash-next <checkpoint-dir> --spec dflash2`
+selects DFlash2 on the three qualified 4 x 3090 P2P rows in the Flash-Next family. It measured +5–18 %
+decode versus MTP, with a smaller 789,668-token KV pool: 3 x 262K sessions, not 6 x 131K.
+Run `./setup.sh --model flash-next --spec dflash2` to download and verify the drafter first.
+
+`merlin serve flash-next <checkpoint-dir> --kv-ram-cache 64g` opts into a host-RAM cache of evicted
+prefix KV blocks. A drain-ahead write-back stores complete restore units before GPU blocks are reclaimed.
+Host eviction takes idle rows first, then copies that duplicate blocks running requests hold on the GPU, then the
+least recently used content, and last copies whose GPU twins are about to be reclaimed; an evicted unit gives
+up only the rows no other session shares, so a common system prompt stays cached. There is no retention interval.
+The tier needs at least one 262K restore unit per rank: the smallest size on 4 x 3090 is `8g` (2 GiB per rank), and
+[SETUP](../../docs/SETUP.md) lists the other layouts. Capacity is counted in whole restore units: by the layout math, 16g on 4 x 3090
+is about 260 host rows per rank, room for 3 whole 262K units (68 rows each, about 4.2 GiB per session over the four ranks).
+That is a row count, not a measured restore count: how many long sessions restore reliably at a given size is not
+yet measured. A 262K restore took 1.2–1.4 s on 4 x RTX 3090, against about 56 s to recompute. Budget the cache in addition to the server's
+host RAM and allow locked memory. **The cache is experimental on Flash-Next in 3.0.1:** under heavy concurrent
+prefill a session may recompute rather than restore (output remains identical). It runs with MTP only;
+`--spec dflash2` with `--kv-ram-cache` is refused. The cache does not change the session cap. `merlin serve --swarm`
+(also experimental) serves up to 24 sessions instead of 8 on the 4 x 3090 profiles, with the cache at the tested 48g or
+more (12 GiB per rank; set to 48g when `--kv-ram-cache` is not given, a smaller one is refused); the boot log says which
+cap applies (default or `--swarm`; an exported `SEQS` above the default is warned about).
+See [3.0.1 options](docs/reference.md#merlin-301-options) for the supported rows, drafter path and per-rank sizing.
+
+`./setup.sh --model flash-next --ple int6` (or `merlin pull flash-next --ple int6`) selects the INT6 g32 PLE table:
+38.74 GiB of host RAM instead of FP8's 47.68 GiB (measured on the reference host: no quality loss against FP8; MTP draft
+acceptance +0.095 on Flash-Next and −0.03 on Swift 1.5, within the 0.10 bar; decode and prefill speed not measured separately).
+There is no second checkpoint. One INT6 pack, downloaded once into `flash-next-ple-int6` beside the checkpoint, serves
+Flash-Next and Swift 1.5 (they share byte-identical FP8 PLE shards). Swift 1.5 Huihui carries the same shards but is
+excluded for now: its MTP acceptance with the INT6 table fell past the threshold, so it stays on FP8. Setup verifies your FP8
+checkpoint and the pack, then builds `<checkpoint>-int6`: links to both plus a generated `config.json` and index. Your
+FP8 files are never changed, and FP8 stays the default. Serve it with
+`merlin serve flash-next <checkpoint>-int6 --ple int6`. The estimated resident floor is 60.06 GiB at four workers (69 GiB
+with FP8); no capped-host boot has measured it yet. Details: [docs/SETUP.md](../../docs/SETUP.md).
 
 ### Container
 
@@ -139,7 +175,7 @@ print(reply.choices[0].message.content)
 
 ## What's new in v3.0.0
 
-v3.0.0 (gated 2026-10-10, never published) used vLLM 0.30. Its decode ladder, GSM8K, needle, follow-up reuse, idle-power,
+v3.0.0 (built 2026-10-10, never published) used vLLM 0.30. Its decode ladder, GSM8K, needle, follow-up reuse, idle-power,
 warmup, boot-time and optional YaRN-entry results are historical: **v3.0.0 (0.30) figure**, not re-measured
 on 0.32. The [v3.0.0 notes](CHANGELOG.md#v300) and
 [historical bench card](benchmarks/2026-10-09/BENCH-CARD.md) retain those results and their original comparators.
@@ -174,7 +210,7 @@ idle-power report and contribution, brandon-nuttall (local-argmax mixin), mgabor
 (club-3090 [discussion](https://github.com/noonghunna/club-3090/discussions/1572) report), DominikBucko
 ([MTP INT4 packing recipe](https://github.com/DominikBucko/qwen38-flash-next-2x3090)), the
 [`peakcrosser7` Flash-Next branch](https://github.com/peakcrosser7/vllm/commits/release/qwen38next_offload) behind vLLM
-[model-support](https://github.com/vllm-project/vllm/pull/53896) and [PLE-offload](https://github.com/vllm-project/vllm/pull/53899) contributions, and aikitoria's open-kernel-module patch (P2P on consumer Ampere). Upstream vLLM fixes in this
+[model-support](https://github.com/vllm-project/vllm/pull/53896) and [PLE-offload](https://github.com/vllm-project/vllm/pull/53899) contributions, aikitoria's open-kernel-module patch (P2P on consumer Ampere), and Zagitta's [gpu-unlock](https://github.com/Zagitta/gpu-unlock) kernel module (the bench basis from 3.0.1; its NVIDIA firmware is personal-use and not shipped; [Sudzpel](https://github.com/Sudzpel), who proposed it with the first measurements on Merlin). Upstream vLLM fixes in this
 tree are credited by PR number in the commit messages and by author in `NOTICE` and in
 [the full credit list](docs/reference.md#credit), which also names independent work on the same hardware class.
 

@@ -106,7 +106,8 @@ def main():
     if quant_names != set(NAMES):
         fails.append("quantised set mismatch: %s" % sorted(set(NAMES) ^ quant_names))
     # 3. config diff
-    cs, cc = json.load(open(src / "config.json")), json.load(open(cand / "config.json"))
+    cs = json.load(open(src / "config.json", encoding="utf-8"))
+    cc = json.load(open(cand / "config.json", encoding="utf-8"))
     qs, qc = cs["quantization_config"], cc["quantization_config"]
     if sorted(qc["ignore"]) != sorted(x for x in qs["ignore"] if x not in NAMES):
         fails.append("config: ignore list differs beyond the nine names")

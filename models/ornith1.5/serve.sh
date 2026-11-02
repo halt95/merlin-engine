@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Merlin 3.0.0: shim for the one launcher, tools/merlin/launch.py --profile ornith-quad-3090.
+# Shim for the one Merlin launcher, tools/merlin/launch.py --profile ornith-quad-3090.
 # TP2 x PP2 + EP with RecoverSSM. Knobs: MODEL GPUS PORT HOST SERVED VENV TREE CACHE_ROOT P2P KV_BYTES CHUNK SEQS MAXLEN BLOCK_SIZE LPT PP_PARTITION MAX_PIXELS UV CUDA_HOME.
 #   MODEL=/path/to/Ornith-1.5-122B-A10B-W4A16-Merlin PORT=8000 bash models/ornith1.5/serve.sh [extra vllm args]
 set -euo pipefail

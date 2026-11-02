@@ -10,6 +10,10 @@ from typing import Literal, overload
 
 from vllm.distributed.kv_events import BlockStored, KVCacheEvent
 from vllm.logger import init_logger
+from vllm.merlin.kv_tier_lookup import (
+    KeyLog,
+    adopted_draws,
+)
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.cache_thrash import SessionYield
 from vllm.v1.core.kv_cache_coordinator import (
@@ -149,6 +153,8 @@ class KVCacheManager:
         metrics_collector: KVCacheMetricsCollector | None = None,
         watermark: float = 0.0,
         enable_mamba_shared_prefix_checkpoint: bool = False,
+        *,
+        causal_sliding_window_kv: bool,
     ) -> None:
         self.max_model_len = max_model_len
         # When unset, fall back to `max_model_len` so the recycling-aware cap
@@ -180,6 +186,7 @@ class KVCacheManager:
             hash_block_size=hash_block_size,
             metrics_collector=self.metrics_collector,
             num_prefill_lookahead=num_prefill_lookahead,
+            causal_sliding_window_kv=causal_sliding_window_kv,
         )
         # One predicate, read by both sides of the feature, so the scheduler
         # cannot end a chunk at a junction the manager would refuse -- a refused
@@ -227,10 +234,17 @@ class KVCacheManager:
         )
 
         self._pinned_hits: dict[str, list[KVCacheBlock]] = {}
+        # A waiter whose pin lookup found nothing is not looked up again
+        # until a key of its own is inserted: request id ->
+        # (signature, key-log position, own hashes or None until needed).
+        self._pin_misses: dict[str, tuple] = {}
+        self._step_key_mark = 0
         self.thrash = SessionYield(self)
         self._grace_pins: dict[str, list[KVCacheBlock]] = {}
         self._grace_block_ids: dict[str, frozenset[int]] = {}
         self._grace_prompt_tokens: dict[str, int] = {}
+        # Lifecycle hooks (installed by the tier; None = no-op)
+        self.tier_hooks = None
         self.enable_grace_pins = (
             self.enable_caching and self.coordinator.enable_partial_hash_hits
         )
@@ -238,6 +252,34 @@ class KVCacheManager:
         self.last_alloc_shortfall = 0
         # Whether the last allocate_slots was refused by its evicts_needed check.
         self.last_alloc_evicts_needed = False
+        # write-back admission gate, installed by
+        # the host-RAM KV tier at connector bind (vllm/merlin/
+        # kv_host_tier_writeback.py WriteBack.admit): (request, fresh blocks,
+        # real shortfall, adopted blocks) -> (shortfall, demotion_wait).
+        self.admission_gate: (
+            Callable[[Request, int, int, Sequence], tuple[int, bool]] | None
+        ) = None
+        # Exact H_run (WriteBack.account_running),
+        # called by the scheduler once per step after allocation.
+        self.running_headroom_hook: Callable[..., int] | None = None
+        # a waiting/preempted admission
+        # refused before the gate (non-coherent full-sequence check) still
+        # names its need to the write-back (WriteBack.note_head): (request,
+        # full-sequence blocks, shortfall) -> None.
+        self.head_need_hook: Callable[[Request, int, int], None] | None = None
+        # Per waiting request, the host
+        # slots (group, table index) of its admitted PrefixHitPlan; set by the
+        # host tier for one admission attempt, consumed by allocate_slots.
+        self.restore_slots: dict[str, tuple[tuple[int, int], ...]] = {}
+        # Per such request, the private
+        # continuation blocks its restored recurrent/partial tails need: drawn
+        # here with the destinations, inside the admission gate, and
+        # taken by the host tier at the hand-off.
+        self.restore_tails: dict[str, int] = {}
+        self.restore_tail_blocks: dict[str, list[KVCacheBlock]] = {}
+        # Whether the last allocate_slots returned None to wait for demotions
+        # (no blocks short, so nothing is yielded).
+        self.last_alloc_demotion_wait = False
         # A producer that moves its live GDN tail's hash to a CoW copy keeps
         # writing the source; pins and graces follow the hash to the copy.
         for manager in self.coordinator.single_type_managers:
@@ -378,13 +420,21 @@ class KVCacheManager:
         computed, per_group_hits = coordinator.find_longest_cache_hit_per_group(
             request.block_hashes, request.num_tokens - 1
         )
-        if any(hit > per_group_hits[fa_group_id] for hit in per_group_hits):
+        num_local = per_group_hits[fa_group_id]
+        if any(hit > num_local for hit in per_group_hits) or any(
+            hit < num_local
+            for hit, group in zip(per_group_hits, self.kv_cache_config.kv_cache_groups)
+            if group.kv_cache_spec.prefix_cacheable
+            and not isinstance(group.kv_cache_spec, MambaSpec)
+        ):
             # A lagging group hit deeper than full attention means its
             # full-attention blocks were evicted; use the reconciled boundary
-            # that every group agrees on.
+            # that every group agrees on. Only a Mamba group may lag behind
+            # it: the connector restores that state, but not the window of
+            # a sliding-window group, whose table would also be too short
+            # for `truncate_computed_blocks`.
             return *self.get_computed_blocks(request), False
 
-        num_local = per_group_hits[fa_group_id]
         blocks = self.create_kv_cache_blocks(computed)
         # Per-group lookups do not detect an uncached shared prefix (boundary 0).
         return blocks, num_local, 0, min(per_group_hits) < num_local
@@ -537,6 +587,18 @@ class KVCacheManager:
             RequestStatus.PREEMPTED,
         ):
             watermark_blocks = self.watermark_blocks
+        # Each host slot of a mixed two-tier
+        # hit draws one private destination, counted with the fixed reserve.
+        restore_slots = (
+            self.restore_slots.get(request.request_id, ())
+            if new_computed_blocks is not None
+            else ()
+        )
+        watermark_blocks += len(restore_slots)
+        restore_tails = (
+            self.restore_tails.get(request.request_id, 0) if restore_slots else 0
+        )
+        watermark_blocks += restore_tails
 
         # Matches the scheduler's own prefill boundary: `num_tokens - 1`
         # extends it to resumed requests replaying their output tokens.
@@ -560,10 +622,20 @@ class KVCacheManager:
             )
             required_blocks = num_blocks_to_allocate + watermark_blocks
             if required_blocks > self.block_pool.get_num_free_blocks():
+                # a non-coherent refusal
+                # still names the waiting head to the write-back (its head
+                # floor and shortfall wait: head_need_hook -> WriteBack.note_head).
                 full_shortfall = required_blocks - self.block_pool.get_num_free_blocks()
                 if not self.thrash.coherent:
                     self.last_alloc_shortfall = full_shortfall
                     self.last_alloc_evicts_needed = False
+                    if self.head_need_hook is not None and request.status in (
+                        RequestStatus.WAITING,
+                        RequestStatus.PREEMPTED,
+                    ):
+                        self.head_need_hook(
+                            request, num_blocks_to_allocate, full_shortfall
+                        )
                     return None
                 # Coherent yields pick ONE session that must cover what the
                 # admission needs, so measure the chunk gate below too (it can
@@ -650,6 +722,32 @@ class KVCacheManager:
         available_blocks = self.block_pool.get_num_free_blocks() - reserved_blocks
         required_blocks = num_blocks_to_allocate + watermark_blocks
         shortfall = max(full_shortfall, required_blocks - available_blocks)
+        # New requests never reclaim un-copied
+        # blocks; running requests are never gated.
+        self.last_alloc_demotion_wait = False
+        if self.admission_gate is not None and request.status in (
+            RequestStatus.WAITING,
+            RequestStatus.PREEMPTED,
+        ):
+            shortfall, self.last_alloc_demotion_wait = self.admission_gate(
+                # The fresh pops: restore
+                # destinations in, adopted cached-free hits out.
+                request,
+                num_blocks_to_allocate
+                + len(restore_slots)
+                + restore_tails
+                - adopted_draws(
+                    self.coordinator,
+                    new_computed_block_list,
+                    num_local_computed_tokens + num_external_computed_tokens,
+                ),
+                shortfall,
+                new_computed_block_list,
+            )
+            if self.last_alloc_demotion_wait:
+                self.last_alloc_shortfall = 0
+                self.last_alloc_evicts_needed = False
+                return None
         if shortfall > 0:
             # Cannot allocate new blocks (either gate)
             self.last_alloc_shortfall = shortfall
@@ -676,7 +774,15 @@ class KVCacheManager:
                 num_local_computed_tokens=num_local_computed_tokens,
                 num_external_computed_tokens=num_external_computed_tokens,
                 skip_zeroing_group_ids=skip_zeroing_group_ids,
+                restore_slots=restore_slots,
             )
+            # The slots are consumed.
+            self.restore_slots.pop(request.request_id, None)
+            self.restore_tails.pop(request.request_id, None)
+            if restore_tails:
+                self.restore_tail_blocks[request.request_id] = (
+                    self.block_pool.get_new_blocks(restore_tails)
+                )
 
         new_blocks = self.coordinator.allocate_new_blocks(
             request.request_id,
@@ -787,13 +893,26 @@ class KVCacheManager:
         self._grace_pins[request_id] = keep
         self._grace_block_ids[request_id] = frozenset(seen)
         self._grace_prompt_tokens[request_id] = request.num_prompt_tokens
+        # lifecycle: the grace is a copy source; overflow is host-aware
+        hooks = self.tier_hooks
+        if hooks is not None:
+            hooks.grace_taken(request, keep)
         while len(self._grace_pins) > self.MAX_GRACE_PINS:
-            self.release_grace_pin(next(iter(self._grace_pins)))
+            victim = hooks and hooks.pick_overflow_victim(list(self._grace_pins))
+            self.release_grace_pin(victim or next(iter(self._grace_pins)), "overflow")
         return len(keep)
 
-    def release_grace_pin(self, request_id: str) -> int:
+    def release_grace_pin(self, request_id: str, reason: str = "yield") -> int:
         """Return a finished request's grace-pinned blocks to the pool (in
-        the eviction order a free would have used). Returns the count."""
+        the eviction order a free would have used). Returns the count.
+
+        ``reason`` (a ``GraceRelease`` value) is passed to the host tier's
+        copy scheduler, for example "yield" (a waiter needed the blocks),
+        "overflow" (more graces than MAX_GRACE_PINS) or "hit" (the turn
+        resumed on the GPU)."""
+        # lifecycle: the copy scheduler sees every grace release
+        if self.tier_hooks is not None and request_id in self._grace_pins:
+            self.tier_hooks.grace_released(request_id, reason)
         blocks = self._grace_pins.pop(request_id, None)
         self._grace_block_ids.pop(request_id, None)
         self._grace_prompt_tokens.pop(request_id, None)
@@ -830,9 +949,10 @@ class KVCacheManager:
         if not candidates:
             return
         reach = num_hit_tokens + 2 * self.block_pool.hash_block_size
-        for request_id in candidates:
+        for request_id in [r for r in self._grace_block_ids if r in candidates]:
             if reach >= self._grace_prompt_tokens.get(request_id, 0):
-                self.release_grace_pin(request_id)
+                # lifecycle: a hit ends the grace (its copy is moot)
+                self.release_grace_pin(request_id, "hit")
 
     def _pins_follow_moved_hash(
         self, source_block: KVCacheBlock, cow_block: KVCacheBlock
@@ -938,6 +1058,10 @@ class KVCacheManager:
         return len(extras)
 
     MAX_PINNED_WAITERS = 16
+    # Waiting requests one pin pass inspects (each
+    # a full prefix lookup): cold requests pin nothing, so the pin bound alone
+    # does not bound the scan.
+    MAX_INSPECTED_WAITERS = 2 * MAX_PINNED_WAITERS
 
     @property
     def num_pinned_waiters(self) -> int:
@@ -969,6 +1093,8 @@ class KVCacheManager:
             or len(self._pinned_hits) >= self.MAX_PINNED_WAITERS
         ):
             return 0
+        if self._pin_miss_holds(request):
+            return 0
         computed, num_hit, _ = self.get_computed_blocks(request)
         blocks = [
             block
@@ -977,7 +1103,9 @@ class KVCacheManager:
             if not block.is_null
         ]
         if num_hit == 0 or not blocks:
+            self._remember_pin_miss(request)
             return 0
+        self._pin_misses.pop(request_id, None)
         unit = self.block_pool.hash_block_size
         proof_idx = num_hit // unit
         if proof_idx < len(request.block_hashes):
@@ -997,6 +1125,56 @@ class KVCacheManager:
         self.thrash.record_pin(request_id, num_hit, computed, request.block_hashes)
         return len(blocks)
 
+    def _pin_signature(self, request: Request) -> tuple:
+        return (
+            request.num_tokens, len(request.block_hashes),
+            self.prefix_cache_lookup_enabled(request),
+        )
+
+    def _pin_key_log(self) -> KeyLog:
+        if self.block_pool.key_log is None:
+            self.block_pool.key_log = KeyLog()
+        return self.block_pool.key_log
+
+    def _pin_miss_holds(self, request: Request) -> bool:
+        """The request's last pin lookup found nothing, and nothing that
+        could change that happened since: same cap, and no key of its own
+        inserted in the GPU pool (a miss only ends with a new key; an
+        eviction only shortens a hit). Same freshness rule as the plan cache,
+        so the bounded pin pass scans a cold waiter once."""
+        entry = self._pin_misses.get(request.request_id)
+        if entry is None:
+            return False
+        signature, position, hashes = entry
+        if signature != self._pin_signature(request):
+            return False
+        keys = self._pin_key_log().since(position)
+        if keys is None:
+            return False
+        if not keys:
+            return True
+        if hashes is None:  # built once, on the first keys to check
+            hashes = frozenset(request.block_hashes)
+            self._pin_misses[request.request_id] = (signature, position, hashes)
+        from vllm.v1.core.kv_cache_utils import get_block_hash
+
+        return not any(get_block_hash(k) in hashes for k in keys)
+
+    def _remember_pin_miss(self, request: Request) -> None:
+        # Keys inserted this step may be excluded from this step's hit
+        # (``published_block_ids_this_step`` / ``cached_blocks_this_step``):
+        # read from the step's start so they end the miss next step.
+        old = self._pin_misses.get(request.request_id)
+        hashes = (
+            old[2]
+            if old is not None and old[0][1] == len(request.block_hashes)
+            else None
+        )
+        position = min(self._step_key_mark, self._pin_key_log().end)
+        self._pin_misses[request.request_id] = (
+            self._pin_signature(request), position, hashes,
+        )
+
     def pinned_hit_blocks(self, request_id: str) -> list[KVCacheBlock]:
         """The blocks pinned for ``request_id`` (empty if none)."""
         return list(self._pinned_hits.get(request_id, ()))
@@ -1005,6 +1183,7 @@ class KVCacheManager:
         """Drop the request's pin (admission, abort, finish). Returns the
         number of blocks released."""
         blocks = self._pinned_hits.pop(request_id, None)
+        self._pin_misses.pop(request_id, None)
         self.thrash.forget(request_id)
         if not blocks:
             return 0
@@ -1027,7 +1206,8 @@ class KVCacheManager:
         yielded = 0
         # Grace pins first (oldest finished conversation first), then the
         # waiters' pins (most recently pinned first).
-        for request_id in list(self._grace_pins):
+        # host-aware grace order (plain oldest-first without the tier)
+        for request_id in self.thrash.grace_yield_order():
             if limit is not None and yielded >= limit:
                 return released
             released += self.thrash.release_for_yield([("grace", request_id)])
@@ -1387,3 +1567,16 @@ class KVCacheManager:
     def new_step_starts(self) -> None:
         """Notify the coordinator that a new step is starting."""
         self.coordinator.new_step_starts()
+        # pin-miss freshness mark.
+        if self.block_pool.key_log is not None:
+            self._step_key_mark = self.block_pool.key_log.end
+
+    def invalidate_step_publications(self, request: Request) -> None:
+        """Withdraw the prefix-cache entries ``request`` published this step.
+
+        Call it before freeing a request that was scheduled this step and is
+        then removed from the schedule: ``allocate_slots`` keys its blocks
+        ahead of a forward that will not run, so they hold no valid KV.
+        """
+        if self.enable_caching:
+            self.coordinator.invalidate_step_publications(request.request_id)

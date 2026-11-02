@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by the Merlin project; see NOTICE.
 """Combined Top-K and Top-P Triton kernels.
 
 Based on the paper "Qrita: High-performance Top-k and Top-p Algorithm for GPUs
@@ -206,7 +207,11 @@ def _topk_topp_kernel(
                 k_pivots_num = tl.zeros((), dtype=tl.uint32)
                 min_larger = float("inf")
                 num_min_larger = tl.zeros((), dtype=tl.uint32)
-                if num_outliers > k:
+                # Port of vllm#61213.
+                if num_finite_total <= k:
+                    # All finite logits survive top-k; skip the cutoff search.
+                    k_pivot = -float("inf")
+                elif num_outliers > k:
                     max_range = max_logit
                     min_range = outlier_pivot
                     search_range = tl.cast(num_outliers, tl.int32)
@@ -1471,8 +1476,7 @@ def _topp_sb_mask_kernel(
         return
     if fin < 0.0:
         fin = best_fin
-    logZ = tl.log(Z)
-    pivot_logit = tl.log(pivot) + logZ + M
+    # Port of vllm#58231: no logit-space pivot
     # numdup/numkeep are exact small integers held in fp32.
     ties = numkeep < numdup
     num_preceding = 0.0
@@ -1498,18 +1502,18 @@ def _topp_sb_mask_kernel(
     for i in range(start, end, BLOCK):
         mask_n = i + offs < end
         x = tl.load(ROW + i + offs, mask=mask_n, other=-float("inf"))
-        keep = x > pivot_logit
+        # Port of vllm#58231.
+        # Mask in probability space (bitwise the step kernels' predicate);
+        # the logit-space pivot rounds to M for huge |M|.
+        prob = tl.exp(x - M) / Z
+        keep = (prob > pivot) | (x == M)
         if ties:
-            # Match the boundary value in probability space with exact
-            # equality: `dup` is a probability computed by the step kernels
-            # as exp(x - M) / Z, so recomputing it here with the same ops
-            # reproduces it bitwise on any platform. (The log/exp round-trip
-            # to logit space loses ~1e-6 to cancellation, breaking any
-            # absolute tolerance.)
-            dmask = tl.exp(x - M) / Z == dup
+            dmask = prob == dup
             cum = tl.cumsum(dmask.to(tl.int32)).to(tl.float32) + num_preceding
             keep_dup = dmask & (cum <= numkeep)
             keep = keep & (~dmask | keep_dup)
+            # Port of vllm#62046.
+            num_preceding += tl.sum(dmask.to(tl.float32))
         tl.store(ROW + i + offs, tl.where(keep, x, MASK_VALUE), mask=mask_n)
 
 

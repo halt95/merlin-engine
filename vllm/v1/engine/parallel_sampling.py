@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by the Merlin project; see NOTICE.
 
 from copy import copy
 from typing import cast
@@ -78,7 +79,9 @@ class ParentRequest:
             self.cached_child_sampling_params = child_sampling_params
         else:
             # Each child gets a clone with a unique seed
-            child_sampling_params.seed = seed + index
+            # Wrap the seed into the int64 the sampler
+            # stores, so seed=INT64_MAX with n>1 cannot overflow the worker.
+            child_sampling_params.seed = (seed + index + 2**63) % 2**64 - 2**63
         return child_sampling_params
 
     def get_child_info(self, index: int) -> tuple[str, SamplingParams]:

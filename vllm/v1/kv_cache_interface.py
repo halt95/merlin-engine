@@ -1495,6 +1495,10 @@ class KVCacheConfig:
     kv_tp_replicas: int = 1
     """Consecutive TP ranks holding identical KV for every layer (1: none)."""
 
+    # Resolved before worker configs are sent.
+    merlin_kv_host_tier_num_blocks: int | None = None
+    """Scheduler host-block count, sized from the widest PP stage."""
+
     @cached_property
     def transfer_group_ids(self) -> tuple[int, ...]:
         """IDs of cache groups that participate in external KV transfer."""

@@ -1,14 +1,20 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright 2026 halt95 (Merlin modifications)
 """``merlin``: one front end over the profile registry, preflight and the one launcher.
 
-    merlin serve [checkpoint] [path] [--profile ID | --tp N] [--instances N] [--dry-run] [-- extra vllm args]
+    merlin serve [checkpoint] [path] [--profile ID | --tp N] [--instances N] [--kv-ram-cache SIZE] [--swarm]
+                 [--ple fp8|int6] [--spec mtp|dflash2] [--dry-run] [-- extra vllm args]
+    merlin verify <dir> [--checkpoint NAME] [--ple fp8|int6]
     merlin list
     merlin doctor [preflight.py args]
 
 The checkpoint name is optional when the directory can be identified (config.json + the recipes' checkpoint.sha256
-lists). The profile comes from preflight (the largest TESTED layout that fits this host, else the largest fitting
-untested row), from ``--profile`` or from ``--tp``; a host with more cards than the layout uses gets a card subset
+lists). Identification does not verify shard bytes: ``merlin verify`` streams all listed files through SHA-256.
+Serve only checks the saved size/mtime stamp and prints a hint if it is missing or stale; it never hashes shards.
+The profile comes from preflight (the largest TESTED layout that fits this host, else the largest fitting
+untested row; a ``testing`` row, run on cloud-hosted hardware but not
+parity-qualified, is picked exactly like an untested one), from ``--profile`` or
+from ``--tp``; a host with more cards than the layout uses gets a card subset
 (P2P-connected where the profile needs it, the tightest topology group first) and a hint for the free cards;
 ``--instances N`` partitions the host into N disjoint sets across every card class and starts one server per set.
 ``GPUS`` / ``CUDA_VISIBLE_DEVICES`` always win. Every profile starts
@@ -20,10 +26,11 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import shlex
 import subprocess
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from itertools import combinations
 from pathlib import Path
 from typing import Any, Callable
@@ -49,7 +56,8 @@ SHIMS: dict[tuple[str, str], str] = {
     ("nemotron-super-vl", "svl-quad-3090"): "models/nemotron-super-vl/serve.sh",
     ("ornith1.5", "ornith-quad-3090"): "models/ornith1.5/serve.sh",
 }
-# Flash-Next host RAM per instance (preflight.py RAM_FLOOR_GIB / RAM_WARN_GIB): ~47.7 GiB pinned PLE table + workers.
+# Flash-Next host RAM per instance (preflight.py RAM_FLOOR_GIB / RAM_WARN_GIB): ~47.7 GiB pinned PLE table + workers,
+# plus the KV host tier (MERLIN_KV_HOST_TIER_GIB per rank) when on: the gates read it off ``inv.kv_tier_gib``.
 FN_RAM_FLOOR_GIB = pf.RAM_FLOOR_GIB
 FN_RAM_WARN_GIB = pf.RAM_WARN_GIB
 MIXED_FN_EVIDENCE = (
@@ -60,7 +68,7 @@ MIXED_FN_EVIDENCE = (
 
 
 NO_P2P_THROUGHPUT_NOTE = (
-    "P2P is off on GPUs {gpus}: TP{tp} is the single-request latency and pool-size layout; for aggregate throughput "
+    "P2P is off on GPUs {gpus}: TP{tp} is the largest-pool layout; for aggregate throughput "
     "without P2P prefer {n} single-card servers (measured on 4 x CMP 170HX 64 GB without P2P, 8 agents x 16K: "
     "TP1 x 4 = 873 tok/s, TP2 x 2 = 523, TP4 = 371; 4 x RTX 4090 showed the same order for prefill): {cmd}"
 )
@@ -91,7 +99,7 @@ class Plan:
 def _profiles_for(name: str, reg: dict[str, Any]) -> list[dict[str, Any]]:
     if name == "flash-next":
         return [p for p in reg["profiles"] if "checkpoint" not in p]
-    if name in ("swift1.5", "swift1.5-huihui"):
+    if name in reg.get("checkpoints", {}):  # a Flash-Next checkpoint row (Swift1.5, Huihui) serves its own rows
         return [p for p in reg["profiles"] if p.get("checkpoint") == name]
     return list(reg["profiles"])
 
@@ -391,6 +399,8 @@ def _ordered_candidates(reg: dict[str, Any], name: str, profile: str | None, tp:
     if tp is not None:
         cands = [p for p in cands if (p.get("layout") or {}).get("tp", p["serve"].get("tensor_parallel")) == tp]
     def tier(p: dict[str, Any]) -> int:
+        if not profile and not R.auto_selectable(p):
+            return 4  # a named alternative (auto_select false): last
         if p["status"] == "tested":
             return 0 if p["match"]["cards"] > 1 else 2
         return 1 if _no_p2p_twin(p) else 3
@@ -433,6 +443,9 @@ def choose(
             for p in _ordered_candidates(reg, name, profile, tp):
                 if status_pass == "tested" and p["status"] != "tested" and not _no_p2p_twin(p):
                     continue  # the untested pass retries tested rows too: on other card names they run untested
+                named = not profile and not R.auto_selectable(p)
+                if status_pass == "tested" and named:
+                    continue  # a named alternative waits for the last pass
                 if not _fits_class(p, group):
                     continue
                 need = p["match"]["cards"]
@@ -493,7 +506,7 @@ def _instance_env_hint(repo: Path, i: int, port: int) -> str:
     builder maps CACHE_ROOT to VLLM_CACHE_ROOT + TRITON_CACHE_DIR) and the distributed ports derived from PORT, so a
     hand-started second server shares nothing with instance 0."""
     m, d = L.distributed_ports(str(port))
-    return f"CACHE_ROOT={repo.as_posix()}/.vllm-cache/instance-{i} MASTER_PORT={m} VLLM_PORT={d}"
+    return f"CACHE_ROOT={shlex.quote(f'{repo.as_posix()}/.vllm-cache/instance-{i}')} MASTER_PORT={m} VLLM_PORT={d}"
 
 
 def _tp1_fits(reg: dict[str, Any], inv: pf.Inventory, group: list[pf.Gpu], card: int) -> bool:
@@ -569,7 +582,8 @@ def _hint_set(reg: dict[str, Any], name: str, inv: pf.Inventory, p: dict[str, An
     for q in sized:
         if not _fits_ram(reg, inv, [*beside, q["match"]["cards"]]):
             refused.append(f"host RAM {_ram_budget_gib(inv):.0f} GiB holds no {q['match']['cards']}-card Flash-Next server beside the "
-                           f"one started (~{pf.ram_floor_gib(q['match']['cards']):.0f} GiB more)")
+                           f"one started (~{pf.ram_floor_gib(q['match']['cards'], inv.kv_tier_gib, inv.ple_table_gib):.0f} GiB more"
+                           f"{pf.ram_tier_text(q['match']['cards'], inv.kv_tier_gib)})")
             continue
         pick = _pick_subset(inv, q, pool, q["match"]["cards"], _want_p2p(reg, q, inv, group), budget)
         if not pick:
@@ -602,7 +616,7 @@ def _fits_ram(reg: dict[str, Any], inv: pf.Inventory, sizes: list[int]) -> bool:
     if reg["model"] != "flash-next":
         return True
     budget = _ram_budget_gib(inv)
-    return budget is None or sum(pf.ram_floor_gib(s) for s in sizes) <= budget
+    return budget is None or sum(pf.ram_floor_gib(s, inv.kv_tier_gib, inv.ple_table_gib) for s in sizes) <= budget
 
 
 def _default_port(reg: dict[str, Any]) -> int:
@@ -619,9 +633,14 @@ def resolve(
     environ: dict[str, str] | None = None,
     tp: int | None = None,
 ) -> Plan:
-    reg = _load(name)
     env_in = os.environ if environ is None else environ
+    try:
+        reg = R.with_kv_dtype(_load(name), env_in.get("KV_DTYPE"))
+    except R.ProfileError as e:
+        raise CliError(str(e)) from None
     ckpt = path or env_in.get("MERLIN_CHECKPOINT_DIR") or PLACEHOLDER
+    # the RAM gates count the KV host tier this launch asks for and the PLE table this checkpoint carries (INT6 g32)
+    inv = replace(inv, kv_tier_gib=pf.kv_host_tier_gib(env_in), ple_table_gib=pf.ple_table_gib_of(ckpt, inv.ple_table_gib))
     if not (repo / LAUNCHER).is_file():
         raise CliError(f"{LAUNCHER} is not in this tree ({repo}); nothing started.")
     sel = _gpu_selection(env_in)
@@ -672,6 +691,15 @@ def resolve(
         if busy_free:
             notes.append(f"GPUs {','.join(map(str, busy_free))} busy: they hold more than 1 GiB and are not offered to another server")
         if free:
+            # The larger row replaces the chosen server, so budget its RAM alone.
+            larger = next((q for q in _ordered_candidates(reg, name, None, None)
+                           if _fits_class(q, group) and q["match"]["cards"] >= 8
+                           and len(cards) < q["match"]["cards"] <= len(cards) + len(free)
+                           and _fits_ram(reg, inv, [q["match"]["cards"]])), None)
+            if larger is not None:
+                notes.append(f"{len(free)} matching cards stay idle with {p['id']}; select the "
+                             f"{larger['match']['cards']}-card row ({R.label_text(reg, larger)}) "
+                             f"with --profile {larger['id']}")
             notes.append(_free_hint(reg, name, ckpt, inv, p, group, free, int(env_in.get("PORT") or _default_port(reg)) + 1,
                                     tp, profile, repo))
     names = sorted({g.name for g in rep.inventory.gpus})
@@ -686,13 +714,15 @@ def resolve(
             notes.append(MIXED_FN_EVIDENCE)
     env: dict[str, str] = {"CUDA_VISIBLE_DEVICES": ",".join(map(str, cards))}
     model = reg["model"]
+    if "KV_DTYPE" in env_in:
+        env["KV_DTYPE"] = env_in["KV_DTYPE"]
     busy = [g.index for g in rep.inventory.gpus if (g.mem_used_mib or 0) > pf.BUSY_MIB]
     if busy:  # only reachable through GPUS / CUDA_VISIBLE_DEVICES: the selector skips busy cards
         notes.append(f"GPUs {','.join(map(str, busy))} already hold more than 1 GiB (another process?); the pinned pool may not fit")
     if model == "flash-next" and inv.source == "probe":
         avail = _mem_available_mib()
-        if avail is not None and pf._gib(avail) < pf.ram_floor_gib(len(cards)):
-            raise CliError(pf.ram_available_text(len(cards), avail) + ". Nothing started.")
+        if avail is not None and pf._gib(avail) < pf.ram_floor_gib(len(cards), inv.kv_tier_gib, inv.ple_table_gib):
+            raise CliError(pf.ram_available_text(len(cards), avail, inv.kv_tier_gib, inv.ple_table_gib) + ". Nothing started.")
     if model in ("27b", "svl"):
         if p["match"]["cards"] > 1 and p["match"]["p2p"] == "on" and rep.effective_p2p != "on":
             raise CliError(
@@ -712,7 +742,15 @@ def resolve(
         if rep.p2p_mode and len(p["interconnect"]["modes"]) > 1:
             env["P2P"] = rep.p2p_mode
     if rep.adjusted is not None:  # the pin preflight derived for these cards (whole blocks where the row records them)
-        env["KV_BYTES"] = str(rep.adjusted["pin_bytes"])
+        pin = rep.adjusted["pin_bytes"]
+        dfl = p["serve"].get("dflash2") if model == "flash-next" and (env_in.get("SPEC") or "mtp") == "dflash2" else None
+        if dfl:  # the derivation is from the MTP pin: lower the DFlash2 pin by the same bytes, in its whole blocks
+            lowered = p["serve"]["kv_cache_memory"] - pin
+            bpb = dfl["kv_cache_memory"] // dfl["kv_blocks"]
+            pin = max(0, (dfl["kv_cache_memory"] - lowered) // bpb * bpb)
+            notes.append(f"SPEC=dflash2: the DFlash2 KV pin is lowered by the same {lowered:,} B for these cards, in whole "
+                         f"blocks: KV_BYTES={pin} (in testing: DFlash2 is validated at the qualified pin only)")
+        env["KV_BYTES"] = str(pin)
         maxlen = reg.get("launch", {}).get("max_model_len")
         if model == "svl" and maxlen and rep.adjusted["pool_tokens"] < maxlen:
             # Super VL serves its native 1M by default; a reduced pool that cannot hold one 1M session serves 262K
@@ -725,11 +763,14 @@ def resolve(
             env[k] = env_in[k]
     argv = [sys.executable, str(repo / LAUNCHER), "--model", model, "--profile", p["id"], "--checkpoint", name, "--status", status,
             "--", ckpt, *extra]
-    warns = [f"{f.code}: {f.text}" for f in rep.findings if f.level == "WARN"]
+    # The launcher prints the sm_80 FP8 warning once when it starts.
+    warns = [f"{f.code}: {f.text}" for f in rep.findings if f.level == "WARN" and f.code != "kv-dtype"]
     try:
         vllm = L.build(model, p["id"], ckpt, {**env_in, **env}, extra, None, name, repo, status=status)
     except L.LaunchError as e:
         raise CliError(f"{p['id']}: {e}", e.code) from None
+    if model == "flash-next":
+        warns += L.dflash2_override_warnings(vllm.profile, vllm.caller_env)
     return Plan(name, p["id"], status, argv, env, LAUNCHER, warns, cards, free, skipped, notes, vllm)
 
 
@@ -828,10 +869,11 @@ def _allocate_instances(
                 want = _want_p2p(reg, p, inv, group)
                 k_max = min(len(pool) // need, remaining)
                 if ram_budget is not None:
-                    k_ram = int((ram_budget - ram_used) // pf.ram_floor_gib(need))
+                    each = pf.ram_floor_gib(need, inv.kv_tier_gib, inv.ple_table_gib)
+                    k_ram = int((ram_budget - ram_used) // each)
                     if k_ram < k_max:
-                        short.append(f"host RAM {ram_budget:.0f} GiB holds {int(ram_budget // pf.ram_floor_gib(need))} x {need}-card "
-                                     f"Flash-Next server(s) (~{pf.ram_floor_gib(need):.0f} GiB each)")
+                        short.append(f"host RAM {ram_budget:.0f} GiB holds {int(ram_budget // each)} x {need}-card "
+                                     f"Flash-Next server(s) (~{each:.0f} GiB each{pf.ram_tier_text(need, inv.kv_tier_gib)})")
                         k_max = k_ram
                 if k_max < 1:
                     break
@@ -859,7 +901,7 @@ def _allocate_instances(
                 tested_n += len(got) if (ch.rep.status == "tested" or _no_p2p_twin(p)) else 0
                 have.append(f"{len(got)} x {p['id']} on GPUs " + " / ".join(",".join(map(str, c)) for c in got))
                 remaining -= len(got)
-                ram_used += len(got) * pf.ram_floor_gib(need)
+                ram_used += len(got) * pf.ram_floor_gib(need, inv.kv_tier_gib, inv.ple_table_gib)
                 used = {c for cards in got for c in cards}
                 pool = [g for g in pool if g.index not in used]
         attempts.append((sets, tested_n, have, short, left_out, size or 0))
@@ -884,8 +926,13 @@ def plan_instances(
     ``MASTER_PORT`` / ``VLLM_PORT`` from ``launch.distributed_ports(PORT)`` (exported on every family; a single
     Flash-Next or 27B launch exports none) and, after the first instance, ``CACHE_ROOT``, ``VLLM_CACHE_ROOT`` and
     ``TRITON_CACHE_DIR`` under ``<cache root>/instance-<i>``."""
-    reg = _load(name)
     env_in = dict(os.environ if environ is None else environ)
+    try:
+        reg = R.with_kv_dtype(_load(name), env_in.get("KV_DTYPE"))
+    except R.ProfileError as e:
+        raise CliError(str(e)) from None
+    # every instance gets the same KV host tier and PLE table (the checkpoint's: INT6 g32 with --ple int6)
+    inv = replace(inv, kv_tier_gib=pf.kv_host_tier_gib(env_in), ple_table_gib=pf.ple_table_gib_of(path or env_in.get("MERLIN_CHECKPOINT_DIR"), inv.ple_table_gib))
     if _gpu_selection(env_in) is not None:
         raise CliError("--instances partitions the host itself; unset GPUS / CUDA_VISIBLE_DEVICES (or start the instances by hand)")
     if n < 1:
@@ -956,30 +1003,162 @@ def plan_instances(
     if reg["model"] == "flash-next":
         need = max(p["match"]["cards"] for p, _ in sets)
         running = _running_fn_instances() // max(need, 1)
-        floors = [pf.ram_floor_gib(len(cards)) for _, cards in sets]  # an octo instance needs more than a quad
+        tier = inv.kv_tier_gib
+        floors = [pf.ram_floor_gib(len(cards), tier, inv.ple_table_gib) for _, cards in sets]  # an octo instance needs more than a quad
         ram, what, count = inv.host.ram_mib, "host RAM", n + running
-        need_gib = sum(floors) + running * FN_RAM_FLOOR_GIB
+        # the KV host tier's arenas (tier x ranks per server; running servers assumed to run the same layout and tier)
+        tier_new = sum(tier * len(cards) for _, cards in sets)
+        tier_gib = tier_new + running * tier * need
+        need_gib = sum(floors) + running * (FN_RAM_FLOOR_GIB - pf.FN_PLE_TABLE_GIB + inv.ple_table_gib + tier * need)  # running: same tier and table
         avail = _mem_available_mib()
         if avail is not None and (ram is None or avail < ram) and inv.source == "probe":
             # what is free now, not MemTotal: running servers' PLE tables are already out of it, so only new ones count
-            ram, what, count, need_gib = avail, "host memory available now", n, sum(floors)
+            ram, what, count, need_gib, tier_gib = avail, "host memory available now", n, sum(floors), tier_new
         if ram is not None:
             have = pf._gib(ram)
             beside = f" beside {running} already running" if running else ""
+            tier_s = f" + a KV host tier of {tier} GiB per rank ({tier_gib} GiB)" if tier > 0 else ""
             if have < need_gib:
                 per = " / ".join(f"~{f:.0f}" for f in sorted(set(floors)))
                 raise CliError(
-                    f"{what} {have:.0f} GiB cannot hold {n} Flash-Next instance(s){beside}: each pins a ~47.7 GiB PLE table "
-                    f"and needs {per} GiB resident ({FN_RAM_FLOOR_GIB:.0f} GiB at four workers plus "
-                    f"{pf.RAM_PER_EXTRA_WORKER_GIB:.0f} GiB per worker above four; ~{need_gib:.0f} GiB for {count}; "
+                    f"{what} {have:.0f} GiB cannot hold {n} Flash-Next instance(s){beside}: each pins a ~{inv.ple_table_gib:.1f} GiB "
+                    f"PLE table and needs {per} GiB resident ({FN_RAM_FLOOR_GIB:.0f} GiB at four workers plus "
+                    f"{pf.RAM_PER_EXTRA_WORKER_GIB:.0f} GiB per worker above four{tier_s}; ~{need_gib:.0f} GiB for {count}; "
                     f"{FN_RAM_WARN_GIB:.0f} GiB per instance is the qualified allocation). Start fewer instances."
                 )
-            if have < count * FN_RAM_WARN_GIB:
+            if have < count * FN_RAM_WARN_GIB + tier_gib:
                 plans[0].warnings.append(
-                    f"ram: {what} {have:.0f} GiB is below {count} x {FN_RAM_WARN_GIB:.0f} GiB qualified "
+                    f"ram: {what} {have:.0f} GiB is below {count} x {FN_RAM_WARN_GIB:.0f} GiB qualified{tier_s} "
                     f"(floor {need_gib:.0f} GiB; the boot peak is unmeasured)"
                 )
+    _check_kv_host_tier_instances(reg, inv, env_in, sets, n)
     return plans
+
+
+def _kv_host_tier_state(env: dict[str, str]) -> tuple[str, int]:
+    """MERLIN_KV_HOST_TIER_GIB as the launcher reads it (stripped, ASCII digits): ``("unset", 0)`` when absent or blank,
+    ``("off", 0)`` for a genuine 0, ``("on", n)`` for n > 0 and ``("malformed", 0)`` for anything else (the launcher
+    refuses that one; --swarm must never overwrite it)."""
+    raw = (env.get("MERLIN_KV_HOST_TIER_GIB") or "").strip()
+    if not raw:
+        return "unset", 0
+    if not (raw.isascii() and raw.isdigit() and len(raw) < 6):
+        return "malformed", 0
+    return ("on", int(raw)) if int(raw) > 0 else ("off", 0)
+
+
+def _kv_host_tier_gib(env: dict[str, str]) -> int:
+    """MERLIN_KV_HOST_TIER_GIB as the engine reads it; anything but a plain positive integer is 0 here (the engine
+    itself refuses a malformed value)."""
+    return _kv_host_tier_state(env)[1]
+
+
+def _check_kv_host_tier_instances(reg: dict, inv: pf.Inventory, env: dict[str, str], sets: list, n: int) -> None:
+    """The host-RAM KV tier knob is GiB per rank and every instance inherits it: each engine checks only its own ranks
+    before weights load, so check the sum of every planned instance's arenas against the host before launching any
+    (Flash-Next's own RAM gates already count its arenas with its resident floor)."""
+    gib = _kv_host_tier_gib(env)
+    if gib <= 0:
+        return
+    rank_counts = [len(cards) for _, cards in sets]
+    minimum = max(pf.min_restore_unit_gib_per_rank(ranks, reg["model"], prof) for (prof, _), ranks in zip(sets, rank_counts))
+    if gib < minimum:
+        raise CliError(
+            f"{KV_HOST_TIER_ENV}={gib} GiB per rank cannot hold one 262K restore unit "
+            f"for this layout; needs at least {minimum} GiB per rank. "
+            "Increase MERLIN_KV_HOST_TIER_GIB or set it to 0 to disable the tier."
+        )
+    if reg["model"] == "flash-next":
+        # Its allocation and instance-count RAM gates already account for the arenas.
+        return
+    ranks = sum(rank_counts)
+    tier_need = gib * ranks
+    ram, what = inv.host.ram_mib, "host RAM"
+    avail = _mem_available_mib()
+    if avail is not None and (ram is None or avail < ram) and inv.source == "probe":
+        ram, what = avail, "host memory available now"
+    if ram is None:
+        return
+    have = pf._gib(ram)
+    if have < tier_need:
+        raise CliError(
+            f"MERLIN_KV_HOST_TIER_GIB={gib} is GiB per rank: {n} instance(s) with {ranks} ranks in all need "
+            f"{tier_need} GiB of host-RAM KV tier arenas, but {what} is {have:.0f} GiB. "
+            "Lower MERLIN_KV_HOST_TIER_GIB, start fewer instances, or set it to 0 (tier off)."
+        )
+
+
+# --kv-ram-cache: the KV host tier (a host-RAM cache for evicted prefix KV blocks,
+# restored instead of recomputed; no extra context or sessions) as the host RAM one server gives it in all, split
+# evenly over that server's ranks (TP x PP) into the engine's knob, which is GiB per rank.
+KV_HOST_TIER_ENV = "MERLIN_KV_HOST_TIER_GIB"
+KV_TIER_FAMILY = "flash-next"  # the Flash-Next family (PLE table, DFlash2)
+# The families whose RecoverSSM path the tier is qualified for (vllm/merlin/kv_host_tier.py): Flash-Next and the
+# dense 27B lanes, where the cache is experimental, and Ornith 1.5 (Qwen3.5 MoE), whose hardware qualification has not
+# run yet, so its plans say untested.
+KV_TIER_FAMILIES = ("flash-next", "27b", "ornith")
+# --swarm: the families that have rows with a qualified high-concurrency cap (profile ``serve.kv_tier_seqs``:
+# Flash-Next 4 x 3090 24 sessions, 27B TP4 32). A row without that block refuses --swarm and names the rows that have it.
+SWARM_FAMILIES = ("flash-next", "27b")
+# The plan note per family besides Flash-Next (whose experimental note the launcher adds): 27B experimental, Ornith
+# untested.
+KV_TIER_UNTESTED = {"27b": "KV RAM cache on the 27B: experimental in 3.0.1 (RecoverSSM path only; a "
+                           "session evicted under heavy concurrent prefill may recompute, output identical)",
+                    "ornith": "KV RAM cache on Ornith 1.5: untested ⚫ (the engine accepts it on the RecoverSSM path; "
+                              "its hardware qualification has not run yet)"}
+# Above this --kv-ram-cache total (GiB per server) the plan adds an untested note. It is a conservative bound, not a size
+# a run validated; raise it only when a larger size has been run.
+KV_RAM_CACHE_TESTED_GIB = 160
+_KV_RAM_CACHE = re.compile(r"(\d+)(?:g|gib)?", re.IGNORECASE)
+
+
+def parse_kv_ram_cache(text: str) -> int:
+    """``--kv-ram-cache`` as whole GiB per server: ``24g``, ``24G``, ``24gib`` or a plain ``24``; 0 = off."""
+    m = _KV_RAM_CACHE.fullmatch(str(text).strip())
+    if not m:
+        raise CliError(f"--kv-ram-cache {text!r}: give the KV RAM cache's host RAM per server in whole GiB, "
+                       "e.g. 24g, 24G, 24gib or 24 (0 = off)")
+    return int(m.group(1))
+
+
+def kv_ram_cache_per_rank(total: int, ranks: list[int], minimum: int | None = None) -> int:
+    """GiB per rank for one server's tier, rounded down to a whole GiB per rank. ``minimum`` is the GiB per rank one
+    262K restore unit needs on these servers' rows (default: 4 GiB per server)."""
+    if total <= 0:
+        return 0
+    sizes = sorted(set(ranks))
+    if len(sizes) != 1:
+        raise CliError(f"--kv-ram-cache {total}g: these servers have different rank counts ({' / '.join(map(str, sizes))}), so "
+                       f"one size cannot split evenly over all of them; start one layout (--tp), or set {KV_HOST_TIER_ENV} "
+                       "(GiB per rank) yourself")
+    n = sizes[0]
+    per_rank = total // n
+    minimum = pf.min_restore_unit_gib_per_rank(n) if minimum is None else minimum
+    if per_rank < minimum:
+        smallest = minimum * n
+        raise CliError(
+            f"--kv-ram-cache {total}g cannot hold one 262K restore unit over the {n} ranks "
+            f"(TP x PP) of each server; the smallest size is {smallest}g "
+            f"({minimum} GiB per rank), or 0 (off). Nothing started."
+        )
+    return per_rank  # kv_ram_cache_text reports the size actually used
+
+
+def kv_ram_cache_untested(total: int | None) -> str | None:
+    """The NOTE for a --kv-ram-cache total above the tested size; None at or below it."""
+    if not total or total <= KV_RAM_CACHE_TESTED_GIB:
+        return None
+    return f"--kv-ram-cache {total}g: sizes above {KV_RAM_CACHE_TESTED_GIB}g are untested ⚫ (no run has covered them)"
+
+
+def kv_ram_cache_text(total: int, per_rank: int, ranks: int, servers: int = 1) -> str:
+    """The plan line for the tier: per server, per rank and, with several servers, in all."""
+    if total <= 0:
+        return "KV RAM cache: off (--kv-ram-cache 0)"
+    used = per_rank * ranks
+    asked = f"{total}g rounded down to " if used != total else ""
+    s = f"KV RAM cache: {asked}{used} GiB per server = {per_rank} GiB per rank x {ranks} ranks ({KV_HOST_TIER_ENV}={per_rank})"
+    return s + (f"; {servers} servers = {used * servers} GiB of host RAM in all" if servers > 1 else "")
 
 
 def _mem_available_mib() -> int | None:
@@ -1017,8 +1196,17 @@ def cmd_list(out: Any, repo: Path = REPO, checkpoint: str | None = None, arch: s
 
 def _print_plan(plan: Plan, out: Any, label: str) -> None:
     out.write(f"# {label}\n")
+    if plan.vllm is not None:
+        for note in plan.vllm.notes:
+            if note in (R.SM80_FP8_WARNING, R.SM80_27B_FP8_WARNING):
+                out.write(f"# WARN {note}\n")
+            elif note.startswith("GUARD="):
+                out.write(f"# NOTE {note}\n")
     for n in plan.notes:
         out.write(f"# NOTE {n}\n")
+    for n in (plan.vllm.notes if plan.vllm is not None else []):
+        if L.is_cap_note(n):  # the launcher prints these at boot: default / --swarm / exported SEQS
+            out.write(f"# WARN {n.removeprefix('WARNING: ')}\n" if n.startswith("WARNING: ") else f"# NOTE {n.removeprefix('note: ')}\n")
     for w in plan.warnings:
         out.write(f"# WARN {w}\n")
     for m in missing_resources(plan, os.environ):
@@ -1060,6 +1248,245 @@ def _identify(args: argparse.Namespace) -> tuple[str, str | None, list[str]]:
     return name, path, notes
 
 
+# --spec: the drafter. mtp (the default everywhere) or dflash2, incoai's DFlash2 block-diffusion drafter for the
+# Flash-Next family on the rows with a qualified DFlash2 geometry (+5-18 % decode vs MTP on 4 x 3090; a 789,668-token
+# pool: 3 x 262K, not 6 x 131K). The launcher's SPEC=none (no drafter, a reference setting) is not offered here.
+SPEC_CHOICES = ("mtp", "dflash2")
+DFLASH2_REPO = "incoai/Qwen3.8-Flash-Next-DFlash2"
+DFLASH2_DEFAULT_DIR = "~/models/flash-next-dflash2"  # setup.sh --spec dflash2 downloads it here
+DFLASH2_FILES = ("config.json", "model.safetensors")  # what serving reads (the checksum list's files)
+DFLASH2_WHY = "+5-18 % decode vs MTP on 4 x 3090; its 789,668-token pool holds 3 x 262K, not 6 x 131K"
+
+
+def dflash2_dir(environ: dict[str, str] | None = None) -> Path:
+    """The DFlash2 drafter's folder: DFLASH2_MODEL, else the default models folder's copy."""
+    env = os.environ if environ is None else environ
+    return Path(env.get("DFLASH2_MODEL") or DFLASH2_DEFAULT_DIR).expanduser()
+
+
+def dflash2_missing(d: Path) -> list[str]:
+    return [f for f in DFLASH2_FILES if not (d / f).is_file()]
+
+
+def _spec_env(args: argparse.Namespace, name: str) -> dict[str, str]:
+    """``--spec`` as the launcher's environment (SPEC, and DFLASH2_MODEL for dflash2); {} without the flag."""
+    spec = getattr(args, "spec", None)
+    if spec is None:
+        return {}
+    if CHECKPOINTS[name] != KV_TIER_FAMILY:
+        if spec == "dflash2":
+            raise CliError(f"--spec dflash2: DFlash2 is only available for the Flash-Next family ({L.FN_FAMILY_NAMES}); "
+                           f"{name} uses its MTP head. Nothing started.")
+        return {"SPEC": "mtp"}  # what it runs anyway
+    if spec == "mtp":
+        return {"SPEC": "mtp"}
+    return {"SPEC": "dflash2", "DFLASH2_MODEL": str(dflash2_dir())}
+
+
+def _serve_flags(args: argparse.Namespace, name: str, path: str | None) -> int | None:
+    """``--ple int6`` and ``--kv-ram-cache``: refused before anything resolves when this build or this checkpoint
+    cannot take them. Returns the tier's GiB per server (0 = off), or None without ``--kv-ram-cache``."""
+    if getattr(args, "ple", "fp8") == "int6":
+        import setup_cli
+
+        why = setup_cli.int6_reason(name, REPO)
+        if why is None and path is not None:
+            why = setup_cli.int6_checkpoint_reason(Path(path)) or setup_cli.overlay_reason(name, Path(path), REPO)
+        if why is not None:
+            raise CliError(f"--ple int6: {why}. Nothing started; --ple fp8 (the default) serves the FP8 PLE table.")
+    elif path is not None and CHECKPOINTS.get(name) == KV_TIER_FAMILY:
+        import setup_cli
+
+        if setup_cli.int6_checkpoint_reason(Path(path)) is None:  # the launcher boots INT6 g32 from the config alone
+            raise CliError(f"{path} carries the INT6 g32 PLE table: serve it with --ple int6. Nothing started; "
+                           "--ple fp8 (the default) needs the FP8 checkpoint.")
+    if getattr(args, "kv_ram_cache", None) is None:
+        return None
+    total = parse_kv_ram_cache(args.kv_ram_cache)
+    if total and CHECKPOINTS[name] not in KV_TIER_FAMILIES:
+        raise CliError("--kv-ram-cache: the KV RAM cache is available for the Flash-Next family, the 27B and Ornith 1.5 "
+                       f"only, not {name}. Nothing started.")
+    return total
+
+
+def swarm_cache_set_text(total: int, need: int, ranks: int, cap: int) -> str:
+    """The note for --swarm with no --kv-ram-cache: the cache was sized for the cap."""
+    return (f"--swarm: no --kv-ram-cache was given, so the KV RAM cache is {total}g per server ({need} GiB per rank x {ranks} "
+            f"ranks), the size the {cap}-session cap was tested at; --kv-ram-cache SIZE sets another size (at least {total}g)")
+
+
+def _restore_unit_minimum(plans: list[Plan]) -> int:
+    """GiB per rank one 262K restore unit needs on every planned server (each row's own host row size)."""
+    return max(pf.min_restore_unit_gib_per_rank(len(p.cards), p.vllm.model if p.vllm else None,
+                                                p.vllm.profile if p.vllm else None) for p in plans)
+
+
+def _plan_kv_ram_cache(plan: Callable[[dict[str, str] | None], list[Plan]], total: int | None,
+                       base: dict[str, str] | None = None, swarm: bool = False) -> list[Plan]:
+    """Resolve with the tier off to learn each server's ranks, split ``total`` over them (rounded down to whole GiB per
+    rank; refused below one 262K restore unit), then resolve again with the per-rank knob so every RAM gate counts the tier; the layout must not move.
+
+    With ``swarm`` the layout is learned at the default cap, then the cache is checked against the size the
+    row's swarm cap was qualified with: ``total`` below it is refused (never raised), and ``total`` None (no
+    --kv-ram-cache given) is set to it, per server, with a note."""
+    env = {**os.environ, **(base or {}), KV_HOST_TIER_ENV: "0"}  # the flag wins over an exported knob
+    env.pop(L.SWARM_ENV, None)  # the layout (and its ranks) is learned at the default cap
+    # knobs that need the tier on are left out of the tier-off layout pass and checked in the sized pass below
+    needs_tier = {k: env.pop(k) for k in L.FN_KV_HOST_TIER_NEEDS_ON if k in env}
+    plans = plan(env)
+    ranks = [len(p.cards) for p in plans]
+    swarm_note = None
+    if swarm:
+        prof = plans[0].vllm.profile
+        gate = L.swarm_gate(prof)
+        if not gate:
+            raise CliError(L.swarm_not_qualified(plans[0].profile_id) + ". Nothing started.")
+        sizes = sorted(set(ranks))
+        if len(sizes) != 1:
+            raise CliError(f"--swarm: these servers have different rank counts ({' / '.join(map(str, sizes))}), so one KV RAM "
+                           "cache size cannot suit all of them; start one layout (--tp). Nothing started.")
+        need, cap = int(gate["min_gib_per_rank"]), int(gate["max_num_seqs"])
+        if total is None:
+            total = need * sizes[0]
+            swarm_note = swarm_cache_set_text(total, need, sizes[0], cap)
+        elif total // sizes[0] < need:
+            raise CliError(L.swarm_cache_refusal(prof, total // sizes[0]) + ". Nothing started.")
+        env[L.SWARM_ENV] = "1"
+    assert total is not None
+    per = kv_ram_cache_per_rank(total, ranks, _restore_unit_minimum(plans))
+    env.update(needs_tier)
+    if per or needs_tier:  # with --kv-ram-cache 0 those knobs are refused as the launcher refuses them
+        env[KV_HOST_TIER_ENV] = str(per)
+        again = plan(env)
+        if [len(p.cards) for p in again] != ranks:
+            raise CliError(f"--kv-ram-cache {total}g changes the layout this host gets; give --tp to pick one. Nothing started.")
+        plans = again
+    for p in plans:
+        p.env[KV_HOST_TIER_ENV] = str(per)
+    plans[0].notes.append(kv_ram_cache_text(total, per, ranks[0], len(plans)))
+    if swarm_note:
+        plans[0].notes.append(swarm_note)
+    big = kv_ram_cache_untested(total)
+    if big:
+        plans[0].notes.append(big)
+    return plans
+
+
+def _swarm_env(args: argparse.Namespace, name: str) -> dict[str, str]:
+    """The one swarm decision as the launcher's environment: ``--swarm`` or an exported SWARM=1 gives SWARM=1 (the plan, the
+    cache sizing and the hand-over to the launcher all read this and nothing else); otherwise {}. A bad exported value is
+    refused here. Refused where the checkpoint's family has no swarm cap at all, naming the rows that have one (a row of a
+    swarm family without one is refused by the launcher, which knows the row)."""
+    try:
+        wanted = bool(getattr(args, "swarm", False)) or L.swarm_requested(os.environ)
+    except L.LaunchError as e:
+        raise CliError(str(e), e.code) from None
+    if not wanted:
+        return {}
+    if CHECKPOINTS[name] not in SWARM_FAMILIES:
+        raise CliError(L.swarm_not_qualified(name) + ". Nothing started.")
+    return {L.SWARM_ENV: "1"}
+
+
+def _verification_list(name: str) -> tuple[Path, dict[str, str]]:
+    import setup_cli
+
+    lst = setup_cli.checksum_list(name, REPO)
+    sums, _ = setup_cli.parse_checksums(lst)
+    if not any(n.endswith(".safetensors") for n in sums):
+        raise CliError(f"{lst}: no safetensors shards listed; cannot verify this checkpoint")
+    return lst, sums
+
+
+def verification_hint(name: str, path: str, ple: str = "fp8") -> str | None:
+    """Check only the checksum list and file stats; never read shard bytes during serve."""
+    import setup_cli
+
+    errors = (CliError, setup_cli.SetupError, OSError, ValueError, TypeError, AttributeError)
+    if ple != "fp8":
+        try:  # the INT6 overlay: its base and pack carry the markers (serve refuses a stale overlay before this)
+            why = setup_cli.overlay_reason(name, Path(path), REPO)
+        except errors as e:
+            why = str(e)
+        return None if why is None else f"INT6 overlay unverified: {why}; run merlin verify {shlex.quote(path)} --checkpoint {name} --ple int6"
+    try:
+        lst, sums = _verification_list(name)
+    except errors as e:
+        # merlin verify reads this same list, so advising it would only fail (a withheld checkpoint ships none)
+        reason = setup_cli.SETUP_WITHHELD.get(name) or str(e)
+        return f"checkpoint shards are unverified; verification is unavailable for {name}: {reason}"
+    try:
+        if setup_cli.marker_ok(Path(path), name, sums, setup_cli.sha256_file(lst)):
+            return None
+    except errors:
+        pass  # unreadable/malformed markers are unverified, not a launch refusal
+    cmd = ["merlin", "verify", path, "--checkpoint", name]
+    return f"checkpoint shards are unverified (no current size/mtime stamp); run {shlex.join(cmd)}"
+
+
+def _verify_overlay(name: str, path: Path, out: Any) -> int:
+    """``merlin verify <overlay> --ple int6``: rehash the FP8 base and the pack its marker names, then check the overlay
+    against both (links, generated config.json / index, the checksum lists and base files it was built from)."""
+    import ple_pack
+    import setup_cli
+
+    m = ple_pack.read_overlay_marker(path)
+    if m is None:
+        raise CliError(f"{path} is not an INT6 overlay (no {ple_pack.OVERLAY_MARKER}); --ple int6 verifies the folder setup built "
+                       "(<checkpoint>-int6). Nothing verified")
+    if m.get("model") != name:
+        raise CliError(f"{path} is the INT6 overlay of {m.get('model')}, not {name}")
+    base, pack = Path(str(m.get("base"))), Path(str(m.get("pack")))
+    say = lambda line: print(line, file=out, flush=True)  # noqa: E731
+    lst, sums = _verification_list(name)
+    ok, bad = setup_cli.verify_checkpoint(base, lst, say=say, model=name, rehash=True)
+    if not ok:
+        raise CliError(f"FP8 base verification failed in {base}:\n  " + "\n  ".join(bad), 1)
+    plst = setup_cli.pack_list(REPO)
+    if not plst.is_file():
+        raise CliError(f"{ple_pack.PACK_LIST} is missing from this release: the INT6 pack cannot be verified", 1)
+    ok, bad = setup_cli.verify_checkpoint(pack, plst, say=say, model=ple_pack.PACK_MARKER_MODEL, rehash=True)
+    if not ok:
+        raise CliError(f"INT6 pack verification failed in {pack}:\n  " + "\n  ".join(bad), 1)
+    probs = ple_pack.overlay_problems(path, setup_cli.overlay_sources(name, base, pack, REPO))
+    if probs:
+        raise CliError(f"INT6 overlay {path} is stale:\n  " + "\n  ".join(probs)
+                       + f"\n  merlin pull {name} --models-dir {shlex.quote(str(base))} --ple int6 rebuilds it", 1)
+    print(f"merlin: INT6 overlay verified: {len(sums)} FP8 files in {base}, the pack in {pack}, links and generated files in {path}", file=out)
+    return 0
+
+
+def cmd_verify(args: argparse.Namespace, out: Any) -> int:
+    """Always rehash, including when a pull/verify stamp is current, without probing GPUs or installing anything."""
+    import setup_cli
+
+    try:
+        path = Path(args.directory)
+        if not path.is_dir():
+            raise CliError(f"checkpoint directory {str(path)!r} is not a directory")
+        name = args.checkpoint
+        if name is None:
+            name, notes = L.identify_checkpoint(str(path), REPO)
+            for note in notes:
+                print(f"merlin: NOTE {note}", file=out)
+        if args.ple == "int6":
+            return _verify_overlay(name, path, out)
+        lst, sums = _verification_list(name)
+        ok, bad = setup_cli.verify_checkpoint(
+            path, lst, say=lambda line: print(line, file=out, flush=True), model=name, rehash=True,
+        )
+        if not ok:
+            raise CliError(f"checkpoint verification failed in {path}:\n  " + "\n  ".join(bad), 1)
+        print(f"merlin: checkpoint verified: {len(sums)} files in {path}", file=out)
+        return 0
+    except (CliError, L.LaunchError, setup_cli.SetupError) as e:
+        print(f"merlin: {e}", file=sys.stderr)
+        return e.code
+    except (OSError, ValueError) as e:
+        print(f"merlin: {e}", file=sys.stderr)
+        return 2
+
+
 def cmd_serve(args: argparse.Namespace, extra: list[str], out: Any) -> int:
     if args.simulate and not args.dry_run:
         print("merlin: --simulate only works with --dry-run (it never launches on fabricated hardware)", file=sys.stderr)
@@ -1073,12 +1500,56 @@ def cmd_serve(args: argparse.Namespace, extra: list[str], out: Any) -> int:
             raise CliError(f"checkpoint directory {path!r} is not a directory")
         if path is None and not os.environ.get("MERLIN_CHECKPOINT_DIR"):
             id_notes.append("no checkpoint directory given: the command below shows " + PLACEHOLDER + " (dry-run only)")
+        tier = _serve_flags(args, name, path or os.environ.get("MERLIN_CHECKPOINT_DIR"))  # the folder that will be served
+        swarm_env = _swarm_env(args, name)
+        ckpt = path or os.environ.get("MERLIN_CHECKPOINT_DIR")
+        hint = verification_hint(name, ckpt, args.ple) if ckpt else None
+        if hint:
+            id_notes.append(hint)
+        spec_env = _spec_env(args, name)
+        launch_env = {**spec_env, **swarm_env}  # what the launcher is told (SPEC, SWARM); the plan env gets it at exec
+        if not swarm_env and L.SWARM_ENV in os.environ:
+            launch_env[L.SWARM_ENV] = "0"  # decided off: the plan and the launcher read the same 0 whatever the export spelt
         inv = pf.simulate(args.simulate) if args.simulate else pf.probe(pf.default_runner)
-        if args.instances is not None and args.instances != 1:
-            plans = plan_instances(name, path, args.profile, inv, extra, args.instances, repo=REPO, tp=args.tp,
-                                   served_suffix=args.served_suffix)
+
+        def plan(environ: dict[str, str] | None) -> list[Plan]:
+            if args.instances is not None and args.instances != 1:
+                return plan_instances(name, path, args.profile, inv, extra, args.instances, repo=REPO, environ=environ,
+                                      tp=args.tp, served_suffix=args.served_suffix)
+            return [resolve(name, path, args.profile, inv, extra, repo=REPO, environ=environ, tp=args.tp)]
+
+        if tier is not None or (swarm_env and _kv_host_tier_state(os.environ)[0] in ("unset", "off")):
+            # --kv-ram-cache SIZE, or --swarm with no cache anywhere (unset, blank or a genuine 0): sized for the swarm cap
+            # An exported size, a small or a malformed one included, goes to the launcher as it is: never overwritten
+            plans = _plan_kv_ram_cache(plan, tier, launch_env, swarm=bool(swarm_env))
         else:
-            plans = [resolve(name, path, args.profile, inv, extra, repo=REPO, tp=args.tp)]
+            plans = plan({**os.environ, **launch_env} if launch_env else None)
+            inherited_tier = _kv_host_tier_gib({**os.environ, **launch_env})
+            if inherited_tier > 0:
+                minimum = _restore_unit_minimum(plans)
+                if inherited_tier < minimum:
+                    raise CliError(
+                        f"{KV_HOST_TIER_ENV}={inherited_tier} GiB per rank cannot hold one "
+                        f"262K restore unit for this layout; needs at least {minimum} GiB per rank. "
+                        f"Increase {KV_HOST_TIER_ENV} or set it to 0 to disable the tier."
+                    )
+        # The untested notice follows the tier the launcher actually gets (the plan's env over the inherited one):
+        # --kv-ram-cache or an exported MERLIN_KV_HOST_TIER_GIB alike
+        if CHECKPOINTS[name] in KV_TIER_UNTESTED and any(
+                _kv_host_tier_gib({**os.environ, **p.env}) > 0 for p in plans):
+            plans[0].notes.append(KV_TIER_UNTESTED[CHECKPOINTS[name]])
+        for p in plans:
+            p.env.update(launch_env)
+        if spec_env.get("SPEC") == "dflash2":
+            d = Path(spec_env["DFLASH2_MODEL"])
+            gone = dflash2_missing(d)
+            fix = (f"the DFlash2 drafter is not in {d} (missing {', '.join(gone)}): ./setup.sh --spec dflash2 downloads "
+                   f"{DFLASH2_REPO} there, or set DFLASH2_MODEL to your copy")
+            if gone and not args.dry_run:
+                raise CliError(fix + ". Nothing started.")
+            plans[0].notes.append(f"--spec dflash2: drafter {d}; {DFLASH2_WHY}")
+            if gone:
+                plans[0].warnings.append("dflash2: " + fix)
     except CliError as e:
         print(f"merlin: {e}", file=sys.stderr)
         return e.code
@@ -1112,27 +1583,160 @@ def cmd_serve(args: argparse.Namespace, extra: list[str], out: Any) -> int:
             print(f"merlin: WARN {w}", file=sys.stderr)
         os.execvpe(plan.argv[0], plan.argv, {**os.environ, **plan.env})
         return 0  # pragma: no cover
-    log_dir = Path(os.environ.get("MERLIN_LOG_DIR") or os.getcwd())
-    started = []
-    for i, plan in enumerate(plans):
-        env = {**os.environ, **plan.env}
-        host, port = L.effective_host_port(plan.vllm.args, plan.vllm.extra)  # type: ignore[union-attr]
+    return launch_instances(plans, Path(os.environ.get("MERLIN_LOG_DIR") or os.getcwd()), wait_ready=getattr(args, "wait_ready", 0.0) or 0.0)
+
+
+def _plan_ports(plan: Plan) -> list[tuple[str, int]]:
+    """(label, port) of every port one instance binds: its HTTP port and the MASTER_PORT / VLLM_PORT pair."""
+    out = [("HTTP port", L.effective_host_port(plan.vllm.args, plan.vllm.extra)[1])]  # type: ignore[union-attr]
+    for key in ("MASTER_PORT", "VLLM_PORT"):
+        v = plan.env.get(key)
+        if v and v.isdigit():
+            out.append((key, int(v)))
+    return out
+
+
+def _stop_instances(procs: list[subprocess.Popen], grace: float = 10.0) -> list[int]:
+    """End the process groups this invocation spawned (SIGTERM, then SIGKILL after ``grace`` s) and reap them.
+    A group counts as gone only when no process is left in it: a worker that ignores SIGTERM after its leader
+    exited still gets SIGKILL. Returns the group ids that could not be confirmed gone. Never touches a process
+    it was not handed."""
+    import signal
+    import time
+
+    def send(proc: subprocess.Popen, sig: int) -> None:
         try:
-            free = L.port_free(host, port)
-        except L.LaunchError as e:
-            print(f"merlin: {e}; nothing more started", file=sys.stderr)
-            return e.code
-        if not free:
-            print(f"merlin: port {port} on {host} is busy; nothing more started (PORT={port + len(plans)} moves the whole block)", file=sys.stderr)
-            return 2
-        log = log_dir / f"merlin-{plan.profile_id}-{port}.log"
-        with open(log, "ab") as fh:
-            proc = subprocess.Popen(plan.argv, env=env, stdout=fh, stderr=subprocess.STDOUT, start_new_session=True)
-        started.append((i, plan, port, proc.pid, log))
-        print(f"merlin: instance {i}: {plan.profile_id} [{plan.status}] GPUs {','.join(map(str, plan.cards))} -> http://{host}:{port} pid {proc.pid} (own process group) log {log}", file=sys.stderr)
-        for n in plan.notes:
-            print(f"merlin: NOTE {n}", file=sys.stderr)
-    print("merlin: endpoints: " + " ".join(f"http://{L.effective_host_port(p.vllm.args, p.vllm.extra)[0]}:{port}" for _, p, port, _, _ in started), file=sys.stderr)  # type: ignore[union-attr]
+            if hasattr(os, "killpg"):
+                os.killpg(proc.pid, sig)  # start_new_session=True made the child its own group leader
+            elif sig == signal.SIGTERM:
+                proc.terminate()
+            else:
+                proc.kill()
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+
+    def alive(proc: subprocess.Popen) -> bool:
+        """The leader is reaped first (a zombie leader would keep its group alive); then signal 0 to the group
+        says whether any process is left in it."""
+        leader = proc.poll() is None
+        if not hasattr(os, "killpg"):
+            return leader
+        try:
+            os.killpg(proc.pid, 0)
+        except ProcessLookupError:
+            return False
+        except OSError:  # PermissionError: something is in the group that this user cannot signal
+            return True
+        return True
+
+    def wait_gone(group: list[subprocess.Popen], until: float) -> list[subprocess.Popen]:
+        left = [p for p in group if alive(p)]
+        while left and time.monotonic() < until:
+            time.sleep(0.2)
+            left = [p for p in left if alive(p)]
+        return left
+
+    for proc in procs:
+        send(proc, signal.SIGTERM)
+    left = wait_gone(list(procs), time.monotonic() + grace)
+    for proc in left:
+        send(proc, getattr(signal, "SIGKILL", signal.SIGTERM))
+    for proc in left:
+        try:
+            proc.wait(timeout=5)
+        except Exception:  # noqa: BLE001 - report, never raise out of a rollback
+            pass
+    return [p.pid for p in wait_gone(left, time.monotonic() + 5)]
+
+
+def _health_ok(host: str, port: int) -> bool:
+    import urllib.request
+
+    h = host.strip("[]")
+    h = "127.0.0.1" if h in ("", "0.0.0.0") else h
+    h = f"[{h}]" if ":" in h else h
+    try:
+        with urllib.request.urlopen(f"http://{h}:{port}/health", timeout=2) as r:
+            return r.status == 200
+    except Exception:  # noqa: BLE001 - not up yet
+        return False
+
+
+def launch_instances(plans: list[Plan], log_dir: Path, wait_ready: float = 0.0) -> int:
+    """Start every plan or none of them. All ports of all instances are checked before the first spawn; if a later spawn
+    fails (or, with ``wait_ready``, an instance dies or misses the /health deadline) the instances THIS invocation
+    spawned are stopped and the exit is non-zero. "spawned" (a process exists) is reported apart from "ready"."""
+    import time
+
+    hosts = [L.effective_host_port(p.vllm.args, p.vllm.extra)[0] for p in plans]  # type: ignore[union-attr]
+    try:
+        for i, (plan, host) in enumerate(zip(plans, hosts)):
+            for label, port in _plan_ports(plan):
+                if not L.port_free(host, port):
+                    hint = f" (PORT={port + len(plans)} moves the whole block)" if label == "HTTP port" else ""
+                    print(f"merlin: instance {i}: {label} {port} on {host} is busy; nothing started{hint}", file=sys.stderr)
+                    return 2
+    except L.LaunchError as e:
+        print(f"merlin: {e}; nothing started", file=sys.stderr)
+        return e.code
+    spawned: list[tuple[int, Plan, int, subprocess.Popen, Path]] = []
+    try:
+        for i, plan in enumerate(plans):
+            env = {**os.environ, **plan.env}
+            port = _plan_ports(plan)[0][1]
+            log = log_dir / f"merlin-{plan.profile_id}-{port}.log"
+            with open(log, "ab") as fh:
+                proc = subprocess.Popen(plan.argv, env=env, stdout=fh, stderr=subprocess.STDOUT, start_new_session=True)
+            spawned.append((i, plan, port, proc, log))
+            print(f"merlin: instance {i}: {plan.profile_id} [{plan.status}] GPUs {','.join(map(str, plan.cards))} -> http://{hosts[i]}:{port} pid {proc.pid} (own process group) log {log}", file=sys.stderr)
+            for n in plan.notes:
+                print(f"merlin: NOTE {n}", file=sys.stderr)
+    except (OSError, ValueError, subprocess.SubprocessError) as e:
+        n_done = len(spawned)
+        survivors = _stop_instances([s[3] for s in spawned])
+        print(f"merlin: instance {n_done} failed to start ({e}); stopped the {n_done} instance(s) this command had spawned"
+              + (f"; could NOT confirm process group(s) {survivors} gone, stop them by hand" if survivors
+                 else ". Nothing is left running by this command."),
+              file=sys.stderr)
+        return 1
+    if wait_ready > 0:
+        deadline = time.monotonic() + wait_ready
+        pending = list(spawned)
+        answered: set[int] = set()
+        failure = ""
+        while not failure:
+            for i, _plan, port, proc, log in spawned:  # every instance, also the ones that already answered
+                if proc.poll() is not None:
+                    when = ("after it answered /health, while others were still loading" if i in answered
+                            else "before it was ready")
+                    failure = f"instance {i} (pid {proc.pid}) exited with code {proc.returncode} {when}; see {log}"
+                    break
+            if failure:
+                break
+            for item in list(pending):
+                if _health_ok(hosts[item[0]], item[2]):
+                    pending.remove(item)
+                    answered.add(item[0])
+            if not pending:
+                # ready only when every instance answers in one pass and every process is still running after it
+                pending = [s for s in spawned if not _health_ok(hosts[s[0]], s[2])]
+                if any(s[3].poll() is not None for s in spawned):
+                    continue  # the exit is reported at the top of the loop
+                if not pending:
+                    break
+            if time.monotonic() >= deadline:
+                failure = f"instance(s) {', '.join(str(x[0]) for x in pending)} not ready after {wait_ready:g}s"
+            else:
+                time.sleep(1.0)
+        if failure:
+            survivors = _stop_instances([s[3] for s in spawned])
+            print(f"merlin: {failure}; stopped all {len(spawned)} instance(s) this command had spawned"
+                  + (f"; could NOT confirm process group(s) {survivors} gone, stop them by hand" if survivors else ""),
+                  file=sys.stderr)
+            return 1
+        print("merlin: ready: " + " ".join(f"http://{hosts[i]}:{port}" for i, _, port, _, _ in spawned), file=sys.stderr)
+        return 0
+    print("merlin: spawned (not yet ready; poll /health, load takes minutes): " + " ".join(f"http://{hosts[i]}:{port}" for i, _, port, _, _ in spawned), file=sys.stderr)
     return 0
 
 
@@ -1160,7 +1764,21 @@ def main(argv: list[str] | None = None, out: Any = None) -> int:
     s.add_argument("--profile", help="force a profile id of this checkpoint (checked against the hardware)")
     s.add_argument("--tp", type=int, help="pick the profile with this tensor-parallel size (a subset of a larger host)")
     s.add_argument("--instances", type=int, help="start N servers on N disjoint card sets (consecutive ports from PORT)")
+    s.add_argument("--wait-ready", type=float, default=0.0, metavar="SECONDS",
+                   help="with --instances: wait up to SECONDS for every /health; on a dead or late instance stop all of them and exit 1")
     s.add_argument("--served-suffix", action="store_true", help="with --instances: append -<i> to the served model name(s)")
+    s.add_argument("--ple", choices=("fp8", "int6"), default="fp8", help="Flash-Next: the PLE table, fp8 (default) or int6 (INT6 "
+                   "g32, 38.74 GiB: give the INT6 overlay folder that setup or merlin pull --ple int6 built, <checkpoint>-int6)")
+    s.add_argument("--spec", choices=SPEC_CHOICES, help="the drafter: mtp (default) or dflash2 (Flash-Next family, rows "
+                   f"with a DFlash2 geometry; {DFLASH2_WHY.replace(chr(37), chr(37) * 2)}; the drafter from DFLASH2_MODEL or {DFLASH2_DEFAULT_DIR})")
+    s.add_argument("--kv-ram-cache", metavar="SIZE", help="Flash-Next (experimental in 3.0.1, MTP only), 27B (experimental in 3.0.1) and Ornith 1.5: a host-RAM cache for prefix KV blocks the GPU pool evicts "
+                   "(restored instead of recomputed; adds no context and does not change the session cap (--swarm does); RAM only, never disk; ~66K tokens/GiB on Flash-Next TP2xPP2; needs memlock: LimitMEMLOCK=infinity or ulimit -l unlimited). SIZE = host RAM per "
+                   f"server (24g, 24gib or 24 = GiB; 0 = off), split over its TP x PP ranks into {KV_HOST_TIER_ENV} (rounded down to whole GiB per rank)")
+    s.add_argument("--swarm", action="store_true", help="the row's tested high-concurrency cap instead of its default (experimental): "
+                   "the Flash-Next 4 x 3090 profiles 24 sessions (default 8), the 27B 4 x 3090 (TP4) profiles 32 (default 24). Needs the KV RAM cache "
+                   "at the size that cap was qualified at (48g per server): without --kv-ram-cache the cache is set to that size, a smaller "
+                   "--kv-ram-cache is refused. Refused on rows with no swarm cap (the error names the rows that have one). An exported SEQS still "
+                   "wins over every cap; the plan and the boot log say which cap applies (default, --swarm or SEQS)")
     s.add_argument("--dry-run", action="store_true", help="print the resolved command and env; start nothing")
     s.add_argument("--simulate", metavar="SPEC", help="preflight's hardware spec, e.g. 4x3090 or 8x4090+8x4090-48g:numa=2 (--dry-run only)")
     ls = sub.add_parser("list", help="checkpoint -> profile -> status -> hardware -> launcher table")
@@ -1169,8 +1787,18 @@ def main(argv: list[str] | None = None, out: Any = None) -> int:
     ls.add_argument("--cards", type=int, help="only rows of this card count")
     ls.add_argument("--vram", type=int, help="only rows of this VRAM class (GB)")
     sub.add_parser("doctor", help="run tools/merlin/preflight.py (all following args pass through)")
-    sub.add_parser("pull", help="download and verify a checkpoint: merlin pull <checkpoint> [--models-dir DIR]")
+    sub.add_parser("pull", help="download and verify a checkpoint: merlin pull <checkpoint> [--models-dir DIR] [--ple int6] "
+                   "(int6: also the family's PLE pack and the overlay DIR-int6)")
+    v = sub.add_parser("verify", help="stream SHA-256 over every listed checkpoint file, including shards")
+    v.add_argument("directory", help="checkpoint directory to verify (always rehashes)")
+    v.add_argument("--checkpoint", choices=list(CHECKPOINTS), help="recipe name when directory identification is ambiguous")
+    v.add_argument("--ple", choices=("fp8", "int6"), default="fp8", help="checkpoint PLE table (default: fp8); int6: the "
+                   "directory is an INT6 overlay, and its FP8 base and the pack are verified with it")
     args = ap.parse_args(argv)
+    if args.cmd == "verify":
+        if extra:
+            ap.error("verify does not accept extra vllm arguments")
+        return cmd_verify(args, out)
     if args.cmd == "list":
         try:
             return cmd_list(out, REPO, args.checkpoint, args.arch, args.cards, args.vram)
@@ -1181,4 +1809,5 @@ def main(argv: list[str] | None = None, out: Any = None) -> int:
 
 
 if __name__ == "__main__":
+    R.safe_stdio()
     sys.exit(main())

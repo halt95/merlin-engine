@@ -3,6 +3,7 @@
  "model": "svl",
  "labels": {
   "tested": "tested on the reference host",
+  "testing": "🟡 testing: full-model runs passed on cloud-hosted hardware; kernel parity qualification still to run",
   "untested": "untested / community-validated"
  },
  "reference": {
@@ -54,7 +55,7 @@
     "fit_1m": 1,
     "fit_262k": 5,
     "fit_131k": 10,
-    "basis": "The shipped 1M default (max_model_len 1,048,576; RecoverSSM + MTP3, block 64, 2.50 GiB pin per card) allocates a 1,856,367-token hybrid pool, logged by the 1M-default reference-host runs (2026-10-21 and 2026-10-22). Residency-proven at 1M: an identical 1,048,052-token re-send was served with 1,047,936 tokens cached, 3.05 s to first token, 0 preemptions. fit_262k is measured (5 x 262K resident), not the pool ratio. 1,392,275 tokens was the pool at the same pin with max_model_len 262,144 (reference-host runs 2026-10-16, where the 3 x 131K load was the gate); 131K residency is that pool's ratio, not a measured 10-stream load."
+    "basis": "The shipped 1M default (max_model_len 1,048,576; RecoverSSM + MTP3, block 64, 2.50 GiB pin per card) allocates a 1,856,367-token hybrid pool, logged by the 1M-default reference-host runs (2026-10-21 and 2026-10-22). Residency-proven at 1M: an identical 1,048,052-token re-send was served with 1,047,936 tokens cached, 3.05 s to first token, 0 preemptions. fit_262k is measured (5 x 262K resident), not the pool ratio. 1,392,275 tokens was the pool at the same pin with max_model_len 262,144 (reference-host runs 2026-10-16, where the 3 x 131K load was the check); 131K residency is that pool's ratio, not a measured 10-stream load."
    },
    "p2p": "Required for the tested numbers: the launcher sets VLLM_SKIP_P2P_CHECK=1 NCCL_P2P_LEVEL=SYS and the reference host runs full P2P. No non-P2P host has been run.",
    "evidence": [
@@ -122,28 +123,31 @@
    },
    "p2p": "For hosts without peer-to-peer: the launcher runs P2P=off (NCCL through host memory, custom all-reduce off), as on the Ada rows.",
    "evidence": [
-    "None on RTX 3090s without P2P. The same layout and per-card pin ran with P2P off on 4 x RTX 4090 (measured 2026-10-18 and 2026-10-20: every gate passed, pool 1,392,275 tokens, 5 x 262K and 9 x 131K resident, needles exact)."
+    "None on RTX 3090s without P2P. The same layout and per-card pin ran with P2P off on 4 x RTX 4090 (measured 2026-10-18 and 2026-10-20: every check passed, pool 1,392,275 tokens, 5 x 262K and 9 x 131K resident, needles exact)."
    ],
    "notes": [
     "Checkpoint: halt95/Nemotron-3.5-Super-VL-120B-A12B-W4A16-Merlin (W4A16 rtn-g128 routed experts, INT4 MTP head).",
     "RecoverSSM is --use-replayssm with --mamba-backend triton on Model Runner V2; prefix caching runs with --mamba-cache-mode align and block / prefix-match unit 64.",
     "Layer partition 46,42 (VLLM_PP_LAYER_PARTITION) leaves both stages above the 512 MiB free floor in the reference-host runs once GPU 0's front-end CUDA context is gone; 44,44 left stage 1 with 64 MiB.",
     "Images: the model's own processor resizes to at most 13,312 patches (about 3.4 MP); 8 MP and larger inputs are accepted and downscaled. There is no size cap to set in --mm-processor-kwargs.",
-    "The 2.50 GiB KV pin is provisional until the release gate (stress run + 3 x 131K load)."
+    "The 2.50 GiB KV pin is provisional until the release check (stress run + 3 x 131K load)."
    ],
    "cuda_visible_devices": "0,1,2,3"
   },
   {
    "id": "svl-quad-sm89-24g",
    "title": "Nemotron Super VL 120B-A12B (W4A16 + INT4 MTP head) on 4 x RTX 4090 24 GB (sm_89), TP2 x PP2 + EP, RecoverSSM, the svl-quad-3090 pin",
-   "status": "untested",
+   "status": "testing",
    "match": {
     "arch": [
      "sm_89"
     ],
     "cards": 4,
     "vram_gib": 24,
-    "p2p": "any"
+    "p2p": "any",
+    "testing_gpu_names": [
+     "RTX 4090$"
+    ]
    },
    "launcher": {
     "path": null,
@@ -177,19 +181,19 @@
     "pool_tokens": 1392275,
     "fit_262k": 5,
     "fit_131k": 10,
-    "basis": "Same per-card KV pin as svl-quad-3090, so the pool is that row's 262K-mode pool (1,392,275; the 1M default allocates 1,856,367 at this pin on the 3090 row) by construction; extra VRAM on the 32 and 48 GB classes is headroom, not a larger pool. Not measured on sm_89 and without P2P. Reference-host runs 2026-10-16 (RecoverSSM + MTP3, block 64, 2.50 GiB pin per card): 1,392,275-token hybrid pool = 5.31 x 262K; the 3 x 131K load was the gate. 131K residency is the pool ratio, not a measured 10-stream load."
+    "basis": "Same per-card KV pin as svl-quad-3090, so the pool is that row's 262K-mode pool (1,392,275; the 1M default allocates 1,856,367 at this pin on the 3090 row) by construction; extra VRAM on the 32 and 48 GB classes is headroom, not a larger pool. Measured on cloud-hosted 4 x RTX 4090 without P2P (2026-10-18 and 2026-10-20): the same 1,392,275-token pool. Reference-host runs 2026-10-16 (RecoverSSM + MTP3, block 64, 2.50 GiB pin per card): 1,392,275-token hybrid pool = 5.31 x 262K; the 3 x 131K load was the check. 131K residency is the pool ratio, not a measured 10-stream load."
    },
    "p2p": "Not required: the launcher takes P2P=on|off; consumer Ada defaults to P2P=off (NCCL through host memory, custom all-reduce off). Ran without P2P on 4 x RTX 4090 (measured 2026-10-18 and 2026-10-20).",
    "evidence": [
     "4 x RTX 4090, measured 2026-10-18: svl-quad-sm89-24g, P2P off, pool 1,392,275 tokens, needles 262K-32K 4/4 exact, coherence 3/3, 8 MP image correct.",
-    "4 x RTX 4090 on the release wheel, measured 2026-10-20: pool 1,392,275, needles 4/4 exact, 5 x 262K, 9 x 131K and 9 x 32K resident and exact, image pass (645 MiB minimum free). The row stays untested until it is qualified on our own test hardware."
+    "4 x RTX 4090 on the release wheel, measured 2026-10-20: pool 1,392,275, needles 4/4 exact, 5 x 262K, 9 x 131K and 9 x 32K resident and exact, image pass (645 MiB minimum free). Both runs used the 262K context mode; the 1M default has not run on these cards. Testing: the runs above were on cloud-hosted hardware; kernel parity qualification is still to run."
    ],
    "notes": [
     "Checkpoint: halt95/Nemotron-3.5-Super-VL-120B-A12B-W4A16-Merlin (W4A16 rtn-g128 routed experts, INT4 MTP head).",
     "RecoverSSM is --use-replayssm with --mamba-backend triton on Model Runner V2; prefix caching runs with --mamba-cache-mode align and block / prefix-match unit 64.",
     "Layer partition 46,42 (VLLM_PP_LAYER_PARTITION) leaves both stages above the 512 MiB free floor in the reference-host runs once GPU 0's front-end CUDA context is gone; 44,44 left stage 1 with 64 MiB.",
     "Images: the model's own processor resizes to at most 13,312 patches (about 3.4 MP); 8 MP and larger inputs are accepted and downscaled. There is no size cap to set in --mm-processor-kwargs.",
-    "The 2.50 GiB KV pin is provisional until the release gate (stress run + 3 x 131K load).",
+    "The 2.50 GiB KV pin is provisional until the release check (stress run + 3 x 131K load).",
     "sm_89 row: untested / community-validated. Super VL images are capped by the model's own processor (about 3.4 MP default), not by an 8 MP cap."
    ],
    "cuda_visible_devices": "0,1,2,3"
@@ -239,18 +243,18 @@
     "pool_tokens": 1392275,
     "fit_262k": 5,
     "fit_131k": 10,
-    "basis": "Same per-card KV pin as svl-quad-3090, so the pool is that row's 262K-mode pool (1,392,275; the 1M default allocates 1,856,367 at this pin on the 3090 row) by construction; extra VRAM on the 32 and 48 GB classes is headroom, not a larger pool. Not measured on sm_89 and without P2P. Reference-host runs 2026-10-16 (RecoverSSM + MTP3, block 64, 2.50 GiB pin per card): 1,392,275-token hybrid pool = 5.31 x 262K; the 3 x 131K load was the gate. 131K residency is the pool ratio, not a measured 10-stream load."
+    "basis": "Same per-card KV pin as svl-quad-3090, so the pool is that row's 262K-mode pool (1,392,275; the 1M default allocates 1,856,367 at this pin on the 3090 row) by construction; extra VRAM on the 32 and 48 GB classes is headroom, not a larger pool. Not measured on sm_89 and without P2P. Reference-host runs 2026-10-16 (RecoverSSM + MTP3, block 64, 2.50 GiB pin per card): 1,392,275-token hybrid pool = 5.31 x 262K; the 3 x 131K load was the check. 131K residency is the pool ratio, not a measured 10-stream load."
    },
    "p2p": "Not required: the launcher takes P2P=on|off; consumer Ada defaults to P2P=off (NCCL through host memory, custom all-reduce off). Ran without P2P on 4 x RTX 4090 (measured 2026-10-18 and 2026-10-20).",
    "evidence": [
-    "None on 32 GB Ada cards. The same per-card pin ran on 4 x RTX 4090 24 GB without P2P (release wheel, measured 2026-10-20: all gates passed, pool 1,392,275, 5 x 262K resident)."
+    "None on 32 GB Ada cards. The same per-card pin ran on 4 x RTX 4090 24 GB without P2P (release wheel, measured 2026-10-20: all checks passed, pool 1,392,275, 5 x 262K resident)."
    ],
    "notes": [
     "Checkpoint: halt95/Nemotron-3.5-Super-VL-120B-A12B-W4A16-Merlin (W4A16 rtn-g128 routed experts, INT4 MTP head).",
     "RecoverSSM is --use-replayssm with --mamba-backend triton on Model Runner V2; prefix caching runs with --mamba-cache-mode align and block / prefix-match unit 64.",
     "Layer partition 46,42 (VLLM_PP_LAYER_PARTITION) leaves both stages above the 512 MiB free floor in the reference-host runs once GPU 0's front-end CUDA context is gone; 44,44 left stage 1 with 64 MiB.",
     "Images: the model's own processor resizes to at most 13,312 patches (about 3.4 MP); 8 MP and larger inputs are accepted and downscaled. There is no size cap to set in --mm-processor-kwargs.",
-    "The 2.50 GiB KV pin is provisional until the release gate (stress run + 3 x 131K load).",
+    "The 2.50 GiB KV pin is provisional until the release check (stress run + 3 x 131K load).",
     "sm_89 row: untested / community-validated. Super VL images are capped by the model's own processor (about 3.4 MP default), not by an 8 MP cap."
    ],
    "cuda_visible_devices": "0,1,2,3"
@@ -300,18 +304,18 @@
     "pool_tokens": 1392275,
     "fit_262k": 5,
     "fit_131k": 10,
-    "basis": "Same per-card KV pin as svl-quad-3090, so the pool is that row's 262K-mode pool (1,392,275; the 1M default allocates 1,856,367 at this pin on the 3090 row) by construction; extra VRAM on the 32 and 48 GB classes is headroom, not a larger pool. Not measured on sm_89 and without P2P. Reference-host runs 2026-10-16 (RecoverSSM + MTP3, block 64, 2.50 GiB pin per card): 1,392,275-token hybrid pool = 5.31 x 262K; the 3 x 131K load was the gate. 131K residency is the pool ratio, not a measured 10-stream load."
+    "basis": "Same per-card KV pin as svl-quad-3090, so the pool is that row's 262K-mode pool (1,392,275; the 1M default allocates 1,856,367 at this pin on the 3090 row) by construction; extra VRAM on the 32 and 48 GB classes is headroom, not a larger pool. Not measured on sm_89 and without P2P. Reference-host runs 2026-10-16 (RecoverSSM + MTP3, block 64, 2.50 GiB pin per card): 1,392,275-token hybrid pool = 5.31 x 262K; the 3 x 131K load was the check. 131K residency is the pool ratio, not a measured 10-stream load."
    },
    "p2p": "Not required: the launcher takes P2P=on|off; consumer Ada defaults to P2P=off (NCCL through host memory, custom all-reduce off). Ran without P2P on 4 x RTX 4090 (measured 2026-10-18 and 2026-10-20).",
    "evidence": [
-    "None on 48 GB Ada cards. The same per-card pin ran on 4 x RTX 4090 24 GB without P2P (release wheel, measured 2026-10-20: all gates passed, pool 1,392,275, 5 x 262K resident)."
+    "None on 48 GB Ada cards. The same per-card pin ran on 4 x RTX 4090 24 GB without P2P (release wheel, measured 2026-10-20: all checks passed, pool 1,392,275, 5 x 262K resident)."
    ],
    "notes": [
     "Checkpoint: halt95/Nemotron-3.5-Super-VL-120B-A12B-W4A16-Merlin (W4A16 rtn-g128 routed experts, INT4 MTP head).",
     "RecoverSSM is --use-replayssm with --mamba-backend triton on Model Runner V2; prefix caching runs with --mamba-cache-mode align and block / prefix-match unit 64.",
     "Layer partition 46,42 (VLLM_PP_LAYER_PARTITION) leaves both stages above the 512 MiB free floor in the reference-host runs once GPU 0's front-end CUDA context is gone; 44,44 left stage 1 with 64 MiB.",
     "Images: the model's own processor resizes to at most 13,312 patches (about 3.4 MP); 8 MP and larger inputs are accepted and downscaled. There is no size cap to set in --mm-processor-kwargs.",
-    "The 2.50 GiB KV pin is provisional until the release gate (stress run + 3 x 131K load).",
+    "The 2.50 GiB KV pin is provisional until the release check (stress run + 3 x 131K load).",
     "sm_89 row: untested / community-validated. Super VL images are capped by the model's own processor (about 3.4 MP default), not by an 8 MP cap."
    ],
    "cuda_visible_devices": "0,1,2,3"
@@ -371,7 +375,7 @@
     "RecoverSSM is --use-replayssm with --mamba-backend triton on Model Runner V2; prefix caching runs with --mamba-cache-mode align and block / prefix-match unit 64.",
     "Layer partition 46,42 (VLLM_PP_LAYER_PARTITION) leaves both stages above the 512 MiB free floor in the reference-host runs once GPU 0's front-end CUDA context is gone; 44,44 left stage 1 with 64 MiB.",
     "Images: the model's own processor resizes to at most 13,312 patches (about 3.4 MP); 8 MP and larger inputs are accepted and downscaled. There is no size cap to set in --mm-processor-kwargs.",
-    "The 25.50 GiB estimated KV pin is provisional until the release gate (stress run + 3 x 131K load).",
+    "The 25.50 GiB estimated KV pin is provisional until the release check (stress run + 3 x 131K load).",
     "sm_86 48 GB row: untested / community-validated; the KV pin is a estimate (KV_BYTES overrides it)."
    ],
    "cuda_visible_devices": "0,1,2,3"
@@ -431,7 +435,7 @@
     "RecoverSSM is --use-replayssm with --mamba-backend triton on Model Runner V2; prefix caching runs with --mamba-cache-mode align and block / prefix-match unit 64.",
     "Layer partition 46,42 (VLLM_PP_LAYER_PARTITION) leaves both stages above the 512 MiB free floor in the reference-host runs once GPU 0's front-end CUDA context is gone; 44,44 left stage 1 with 64 MiB.",
     "Images: the model's own processor resizes to at most 13,312 patches (about 3.4 MP); 8 MP and larger inputs are accepted and downscaled. There is no size cap to set in --mm-processor-kwargs.",
-    "The 2.50 GiB estimated KV pin is provisional until the release gate (stress run + 3 x 131K load).",
+    "The 2.50 GiB estimated KV pin is provisional until the release check (stress run + 3 x 131K load).",
     "sm_80 24 GB row: untested / community-validated; the KV pin is a estimate (KV_BYTES overrides it)."
    ],
    "cuda_visible_devices": "0,1,2,3"
@@ -491,7 +495,7 @@
     "RecoverSSM is --use-replayssm with --mamba-backend triton on Model Runner V2; prefix caching runs with --mamba-cache-mode align and block / prefix-match unit 64.",
     "Layer partition 46,42 (VLLM_PP_LAYER_PARTITION) leaves both stages above the 512 MiB free floor in the reference-host runs once GPU 0's front-end CUDA context is gone; 44,44 left stage 1 with 64 MiB.",
     "Images: the model's own processor resizes to at most 13,312 patches (about 3.4 MP); 8 MP and larger inputs are accepted and downscaled. There is no size cap to set in --mm-processor-kwargs.",
-    "The 10.12 GiB estimated KV pin is provisional until the release gate (stress run + 3 x 131K load).",
+    "The 10.12 GiB estimated KV pin is provisional until the release check (stress run + 3 x 131K load).",
     "sm_80 32 GB row: untested / community-validated; the KV pin is a estimate (KV_BYTES overrides it)."
    ],
    "cuda_visible_devices": "0,1,2,3"
@@ -551,7 +555,7 @@
     "RecoverSSM is --use-replayssm with --mamba-backend triton on Model Runner V2; prefix caching runs with --mamba-cache-mode align and block / prefix-match unit 64.",
     "Layer partition 46,42 (VLLM_PP_LAYER_PARTITION) leaves both stages above the 512 MiB free floor in the reference-host runs once GPU 0's front-end CUDA context is gone; 44,44 left stage 1 with 64 MiB.",
     "Images: the model's own processor resizes to at most 13,312 patches (about 3.4 MP); 8 MP and larger inputs are accepted and downscaled. There is no size cap to set in --mm-processor-kwargs.",
-    "The 17.81 GiB estimated KV pin is provisional until the release gate (stress run + 3 x 131K load).",
+    "The 17.81 GiB estimated KV pin is provisional until the release check (stress run + 3 x 131K load).",
     "sm_80 40 GB row: untested / community-validated; the KV pin is a estimate (KV_BYTES overrides it)."
    ],
    "cuda_visible_devices": "0,1,2,3"
@@ -559,14 +563,17 @@
   {
    "id": "svl-quad-sm80-64g",
    "title": "Nemotron Super VL 120B-A12B on 4 x CMP 170HX 64 GB (sm_80), TP2 x PP2 + EP, RecoverSSM, estimated pin",
-   "status": "untested",
+   "status": "testing",
    "match": {
     "arch": [
      "sm_80"
     ],
     "cards": 4,
     "vram_gib": 64,
-    "p2p": "any"
+    "p2p": "any",
+    "testing_gpu_names": [
+     "CMP 170HX"
+    ]
    },
    "launcher": {
     "path": null,
@@ -600,18 +607,18 @@
     "pool_tokens": 22763696,
     "fit_262k": 86,
     "fit_131k": 173,
-    "basis": "Estimate: usable 61.44 GiB = 64 GiB x 0.96; weights + overhead per card 20.54 GiB (what the svl-quad-3090 pin leaves out of 23.04 GiB); pin 43,889,197,056 B (40.88 GiB); pool scaled linearly from the 3090 row (1,392,275 tokens per 2.50 GiB) = ~22,763,696 tokens. Not measured on this card."
+    "basis": "Estimate: usable 61.44 GiB = 64 GiB x 0.96; weights + overhead per card 20.54 GiB (what the svl-quad-3090 pin leaves out of 23.04 GiB); pin 43,889,197,056 B (40.88 GiB); pool scaled linearly from the 3090 row (1,392,275 tokens per 2.50 GiB) = ~22,763,696 tokens. Booted to 22,777,400 tokens on cloud-hosted 4 x CMP 170HX 64 GB (2026-10-18)."
    },
    "p2p": "Not required: the launcher takes P2P=on|off from merlin serve / preflight.",
    "evidence": [
-    "4 x CMP 170HX 64 GB, measured 2026-10-18: svl-quad-sm80-64g, fp8 KV (the first Super VL boot on sm_80), pool 22,777,400 tokens, needles 262K-32K 4/4 exact, 9 x 262K 9/9 exact. The row stays untested until it is qualified on our own test hardware."
+    "4 x CMP 170HX 64 GB, measured 2026-10-18: svl-quad-sm80-64g, fp8 KV (the first Super VL boot on sm_80), pool 22,777,400 tokens, needles 262K-32K 4/4 exact, 9 x 262K 9/9 exact. The run used the 262K context mode; the 1M default has not run on these cards. Testing: the runs above were on cloud-hosted hardware; kernel parity qualification is still to run."
    ],
    "notes": [
     "Checkpoint: halt95/Nemotron-3.5-Super-VL-120B-A12B-W4A16-Merlin (W4A16 rtn-g128 routed experts, INT4 MTP head).",
     "RecoverSSM is --use-replayssm with --mamba-backend triton on Model Runner V2; prefix caching runs with --mamba-cache-mode align and block / prefix-match unit 64.",
     "Layer partition 46,42 (VLLM_PP_LAYER_PARTITION) leaves both stages above the 512 MiB free floor in the reference-host runs once GPU 0's front-end CUDA context is gone; 44,44 left stage 1 with 64 MiB.",
     "Images: the model's own processor resizes to at most 13,312 patches (about 3.4 MP); 8 MP and larger inputs are accepted and downscaled. There is no size cap to set in --mm-processor-kwargs.",
-    "The 40.88 GiB estimated KV pin is provisional until the release gate (stress run + 3 x 131K load).",
+    "The 40.88 GiB estimated KV pin is provisional until the release check (stress run + 3 x 131K load).",
     "sm_80 64 GB row: untested / community-validated; the KV pin is a estimate (KV_BYTES overrides it)."
    ],
    "cuda_visible_devices": "0,1,2,3"
@@ -671,7 +678,7 @@
     "RecoverSSM is --use-replayssm with --mamba-backend triton on Model Runner V2; prefix caching runs with --mamba-cache-mode align and block / prefix-match unit 64.",
     "Layer partition 46,42 (VLLM_PP_LAYER_PARTITION) leaves both stages above the 512 MiB free floor in the reference-host runs once GPU 0's front-end CUDA context is gone; 44,44 left stage 1 with 64 MiB.",
     "Images: the model's own processor resizes to at most 13,312 patches (about 3.4 MP); 8 MP and larger inputs are accepted and downscaled. There is no size cap to set in --mm-processor-kwargs.",
-    "The 56.25 GiB estimated KV pin is provisional until the release gate (stress run + 3 x 131K load).",
+    "The 56.25 GiB estimated KV pin is provisional until the release check (stress run + 3 x 131K load).",
     "sm_80 80 GB row: untested / community-validated; the KV pin is a estimate (KV_BYTES overrides it)."
    ],
    "cuda_visible_devices": "0,1,2,3"

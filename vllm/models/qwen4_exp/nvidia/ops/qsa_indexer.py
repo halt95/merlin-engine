@@ -491,6 +491,9 @@ def warmup_qsa_mqa_paged_decode(
                 triton.cdiv(columns, _DECODE_BLOCK_N * tiles_per_program),
             ),
         )
+    # Load the binaries now, not mid-forward.
+    from vllm.merlin.triton_preload import preload_qsa_indexer_decode_kernels
+    preload_qsa_indexer_decode_kernels(len(profiles))
     return profiles
 
 

@@ -1,4 +1,4 @@
-NOTICE — Merlin 3.0.0
+NOTICE — Merlin 3.0.1
 Copyright 2026 halt95 (Merlin modifications)
 
 Upstream attribution
@@ -58,46 +58,10 @@ Changed upstream paths include:
   vllm/third_party/flash_linear_attention/ops/solve_tril.py
   vllm/third_party/flash_linear_attention/ops/utils.py
   vllm/third_party/flash_linear_attention/ops/wy_fast.py
-  tests/conftest.py
-  tests/engine/test_arg_utils.py
-  tests/kernels/fla/test_fused_sigmoid_gating_delta_rule.py
-  tests/kernels/mamba/test_precopy_mamba_align.py
-  tests/model_executor/test_nemotron_h_quantization.py
-  tests/models/glm5next/test_kda_state_dtype.py
-  tests/models/kimi_k3/test_kda.py
-  tests/models/kimi_k3/test_kda_metadata.py
-  tests/models/qwen4_exp/test_config.py
-  tests/models/qwen4_exp/test_ple.py
-  tests/models/qwen4_exp/test_qsa_prepare.py
-  tests/models/qwen4_exp/test_qsa_reference.py
-  tests/models/qwen4_exp/test_tpsp.py
-  tests/models/test_deepseek_v41_decoder_replay_layers.py
-  tests/test_config.py
-  tests/v1/core/prefix_cache/test_mamba_eagle_resume_checkpoint.py
-  tests/v1/core/prefix_cache/test_partial_prefix_cache_hits.py
-  tests/v1/core/test_deferred_block_free.py
-  tests/v1/core/test_mamba_align_chunk_split.py
-  tests/v1/core/test_prefix_caching.py
-  tests/v1/core/test_scheduler.py
-  tests/v1/core/test_single_type_kv_cache_manager.py
-  tests/v1/cudagraph/test_cudagraph_manager.py
-  tests/v1/executor/test_executor.py
-  tests/v1/sample/test_logprobs.py
-  tests/v1/worker/test_gpu_batch_ordering.py
-  tests/v1/worker/test_gpu_model_runner_v2.py
-  tests/v1/worker/test_gpu_model_runner_v2_cudagraph_profiling.py
-  tests/v1/worker/test_gpu_model_runner_v2_eplb.py
-  tests/v1/worker/test_gpu_target_dependent_ar_speculator.py
-  tests/v1/worker/test_gpu_worker.py
-  tests/v1/worker/test_grammar_invalid_drafts.py
-  tests/v1/worker/test_mamba_hybrid_model_state.py
-  tests/v1/worker/test_mamba_utils.py
-  tests/v1/worker/test_utils.py
-  tests/watermarking/test_watermarking.py
 
 The vendored Flash Linear Attention files above (vllm/third_party/flash_linear_attention/)
-keep their MIT notices. The listed tests/ files are not shipped in this slim release; they
-are listed to complete the change record.
+keep their MIT notices. Merlin also changes upstream tests/ files in its development tree; those
+tests are not shipped in this release.
 
 Merlin-specific additions include csrc/merlin/, vllm/merlin/,
 vllm/v1/ple_offload/, vllm_ple_offload_bootstrap/, tools/merlin/,
@@ -110,10 +74,10 @@ base and compare:
   git diff --name-status --no-renames 5df63a7203 HEAD
   git diff 5df63a7203 HEAD -- <path>
 
-For the published release, use the merlin-v3.0.0 tag in place of HEAD. Source
-files retain their applicable notices. Each modified upstream file carries the line
-"Modified by the Merlin project; see NOTICE." (the csrc/ and CMake files carry inline
-Merlin markers instead). This central record supplements those notices.
+For the published release, use the merlin-v3.0.1 tag in place of HEAD. Source
+files retain their applicable notices. Each modified upstream file, including
+CMakeLists.txt and the modified csrc/ files, carries the line "Modified by the Merlin
+project; see NOTICE." This central record supplements those notices.
 
 Adapted third-party kernel code
 -------------------------------
@@ -136,7 +100,11 @@ Additional credits: pondzikk (vLLM contributions); lucifer1004 (uniform multi-to
 (LocalArgmaxMixin and the TP2 x PP4 community rig); peakcrosser7 (Flash-Next
 model support and original PLE offload); a community idle-power report and
 community PR; Jon-Nielsen (TP4 x PP2 serving kit); mgabor3141 (Swift reports);
-aikitoria (consumer Ampere P2P driver work); DominikBucko (MTP INT4 packing
+aikitoria (consumer Ampere P2P driver work); Zagitta (gpu-unlock kernel module; its NVIDIA firmware is personal-use and not shipped); Sudzpel (the GPU unlock
+proposal and its first measurements on Merlin);
+incoai (the Qwen3.8-Flash-Next-DFlash2 drafter, Apache-2.0, downloaded by setup at a pinned revision and not shipped);
+the club-3090 community (an sm_80 FP8 KV decoder port shared in github.com/noonghunna/club-3090 discussion #1735,
+which informed the sm_80 FP8 KV opt-in; Merlin serves it through its own sm_86 byte-decoder path); DominikBucko (MTP INT4 packing
 recipe); Neiko2002, Yarikdevcom, noonghunna/club-3090 and tfriedel (independent work on the same hardware class); Intel (AutoRound experts); RadixArk (FP8 PLE table); Qwen, UkisAI,
 huihui-ai, philbert, BottleCap AI, NVIDIA and ornith-ai (source models and checkpoints).
 

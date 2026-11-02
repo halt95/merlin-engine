@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by the Merlin project; see NOTICE.
 
 from typing import TYPE_CHECKING, Any, cast
 
@@ -96,6 +97,14 @@ def should_load_quant_weights(quant_method: QuantizeMethodBase | None) -> bool:
     return quant_method is not None and not isinstance(
         quant_method, UnquantizedLinearMethod
     )
+
+
+def _is_flashnext_family_target(vllm_config: "VllmConfig") -> bool:
+    from vllm import flashnext_family
+
+    model_config = getattr(vllm_config, "model_config", None)
+    architectures = set(getattr(model_config, "architectures", None) or [])
+    return bool(architectures & set(flashnext_family.target_archs()))
 
 
 def _largest_kernel_block_within(
@@ -649,6 +658,15 @@ class Attention(nn.Module, AttentionLayerBase):
             )
             sw_per_token = kv_cache_spec.real_page_size_bytes
             page_budget = shared_page or sw_per_token * block_size
+            # Hybrid mamba targets align every mamba page to the primary
+            # attention page (mamba_page_size_padded). A larger SW page (e.g. a
+            # BF16 DFlash draft next to an FP8 Flash-Next target: 8 MiB vs
+            # 2 MiB at block 4096) makes ``unify`` pad every mamba page up to
+            # it and cuts the pool ~2.7x; fit the SW block to the aligned page.
+            # Scoped to Flash-Next-family targets (the qualified case): on other
+            # hybrids equal pages can switch grouping strategy and cost capacity.
+            # The fitted block must divide the primary block (scheduler LCM and
+            # prefix-hash alignment stay those of the primary).
             sw_block_size = _largest_kernel_block_within(
                 self.attn_backend,
                 sw_per_token,
@@ -656,6 +674,22 @@ class Attention(nn.Module, AttentionLayerBase):
                 block_size,
                 kv_cache_spec,
             )
+            mamba_page = vllm_config.cache_config.mamba_page_size_padded
+            if (
+                shared_page is None
+                and mamba_page
+                and page_budget > mamba_page
+                and _is_flashnext_family_target(vllm_config)
+            ):
+                fitted = _largest_kernel_block_within(
+                    self.attn_backend,
+                    sw_per_token,
+                    mamba_page,
+                    block_size,
+                    kv_cache_spec,
+                )
+                if fitted * sw_per_token <= mamba_page and block_size % fitted == 0:
+                    sw_block_size = fitted
             return SlidingWindowSpec(
                 block_size=sw_block_size,
                 num_kv_heads=self.num_kv_heads,

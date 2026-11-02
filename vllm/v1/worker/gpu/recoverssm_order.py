@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright 2026 halt95 (Merlin modifications)
 """Eligibility of VLLM_RECOVERSSM_COMMIT_AFTER_PROPOSE (the RecoverSSM GDN
 commit enqueued after the MTP proposal). Kept free of the runner so it can be
 tested without the CUDA stack."""

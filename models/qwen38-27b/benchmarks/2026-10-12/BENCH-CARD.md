@@ -23,7 +23,7 @@ v1.3.0 = Merlin engine v2.5.2 (vLLM 0.30.0 plus the Flash-Next fork's commits an
 
 **Units.** Context depths are prompt targets: 4K = 4,096; 32K = 32,768; 128K = 131,072; 255K = 261,120 tokens. The actual prompt lengths are in the rows. "cN" = N concurrent streams. GB = 10^9 bytes, GiB = 2^30 bytes.
 
-**Evidence.** Every figure is a maintainer measurement on the reference host, served as shipped, by the harnesses named in each section. The results and the setup are documented here; the raw run artifacts (rows, harnesses, gate records, boot logs) are not published. **Measured** (2026-10-08 to 2026-10-09, UTC): dual card 2026-10-08 20:23-22:20; quad card 2026-10-08 22:52 to 2026-10-09 00:23.
+**Evidence.** Every figure is a maintainer measurement on the reference host, served as shipped, by the harnesses named in each section. The results and the setup are documented here; the raw run artifacts (rows, harnesses, check records, boot logs) are not published. **Measured** (2026-10-08 to 2026-10-09, UTC): dual card 2026-10-08 20:23-22:20; quad card 2026-10-08 22:52 to 2026-10-09 00:23.
 
 > **Trees.** Sections 1-6 were measured on the gate tree; the later trees and what each re-checked are in section 7.
 >
@@ -45,7 +45,7 @@ v1.3.0 = Merlin engine v2.5.2 (vLLM 0.30.0 plus the Flash-Next fork's commits an
 | 8-conversation load: prefix-cache hit rate, TTFT p50 / p99 | 92.6 %, 9.0 / 282.9 s | 88.6 %, 7.7 / 101.5 s |
 | GSM8K-200 | 196 / 200 | 194 / 200 |
 | loop gate: genuine collapses | 0 of 72 | 0 of 72 |
-| peak VRAM per card over the gate steps | 23,844 MiB | 23,736 MiB |
+| peak VRAM per card over the check steps | 23,844 MiB | 23,736 MiB |
 
 ## 1. Single stream over context depth
 

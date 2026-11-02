@@ -32,18 +32,18 @@ not published, reviewed or endorsed by BottleCap AI or Qwen. Bare metal, sm_86 (
 Both checkpoints share the engine, port 8100, served name `qwen38-27b` and profile settings.
 The wrappers select the ThinkingCap checkpoint and forward the other variables; both checkpoints default to reasoning effort `medium`.
 
-## 3.0.0 results
+## Merlin 3.0.1 bench card (2026-11-02)
 
-Maintainer measurements on 4× RTX 3090 (220 W, PCIe Gen4 with P2P) with the Merlin 3.0.0 release wheel, one fresh `merlin serve` boot per configuration, 2026-10-20, except the two-card agents and GSM8K and the one-card GSM8K (a 2026-10-17 pre-release build); method and every cell in the [bench card](benchmarks/2026-10-20/BENCH-CARD.md). Decode is one stream with thinking on (tok/s after the first streamed token); prefill is one cold request.
+Maintainer measurements on 4× RTX 3090 (220 W, PCIe Gen4) with P2P (the aikitoria patched driver) and the Zagitta [gpu-unlock](https://github.com/Zagitta/gpu-unlock) kernel module, one fresh `merlin serve` boot per configuration, 2026-11-01 to 2026-11-02; method and every cell in the [bench card](benchmarks/2026-11-02/BENCH-CARD.md). Decode is one stream with thinking on at reasoning effort medium, the server default (tok/s after the first streamed token); prefill is one cold request. With thinking on, a 512-token agent follow-up may end inside the reasoning, and reasoning tokens count. GSM8K at medium ran on four cards. Thinking-off GSM8K is from the 3.0.0 runs (two-card and one-card: a 2026-10-17 pre-release build). The agent overlap windows on four cards and the two-card thinking-on window are under 5 s: read those totals loosely. Rows marked (3.0.0 run) were not re-run for 3.0.1; they and the rest of the 3.0.0 figures are on the [3.0.0 bench card](benchmarks/2026-10-20/BENCH-CARD.md).
 
 | Measurement | 2× RTX 3090 (TP2) | 4× RTX 3090 (TP4) | 1× RTX 3090 |
 |---|---|---|---|
-| Decode, 4K / 131K / 262K prompt | 207 / 173 / 142 tok/s | 250 / 235 / 215 tok/s | 124 / 95 / 73 tok/s |
-| Cold prefill, 10K / 100K prompt | 1,823 / 1,297 tok/s | 3,009 / 2,295 tok/s | 1,021 / 708 tok/s |
-| Agents at once (8 × 16K conversations), total | 517 tok/s | 752 tok/s | n/a |
-| GSM8K-200 (5-shot, thinking off) | 194/200 | 197/200 | 195/200 |
-| Sessions held at once | 3 × 262K and 6 × 131K, every session resident (re-sent prompts ≥ 99.98 % cached), 0 preemptions | 7 × 262K and 14 × 131K, every session resident (re-sent prompts ≥ 99.98 % cached), 0 preemptions | 1 × 262K and 2 × 131K, every session resident, 0 preemptions |
-| 8 MP image | one, two at once and four in one prompt (32,842 tokens) correct; lowest free memory 886 MiB on any card | one, two at once and four in one prompt (32,842 tokens) correct; lowest free memory 862 MiB on any card | 8 MP: out of memory on one card. One card takes 4 MP instead: one and two at once correct with the single-card memory settings, lowest free memory 558-563 MiB (2026-10-21) |
+| Decode, 4K / 131K / 262K prompt | 210 / 182 / 143 tok/s | 251 / 243 / 238 tok/s | 125 / 95 / 71 tok/s |
+| Cold prefill, 10K / 100K / 262K prompt | 2,301 / 1,672 / 1,115 tok/s | 3,866 / 2,995 / 2,101 tok/s | 1,200 / 871 / 579 tok/s |
+| Agents at once (8 × 16K conversations), total, thinking on / off | 705 / 615 tok/s | 954 / 854 tok/s | n/a |
+| GSM8K-200 (5-shot), correct of 200, thinking on at medium / thinking off | – / 194 | 198 / 197 | – / 195 |
+| Sessions held at once (3.0.0 run) | 3 × 262K and 6 × 131K, every session resident (re-sent prompts ≥ 99.98 % cached), 0 preemptions | 7 × 262K and 14 × 131K, every session resident (re-sent prompts ≥ 99.98 % cached), 0 preemptions | 1 × 262K and 2 × 131K, every session resident, 0 preemptions |
+| 8 MP image (3.0.0 run) | one, two at once and four in one prompt (32,842 tokens) correct; lowest free memory 886 MiB on any card | one, two at once and four in one prompt (32,842 tokens) correct; lowest free memory 862 MiB on any card | 8 MP: out of memory on one card. One card takes 4 MP instead: one and two at once correct with the single-card memory settings, lowest free memory 558-563 MiB (2026-10-21) |
 
 The [2026-10-15 bench card](benchmarks/2026-10-15/BENCH-CARD.md) records the 0.32 tile reclaim.
 With patched **FlashInfer 0.7.0.post1** and `FLASHINFER_SM8X_FP8_SMALLQ=cta32`, the median decode-step
@@ -59,7 +59,7 @@ against v1.3.0's **196/200**: −2.0 pp, 95 % Newcombe CI **[−5.89, +1.61] pp*
 significantly worse. Tile on and off are not bitwise identical. The tile run used a 0.32 candidate;
 it was not a rerun of the final release assembly. The card explains that boundary and the cache-provenance check.
 
-- **KV pools:** TP2 **826,689 tokens** at the shipped K=4 pin. TP4 serves RecoverSSM on with the shipped TP4 geometry (block 1024, chunk 4096, LPT 832, pin 17,923,833,856 B = 2,011 blocks): **2,012,105 tokens** (7.68 × 262K), all correctness gates passed, and the 2026-10-20 release bench card measured decode 252.4 / 235.4 / 224.0 tok/s at 32K / 131K / 259K (thinking on). The other TP4 figures here were measured on the retired RecoverSSM-off line (1,974,072 tokens).
+- **KV pools:** TP2 **826,689 tokens** at the shipped K=4 pin. TP4 serves RecoverSSM on with the shipped TP4 geometry (block 1024, chunk 4096, LPT 832, pin 17,923,833,856 B = 2,011 blocks): **2,012,105 tokens** (7.68 × 262K), all correctness checks passed, and the 2026-10-20 release bench card measured decode 252.4 / 235.4 / 224.0 tok/s at 32K / 131K / 259K (thinking on). The TP4 ITL and concurrent-decode figures in this section were measured on the retired RecoverSSM-off line (1,974,072 tokens).
 - **FGPC ON** on both profiles: `--enable-mamba-shared-prefix-checkpoint`, inherited by ThinkingCap.
 - 27B TP2 serves images up to 8 MP. With the vision-peak option on (`VLLM_MERLIN_VISION_PEAK=1`, the TP2 launcher default), the 50-item TP2 stress sweep's worst minimum free was 806 MiB per card (2026-10-15), above the 524 MiB floor. A separate knob OFF/ON identity check matched tokens and logprobs on 6/6 prompts. Flash-Next (902 MiB) meets the target. 27B TP4 left 690 MiB free on the retired RecoverSSM-off pin; at the shipped chunk 4096 with RecoverSSM on, the 2026-10-20 bench card measured 862 MiB lowest free (one 8 MP image, two at once, and four in one prompt; 2 cards: 886 MiB), above the 524 MiB floor.
   These base-checkpoint measurements do not constitute a new ThinkingCap benchmark.
@@ -71,9 +71,28 @@ tok/s, token savings and quality figures are not new 3.0.0 results.
 
 ## What you need
 
-Two or four 24 GB RTX 3090s with working GPU peer-to-peer, Linux x86_64, a CUDA toolkit for FlashInfer JIT,
-and the shared 0.32 environment described in [release/README.md](../../release/README.md).
+Two or four 24 GB RTX 3090s, Linux x86_64, and the shared 0.32 environment described in
+[release/README.md](../../release/README.md); it carries its own CUDA 13.0 toolkit for FlashInfer JIT, so no system
+toolkit is needed. The tested numbers use GPU peer-to-peer (P2P). Without it, `merlin serve 27b <dir> --tp 2` picks the
+no-P2P row, or run `P2P=off bash models/qwen38-27b/serve.sh`; RTX 3090s without P2P are untested on this release (⚫); the four-card
+no-P2P row (`27b-tp4-3090-nop2p`) was boot-checked with `--swarm` on 2026-11-01.
 Host-resident embeddings require about 2.4 GiB additional pinned host RAM (1.18 GiB per TP2 rank, 0.59 per TP4 rank).
+
+`merlin serve 27b <dir> --kv-ram-cache SIZE` turns on the host-RAM KV cache (evicted prefix KV blocks restored from RAM
+instead of recomputed; SIZE GiB per server, pinned, on top of the RAM above). A drain-ahead write-back stores whole
+restore units before GPU blocks are reclaimed; host eviction takes idle rows first, then copies that duplicate blocks
+running requests hold on the GPU, then the least recently used content, and last copies whose GPU twins are about to
+be reclaimed; an evicted unit gives up only the rows no other session shares. There is no retention
+interval; tuning knobs are listed in the
+[Flash-Next reference](../flash-next/docs/reference.md#kv-ram-cache-tuning-knobs). The tier needs at least one 262K restore
+unit per rank: the smallest size is `9g` on one card, `10g` on two and `12g` on four. It does not change the session cap: on the quad card `--swarm` serves up to 32
+sessions instead of 24 (experimental), setting this cache to the tested 48g when `--kv-ram-cache` is not given. It runs on the RecoverSSM path only and remains
+**experimental** on the 27B in 3.0.1; see [SETUP](../../docs/SETUP.md). Under heavy concurrent prefill a session may
+recompute instead of restoring (output identical).
+
+**Multi-session behaviour on TP4 (3.0.1).** While one session prefills a long prompt, the other sessions' decode slows
+sharply and a burst of new sessions waits longer for its first token, with the KV RAM cache off or on. Long prefills
+are not interleaved fairly with decode yet.
 The [reference](docs/reference.md#requirements) describes the measured host and separates the old install requirements.
 
 ## Quick start
@@ -168,18 +187,18 @@ Historical release notes for vLLM 0.30; the install and performance claims in th
   licence ([License](#license)); details in [ThinkingCap checkpoint profile](docs/reference.md#thinkingcap-checkpoint-profile).
 - **FlashInfer 32-row verify tile, on by default** (`FLASHINFER_SM8X_FP8_SMALLQ=cta32`). The MTP verify step at K=4 has
   5 query rows per sequence; the tile runs that attention with 32-row tiles instead of stock FlashInfer's smaller ones,
-  and because it acts on attention its effect grows with context depth. The release gate measured the shipped profiles
+  and because it acts on attention its effect grows with context depth. The release check measured the shipped profiles
   with the tile on; tile-off decode speed was not re-measured (bench card section 6 has a tile-off boot and its
   GSM8K-200). `release/install-env.sh` patches FlashInfer with
   `release/apply-flashinfer-patch.sh`; each rank prints a proof line when the tile is in use
   ([Check it's working](docs/reference.md#check-its-working)).
-- **MTP K=4 by default** (was K=3): the drafter proposes four tokens per step instead of three. The release gate measured
+- **MTP K=4 by default** (was K=3): the drafter proposes four tokens per step instead of three. The release check measured
   K=4 only; `SPEC_K=3` and `SPEC_K=1` remain accepted ([SPEC_K](docs/reference.md#spec_k)).
 - **`--prefix-match-unit 16`.** The hybrid KV block is 848 tokens at K=4 (832 at K≤3) and 960 on dual card with
   RecoverSSM; 64 does not divide 848, 16 divides all three.
 - **Dual card runs RecoverSSM** (`--use-replayssm`) with shared prefix checkpoints (`--enable-mamba-shared-prefix-checkpoint` in vLLM 0.32), so three 262K or six
   131K sessions stay fully resident; the pin is 883 whole blocks. Patch 0011 runs the RecoverSSM commit from CUDA graphs
-  after the MTP proposal to keep its per-step cost down; the release-gate decode figures in
+  after the MTP proposal to keep its per-step cost down; the release-check decode figures in
   [numbers](docs/reference.md#v130-numbers) are with RecoverSSM on.
 - **Quad card** uses shared prefix checkpoints (`--enable-mamba-shared-prefix-checkpoint` in vLLM 0.32) (no RecoverSSM) and holds seven 262K sessions.
 - **Scheduler limits tightened:** dual card `--max-num-seqs 16 --max-num-batched-tokens 2048` (was 32 / 4096), quad card
@@ -201,7 +220,7 @@ Historical release notes for vLLM 0.30; the install and performance claims in th
   (the multi-card layouts take 8 MP). Three output-identical memory settings make that fit and are on by default: a
   96 MiB FlashInfer workspace, the MTP drafter sharing it, and the vision rotary applied in place. Measured 2026-10-21:
   4 MP passes at one and two sequences and after a 262K needle with 558-563 MiB free (bar 524 MiB); 8 MP stays short on
-  one card. The row passed its Merlin 3.0.0 TP1 gate on 2026-10-21 (pool 271,506 tokens); the KV pin is the gated value. The container
+  one card. The row passed its Merlin 3.0.0 TP1 check on 2026-10-21 (pool 271,506 tokens); the KV pin is the checked value. The container
   route is removed for this release.
 
 Upgrading from v1.0.0, and every change: [CHANGELOG.md](CHANGELOG.md#v130).
@@ -229,16 +248,23 @@ serve profiles at 262K with MTP K=3, and a container recipe. Its numbers: [docs/
 ## Known limitations
 
 - Tested on one setup: 4× RTX 3090 at 220 W, PCIe Gen4 x16, with peer-to-peer. sm_86 only; no other GPU, distribution,
-  driver or non-P2P host has been run. Other 24 GB-class sm_86 cards (RTX A5000, 3090 Ti) resolve to the same rows but
+  driver or non-P2P host has been run on our hardware. On cloud-hosted cards without P2P the 2- and 4-card RTX 4090 24 GB
+  rows and the 1-, 2- and 4-card CMP 170HX 64 GB rows passed full-model runs: they are 🟡 testing (kernel parity
+  qualification still to run). On the older v1.3.0 engine, two cloud-hosted RTX 3090s without P2P ran the TP2 layout
+  with MTP (2026-10-09: 262K 3-needle 3/3, 255K decode 81.5 tok/s; not comparable to this release's numbers). The
+  RTX 3090 no-P2P rows stay ⚫ until this release runs there (the four-card row was boot-checked with `--swarm` on
+  2026-11-01). Other 24 GB-class sm_86 cards (RTX A5000, 3090 Ti)
+  resolve to the same rows but
   are reported untested / community-validated; cards reporting under 24 GiB (A10, A10G, L4 at 22.5 GiB; 12 and 20 GB
   cards) are refused by preflight, because the launchers pin KV bytes for 24 GiB and the pool is not cut. See the
   [hardware matrix](../../docs/merlin/hardware-matrix.md).
 - The container route returns in a later release.
+- Windows: WSL2 only, and untested (⚫). See [WSL2](../../docs/merlin/hardware-matrix.md#wsl2) for the settings it needs.
 - Switching the verify tile (`FLASHINFER_SM8X_FP8_SMALLQ`) or `SPEC_K`, or reusing prefix-cache blocks, can change output
-  at near-tied tokens. The 0.30 gate did not establish repeatability across fresh compile caches.
+  at near-tied tokens. The 0.30 check did not establish repeatability across fresh compile caches.
 - Changing `--limit-mm-per-prompt` needs a fresh compile cache (`VLLM_CACHE_ROOT`).
 - A same-day 0.32 tile-off GSM8K-200 remains pending.
-- JSON-schema structured output was not tested at the historical 0.30 base release gate; no new long-soak result is claimed here.
+- JSON-schema structured output was not tested at the historical 0.30 base release check; no new long-soak result is claimed here.
 - The ThinkingCap token saving was measured on arithmetic word problems only.
 
 The full list, with causes: [Known behaviours](docs/reference.md#known-behaviours).
@@ -254,6 +280,7 @@ and lucifer1004 ([uniform multi-token decode](https://github.com/vllm-project/vl
 [compressed-tensors](https://github.com/vllm-project/compressed-tensors) (the checkpoint format; `quant/` packs with it),
 froggeric ([Qwen-Fixed-Chat-Templates](https://huggingface.co/froggeric/Qwen-Fixed-Chat-Templates) v22.5),
 [aikitoria's open-kernel-module patch](https://github.com/aikitoria/open-gpu-kernel-modules) (P2P on consumer Ampere),
+Zagitta's [gpu-unlock](https://github.com/Zagitta/gpu-unlock) kernel module (the bench basis from 3.0.1; its NVIDIA firmware is personal-use and not shipped; [Sudzpel](https://github.com/Sudzpel), who proposed it with the first measurements on Merlin),
 and a community Flash-Next
 [idle-power report](https://github.com/halt95/merlin-engine/issues/2) and
 [contribution](https://github.com/halt95/qwen38-flash-next-3090s/pull/3), behind the guard fix in Merlin engine v2.5.2.

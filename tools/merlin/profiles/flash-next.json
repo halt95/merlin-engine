@@ -3,12 +3,12 @@
  "model": "flash-next",
  "labels": {
   "tested": "tested on the reference host",
+  "testing": "🟡 testing: full-model runs passed on cloud-hosted hardware; kernel parity qualification still to run",
   "untested": "untested / community-validated"
  },
  "reference": {
   "profile": "fn-quad-3090",
-  "launcher": "models/flash-next/serve.sh",
-  "capacity_tool": "fn_probe.py (capacity probe; not part of this tree)"
+  "launcher": "models/flash-next/serve.sh"
  },
  "base": {
   "served_names": "flash-next-v2 flash-next flash-mtp flash-next-mtp",
@@ -16,7 +16,6 @@
   "gpu_memory_utilization": 0.96,
   "img_cap_px_default": 8388608,
   "img_cap_note": "Merlin 3.0.0 value (8 MP), the same default as earlier Flash-Next releases.",
-  "draft_vocab_sha256": "cf1d5a432d2b1a45b72235031434c960131d34bbe9ffd5690fe1558a00f78d71",
   "port": 8000,
   "block_size": 4096,
   "scales": "scales/qsa_kv_scales_262k.json"
@@ -27,6 +26,7 @@
   "fn-quad-3090-nop2p-pp4",
   "fn-2x48g-pp2-sm86",
   "fn-quad-24g-sm89",
+  "fn-quad-24g-sm89-pp4",
   "fn-quad-24g-sm80",
   "fn-4x48g-tp2pp2-sm89",
   "fn-sm80-64g-x2-pp2",
@@ -35,7 +35,7 @@
  "profiles": [
   {
    "id": "fn-quad-3090",
-   "title": "4 x RTX 3090 24 GB, P2P, TP2xPP2+EP (the shipped v3.0.0 profile)",
+   "title": "4 x RTX 3090 24 GB, P2P, TP2xPP2+EP",
    "status": "tested",
    "rank": 1,
    "latency": false,
@@ -91,11 +91,29 @@
        "fit_262k": 1,
        "fit_131k": 3,
        "bytes_per_block_mib": [
-        28.0,
+        28,
         29.8
        ]
       }
      }
+    },
+    "dflash2": {
+     "partition": [
+      24,
+      24
+     ],
+     "max_num_batched_tokens": 2048,
+     "kv_cache_memory": 3468165120,
+     "kv_blocks": 245,
+     "basis": "Measured 2026-10-22 on the reference host (DFlash2 pool-fit run): DFlash2 drafter, PP split 24/24, chunk 2048, 245 whole blocks of 14,155,776 B: engine pool 789,668 (3.01x 262K; 3 concurrent 254,734-token requests resident), 8 MP image during a cold 131K prefill min free 950 / 532 MiB (stage 0 / stage 1; floor 524). At the MTP geometry (25/23, 4.1e9) the drafter's KV blocks cost stage 0 and the 8 MP floor fails (202 MiB).",
+     "pool_tokens": 789668,
+     "fit_262k": 3
+    },
+    "kv_tier_seqs": {
+     "max_num_seqs": 24,
+     "min_gib_per_rank": 12,
+     "status": "tested",
+     "basis": "Experimental, merlin serve --swarm: 24 sequences with the KV RAM cache at >= 12 GiB per rank (48g on four ranks), the size qualified on the reference host (4 x RTX 3090, P2P on); 2 x L_max = 6.3 GiB per rank is the floor below it. The cache alone does not raise the cap: the row keeps its 3.0.0 cap of 8."
     }
    },
    "interconnect": {
@@ -117,19 +135,19 @@
    "warm": 1,
    "capacity": {
     "estimate": false,
-    "basis": "Measured on every v2.5.1 / v3.0.0 boot on the reference host (--kv-cache-memory 4100000000 per rank); fn_probe reproduces it exactly.",
+    "basis": "Measured on every v2.5.1 / v3.0.0 boot on the reference host (--kv-cache-memory 4100000000 per rank).",
     "pin_gib": 3.82,
     "kv_blocks": 248,
     "pool_tokens": 924993,
     "fit_262k": 3,
     "fit_131k": 6,
     "bytes_per_block_mib": [
-     14.0,
+     14,
      15.8
     ]
    },
    "evidence": [
-    "Qualified on the reference host: the v3.0.0 release gate (4 x RTX 3090 at 220 W, P2P over the aikitoria open-kernel-module patch, host RAM 96 GB); pool 924,993 on every v2.5.1 / v3.0.0 boot."
+    "Qualified on the reference host: the v3.0.0 release check (4 x RTX 3090 at 220 W, P2P over the aikitoria open-kernel-module patch, host RAM 96 GB); pool 924,993 on every v2.5.1 / v3.0.0 boot."
    ],
    "notes": [
     "Reference profile: models/flash-next/serve.sh runs this row.",
@@ -193,11 +211,17 @@
        "fit_262k": 1,
        "fit_131k": 3,
        "bytes_per_block_mib": [
-        28.0,
+        28,
         29.8
        ]
       }
      }
+    },
+    "kv_tier_seqs": {
+     "max_num_seqs": 24,
+     "min_gib_per_rank": 12,
+     "status": "untested",
+     "basis": "Experimental, merlin serve --swarm: 24 sequences with the KV RAM cache at >= 12 GiB per rank (48g on four ranks), the size qualified on the reference host (4 x RTX 3090, P2P on); 2 x L_max = 6.3 GiB per rank is the floor below it. The cache alone does not raise the cap: the row keeps its 3.0.0 cap of 8. Boot-checked with --swarm on 4 x RTX 3090 without P2P, 2026-11-01: booted at 24 sequences with 48g, a 24-session burst with 0 errors and one 262K host restore. Untested like the row: no full qualification run."
     }
    },
    "interconnect": {
@@ -229,27 +253,29 @@
     "fit_262k": 3,
     "fit_131k": 6,
     "bytes_per_block_mib": [
-     14.0,
+     14,
      15.8
     ]
    },
    "evidence": [
-    "models/flash-next/docs/reference.md, 'Without peer-to-peer': a 2026-09-24 run on a 4x RTX 3090 host without P2P (v2.2.0, serve-v2.2.sh unchanged): up in 6 min, ~4,000 tok/s prefill at 54,713 tokens, 127-141 tok/s decode including time to first token; not repeated on v2.5.1 or v3.0.0."
+    "models/flash-next/docs/reference.md, 'Without peer-to-peer': a 2026-09-24 run on a 4x RTX 3090 host without P2P (v2.2.0): up in 6 min, ~4,000 tok/s prefill at 54,713 tokens, 127-141 tok/s decode including time to first token; not repeated on v2.5.1 or v3.0.0.",
+    "2026-10-19, the reference host with software P2P off, this layout measured beside the PP4 row on random prompts, 0 % prefix hits: pool 924,993; c1 TTFT 4K 0.91-0.96 s, 32K 6.47 s, 131K 25.9 s, 262K (261,888 + 128) 50.5-53.2 s; real-text c1 decode 130.1 tok/s (ITL 18.3 ms); coherence PASS. Needles and the 8 MP image were not run on this arm, so the row stays untested."
    ],
    "notes": [
     "Rendered launcher (generate it with --emit launcher): NCCL_P2P_DISABLE=1 and custom all-reduce off, so a BAR1 veto or a driver without peer access cannot leave P2P on. The earlier serve.sh, which the 2026-09-24 evidence below used, keeps NCCL_P2P_LEVEL=SYS and is not used for this row.",
     "Same layout, partition and pin as fn-quad-3090: NCCL moves the TP and PP traffic through host memory.",
     "Expect lower prefill than the P2P host (about 4,000 against 5,410 tok/s at 50K on that host, which also had x8 links and two NUMA nodes).",
-    "Labelled untested because the only no-P2P run was v2.2.0 on a host without P2P and was never repeated on v3.",
-    "Preferred over the PP-heavy layout (fn-quad-3090-nop2p-pp4) because it keeps the full 924,993-token pool; a measured no-P2P comparison of the two decides the default."
+    "Labelled untested: no 3.0.1 run of this row without P2P has covered the needles and the 8 MP image. It ran in the 2026-10-19 measurement below and was boot-checked with --swarm on 4 x RTX 3090 without P2P on 2026-11-01.",
+    "The no-P2P default (chosen 2026-10-25): it keeps the full 924,993-token pool and the faster decode. fn-quad-3090-nop2p-pp4 is the named prefill alternative (--profile fn-quad-3090-nop2p-pp4): measured on the reference host with P2P off, c1 prefill +47-53 % and real-text c1 decode -14 % against this row (112.0 vs 130.1 tok/s), pool 906,581 tokens."
    ],
-   "acceptance": "A no-P2P comparison on a 4 x RTX 3090 host with P2P off: the 4-card quad profile against the PP4 profile; decode, prefill, 3 x 262K residency."
+   "acceptance": "A Merlin 3.x run of this row on a 4 x RTX 3090 host with P2P off that adds the needles and the 8 MP smoke to the 2026-10-19 comparison numbers (pool, prefill, decode)."
   },
   {
    "id": "fn-quad-3090-nop2p-pp4",
-   "title": "4 x 24 GB, no P2P, measured PP-heavy PP4 x TP1",
-   "status": "untested",
+   "title": "4 x RTX 3090 24 GB, no P2P, PP4 x TP1 (named prefill alternative; TP2xPP2 stays the default)",
+   "status": "tested",
    "rank": 2,
+   "auto_select": false,
    "latency": false,
    "match": {
     "arch": [
@@ -257,7 +283,10 @@
     ],
     "cards": 4,
     "vram_gib": 24,
-    "p2p": "off"
+    "p2p": "off",
+    "tested_gpu_names": [
+     "RTX 3090$"
+    ]
    },
    "layout": {
     "tp": 1,
@@ -274,7 +303,7 @@
     "max_num_seqs": 32,
     "max_num_batched_tokens": 1024,
     "kv_cache_dtype": "fp8_e4m3",
-    "kv_cache_memory": 2500000000,
+    "kv_cache_memory": 4456448000,
     "capture_sizes": [
      1,
      2,
@@ -316,24 +345,36 @@
    "cuda_visible_devices": "0,1,2,3",
    "warm": 1,
    "capacity": {
-    "estimate": true,
-    "basis": "Measured 506,083-token pool on a quad 3090 host, PP4 layout, with software P2P disabled, partition 12/13/13/10 and a 2,500,000,000-byte per-card pin. This is measured on that host; capacity on other physical no-P2P hosts remains unqualified.",
-    "pin_gib": 2.33,
-    "pool_tokens": 506083,
-    "fit_262k": 1,
-    "fit_131k": 3
+    "estimate": false,
+    "basis": "Measured 906,581-token pool on the reference host with software P2P off (2026-10-19), PP4 x TP1, partition 12/13/13/10, max_num_seqs 32, at a 4,456,448,000-byte per-card pin = 250 whole blocks of the binding stage-3 block (17,825,792 B; stage 3 carries the MTP layer). The engine log pool equals the get_kv_cache_configs probe. Stage 3 binds: 1,022 MiB free at the 8 MP peak against the 1,000 MiB floor, so 251 blocks would cross it. Capacity on other physical no-P2P hosts is not measured.",
+    "pin_gib": 4.15,
+    "kv_blocks": 250,
+    "pool_tokens": 906581,
+    "fit_262k": 3,
+    "fit_131k": 6,
+    "bytes_per_block_mib": [
+     12.75,
+     16,
+     16,
+     17
+    ]
    },
    "evidence": [
-    "The PP4 partition and pool were measured on a quad 3090 host. A comparison of software P2P on and off on that host does not qualify other physical no-P2P hosts. Cold-start qualification remains pending."
+    "2026-10-19, reference host (4 x RTX 3090, 220 W), software P2P off, 250-block pin: pool 906,581, boot 401 s; 262K needle exact (38.2 s), 131K needle exact (17.7 s); 8 MP image PASS; coherence 3/3; 0 OOM / EngineDead; minimum free per card at the 8 MP peak 1,468 / 1,262 / 1,264 / 1,022 MiB.",
+    "2026-10-19, same host and pin, bench card against fn-quad-3090-nop2p and fn-quad-3090 (P2P on), seeded rows, 0 % prefix hits: c1 TTFT 4K 0.82 / 0.96 / 0.89 s, 32K 4.39 / 6.47 / 6.05 s, 131K 17.0 / 25.9 / 24.2 s, 262K (261,888 + 128) 34.6-34.7 / 50.5-53.2 / 49.9-50.0 s (prefill +47-53 % vs the no-P2P TP2xPP2 row, +42-44 % vs P2P on); random-token decode 95 / 97 / 109 tok/s at 4K / 131K / 262K; real-text c1 decode 112.0 tok/s vs 130.1 (no-P2P TP2xPP2, -14 %) and 138.7 (P2P on, -19 %); c4 x 60K aggregate output 22.0 / 16.9 / 20.6 tok/s.",
+    "MTP k=2 on this row (2026-10-19): ITL 22.2 -> 19.8 ms, real-text decode unchanged (110.7 vs 112.0 tok/s); k=3 kept. The c1 decode gap is the serial four-stage step (stage 3 carries MTP and lm_head), not tuning.",
+    "Measured on the reference host with P2P switched off in software; other physical no-P2P hosts are not measured. No token-identity run against a P2P control yet."
    ],
    "notes": [
-    "TP1 removes the tensor-parallel all-reduce; only the pipeline relay between stages remains.",
-    "Measured pool 506,083 tokens (1 x 262K / 3 x 131K resident fit) at pin 2,500,000,000 bytes with partition 12/13/13/10 and max_num_seqs=32; the former even 12/12/12/12 partition OOMed on stage 3.",
+    "Named alternative (chosen 2026-10-25): automatic selection keeps fn-quad-3090-nop2p (TP2xPP2+EP) as the no-P2P default; this row runs only when named: merlin serve flash-next <dir> --profile fn-quad-3090-nop2p-pp4, or bash tools/merlin/launchers/serve-quad-3090-nop2p-pp4.sh <dir>.",
+    "Pick it for long prefills: no tensor-parallel all-reduce, so 32K-262K prompts prefill ~1.5x faster than the TP2xPP2 row without P2P; c1 decode is 14 % slower (four stages run in series at one request).",
+    "Measured pool 906,581 tokens (3 x 262K / 6 x 131K resident fit) at pin 4,456,448,000 bytes (250 whole stage-3 blocks) with partition 12/13/13/10 and max_num_seqs=32; the earlier 2,500,000,000-byte pin gave 506,083 tokens. The even 12/12/12/12 partition OOMed on stage 3.",
     "No --enable-expert-parallel (EP is a no-op at TP1; whether the tree boots with the flag at TP1 is unverified).",
     "NCCL_PROTO is left to NCCL: the earlier LL default has never been compared with NCCL's own choice without P2P.",
     "Cold-start risk on host-staged PP relays: DUFRelic batches the three tensor-dict isend/irecv call sites with batch_isend_irecv; that patch is not in this tree."
    ],
-   "acceptance": "A no-P2P run of PP4 x TP1 with the measured partition, pin, pool and 32-sequence cap; verify clean cold starts, token identity against a P2P control, and step-time impact."
+   "acceptance": "Tested on the reference host with P2P off (pool, decode at 4K / 131K / 262K, needles, 8 MP smoke). Still open: token identity against a P2P control and a physical no-P2P host. TP2xPP2 stays the no-P2P default.",
+   "tested_label": "tested on the reference host with P2P off (2026-10-19)"
   },
   {
    "id": "fn-octo-3090-tp2pp4",
@@ -430,7 +471,7 @@
      6.8,
      6.8,
      6.8,
-     9.0
+     9
     ],
     "alternative_pins": [
      {
@@ -464,9 +505,9 @@
     "GPU order: with CUDA_VISIBLE_DEVICES=0..7 the TP pairs are (0,1) (2,3) (4,5) (6,7) and the PP edges run pair to pair; list the cards so each TP pair shares the best link. models/flash-next/topo_select.py handles four GPUs only.",
     "Host RAM: 69 GiB floor / 96 GB qualified were measured with four workers; eight workers add roughly 8 GiB (estimate from ~8 GiB across four workers and the engine).",
     "P2P=on (default) uses the qualified 4-card settings (brandon-nuttall's report does not say whether his rig had P2P). P2P=off uses Jon-Nielsen's NCCL settings (NCCL_P2P_DISABLE=1, ring algorithm, LL128, --disable-custom-all-reduce), the only 8-card evidence without peer-to-peer (his rig ran TP4xPP2 on an older stack, so TP2xPP4 without P2P is untested on any stack).",
-    "Optional community knob, not in this profile: greedy draft + use_local_argmax_reduction gave +10-20 % 8-way aggregate and -8 to -10 % single-stream at 4K on brandon's rig; it changes the draft sampling mode, so it needs its own gate."
+    "Optional community knob, not in this profile: greedy draft + use_local_argmax_reduction gave +10-20 % 8-way aggregate and -8 to -10 % single-stream at 4K on brandon's rig; it changes the draft sampling mode, so it needs its own qualification."
    ],
-   "acceptance": "A community 8 x 3090 run on v3 reporting pool, decode at 4K/131K/262K, needles and the smoke test. The PP>2 path check (TP1xPP4 on a four-card 3090 host) is done and is not an eight-card result."
+   "acceptance": "A community 8 x 3090 run on Merlin 3.x reporting pool, decode at 4K/131K/262K, needles and the smoke test. The PP>2 path check (TP1xPP4 on a four-card 3090 host) is done and is not an eight-card result."
   },
   {
    "id": "fn-octo-3090-tp4pp2",
@@ -555,7 +596,7 @@
     "fit_262k": 11,
     "fit_131k": 20,
     "bytes_per_block_mib": [
-     14.0,
+     14,
      15.8
     ],
     "alternative_pins": [
@@ -585,7 +626,7 @@
     "P2P=on uses the 4-card settings. P2P=off copies Jon-Nielsen's recipe: NCCL_P2P_DISABLE=1, ring algorithm, LL128, --disable-custom-all-reduce (his kit calls this the NCCL trio that makes PP work on a BAR1-blocked rig).",
     "The TP4 all-reduce without P2P is community-validated on the older stack only; on this engine it is untested."
    ],
-   "acceptance": "A community 8 x 3090 run on v3 (P2P on and off): pool, decode at 4K/131K/262K, needles, smoke."
+   "acceptance": "A community 8 x 3090 run on Merlin 3.x (P2P on and off): pool, decode at 4K/131K/262K, needles, smoke."
   },
   {
    "id": "fn-2x48g-pp2-sm86",
@@ -643,7 +684,7 @@
        "fit_262k": 2,
        "fit_131k": 4,
        "bytes_per_block_mib": [
-        56.0,
+        56,
         57.8
        ]
       }
@@ -689,7 +730,7 @@
     "fit_262k": 5,
     "fit_131k": 9,
     "bytes_per_block_mib": [
-     28.0,
+     28,
      29.8
     ]
    },
@@ -702,7 +743,7 @@
     "max-num-seqs is capped at the 131K-session fit and at 32 so admitted sessions stay resident.",
     "KV_BYTES is a per-card pin estimate: after a pool-only boot read the logged pool and adjust in 0.25 GiB steps (lower it if the boot OOMs)."
    ],
-   "acceptance": "A pool-only boot on 2 x A6000 / A40, then the standard gate."
+   "acceptance": "A pool-only boot on 2 x A6000 / A40, then the standard checks."
   },
   {
    "id": "fn-4x48g-tp2pp2-sm86",
@@ -766,7 +807,7 @@
        "fit_262k": 13,
        "fit_131k": 24,
        "bytes_per_block_mib": [
-        28.0,
+        28,
         29.8
        ]
       }
@@ -812,7 +853,7 @@
     "fit_262k": 25,
     "fit_131k": 46,
     "bytes_per_block_mib": [
-     14.0,
+     14,
      15.8
     ]
    },
@@ -829,7 +870,7 @@
   {
    "id": "fn-quad-24g-sm89",
    "title": "4 x 24 GB sm_89 (RTX 4090), TP2xPP2+EP, fp8 KV",
-   "status": "untested",
+   "status": "testing",
    "rank": 1,
    "latency": false,
    "match": {
@@ -838,7 +879,10 @@
     ],
     "cards": 4,
     "vram_gib": 24,
-    "p2p": "any"
+    "p2p": "any",
+    "testing_gpu_names": [
+     "RTX 4090$"
+    ]
    },
    "layout": {
     "tp": 2,
@@ -851,7 +895,7 @@
    },
    "serve": {
     "max_num_seqs": 8,
-    "max_num_batched_tokens": 1024,
+    "max_num_batched_tokens": 2048,
     "kv_cache_dtype": "fp8_e4m3",
     "kv_cache_memory": 4100000000,
     "capture_sizes": [
@@ -878,7 +922,7 @@
        "fit_262k": 1,
        "fit_131k": 3,
        "bytes_per_block_mib": [
-        28.0,
+        28,
         29.8
        ]
       },
@@ -920,29 +964,125 @@
    "warm": 0,
    "capacity": {
     "estimate": true,
-    "basis": "Estimate: same layout and per-card KV pin as fn-quad-3090 (fp8 KV), whose pool is measured on sm_86; the sm_89 native E4M3 path is not measured on any Ada card.",
+    "basis": "Estimate: same layout and per-card KV pin as fn-quad-3090 (fp8 KV), whose pool is measured on sm_86; the cloud-hosted 4 x RTX 4090 24 GB (2026-10-18, P2P off) booted this pin to the same 924,993-token pool.",
     "pin_gib": 3.82,
     "kv_blocks": 248,
     "pool_tokens": 924993,
     "fit_262k": 3,
     "fit_131k": 6,
     "bytes_per_block_mib": [
-     14.0,
+     14,
      15.8
     ]
    },
    "evidence": [
-    "None: no A30 run report exists."
+    "Cloud-hosted 4 x RTX 4090 24 GB, measured 2026-10-18 (P2P off, fp8 KV, chunk 1024): pool 924,993 tokens, needles 262K-32K 4/4 exact (262K in 48.8 s), coherence 3/3, 8 MP image correct (1,063 MiB minimum free). The shipped chunk 2048 measured +15-20 % prefill on the same cards (131K TTFT 22.5 s against 24.4-27.0 s at 1024, step time unchanged); its 8 MP image and 262K checks have not run yet (CHUNK=1024 falls back to the checked chunk).",
+    "Testing: the runs above were on cloud-hosted hardware; kernel parity qualification is still to run."
    ],
    "notes": [
-    "KV default is fp8_e4m3: the 0.32 engine admits E4M3 KV on sm_89+ through upstream's native cast (vllm/models/qwen4_exp/nvidia/qsa.py, _validated_qsa_fp8_dtype), but that path has not run on any Ada card, so the row stays untested. Pool 924,993 tokens = 3 x 262K / 6 x 131K at fp8 KV; the selectable bf16 variant (tools/merlin/launchers/serve-quad-24g-sm89-kv-bf16.sh) keeps the earlier bf16 sizing: pool 486,838 tokens = 1 x 262K / 3 x 131K, seqs 3. The fp8 default exports the VLLM_QSA_KV_SCALES sidecar (E4M3-only); the bf16 variant does not.",
+    "KV default is fp8_e4m3: the 0.32 engine admits E4M3 KV on sm_89+ through upstream's native cast (vllm/models/qwen4_exp/nvidia/qsa.py, _validated_qsa_fp8_dtype), and that path ran on cloud-hosted 4 x RTX 4090 cards (2026-10-18), so the row is testing: kernel parity qualification is still to run. Pool 924,993 tokens = 3 x 262K / 6 x 131K at fp8 KV; the selectable bf16 variant (tools/merlin/launchers/serve-quad-24g-sm89-kv-bf16.sh) keeps the earlier bf16 sizing: pool 486,838 tokens = 1 x 262K / 3 x 131K, seqs 3. The fp8 default exports the VLLM_QSA_KV_SCALES sidecar (E4M3-only); the bf16 variant does not.",
     "Consumer Ada (RTX 4090) has no P2P in the stock driver: the default mode is P2P=off; use P2P=on only with a patched open kernel module.",
     "WARM defaults to 0 because the persisted Triton autotune is sm_86 only.",
     "Host RAM does not depend on the card: ~47.7 GiB pinned FP8 PLE table inside the qualified 96 GB allocation (69 GiB measured floor).",
-    "max-num-seqs is capped at the 131K-session fit and at 8 (the only concurrency the engine is gated at) so admitted sessions stay resident.",
+    "max-num-seqs is capped at the 131K-session fit and at 8 (the only concurrency the engine is qualified at) so admitted sessions stay resident.",
     "KV_BYTES is a per-card pin estimate: after a pool-only boot read the logged pool and adjust in 0.25 GiB steps (lower it if the boot OOMs)."
    ],
    "acceptance": "sm_89: native E4M3 KV and kernel parity on Ada (needs hardware access)."
+  },
+  {
+   "id": "fn-quad-24g-sm89-pp4",
+   "title": "4 x 24 GB sm_89 (RTX 4090), no P2P, PP4 x TP1, fp8 KV (named prefill alternative)",
+   "status": "untested",
+   "rank": 2,
+   "auto_select": false,
+   "latency": false,
+   "match": {
+    "arch": [
+     "sm_89"
+    ],
+    "cards": 4,
+    "vram_gib": 24,
+    "p2p": "off"
+   },
+   "layout": {
+    "tp": 1,
+    "pp": 4,
+    "ep": false,
+    "partition": [
+     12,
+     13,
+     13,
+     10
+    ]
+   },
+   "serve": {
+    "max_num_seqs": 32,
+    "max_num_batched_tokens": 1024,
+    "kv_cache_dtype": "fp8_e4m3",
+    "kv_cache_memory": 2500000000,
+    "capture_sizes": [
+     1,
+     2,
+     3,
+     4,
+     6,
+     8,
+     12,
+     16,
+     24,
+     32,
+     40,
+     48,
+     64,
+     80,
+     96,
+     112,
+     128
+    ]
+   },
+   "interconnect": {
+    "modes": {
+     "off": {
+      "exports": {
+       "VLLM_SKIP_P2P_CHECK": "1",
+       "NCCL_P2P_DISABLE": "1"
+      },
+      "unset": [
+       "NCCL_P2P_LEVEL",
+       "NCCL_PROTO",
+       "NCCL_ALGO",
+       "VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC"
+      ],
+      "disable_custom_all_reduce": true
+     }
+    },
+    "default": "off"
+   },
+   "cuda_visible_devices": "0,1,2,3",
+   "warm": 0,
+   "capacity": {
+    "estimate": true,
+    "basis": "Pool 506,083 tokens measured on a cloud-hosted 4 x RTX 4090 (no P2P, PCIe Gen4 x16; 2026-10-18), PP4 x TP1, partition 12/13/13/10, max_num_seqs 32, at a 2,500,000,000-byte per-card pin (140 stage-3 blocks, not a whole-block pin). A cloud-hosted run, not a reference-host measurement, so the row stays an estimate. The sm_86 row's 250-block pin is not measured on Ada; raise this pin only after a pool + 8 MP image headroom boot on the card.",
+    "pin_gib": 2.33,
+    "kv_blocks": 140,
+    "pool_tokens": 506083,
+    "fit_262k": 1,
+    "fit_131k": 3
+   },
+   "evidence": [
+    "2026-10-18, cloud-hosted 4 x RTX 4090 (no P2P, PCIe Gen4 x16), this layout through launch.py at the 2.5e9 pin: needles 4/4 exact (262K 19.0 s cold), 8 MP image PASS, minimum free 2.7-3.3 GB per card, coherence PASS, 0 OOM.",
+    "The same cloud-hosted cards against fn-quad-24g-sm89 (TP2xPP2+EP, P2P off), seeded rows: c1 TTFT 4K 0.41 vs 0.92 s, 131K 8.5-8.6 vs 25-27 s, 262K 17.3 vs 47-55 s; real-text c1 decode 146.6 vs 138.6 tok/s (ITL 19.0 vs 16.4 ms). The TP2xPP2 prefill there is bound by host-staged NCCL (75-76 % of GPU time in a 32K prefill profile).",
+    "Not run on the reference host (no Ada card here); evidence from cloud-hosted cards only."
+   ],
+   "notes": [
+    "Named alternative (chosen 2026-10-25): automatic selection keeps fn-quad-24g-sm89 (TP2xPP2+EP) as the default; this row runs only when named: merlin serve flash-next <dir> --profile fn-quad-24g-sm89-pp4, or bash tools/merlin/launchers/serve-quad-24g-sm89-pp4.sh <dir>.",
+    "TP1 removes the tensor-parallel all-reduce; only the pipeline relay between stages remains. Without P2P this is the layout whose prefill scales with Ada compute (3x the TP2xPP2 row on the same cloud-hosted cards).",
+    "Pool 506,083 tokens (1 x 262K / 3 x 131K) at the 2.5e9 pin, about half of fn-quad-24g-sm89 (924,993).",
+    "KV is fp8_e4m3 through the 0.32 engine's native E4M3 cast on sm_89 (vllm/models/qwen4_exp/nvidia/qsa.py, _validated_qsa_fp8_dtype); it ran clean on the cloud-hosted 4 x RTX 4090. The fp8 default exports the VLLM_QSA_KV_SCALES sidecar. No bf16 KV variant is defined for this row.",
+    "The release wheel covers sm_80, sm_86 and sm_89; a source build needs 8.9 in TORCH_CUDA_ARCH_LIST. WARM defaults to 0 because the persisted Triton autotune is sm_86 only.",
+    "No --enable-expert-parallel (EP is a no-op at TP1)."
+   ],
+   "acceptance": "A no-P2P 4 x RTX 4090 run at a whole-block pin above 2.5e9 (pool boot + 262K needle + 8 MP image headroom), cold starts and token identity against the sm_86 row."
   },
   {
    "id": "fn-quad-24g-sm80",
@@ -1021,8 +1161,21 @@
     "fit_262k": 1,
     "fit_131k": 3,
     "bytes_per_block_mib": [
-     28.0,
+     28,
      29.8
+    ]
+   },
+   "capacity_fp8_opt_in": {
+    "estimate": true,
+    "basis": "FP8 opt-in engine-fit estimate, not measured on sm_80: same per-card pin 4086562816 B; binding block 16515072 B (247 blocks). Arithmetic follows get_kv_cache_configs/get_kv_cache_capacity: reserve one shared ring block (null-block admission is checked separately), 70 blocks per 262K request and 38 per 131K request. BF16 main pages shrink to E4M3 bytes; compressed BF16 indexer pages and ring state keep their dtype. Covered by the CPU engine-capacity harness; not yet run by us on sm_80.",
+    "pin_gib": 3.81,
+    "kv_blocks": 247,
+    "pool_tokens": 921248,
+    "fit_262k": 3,
+    "fit_131k": 6,
+    "bytes_per_block_mib": [
+     14,
+     15.75
     ]
    },
    "evidence": [
@@ -1030,14 +1183,14 @@
     "None: no A30 run report exists."
    ],
    "notes": [
-    "The shipped quad layout and pin with bf16 KV: the pool is 486,838 tokens (1 x 262K, 3 x 131K), about half of the fp8 pool, because only fp8 KV reaches 3 x 262K on 24 GB cards. KV default is bfloat16, the conservative choice: the engine admits fp8_e4m3 KV on sm_86 (Merlin byte decoder) and on sm_89+ (upstream native E4M3 cast) (vllm/models/qwen4_exp/nvidia/qsa.py, _validated_qsa_fp8_dtype), but the native sm_89 path has not run on any Ada card. fp8_e4m3 KV is the selectable capacity variant (tools/merlin/launchers/serve-quad-24g-bf16-kv-fp8.sh, pool in the hardware matrix); AUTO_PROFILE picks it on sm_89. The fp8 variant exports the VLLM_QSA_KV_SCALES sidecar; this bf16 default does not (it is E4M3-only).",
+    "BF16 KV stays the default on sm_80: pool 486,838 tokens = 1 x 262K / 3 x 131K. KV_DTYPE=fp8 opts into the byte decoder with the same pin and admission cap; its engine-fit estimate is 921,248 tokens = 3 x 262K / 6 x 131K (capacity_fp8_opt_in), not a measured pool. FP8 status: ⚫ untested (a profile ships, not yet run by us, expected to work). Only FP8 exports the checkpoint/recipe VLLM_QSA_KV_SCALES sidecar; BF16 evidence does not qualify FP8.",
     "Consumer Ada (RTX 4090) has no P2P in the stock driver: the default mode is P2P=off; use P2P=on only with a patched open kernel module. A30 supports P2P over PCIe.",
     "WARM defaults to 0 because the persisted Triton autotune is sm_86 only.",
     "Host RAM does not depend on the card: ~47.7 GiB pinned FP8 PLE table inside the qualified 96 GB allocation (69 GiB measured floor).",
-    "max-num-seqs is capped at the 131K-session fit and at 8 (the only concurrency the engine is gated at) so admitted sessions stay resident.",
+    "max-num-seqs is capped at the 131K-session fit and at 8 (the only concurrency the engine is qualified at) so admitted sessions stay resident.",
     "KV_BYTES is a per-card pin estimate: after a pool-only boot read the logged pool and adjust in 0.25 GiB steps (lower it if the boot OOMs)."
    ],
-   "acceptance": "sm_89: kernel parity and fp8 KV on Ada (needs hardware access); sm_80: fp8 KV on sm_80, op tests with a truncated model."
+   "acceptance": "BF16 status and evidence remain as recorded above. FP8 KV is opt-in and untested by us on sm_80; future hardware validation covers pool boot, output agreement, long-context needles and resident concurrency."
   },
   {
    "id": "fn-2x48g-pp2-sm89",
@@ -1092,7 +1245,7 @@
        "fit_262k": 2,
        "fit_131k": 4,
        "bytes_per_block_mib": [
-        56.0,
+        56,
         57.8
        ]
       },
@@ -1141,7 +1294,7 @@
     "fit_262k": 5,
     "fit_131k": 9,
     "bytes_per_block_mib": [
-     28.0,
+     28,
      29.8
     ]
    },
@@ -1149,7 +1302,7 @@
     "None: no run report yet; the demand signal is community RTX 4090 / 4080 Super 32 GB users."
    ],
    "notes": [
-    "KV default is fp8_e4m3: the 0.32 engine admits E4M3 KV on sm_89+ through upstream's native cast (vllm/models/qwen4_exp/nvidia/qsa.py, _validated_qsa_fp8_dtype), but that path has not run on any Ada card, so the row stays untested. Pool 1,419,322 tokens = 5 x 262K / 9 x 131K at fp8 KV; the selectable bf16 variant (tools/merlin/launchers/serve-2x48g-pp2-sm89-kv-bf16.sh) keeps the earlier bf16 sizing: pool 726,513 tokens = 2 x 262K / 4 x 131K, seqs 4. The fp8 default exports the VLLM_QSA_KV_SCALES sidecar (E4M3-only); the bf16 variant does not.",
+    "KV default is fp8_e4m3: the 0.32 engine admits E4M3 KV on sm_89+ through upstream's native cast (vllm/models/qwen4_exp/nvidia/qsa.py, _validated_qsa_fp8_dtype), but that path has not run on any Ada card, so the row stays untested. Pool 1,419,322 tokens = 5 x 262K / 9 x 131K at fp8 KV; the selectable bf16 variant (generate its launcher with python tools/merlin/preflight.py --emit launcher --profile fn-2x48g-pp2-sm89 --kv bf16) keeps the earlier bf16 sizing: pool 726,513 tokens = 2 x 262K / 4 x 131K, seqs 4. The fp8 default exports the VLLM_QSA_KV_SCALES sidecar (E4M3-only); the bf16 variant does not.",
     "An L40S reports ~45 GiB, about 3 GiB under the 48 GiB class: lower KV_BYTES by that amount (preflight prints the figure).",
     "Ada workstation / datacenter cards have no P2P in the stock driver: default P2P=off.",
     "WARM defaults to 0 because the persisted Triton autotune is sm_86 only.",
@@ -1218,7 +1371,7 @@
        "fit_262k": 13,
        "fit_131k": 24,
        "bytes_per_block_mib": [
-        28.0,
+        28,
         29.8
        ]
       },
@@ -1267,7 +1420,7 @@
     "fit_262k": 25,
     "fit_131k": 46,
     "bytes_per_block_mib": [
-     14.0,
+     14,
      15.8
     ]
    },
@@ -1340,7 +1493,7 @@
        "fit_262k": 5,
        "fit_131k": 10,
        "bytes_per_block_mib": [
-        28.0,
+        28,
         29.8
        ]
       },
@@ -1389,7 +1542,7 @@
     "fit_262k": 10,
     "fit_131k": 19,
     "bytes_per_block_mib": [
-     14.0,
+     14,
      15.8
     ]
    },
@@ -1397,7 +1550,7 @@
     "None: no run report yet; the demand signal is community RTX 4090 / 4080 Super 32 GB users."
    ],
    "notes": [
-    "KV default is fp8_e4m3: the 0.32 engine admits E4M3 KV on sm_89+ through upstream's native cast (vllm/models/qwen4_exp/nvidia/qsa.py, _validated_qsa_fp8_dtype), but that path has not run on any Ada card, so the row stays untested. Pool 2,857,802 tokens = 10 x 262K / 19 x 131K at fp8 KV; the selectable bf16 variant (tools/merlin/launchers/serve-quad-32g-sm89-kv-bf16.sh) keeps the earlier bf16 sizing: pool 1,516,690 tokens = 5 x 262K / 10 x 131K, seqs 8. The fp8 default exports the VLLM_QSA_KV_SCALES sidecar (E4M3-only); the bf16 variant does not.",
+    "KV default is fp8_e4m3: the 0.32 engine admits E4M3 KV on sm_89+ through upstream's native cast (vllm/models/qwen4_exp/nvidia/qsa.py, _validated_qsa_fp8_dtype), but that path has not run on any Ada card, so the row stays untested. Pool 2,857,802 tokens = 10 x 262K / 19 x 131K at fp8 KV; the selectable bf16 variant (generate its launcher with python tools/merlin/preflight.py --emit launcher --profile fn-quad-32g-sm89 --kv bf16) keeps the earlier bf16 sizing: pool 1,516,690 tokens = 5 x 262K / 10 x 131K, seqs 8. The fp8 default exports the VLLM_QSA_KV_SCALES sidecar (E4M3-only); the bf16 variant does not.",
     "Default P2P=off (stock driver). Pin = 32 - 17.44 - 2.75 GiB.",
     "WARM defaults to 0 because the persisted Triton autotune is sm_86 only.",
     "Host RAM does not depend on the card: ~47.7 GiB pinned FP8 PLE table inside the qualified 96 GB allocation (69 GiB measured floor).",
@@ -1464,18 +1617,30 @@
      107.2
     ]
    },
+   "capacity_fp8_opt_in": {
+    "estimate": true,
+    "basis": "FP8 opt-in engine-fit estimate, not measured on sm_80: same per-card pin 10458759168 B; binding block 57933824 B (180 blocks). Arithmetic follows get_kv_cache_configs/get_kv_cache_capacity: reserve one shared ring block (null-block admission is checked separately), 70 blocks per 262K request and 38 per 131K request. BF16 main pages shrink to E4M3 bytes; compressed BF16 indexer pages and ring state keep their dtype. Covered by the CPU engine-capacity harness; not yet run by us on sm_80.",
+    "pin_gib": 9.74,
+    "kv_blocks": 180,
+    "pool_tokens": 670339,
+    "fit_262k": 2,
+    "fit_131k": 4,
+    "bytes_per_block_mib": [
+     55.25
+    ]
+   },
    "evidence": [
     "None: no A100 run report exists; the only sm_80 Flash-Next reports are CMP 170HX rigs."
    ],
    "notes": [
-    "The whole model on one card (~67.5 GiB of weights): pool 344,532 tokens = 1 x 262K / 2 x 131K at bf16; per GB the worst option, useful mainly as the sm_80 test machine. KV is bfloat16 because the engine refuses fp8_e4m3 KV on sm_80 (vllm/models/qwen4_exp/nvidia/qsa.py, _validated_qsa_fp8_dtype admits sm_86 and sm_89+ only); the fp8 pool columns in the hardware matrix do not apply here. fp8 KV on sm_80 is engine work, not part of this release. No VLLM_QSA_KV_SCALES sidecar is exported (it is E4M3-only).",
+    "BF16 KV stays the default on sm_80: pool 344,532 tokens = 1 x 262K / 2 x 131K. KV_DTYPE=fp8 opts into the byte decoder with the same pin and admission cap; its engine-fit estimate is 670,339 tokens = 2 x 262K / 4 x 131K (capacity_fp8_opt_in), not a measured pool. FP8 status: ⚫ untested (a profile ships, not yet run by us, expected to work). Only FP8 exports the checkpoint/recipe VLLM_QSA_KV_SCALES sidecar; BF16 evidence does not qualify FP8.",
     "TP1 PP1: no expert parallel, no pipeline, no interconnect traffic.",
     "WARM defaults to 0 because the persisted Triton autotune is sm_86 only.",
     "Host RAM does not depend on the card: ~47.7 GiB pinned FP8 PLE table inside the qualified 96 GB allocation (69 GiB measured floor).",
-    "max-num-seqs is capped at the 131K-session fit and at 8 (the only concurrency the engine is gated at) so admitted sessions stay resident.",
+    "max-num-seqs is capped at the 131K-session fit and at 8 (the only concurrency the engine is qualified at) so admitted sessions stay resident.",
     "KV_BYTES is a per-card pin estimate: after a pool-only boot read the logged pool and adjust in 0.25 GiB steps (lower it if the boot OOMs)."
    ],
-   "acceptance": "fp8 KV on sm_80, op tests with a truncated model, and a pool-only boot; all need sm_80 hardware access."
+   "acceptance": "BF16 status and evidence remain as recorded above. FP8 KV is opt-in and untested by us on sm_80; future hardware validation covers pool boot, output agreement, long-context needles and resident concurrency."
   },
   {
    "id": "fn-sm80-80g-x2-tp2",
@@ -1552,7 +1717,7 @@
    "capacity": {
     "estimate": true,
     "basis": "Estimate from the engine's own get_kv_cache_configs evaluated on per-stage specs (v3.0.0 tree); the TP2xPP2 25/23 calibration at 4.1e9 reproduces 924,993 tokens exactly. Pin = card VRAM - binding-stage weights - 2.75 GiB overhead; the weights are derived except TP2xPP2 (measured). An ESTIMATE until a pool-only boot on the hardware. The prefix-cache block copy is a per-row copy with no temporary, so this row needs no copy reserve; pin rounded down to whole KV blocks (797 x 57,933,824 B); engine-truth probe 2,980,951 tokens, fit 11/20.",
-    "pin_gib": 43.0,
+    "pin_gib": 43,
     "kv_blocks": 797,
     "pool_tokens": 2980951,
     "fit_262k": 11,
@@ -1561,18 +1726,30 @@
      55.2
     ]
    },
+   "capacity_fp8_opt_in": {
+    "estimate": true,
+    "basis": "FP8 opt-in engine-fit estimate, not measured on sm_80: same per-card pin 46173257728 B; binding block 30670848 B (1505 blocks). Arithmetic follows get_kv_cache_configs/get_kv_cache_capacity: reserve one shared ring block (null-block admission is checked separately), 70 blocks per 262K request and 38 per 131K request. BF16 main pages shrink to E4M3 bytes; compressed BF16 indexer pages and ring state keep their dtype. Covered by the CPU engine-capacity harness; not yet run by us on sm_80.",
+    "pin_gib": 43,
+    "kv_blocks": 1505,
+    "pool_tokens": 5632351,
+    "fit_262k": 21,
+    "fit_131k": 39,
+    "bytes_per_block_mib": [
+     29.25
+    ]
+   },
    "evidence": [
     "None: no A100 run report exists; the only sm_80 Flash-Next reports are CMP 170HX rigs."
    ],
    "notes": [
-    "Pool 2,980,951 tokens = 11 x 262K / 20 x 131K at bf16. KV is bfloat16 because the engine refuses fp8_e4m3 KV on sm_80 (vllm/models/qwen4_exp/nvidia/qsa.py, _validated_qsa_fp8_dtype admits sm_86 and sm_89+ only); the fp8 pool columns in the hardware matrix do not apply here. fp8 KV on sm_80 is engine work, not part of this release. No VLLM_QSA_KV_SCALES sidecar is exported (it is E4M3-only).",
+    "BF16 KV stays the default on sm_80: pool 2,980,951 tokens = 11 x 262K / 20 x 131K. KV_DTYPE=fp8 opts into the byte decoder with the same pin and admission cap; its engine-fit estimate is 5,632,351 tokens = 21 x 262K / 39 x 131K (capacity_fp8_opt_in), not a measured pool. FP8 status: ⚫ untested (a profile ships, not yet run by us, expected to work). Only FP8 exports the checkpoint/recipe VLLM_QSA_KV_SCALES sidecar; BF16 evidence does not qualify FP8.",
     "A100 80 GB cards (SXM or PCIe) report P2P over NVLink / PCIe: default P2P=on.",
     "WARM defaults to 0 because the persisted Triton autotune is sm_86 only.",
     "Host RAM does not depend on the card: ~47.7 GiB pinned FP8 PLE table inside the qualified 96 GB allocation (69 GiB measured floor).",
     "max-num-seqs is capped at the 131K-session fit and at 32 so admitted sessions stay resident.",
     "KV_BYTES is a per-card pin estimate: after a pool-only boot read the logged pool and adjust in 0.25 GiB steps (lower it if the boot OOMs)."
    ],
-   "acceptance": "fp8 KV on sm_80, op tests with a truncated model, and a pool-only boot; all need sm_80 hardware access."
+   "acceptance": "BF16 status and evidence remain as recorded above. FP8 KV is opt-in and untested by us on sm_80; future hardware validation covers pool boot, output agreement, long-context needles and resident concurrency."
   },
   {
    "id": "fn-sm80-80g-x2-pp2",
@@ -1648,21 +1825,34 @@
     "fit_262k": 10,
     "fit_131k": 19,
     "bytes_per_block_mib": [
-     56.0,
+     56,
      57.8
+    ]
+   },
+   "capacity_fp8_opt_in": {
+    "estimate": true,
+    "basis": "FP8 opt-in engine-fit estimate, not measured on sm_80: same per-card pin 46203666432 B; binding block 31195136 B (1481 blocks). Arithmetic follows get_kv_cache_configs/get_kv_cache_capacity: reserve one shared ring block (null-block admission is checked separately), 70 blocks per 262K request and 38 per 131K request. BF16 main pages shrink to E4M3 bytes; compressed BF16 indexer pages and ring state keep their dtype. Covered by the CPU engine-capacity harness; not yet run by us on sm_80.",
+    "pin_gib": 43.03,
+    "kv_blocks": 1481,
+    "pool_tokens": 5542473,
+    "fit_262k": 21,
+    "fit_131k": 38,
+    "bytes_per_block_mib": [
+     28,
+     29.75
     ]
    },
    "evidence": [
     "None: no A100 run report exists; the only sm_80 Flash-Next reports are CMP 170HX rigs."
    ],
    "notes": [
-    "Pool 2,853,624 tokens = 10 x 262K / 19 x 131K at bf16; PP removes the TP all-reduce. KV is bfloat16 because the engine refuses fp8_e4m3 KV on sm_80 (vllm/models/qwen4_exp/nvidia/qsa.py, _validated_qsa_fp8_dtype admits sm_86 and sm_89+ only); the fp8 pool columns in the hardware matrix do not apply here. fp8 KV on sm_80 is engine work, not part of this release. No VLLM_QSA_KV_SCALES sidecar is exported (it is E4M3-only).",
+    "BF16 KV stays the default on sm_80: pool 2,853,624 tokens = 10 x 262K / 19 x 131K. KV_DTYPE=fp8 opts into the byte decoder with the same pin and admission cap; its engine-fit estimate is 5,542,473 tokens = 21 x 262K / 38 x 131K (capacity_fp8_opt_in), not a measured pool. FP8 status: ⚫ untested (a profile ships, not yet run by us, expected to work). Only FP8 exports the checkpoint/recipe VLLM_QSA_KV_SCALES sidecar; BF16 evidence does not qualify FP8.",
     "WARM defaults to 0 because the persisted Triton autotune is sm_86 only.",
     "Host RAM does not depend on the card: ~47.7 GiB pinned FP8 PLE table inside the qualified 96 GB allocation (69 GiB measured floor).",
     "max-num-seqs is capped at the 131K-session fit and at 32 so admitted sessions stay resident.",
     "KV_BYTES is a per-card pin estimate: after a pool-only boot read the logged pool and adjust in 0.25 GiB steps (lower it if the boot OOMs)."
    ],
-   "acceptance": "fp8 KV on sm_80, op tests with a truncated model, and a pool-only boot; all need sm_80 hardware access."
+   "acceptance": "BF16 status and evidence remain as recorded above. FP8 KV is opt-in and untested by us on sm_80; future hardware validation covers pool boot, output agreement, long-context needles and resident concurrency."
   },
   {
    "id": "fn-sm80-80g-x4-tp2pp2",
@@ -1751,27 +1941,40 @@
     "fit_262k": 28,
     "fit_131k": 52,
     "bytes_per_block_mib": [
-     28.0,
+     28,
      29.8
+    ]
+   },
+   "capacity_fp8_opt_in": {
+    "estimate": true,
+    "basis": "FP8 opt-in engine-fit estimate, not measured on sm_80: same per-card pin 64199589888 B; binding block 16515072 B (3887 blocks). Arithmetic follows get_kv_cache_configs/get_kv_cache_capacity: reserve one shared ring block (null-block admission is checked separately), 70 blocks per 262K request and 38 per 131K request. BF16 main pages shrink to E4M3 bytes; compressed BF16 indexer pages and ring state keep their dtype. Covered by the CPU engine-capacity harness; not yet run by us on sm_80.",
+    "pin_gib": 59.79,
+    "kv_blocks": 3887,
+    "pool_tokens": 14552736,
+    "fit_262k": 55,
+    "fit_131k": 102,
+    "bytes_per_block_mib": [
+     14,
+     15.75
     ]
    },
    "evidence": [
     "None: no A100 run report exists; the only sm_80 Flash-Next reports are CMP 170HX rigs."
    ],
    "notes": [
-    "Pool 7,703,288 tokens = 28 x 262K / 52 x 131K at bf16. KV is bfloat16 because the engine refuses fp8_e4m3 KV on sm_80 (vllm/models/qwen4_exp/nvidia/qsa.py, _validated_qsa_fp8_dtype admits sm_86 and sm_89+ only); the fp8 pool columns in the hardware matrix do not apply here. fp8 KV on sm_80 is engine work, not part of this release. No VLLM_QSA_KV_SCALES sidecar is exported (it is E4M3-only).",
+    "BF16 KV stays the default on sm_80: pool 7,703,288 tokens = 28 x 262K / 52 x 131K. KV_DTYPE=fp8 opts into the byte decoder with the same pin and admission cap; its engine-fit estimate is 14,552,736 tokens = 55 x 262K / 102 x 131K (capacity_fp8_opt_in), not a measured pool. FP8 status: ⚫ untested (a profile ships, not yet run by us, expected to work). Only FP8 exports the checkpoint/recipe VLLM_QSA_KV_SCALES sidecar; BF16 evidence does not qualify FP8.",
     "A100 80 GB cards (SXM or PCIe) report P2P over NVLink / PCIe: default P2P=on.",
     "WARM defaults to 0 because the persisted Triton autotune is sm_86 only.",
     "Host RAM does not depend on the card: ~47.7 GiB pinned FP8 PLE table inside the qualified 96 GB allocation (69 GiB measured floor).",
     "max-num-seqs is capped at the 131K-session fit and at 32 so admitted sessions stay resident.",
     "KV_BYTES is a per-card pin estimate: after a pool-only boot read the logged pool and adjust in 0.25 GiB steps (lower it if the boot OOMs)."
    ],
-   "acceptance": "fp8 KV on sm_80, op tests with a truncated model, and a pool-only boot; all need sm_80 hardware access."
+   "acceptance": "BF16 status and evidence remain as recorded above. FP8 KV is opt-in and untested by us on sm_80; future hardware validation covers pool boot, output agreement, long-context needles and resident concurrency."
   },
   {
    "id": "fn-sm80-64g-x2-pp2",
    "title": "2 x 64 GB sm_80 (CMP 170HX dual-rank), PP2 x TP1, bf16 KV",
-   "status": "untested",
+   "status": "testing",
    "rank": 1,
    "latency": false,
    "match": {
@@ -1780,7 +1983,10 @@
     ],
     "cards": 2,
     "vram_gib": 64,
-    "p2p": "any"
+    "p2p": "any",
+    "testing_gpu_names": [
+     "CMP 170HX"
+    ]
    },
    "layout": {
     "tp": 1,
@@ -1843,24 +2049,39 @@
    "warm": 0,
    "capacity": {
     "estimate": true,
-    "basis": "Estimate from the engine's own get_kv_cache_configs evaluated on per-stage specs (v3.0.0 tree); the TP2xPP2 25/23 calibration at 4.1e9 reproduces 924,993 tokens exactly. Pin = card VRAM - binding-stage weights - 2.75 GiB overhead; the weights are derived except TP2xPP2 (measured). An ESTIMATE until a pool-only boot on the hardware. The prefix-cache block copy is a per-row copy with no temporary, so this row needs no copy reserve; pin rounded down to whole KV blocks (479 x 60,555,264 B); engine-truth probe 1,790,069 tokens, fit 6/12.",
+    "basis": "Estimate from the engine's own get_kv_cache_configs evaluated on per-stage specs (v3.0.0 tree); the TP2xPP2 25/23 calibration at 4.1e9 reproduces 924,993 tokens exactly. Pin = card VRAM - binding-stage weights - 2.75 GiB overhead; the weights are derived except TP2xPP2 (measured). Booted to 1,790,069 tokens on cloud-hosted 4 x CMP 170HX 64 GB (2026-10-18 and 2026-10-19). The prefix-cache block copy is a per-row copy with no temporary, so this row needs no copy reserve; pin rounded down to whole KV blocks (479 x 60,555,264 B); engine-truth probe 1,790,069 tokens, fit 6/12.",
     "pin_gib": 27.01,
     "kv_blocks": 479,
     "pool_tokens": 1790069,
     "fit_262k": 6,
     "fit_131k": 12,
     "bytes_per_block_mib": [
-     56.0,
+     56,
      57.8
+    ]
+   },
+   "capacity_fp8_opt_in": {
+    "estimate": true,
+    "basis": "FP8 opt-in engine-fit estimate, not measured on sm_80: same per-card pin 29005971456 B; binding block 31195136 B (929 blocks). Arithmetic follows get_kv_cache_configs/get_kv_cache_capacity: reserve one shared ring block (null-block admission is checked separately), 70 blocks per 262K request and 38 per 131K request. BF16 main pages shrink to E4M3 bytes; compressed BF16 indexer pages and ring state keep their dtype. Covered by the CPU engine-capacity harness; not yet run by us on sm_80.",
+    "pin_gib": 27.01,
+    "kv_blocks": 929,
+    "pool_tokens": 3475280,
+    "fit_262k": 13,
+    "fit_131k": 24,
+    "bytes_per_block_mib": [
+     28,
+     29.75
     ]
    },
    "evidence": [
     "Community: DUFRelic/qwen38-flash-next-recipe (2026-10-04): 2x CMP 170HX, stock vLLM 0.30.0, PP2 TP1, MTP k=3, BF16 KV (its pinned QSA path rejects fp8), P2P on via BAR1 patches, seqs 8, 262,144 context: 133 tok/s at c1, 245 aggregate at c4; batched send/recv patch against cold-start stalls.",
     "Community report (2x CMP 170HX): TP2+EP, P2P off, BF16 KV (fp8 gave +36 % capacity but 6-11 % slower decode), 126 tok/s at c1, 392 tok/s aggregate at c4.",
-    "Measured 2026-10-19 on 4 x CMP 170HX 64 GB: chunk 2048 at this 479-block pin: real-text prefill +14-16 % (~7,420 / ~7,540 / ~7,280 tok/s at 32K / 131K / 258K), 262K card TTFT 34.92 s vs 39.31 s, 8 MP min free 1,148 MiB, GSM8K 0.98, TTFT probe 48/48, pool unchanged. Chunk 4096 does not boot at 479 blocks; it fits at 461 blocks."
+    "Measured 2026-10-19 on 4 x CMP 170HX 64 GB: chunk 2048 at this 479-block pin: real-text prefill +14-16 % (~7,420 / ~7,540 / ~7,280 tok/s at 32K / 131K / 258K), 262K card TTFT 34.92 s vs 39.31 s, 8 MP min free 1,148 MiB, GSM8K 0.98, TTFT probe 48/48, pool unchanged. Chunk 4096 does not boot at 479 blocks; it fits at 461 blocks.",
+    "Cloud-hosted 4 x CMP 170HX 64 GB, measured 2026-10-19 on GPUs 0,1 (P2P off, bf16 KV, this 479-block pin, the then-default chunk 1024): pool 1,790,069 tokens; needles 262K and 131K exact; 6 x 262K, 8 x 131K and 8 x 32K resident and exact; 8 MP image (1,144 MiB minimum free); GSM8K-50 c8 0.98 three times; shared-prefix TTFT probe 48/48; 0 OOM. On 2026-10-18, before the row-wise prefix-cache block copy, the same pin died on the first prefix-cache hits.",
+    "Testing: the runs above were on cloud-hosted hardware; kernel parity qualification is still to run."
    ],
    "notes": [
-    "The community's 2-card Flash-Next setup. Pool 1,790,069 tokens = 6 x 262K / 12 x 131K at bf16 (13 x 262K only with fp8 KV, which is not reachable here yet). KV is bfloat16 because the engine refuses fp8_e4m3 KV on sm_80 (vllm/models/qwen4_exp/nvidia/qsa.py, _validated_qsa_fp8_dtype admits sm_86 and sm_89+ only); the fp8 pool columns in the hardware matrix do not apply here. fp8 KV on sm_80 is engine work, not part of this release. No VLLM_QSA_KV_SCALES sidecar is exported (it is E4M3-only).",
+    "BF16 KV stays the default on sm_80: pool 1,790,069 tokens = 6 x 262K / 12 x 131K. KV_DTYPE=fp8 opts into the byte decoder with the same pin and admission cap; its engine-fit estimate is 3,475,280 tokens = 13 x 262K / 24 x 131K (capacity_fp8_opt_in), not a measured pool. FP8 status: ⚫ untested (a profile ships, not yet run by us, expected to work). Only FP8 exports the checkpoint/recipe VLLM_QSA_KV_SCALES sidecar; BF16 evidence does not qualify FP8.",
     "170HX VRAM is a profile axis: 64 GB (dual-rank 8 GB SKU), 32 GB (single-rank) and 40 GB (10 GB SKU). The Gen2 x16 link is ~6.2-6.7 GB/s per card and shares traffic with the PLE pull (decode cost unmeasured). Community recipes cap the cards at 140-180 W and report Xid 31 / 79 events.",
     "Stock 170HX has canAccessPeer=0 (host-staged copies); direct P2P needs 4+ BAR1 driver patches and a BIOS placement fix (community BAR1 patch work for CMP 170HX). Default mode is P2P=off.",
     "WARM defaults to 0 because the persisted Triton autotune is sm_86 only.",
@@ -1869,7 +2090,7 @@
     "max-num-seqs is capped at the 131K-session fit and at 32 so admitted sessions stay resident.",
     "KV_BYTES is a per-card pin estimate: after a pool-only boot read the logged pool and adjust in 0.25 GiB steps (lower it if the boot OOMs)."
    ],
-   "acceptance": "fp8 KV on sm_80, op tests with a truncated model, and the batched send/recv work; all need sm_80 hardware access."
+   "acceptance": "BF16 status and evidence remain as recorded above. FP8 KV is opt-in and untested by us on sm_80; future hardware validation covers pool boot, output agreement, long-context needles and resident concurrency."
   },
   {
    "id": "fn-sm80-32g-x4-pp4",
@@ -1956,22 +2177,37 @@
      24.8,
      24.8,
      24.8,
-     33.0
+     33
+    ]
+   },
+   "capacity_fp8_opt_in": {
+    "estimate": true,
+    "basis": "FP8 opt-in engine-fit estimate, not measured on sm_80: same per-card pin 11626610688 B; binding block 17825792 B (652 blocks). Arithmetic follows get_kv_cache_configs/get_kv_cache_capacity: reserve one shared ring block (null-block admission is checked separately), 72 blocks per 262K request and 40 per 131K request. BF16 main pages shrink to E4M3 bytes; compressed BF16 indexer pages and ring state keep their dtype. Covered by the CPU engine-capacity harness; not yet run by us on sm_80.",
+    "pin_gib": 10.83,
+    "kv_blocks": 652,
+    "pool_tokens": 2370218,
+    "fit_262k": 9,
+    "fit_131k": 16,
+    "bytes_per_block_mib": [
+     12.75,
+     12.75,
+     12.75,
+     17
     ]
    },
    "evidence": [
     "Community: DUFRelic/qwen38-flash-next-recipe (2026-10-04): 2x CMP 170HX, stock vLLM 0.30.0, PP2 TP1, MTP k=3, BF16 KV (its pinned QSA path rejects fp8), P2P on via BAR1 patches, seqs 8, 262,144 context: 133 tok/s at c1, 245 aggregate at c4; batched send/recv patch against cold-start stalls."
    ],
    "notes": [
-    "Pool 1,219,697 tokens = 4 x 262K / 8 x 131K at bf16. KV is bfloat16 because the engine refuses fp8_e4m3 KV on sm_80 (vllm/models/qwen4_exp/nvidia/qsa.py, _validated_qsa_fp8_dtype admits sm_86 and sm_89+ only); the fp8 pool columns in the hardware matrix do not apply here. fp8 KV on sm_80 is engine work, not part of this release. No VLLM_QSA_KV_SCALES sidecar is exported (it is E4M3-only).",
+    "BF16 KV stays the default on sm_80: pool 1,219,697 tokens = 4 x 262K / 8 x 131K. KV_DTYPE=fp8 opts into the byte decoder with the same pin and admission cap; its engine-fit estimate is 2,370,218 tokens = 9 x 262K / 16 x 131K (capacity_fp8_opt_in), not a measured pool. FP8 status: ⚫ untested (a profile ships, not yet run by us, expected to work). Only FP8 exports the checkpoint/recipe VLLM_QSA_KV_SCALES sidecar; BF16 evidence does not qualify FP8.",
     "170HX VRAM is a profile axis: 64 GB (dual-rank 8 GB SKU), 32 GB (single-rank) and 40 GB (10 GB SKU). The Gen2 x16 link is ~6.2-6.7 GB/s per card and shares traffic with the PLE pull (decode cost unmeasured). Community recipes cap the cards at 140-180 W and report Xid 31 / 79 events.",
     "Stock 170HX has canAccessPeer=0 (host-staged copies); direct P2P needs 4+ BAR1 driver patches and a BIOS placement fix (community BAR1 patch work for CMP 170HX). Default mode is P2P=off.",
     "WARM defaults to 0 because the persisted Triton autotune is sm_86 only.",
     "Host RAM does not depend on the card: ~47.7 GiB pinned FP8 PLE table inside the qualified 96 GB allocation (69 GiB measured floor).",
-    "max-num-seqs is capped at the 131K-session fit and at 8 (the only concurrency the engine is gated at) so admitted sessions stay resident.",
+    "max-num-seqs is capped at the 131K-session fit and at 8 (the only concurrency the engine is qualified at) so admitted sessions stay resident.",
     "KV_BYTES is a per-card pin estimate: after a pool-only boot read the logged pool and adjust in 0.25 GiB steps (lower it if the boot OOMs)."
    ],
-   "acceptance": "fp8 KV on sm_80, op tests with a truncated model, and the batched send/recv work; all need sm_80 hardware access."
+   "acceptance": "BF16 status and evidence remain as recorded above. FP8 KV is opt-in and untested by us on sm_80; future hardware validation covers pool boot, output agreement, long-context needles and resident concurrency."
   },
   {
    "id": "fn-sm80-32g-x3-pp3",
@@ -2051,24 +2287,38 @@
     "fit_262k": 1,
     "fit_131k": 3,
     "bytes_per_block_mib": [
-     33.0,
-     33.0,
+     33,
+     33,
      41.2
+    ]
+   },
+   "capacity_fp8_opt_in": {
+    "estimate": true,
+    "basis": "FP8 opt-in engine-fit estimate, not measured on sm_80: same per-card pin 5622988800 B; binding block 22282240 B (252 blocks). Arithmetic follows get_kv_cache_configs/get_kv_cache_capacity: reserve one shared ring block (null-block admission is checked separately), 72 blocks per 262K request and 40 per 131K request. BF16 main pages shrink to E4M3 bytes; compressed BF16 indexer pages and ring state keep their dtype. Covered by the CPU engine-capacity harness; not yet run by us on sm_80.",
+    "pin_gib": 5.24,
+    "kv_blocks": 252,
+    "pool_tokens": 913863,
+    "fit_262k": 3,
+    "fit_131k": 6,
+    "bytes_per_block_mib": [
+     17,
+     17,
+     21.25
     ]
    },
    "evidence": [
     "Community: DUFRelic/qwen38-flash-next-recipe (2026-10-04): 2x CMP 170HX, stock vLLM 0.30.0, PP2 TP1, MTP k=3, BF16 KV (its pinned QSA path rejects fp8), P2P on via BAR1 patches, seqs 8, 262,144 context: 133 tok/s at c1, 245 aggregate at c4; batched send/recv patch against cold-start stalls."
    ],
    "notes": [
-    "Pool 469,674 tokens = 1 x 262K / 3 x 131K at bf16: the minimum that serves one full-context request. KV is bfloat16 because the engine refuses fp8_e4m3 KV on sm_80 (vllm/models/qwen4_exp/nvidia/qsa.py, _validated_qsa_fp8_dtype admits sm_86 and sm_89+ only); the fp8 pool columns in the hardware matrix do not apply here. fp8 KV on sm_80 is engine work, not part of this release. No VLLM_QSA_KV_SCALES sidecar is exported (it is E4M3-only).",
+    "BF16 KV stays the default on sm_80: pool 469,674 tokens = 1 x 262K / 3 x 131K. KV_DTYPE=fp8 opts into the byte decoder with the same pin and admission cap; its engine-fit estimate is 913,863 tokens = 3 x 262K / 6 x 131K (capacity_fp8_opt_in), not a measured pool. FP8 status: ⚫ untested (a profile ships, not yet run by us, expected to work). Only FP8 exports the checkpoint/recipe VLLM_QSA_KV_SCALES sidecar; BF16 evidence does not qualify FP8.",
     "170HX VRAM is a profile axis: 64 GB (dual-rank 8 GB SKU), 32 GB (single-rank) and 40 GB (10 GB SKU). The Gen2 x16 link is ~6.2-6.7 GB/s per card and shares traffic with the PLE pull (decode cost unmeasured). Community recipes cap the cards at 140-180 W and report Xid 31 / 79 events.",
     "Stock 170HX has canAccessPeer=0 (host-staged copies); direct P2P needs 4+ BAR1 driver patches and a BIOS placement fix (community BAR1 patch work for CMP 170HX). Default mode is P2P=off.",
     "WARM defaults to 0 because the persisted Triton autotune is sm_86 only.",
     "Host RAM does not depend on the card: ~47.7 GiB pinned FP8 PLE table inside the qualified 96 GB allocation (69 GiB measured floor).",
-    "max-num-seqs is capped at the 131K-session fit and at 8 (the only concurrency the engine is gated at) so admitted sessions stay resident.",
+    "max-num-seqs is capped at the 131K-session fit and at 8 (the only concurrency the engine is qualified at) so admitted sessions stay resident.",
     "KV_BYTES is a per-card pin estimate: after a pool-only boot read the logged pool and adjust in 0.25 GiB steps (lower it if the boot OOMs)."
    ],
-   "acceptance": "fp8 KV on sm_80 and op tests with a truncated model; needs sm_80 hardware access."
+   "acceptance": "BF16 status and evidence remain as recorded above. FP8 KV is opt-in and untested by us on sm_80; future hardware validation covers pool boot, output agreement, long-context needles and resident concurrency."
   },
   {
    "id": "fn-sm80-40g-x4-pp4",
@@ -2158,14 +2408,29 @@
      24.8,
      24.8,
      24.8,
-     33.0
+     33
+    ]
+   },
+   "capacity_fp8_opt_in": {
+    "estimate": true,
+    "basis": "FP8 opt-in engine-fit estimate, not measured on sm_80: same per-card pin 20208156672 B; binding block 17825792 B (1133 blocks). Arithmetic follows get_kv_cache_configs/get_kv_cache_capacity: reserve one shared ring block (null-block admission is checked separately), 72 blocks per 262K request and 40 per 131K request. BF16 main pages shrink to E4M3 bytes; compressed BF16 indexer pages and ring state keep their dtype. Covered by the CPU engine-capacity harness; not yet run by us on sm_80.",
+    "pin_gib": 18.82,
+    "kv_blocks": 1133,
+    "pool_tokens": 4121486,
+    "fit_262k": 15,
+    "fit_131k": 28,
+    "bytes_per_block_mib": [
+     12.75,
+     12.75,
+     12.75,
+     17
     ]
    },
    "evidence": [
     "Community: DUFRelic/qwen38-flash-next-recipe (2026-10-04): 2x CMP 170HX, stock vLLM 0.30.0, PP2 TP1, MTP k=3, BF16 KV (its pinned QSA path rejects fp8), P2P on via BAR1 patches, seqs 8, 262,144 context: 133 tok/s at c1, 245 aggregate at c4; batched send/recv patch against cold-start stalls."
    ],
    "notes": [
-    "Pool 2,122,638 tokens = 7 x 262K / 14 x 131K at bf16. 2 x 40 GB has no profile: the weights leave ~3 GiB per card, which cannot hold one 262K session at bf16 (the 'trap' row). KV is bfloat16 because the engine refuses fp8_e4m3 KV on sm_80 (vllm/models/qwen4_exp/nvidia/qsa.py, _validated_qsa_fp8_dtype admits sm_86 and sm_89+ only); the fp8 pool columns in the hardware matrix do not apply here. fp8 KV on sm_80 is engine work, not part of this release. No VLLM_QSA_KV_SCALES sidecar is exported (it is E4M3-only).",
+    "BF16 KV stays the default on sm_80: pool 2,122,638 tokens = 7 x 262K / 14 x 131K. KV_DTYPE=fp8 opts into the byte decoder with the same pin and admission cap; its engine-fit estimate is 4,121,486 tokens = 15 x 262K / 28 x 131K (capacity_fp8_opt_in), not a measured pool. FP8 status: ⚫ untested (a profile ships, not yet run by us, expected to work). Only FP8 exports the checkpoint/recipe VLLM_QSA_KV_SCALES sidecar; BF16 evidence does not qualify FP8.",
     "170HX VRAM is a profile axis: 64 GB (dual-rank 8 GB SKU), 32 GB (single-rank) and 40 GB (10 GB SKU). The Gen2 x16 link is ~6.2-6.7 GB/s per card and shares traffic with the PLE pull (decode cost unmeasured). Community recipes cap the cards at 140-180 W and report Xid 31 / 79 events.",
     "Stock 170HX has canAccessPeer=0 (host-staged copies); direct P2P needs 4+ BAR1 driver patches and a BIOS placement fix (community BAR1 patch work for CMP 170HX). Default mode is P2P=off.",
     "WARM defaults to 0 because the persisted Triton autotune is sm_86 only.",
@@ -2173,12 +2438,12 @@
     "max-num-seqs is capped at the 131K-session fit and at 32 so admitted sessions stay resident.",
     "KV_BYTES is a per-card pin estimate: after a pool-only boot read the logged pool and adjust in 0.25 GiB steps (lower it if the boot OOMs)."
    ],
-   "acceptance": "fp8 KV on sm_80 and op tests with a truncated model; needs sm_80 hardware access."
+   "acceptance": "BF16 status and evidence remain as recorded above. FP8 KV is opt-in and untested by us on sm_80; future hardware validation covers pool boot, output agreement, long-context needles and resident concurrency."
   },
   {
    "id": "fn-sm80-64g-x4-pp4",
    "title": "4 x 64 GB sm_80 (CMP 170HX dual-rank), PP4 x TP1, bf16 KV, chunk 2048",
-   "status": "tested",
+   "status": "testing",
    "rank": 1,
    "latency": false,
    "match": {
@@ -2188,7 +2453,7 @@
     "cards": 4,
     "vram_gib": 64,
     "p2p": "any",
-    "tested_gpu_names": [
+    "testing_gpu_names": [
      "CMP 170HX"
     ]
    },
@@ -2261,24 +2526,39 @@
      24.8,
      24.8,
      24.8,
-     33.0
+     33
+    ]
+   },
+   "capacity_fp8_opt_in": {
+    "estimate": true,
+    "basis": "FP8 opt-in engine-fit estimate, not measured on sm_80: same per-card pin 44118835200 B; binding block 17825792 B (2475 blocks). Arithmetic follows get_kv_cache_configs/get_kv_cache_capacity: reserve one shared ring block (null-block admission is checked separately), 72 blocks per 262K request and 40 per 131K request. BF16 main pages shrink to E4M3 bytes; compressed BF16 indexer pages and ring state keep their dtype. Covered by the CPU engine-capacity harness; not yet run by us on sm_80.",
+    "pin_gib": 41.09,
+    "kv_blocks": 2475,
+    "pool_tokens": 9007559,
+    "fit_262k": 34,
+    "fit_131k": 61,
+    "bytes_per_block_mib": [
+     12.75,
+     12.75,
+     12.75,
+     17
     ]
    },
    "evidence": [
     "Measured 2026-10-19 on 4 x CMP 170HX 64 GB (Gen2 x16, no P2P): this row at chunk 2048 + MTP k=3: 262K needle exact 21.6 s; 8 MP image min free 1,694 MiB (GPU 3); GSM8K-50 c8 1.00; shared-prefix TTFT 48/48; card c1 262K TTFT 19.57 s; 16K c4 122.2 tok/s; real-text prefill ~12,000 / ~13,120 / ~12,700 tok/s at 32K / 131K / 258K (2.0 x fn-sm80-64g-x2-pp2); decode 142-157 tok/s c1; 0 OOM.",
-    "Same pin at the default chunk 1024: 8 x 262K 8/8 in 171 s, 8 x 131K 83 s, 8 x 32K 21 s; GSM8K 0.98; real-text prefill ~11,240 / ~11,760 / ~11,340 tok/s; agent cache (4 agents x 6 turns, append) 0.994 of ideal. MTP k=4 on this row: +4-6 % c1 decode, -24 % at 16K c4 (k=3 kept)."
+    "Same pin at the default chunk 1024: 8 x 262K 8/8 in 171 s, 8 x 131K 83 s, 8 x 32K 21 s; GSM8K 0.98; real-text prefill ~11,240 / ~11,760 / ~11,340 tok/s; agent cache (4 agents x 6 turns, append) 0.994 of ideal. MTP k=4 on this row: +4-6 % c1 decode, -24 % at 16K c4 (k=3 kept).",
+    "Labelled tested on 4 x CMP 170HX 64 GB (2026-10-19) in Merlin 3.0.0; back to testing in 3.0.1 pending re-qualification: the runs above were on cloud-hosted hardware; kernel parity qualification is still to run."
    ],
    "notes": [
-    "The 4 x 64 GB Flash-Next row (the default on 4 x 64 GB sm_80). Pool 4,638,492 tokens; max_num_seqs 8 caps concurrency at 8 x 262K. Chunk 2048 at the same pin: +7-12 % real-text prefill and +15 % at 16K c4 over chunk 1024, headroom unchanged.",
+    "BF16 KV stays the default on sm_80: pool 4,638,492 tokens = 17 x 262K / 31 x 131K. KV_DTYPE=fp8 opts into the byte decoder with the same pin and admission cap; its engine-fit estimate is 9,007,559 tokens = 34 x 262K / 61 x 131K (capacity_fp8_opt_in), not a measured pool. FP8 status: ⚫ untested (a profile ships, not yet run by us, expected to work). Only FP8 exports the checkpoint/recipe VLLM_QSA_KV_SCALES sidecar; BF16 evidence does not qualify FP8.",
     "170HX VRAM is a profile axis: 64 GB (dual-rank 8 GB SKU), 32 GB (single-rank) and 40 GB (10 GB SKU). The Gen2 x16 link is ~6.2-6.7 GB/s per card and shares traffic with the PLE pull (decode cost unmeasured). Community recipes cap the cards at 140-180 W and report Xid 31 / 79 events.",
     "Stock 170HX has canAccessPeer=0 (host-staged copies); direct P2P needs 4+ BAR1 driver patches and a BIOS placement fix (community BAR1 patch work for CMP 170HX). Default mode is P2P=off.",
-    "Needs a build with 8.0 in TORCH_CUDA_ARCH_LIST; the kit's artefact tarball is sm_86 only, so use BUILD_OWN=1 with that list. WARM defaults to 0 because the persisted Triton autotune is sm_86 only.",
+    "The release wheel covers sm_80, sm_86 and sm_89; a source build needs 8.0 in TORCH_CUDA_ARCH_LIST. WARM defaults to 0 because the persisted Triton autotune is sm_86 only.",
     "Host RAM does not depend on the card: ~47.7 GiB pinned FP8 PLE table inside the qualified 96 GB allocation (69 GiB measured floor).",
-    "max-num-seqs is capped at the 131K-session fit and at 8 (the only concurrency the engine is gated at) so admitted sessions stay resident.",
+    "max-num-seqs is capped at the 131K-session fit and at 8 (the only concurrency the engine is qualified at) so admitted sessions stay resident.",
     "KV_BYTES is a per-card pin estimate: after a pool-only boot read the logged pool and adjust in 0.25 GiB steps (lower it if the boot OOMs)."
    ],
-   "acceptance": "Measured on 4 x CMP 170HX 64 GB (see evidence); fp8 KV on sm_80 is still engine work.",
-   "tested_label": "tested on 4 x CMP 170HX 64 GB (2026-10-19)"
+   "acceptance": "BF16 status and evidence remain as recorded above. FP8 KV is opt-in and untested by us on sm_80; future hardware validation covers pool boot, output agreement, long-context needles and resident concurrency."
   },
   {
    "id": "fn-swift1.5-quad-3090",
@@ -2322,7 +2602,25 @@
      16,
      24,
      32
-    ]
+    ],
+    "dflash2": {
+     "partition": [
+      24,
+      24
+     ],
+     "max_num_batched_tokens": 2048,
+     "kv_cache_memory": 3468165120,
+     "kv_blocks": 245,
+     "basis": "Qualified on this checkpoint on 2026-10-23: PP split 24/24, chunk 2048, KV pin 3,468,165,120 B, pool 789,668; 8 MP image >= 774 MiB free, 262K needle, 3 x 262K residency with a shared-prefix caveat.",
+     "pool_tokens": 789668,
+     "fit_262k": 3
+    },
+    "kv_tier_seqs": {
+     "max_num_seqs": 24,
+     "min_gib_per_rank": 12,
+     "status": "untested",
+     "basis": "Experimental, merlin serve --swarm: 24 sequences with the KV RAM cache at >= 12 GiB per rank (48g on four ranks), the size qualified on the reference host (4 x RTX 3090, P2P on); 2 x L_max = 6.3 GiB per rank is the floor below it. The cache alone does not raise the cap: the row keeps its 3.0.0 cap of 8. Not run on this checkpoint; the cap is the Flash-Next one, so its status is untested."
+    }
    },
    "interconnect": {
     "modes": {
@@ -2362,8 +2660,9 @@
    "notes": [
     "Recipe launcher models/swift1.5/serve.sh is a shim for tools/merlin/launch.py --profile fn-swift1.5-quad-3090 (regenerate with preflight.py --emit launcher).",
     "FGPC is off. The 8 MP cap, TP2xPP2+EP partition 25,23, 4.1e9-byte KV pin and target pool 924,993 are inherited from Flash-Next.",
-    "Full-vocabulary MTP head, K=3 (DRAFT_HEAD=bf16|int8|int4 sets its precision; default bf16). No reduced draft-vocab table ships or is qualified for this checkpoint; the launcher refuses REDUCED_DRAFT_VOCAB=1.",
-    "Explicitly select this profile with --profile fn-swift1.5-quad-3090; automatic hardware selection continues to choose Flash-Next."
+    "Full-vocabulary MTP head, K=3 (DRAFT_HEAD=bf16|int8|int4 sets its precision; default bf16). The reduced draft vocabulary was removed in 3.0.1; the launcher refuses REDUCED_DRAFT_VOCAB.",
+    "Explicitly select this profile with --profile fn-swift1.5-quad-3090; automatic hardware selection continues to choose Flash-Next.",
+    "SPEC=dflash2 (with DFLASH2_MODEL=<DFlash2 drafter dir>) is an option: the DFlash2 drafter in place of the MTP head, with the serve.dflash2 geometry inherited from fn-quad-3090 (PP 24/24, chunk 2048, 245 KV blocks). MTP stays the default."
    ],
    "acceptance": "Tested on the reference host: the generated launcher qualified on 2026-10-16 on the 4x RTX 3090 reference host (boot, pool, prefix-cache/MTP, 8 MP vision, GSM8K-20) and passed the Merlin 3.0.0 release bench card (2026-10-20), after the pre-release bench run (2026-10-17).",
    "checkpoint": "swift1.5",
@@ -2411,7 +2710,25 @@
      16,
      24,
      32
-    ]
+    ],
+    "dflash2": {
+     "partition": [
+      24,
+      24
+     ],
+     "max_num_batched_tokens": 2048,
+     "kv_cache_memory": 3468165120,
+     "kv_blocks": 245,
+     "basis": "Qualified on this checkpoint on 2026-10-23: PP split 24/24, chunk 2048, KV pin 3,468,165,120 B, pool 789,668; 8 MP image >= 774 MiB free, 262K needle, 3 x 262K residency with a shared-prefix caveat.",
+     "pool_tokens": 789668,
+     "fit_262k": 3
+    },
+    "kv_tier_seqs": {
+     "max_num_seqs": 24,
+     "min_gib_per_rank": 12,
+     "status": "untested",
+     "basis": "Experimental, merlin serve --swarm: 24 sequences with the KV RAM cache at >= 12 GiB per rank (48g on four ranks), the size qualified on the reference host (4 x RTX 3090, P2P on); 2 x L_max = 6.3 GiB per rank is the floor below it. The cache alone does not raise the cap: the row keeps its 3.0.0 cap of 8. Not run on this checkpoint; the cap is the Flash-Next one, so its status is untested."
+    }
    },
    "interconnect": {
     "modes": {
@@ -2451,8 +2768,9 @@
    "notes": [
     "Recipe launcher models/swift1.5-huihui/serve.sh is a shim for tools/merlin/launch.py --profile fn-swift1.5-huihui-quad-3090 (regenerate with preflight.py --emit launcher).",
     "FGPC is off. The 8 MP cap, TP2xPP2+EP partition 25,23, 4.1e9-byte KV pin and target pool 924,993 are inherited from Flash-Next.",
-    "Full-vocabulary MTP head, K=3 (DRAFT_HEAD=bf16|int8|int4 sets its precision; default bf16). No reduced draft-vocab table ships or is qualified for this checkpoint; the launcher refuses REDUCED_DRAFT_VOCAB=1.",
-    "Explicitly select this profile with --profile fn-swift1.5-huihui-quad-3090; automatic hardware selection continues to choose Flash-Next."
+    "Full-vocabulary MTP head, K=3 (DRAFT_HEAD=bf16|int8|int4 sets its precision; default bf16). The reduced draft vocabulary was removed in 3.0.1; the launcher refuses REDUCED_DRAFT_VOCAB.",
+    "Explicitly select this profile with --profile fn-swift1.5-huihui-quad-3090; automatic hardware selection continues to choose Flash-Next.",
+    "SPEC=dflash2 (with DFLASH2_MODEL=<DFlash2 drafter dir>) is an option: the DFlash2 drafter in place of the MTP head, with the serve.dflash2 geometry inherited from fn-quad-3090 (PP 24/24, chunk 2048, 245 KV blocks). MTP stays the default."
    ],
    "acceptance": "Tested on the reference host: the generated launcher qualified on 2026-10-16 on the 4x RTX 3090 reference host (boot, pool, prefix-cache/MTP, 8 MP vision, GSM8K-20) and passed the Merlin 3.0.0 release bench card (2026-10-20).",
    "checkpoint": "swift1.5-huihui",
@@ -2497,7 +2815,13 @@
      16,
      24,
      32
-    ]
+    ],
+    "kv_tier_seqs": {
+     "max_num_seqs": 24,
+     "min_gib_per_rank": 12,
+     "status": "untested",
+     "basis": "Experimental, merlin serve --swarm: 24 sequences with the KV RAM cache at >= 12 GiB per rank (48g on four ranks), the size qualified on the reference host (4 x RTX 3090, P2P on); 2 x L_max = 6.3 GiB per rank is the floor below it. The cache alone does not raise the cap: the row keeps its 3.0.0 cap of 8. Not run on this checkpoint or without P2P; the cap is the Flash-Next one, so its status is untested."
+    }
    },
    "interconnect": {
     "modes": {
@@ -2528,7 +2852,7 @@
     "fit_262k": 3,
     "fit_131k": 6,
     "bytes_per_block_mib": [
-     14.0,
+     14,
      15.8
     ]
    },
@@ -2545,7 +2869,7 @@
   {
    "id": "fn-swift1.5-quad-24g-sm89",
    "title": "swift1.5 on 4 x 24 GB sm_89 (RTX 4090), same layout, pin and partition as fn-quad-24g-sm89",
-   "status": "untested",
+   "status": "testing",
    "rank": 100,
    "latency": false,
    "match": {
@@ -2554,7 +2878,10 @@
     ],
     "cards": 4,
     "vram_gib": 24,
-    "p2p": "any"
+    "p2p": "any",
+    "testing_gpu_names": [
+     "RTX 4090$"
+    ]
    },
    "layout": {
     "tp": 2,
@@ -2615,19 +2942,21 @@
    "warm": 0,
    "capacity": {
     "estimate": true,
-    "basis": "Estimate: same layout and per-card KV pin as fn-quad-3090 (fp8 KV), whose pool is measured on sm_86; the sm_89 native E4M3 path is not measured on any Ada card.",
+    "basis": "Estimate: same layout and per-card KV pin as fn-quad-3090 (fp8 KV), whose pool is measured on sm_86; the cloud-hosted 4 x RTX 4090 24 GB (2026-10-18, P2P off) booted this pin to the same 924,993-token pool.",
     "pin_gib": 3.82,
     "kv_blocks": 248,
     "pool_tokens": 924993,
     "fit_262k": 3,
     "fit_131k": 6,
     "bytes_per_block_mib": [
-     14.0,
+     14,
      15.8
     ]
    },
    "evidence": [
-    "None: no swift1.5 run report on this hardware. The layout is fn-quad-24g-sm89, itself untested; the checkpoint differs in its scale sidecar, MTP head and served names."
+    "Cloud-hosted 4 x RTX 4090 24 GB, measured 2026-10-18 (P2P off, fp8 KV): pool 924,993 tokens, needles 262K-32K 4/4 exact, coherence 3/3, 8 MP image correct (1,063 MiB minimum free).",
+    "4 x RTX 4090 on the release wheel, measured 2026-10-20: pool 924,993, needles 4/4 exact (262K in 24 s), 3 x 262K, 7 x 131K and 8 x 32K resident and exact, coherence, GSM8K and 8 MP image pass (961 MiB minimum free).",
+    "Testing: the runs above were on cloud-hosted hardware; kernel parity qualification is still to run."
    ],
    "notes": [
     "Not a canonical recipe launcher: generate with preflight.py --emit launcher --profile fn-swift1.5-quad-24g-sm89 (or merlin serve swift1.5). Same TP/PP/EP layout, partition and per-card KV pin as fn-quad-24g-sm89; fp8 KV only (no bf16 variant is offered for the checkpoint profiles).",
@@ -2720,7 +3049,7 @@
     "fit_262k": 10,
     "fit_131k": 19,
     "bytes_per_block_mib": [
-     14.0,
+     14,
      15.8
     ]
    },
@@ -2815,7 +3144,7 @@
     "fit_262k": 5,
     "fit_131k": 9,
     "bytes_per_block_mib": [
-     28.0,
+     28,
      29.8
     ]
    },
@@ -2916,7 +3245,7 @@
     "fit_262k": 25,
     "fit_131k": 46,
     "bytes_per_block_mib": [
-     14.0,
+     14,
      15.8
     ]
    },
@@ -2969,7 +3298,13 @@
      16,
      24,
      32
-    ]
+    ],
+    "kv_tier_seqs": {
+     "max_num_seqs": 24,
+     "min_gib_per_rank": 12,
+     "status": "untested",
+     "basis": "Experimental, merlin serve --swarm: 24 sequences with the KV RAM cache at >= 12 GiB per rank (48g on four ranks), the size qualified on the reference host (4 x RTX 3090, P2P on); 2 x L_max = 6.3 GiB per rank is the floor below it. The cache alone does not raise the cap: the row keeps its 3.0.0 cap of 8. Not run on this checkpoint or without P2P; the cap is the Flash-Next one, so its status is untested."
+    }
    },
    "interconnect": {
     "modes": {
@@ -3000,7 +3335,7 @@
     "fit_262k": 3,
     "fit_131k": 6,
     "bytes_per_block_mib": [
-     14.0,
+     14,
      15.8
     ]
    },
@@ -3087,19 +3422,19 @@
    "warm": 0,
    "capacity": {
     "estimate": true,
-    "basis": "Estimate: same layout and per-card KV pin as fn-quad-3090 (fp8 KV), whose pool is measured on sm_86; the sm_89 native E4M3 path is not measured on any Ada card.",
+    "basis": "Estimate: same layout and per-card KV pin as fn-quad-3090 (fp8 KV), whose pool is measured on sm_86; the vanilla and Swift 1.5 rows booted this pin to 924,993 tokens on cloud-hosted 4 x RTX 4090 (2026-10-18); this checkpoint has not run there.",
     "pin_gib": 3.82,
     "kv_blocks": 248,
     "pool_tokens": 924993,
     "fit_262k": 3,
     "fit_131k": 6,
     "bytes_per_block_mib": [
-     14.0,
+     14,
      15.8
     ]
    },
    "evidence": [
-    "None: no swift1.5-huihui run report on this hardware. The layout is fn-quad-24g-sm89, itself untested; the checkpoint differs in its scale sidecar, MTP head and served names."
+    "None: no swift1.5-huihui run report on this hardware. The layout is fn-quad-24g-sm89 (testing); the checkpoint differs in its scale sidecar, MTP head and served names."
    ],
    "notes": [
     "Not a canonical recipe launcher: generate with preflight.py --emit launcher --profile fn-swift1.5-huihui-quad-24g-sm89 (or merlin serve swift1.5-huihui). Same TP/PP/EP layout, partition and per-card KV pin as fn-quad-24g-sm89; fp8 KV only (no bf16 variant is offered for the checkpoint profiles).",
@@ -3192,7 +3527,7 @@
     "fit_262k": 10,
     "fit_131k": 19,
     "bytes_per_block_mib": [
-     14.0,
+     14,
      15.8
     ]
    },
@@ -3287,7 +3622,7 @@
     "fit_262k": 5,
     "fit_131k": 9,
     "bytes_per_block_mib": [
-     28.0,
+     28,
      29.8
     ]
    },
@@ -3388,7 +3723,7 @@
     "fit_262k": 25,
     "fit_131k": 46,
     "bytes_per_block_mib": [
-     14.0,
+     14,
      15.8
     ]
    },
@@ -3483,7 +3818,7 @@
     "fit_262k": 5,
     "fit_131k": 9,
     "bytes_per_block_mib": [
-     28.0,
+     28,
      29.8
     ]
    },
@@ -3582,7 +3917,7 @@
     "fit_262k": 25,
     "fit_131k": 46,
     "bytes_per_block_mib": [
-     14.0,
+     14,
      15.8
     ]
    },
@@ -3671,15 +4006,28 @@
     "fit_262k": 1,
     "fit_131k": 3,
     "bytes_per_block_mib": [
-     28.0,
+     28,
      29.8
+    ]
+   },
+   "capacity_fp8_opt_in": {
+    "estimate": true,
+    "basis": "FP8 opt-in engine-fit estimate, not measured on sm_80: same per-card pin 4086562816 B; binding block 16515072 B (247 blocks). Arithmetic follows get_kv_cache_configs/get_kv_cache_capacity: reserve one shared ring block (null-block admission is checked separately), 70 blocks per 262K request and 38 per 131K request. BF16 main pages shrink to E4M3 bytes; compressed BF16 indexer pages and ring state keep their dtype. Covered by the CPU engine-capacity harness; not yet run by us on sm_80.",
+    "pin_gib": 3.81,
+    "kv_blocks": 247,
+    "pool_tokens": 921248,
+    "fit_262k": 3,
+    "fit_131k": 6,
+    "bytes_per_block_mib": [
+     14,
+     15.75
     ]
    },
    "evidence": [
     "None: swift1.5 has not run on this hardware (the vanilla row fn-quad-24g-sm80 is itself untested)."
    ],
    "notes": [
-    "swift1.5 on the fn-quad-24g-sm80 layout: same pin, KV dtype and concurrency; its own scales and served names. Untested / community-validated."
+    "BF16 KV stays the default on sm_80: pool 486,838 tokens = 1 x 262K / 3 x 131K. KV_DTYPE=fp8 opts into the byte decoder with the same pin and admission cap; its engine-fit estimate is 921,248 tokens = 3 x 262K / 6 x 131K (capacity_fp8_opt_in), not a measured pool. FP8 status: ⚫ untested (a profile ships, not yet run by us, expected to work). Only FP8 exports the checkpoint/recipe VLLM_QSA_KV_SCALES sidecar; BF16 evidence does not qualify FP8."
    ],
    "checkpoint": "swift1.5"
   },
@@ -3741,11 +4089,23 @@
      107.2
     ]
    },
+   "capacity_fp8_opt_in": {
+    "estimate": true,
+    "basis": "FP8 opt-in engine-fit estimate, not measured on sm_80: same per-card pin 10458759168 B; binding block 57933824 B (180 blocks). Arithmetic follows get_kv_cache_configs/get_kv_cache_capacity: reserve one shared ring block (null-block admission is checked separately), 70 blocks per 262K request and 38 per 131K request. BF16 main pages shrink to E4M3 bytes; compressed BF16 indexer pages and ring state keep their dtype. Covered by the CPU engine-capacity harness; not yet run by us on sm_80.",
+    "pin_gib": 9.74,
+    "kv_blocks": 180,
+    "pool_tokens": 670339,
+    "fit_262k": 2,
+    "fit_131k": 4,
+    "bytes_per_block_mib": [
+     55.25
+    ]
+   },
    "evidence": [
     "None: swift1.5 has not run on this hardware (the vanilla row fn-sm80-80g-x1 is itself untested)."
    ],
    "notes": [
-    "swift1.5 on the fn-sm80-80g-x1 layout: same pin, KV dtype and concurrency; its own scales and served names. Untested / community-validated."
+    "BF16 KV stays the default on sm_80: pool 344,532 tokens = 1 x 262K / 2 x 131K. KV_DTYPE=fp8 opts into the byte decoder with the same pin and admission cap; its engine-fit estimate is 670,339 tokens = 2 x 262K / 4 x 131K (capacity_fp8_opt_in), not a measured pool. FP8 status: ⚫ untested (a profile ships, not yet run by us, expected to work). Only FP8 exports the checkpoint/recipe VLLM_QSA_KV_SCALES sidecar; BF16 evidence does not qualify FP8."
    ],
    "checkpoint": "swift1.5"
   },
@@ -3824,7 +4184,7 @@
    "capacity": {
     "estimate": true,
     "basis": "The fn-sm80-80g-x2-tp2 layout and pin; swift1.5 has the same weights shape. Not measured. The prefix-cache block copy is a per-row copy with no temporary, so this row needs no copy reserve; pin rounded down to whole KV blocks (797 x 57,933,824 B); engine-truth probe 2,980,951 tokens, fit 11/20.",
-    "pin_gib": 43.0,
+    "pin_gib": 43,
     "kv_blocks": 797,
     "pool_tokens": 2980951,
     "fit_262k": 11,
@@ -3833,11 +4193,23 @@
      55.2
     ]
    },
+   "capacity_fp8_opt_in": {
+    "estimate": true,
+    "basis": "FP8 opt-in engine-fit estimate, not measured on sm_80: same per-card pin 46173257728 B; binding block 30670848 B (1505 blocks). Arithmetic follows get_kv_cache_configs/get_kv_cache_capacity: reserve one shared ring block (null-block admission is checked separately), 70 blocks per 262K request and 38 per 131K request. BF16 main pages shrink to E4M3 bytes; compressed BF16 indexer pages and ring state keep their dtype. Covered by the CPU engine-capacity harness; not yet run by us on sm_80.",
+    "pin_gib": 43,
+    "kv_blocks": 1505,
+    "pool_tokens": 5632351,
+    "fit_262k": 21,
+    "fit_131k": 39,
+    "bytes_per_block_mib": [
+     29.25
+    ]
+   },
    "evidence": [
     "None: swift1.5 has not run on this hardware (the vanilla row fn-sm80-80g-x2-tp2 is itself untested)."
    ],
    "notes": [
-    "swift1.5 on the fn-sm80-80g-x2-tp2 layout: same pin, KV dtype and concurrency; its own scales and served names. Untested / community-validated."
+    "BF16 KV stays the default on sm_80: pool 2,980,951 tokens = 11 x 262K / 20 x 131K. KV_DTYPE=fp8 opts into the byte decoder with the same pin and admission cap; its engine-fit estimate is 5,632,351 tokens = 21 x 262K / 39 x 131K (capacity_fp8_opt_in), not a measured pool. FP8 status: ⚫ untested (a profile ships, not yet run by us, expected to work). Only FP8 exports the checkpoint/recipe VLLM_QSA_KV_SCALES sidecar; BF16 evidence does not qualify FP8."
    ],
    "checkpoint": "swift1.5"
   },
@@ -3915,15 +4287,28 @@
     "fit_262k": 10,
     "fit_131k": 19,
     "bytes_per_block_mib": [
-     56.0,
+     56,
      57.8
+    ]
+   },
+   "capacity_fp8_opt_in": {
+    "estimate": true,
+    "basis": "FP8 opt-in engine-fit estimate, not measured on sm_80: same per-card pin 46203666432 B; binding block 31195136 B (1481 blocks). Arithmetic follows get_kv_cache_configs/get_kv_cache_capacity: reserve one shared ring block (null-block admission is checked separately), 70 blocks per 262K request and 38 per 131K request. BF16 main pages shrink to E4M3 bytes; compressed BF16 indexer pages and ring state keep their dtype. Covered by the CPU engine-capacity harness; not yet run by us on sm_80.",
+    "pin_gib": 43.03,
+    "kv_blocks": 1481,
+    "pool_tokens": 5542473,
+    "fit_262k": 21,
+    "fit_131k": 38,
+    "bytes_per_block_mib": [
+     28,
+     29.75
     ]
    },
    "evidence": [
     "None: swift1.5 has not run on this hardware (the vanilla row fn-sm80-80g-x2-pp2 is itself untested)."
    ],
    "notes": [
-    "swift1.5 on the fn-sm80-80g-x2-pp2 layout: same pin, KV dtype and concurrency; its own scales and served names. Untested / community-validated."
+    "BF16 KV stays the default on sm_80: pool 2,853,624 tokens = 10 x 262K / 19 x 131K. KV_DTYPE=fp8 opts into the byte decoder with the same pin and admission cap; its engine-fit estimate is 5,542,473 tokens = 21 x 262K / 38 x 131K (capacity_fp8_opt_in), not a measured pool. FP8 status: ⚫ untested (a profile ships, not yet run by us, expected to work). Only FP8 exports the checkpoint/recipe VLLM_QSA_KV_SCALES sidecar; BF16 evidence does not qualify FP8."
    ],
    "checkpoint": "swift1.5"
   },
@@ -4014,22 +4399,35 @@
     "fit_262k": 28,
     "fit_131k": 52,
     "bytes_per_block_mib": [
-     28.0,
+     28,
      29.8
+    ]
+   },
+   "capacity_fp8_opt_in": {
+    "estimate": true,
+    "basis": "FP8 opt-in engine-fit estimate, not measured on sm_80: same per-card pin 64199589888 B; binding block 16515072 B (3887 blocks). Arithmetic follows get_kv_cache_configs/get_kv_cache_capacity: reserve one shared ring block (null-block admission is checked separately), 70 blocks per 262K request and 38 per 131K request. BF16 main pages shrink to E4M3 bytes; compressed BF16 indexer pages and ring state keep their dtype. Covered by the CPU engine-capacity harness; not yet run by us on sm_80.",
+    "pin_gib": 59.79,
+    "kv_blocks": 3887,
+    "pool_tokens": 14552736,
+    "fit_262k": 55,
+    "fit_131k": 102,
+    "bytes_per_block_mib": [
+     14,
+     15.75
     ]
    },
    "evidence": [
     "None: swift1.5 has not run on this hardware (the vanilla row fn-sm80-80g-x4-tp2pp2 is itself untested)."
    ],
    "notes": [
-    "swift1.5 on the fn-sm80-80g-x4-tp2pp2 layout: same pin, KV dtype and concurrency; its own scales and served names. Untested / community-validated."
+    "BF16 KV stays the default on sm_80: pool 7,703,288 tokens = 28 x 262K / 52 x 131K. KV_DTYPE=fp8 opts into the byte decoder with the same pin and admission cap; its engine-fit estimate is 14,552,736 tokens = 55 x 262K / 102 x 131K (capacity_fp8_opt_in), not a measured pool. FP8 status: ⚫ untested (a profile ships, not yet run by us, expected to work). Only FP8 exports the checkpoint/recipe VLLM_QSA_KV_SCALES sidecar; BF16 evidence does not qualify FP8."
    ],
    "checkpoint": "swift1.5"
   },
   {
    "id": "fn-swift1.5-sm80-64g-x2-pp2",
    "title": "swift1.5: 2 x 64 GB sm_80 (CMP 170HX dual-rank), PP2 x TP1, bf16 KV",
-   "status": "untested",
+   "status": "testing",
    "rank": 1,
    "latency": false,
    "match": {
@@ -4038,7 +4436,10 @@
     ],
     "cards": 2,
     "vram_gib": 64,
-    "p2p": "any"
+    "p2p": "any",
+    "testing_gpu_names": [
+     "CMP 170HX"
+    ]
    },
    "layout": {
     "tp": 1,
@@ -4101,22 +4502,36 @@
    "warm": 0,
    "capacity": {
     "estimate": true,
-    "basis": "The fn-sm80-64g-x2-pp2 layout and pin; swift1.5 has the same weights shape. Not measured. The prefix-cache block copy is a per-row copy with no temporary, so this row needs no copy reserve; pin rounded down to whole KV blocks (479 x 60,555,264 B); engine-truth probe 1,790,069 tokens, fit 6/12.",
+    "basis": "The fn-sm80-64g-x2-pp2 layout and pin; swift1.5 has the same weights shape. Booted to 1,790,069 tokens on cloud-hosted 4 x CMP 170HX 64 GB (2026-10-19). The prefix-cache block copy is a per-row copy with no temporary, so this row needs no copy reserve; pin rounded down to whole KV blocks (479 x 60,555,264 B); engine-truth probe 1,790,069 tokens, fit 6/12.",
     "pin_gib": 27.01,
     "kv_blocks": 479,
     "pool_tokens": 1790069,
     "fit_262k": 6,
     "fit_131k": 12,
     "bytes_per_block_mib": [
-     56.0,
+     56,
      57.8
     ]
    },
+   "capacity_fp8_opt_in": {
+    "estimate": true,
+    "basis": "FP8 opt-in engine-fit estimate, not measured on sm_80: same per-card pin 29005971456 B; binding block 31195136 B (929 blocks). Arithmetic follows get_kv_cache_configs/get_kv_cache_capacity: reserve one shared ring block (null-block admission is checked separately), 70 blocks per 262K request and 38 per 131K request. BF16 main pages shrink to E4M3 bytes; compressed BF16 indexer pages and ring state keep their dtype. Covered by the CPU engine-capacity harness; not yet run by us on sm_80.",
+    "pin_gib": 27.01,
+    "kv_blocks": 929,
+    "pool_tokens": 3475280,
+    "fit_262k": 13,
+    "fit_131k": 24,
+    "bytes_per_block_mib": [
+     28,
+     29.75
+    ]
+   },
    "evidence": [
-    "None: swift1.5 has not run on this hardware (the vanilla row fn-sm80-64g-x2-pp2 is itself untested)."
+    "Cloud-hosted 4 x CMP 170HX 64 GB, measured 2026-10-19 on GPUs 2,3 (P2P off, bf16 KV, this 479-block pin, the then-default chunk 1024): pool 1,790,069 tokens; needles 262K and 131K exact; 6 x 262K, 8 x 131K and 8 x 32K resident and exact; 8 MP image (1,150 MiB minimum free); GSM8K-50 c8 0.98 three times; shared-prefix TTFT probe 48/48; 0 OOM. The shipped chunk 2048 ran on the vanilla row only.",
+    "Testing: the runs above were on cloud-hosted hardware; kernel parity qualification is still to run."
    ],
    "notes": [
-    "swift1.5 on the fn-sm80-64g-x2-pp2 layout: same pin, KV dtype, chunk (2048, as measured on the vanilla row) and concurrency; its own scales and served names. Untested / community-validated."
+    "BF16 KV stays the default on sm_80: pool 1,790,069 tokens = 6 x 262K / 12 x 131K. KV_DTYPE=fp8 opts into the byte decoder with the same pin and admission cap; its engine-fit estimate is 3,475,280 tokens = 13 x 262K / 24 x 131K (capacity_fp8_opt_in), not a measured pool. FP8 status: ⚫ untested (a profile ships, not yet run by us, expected to work). Only FP8 exports the checkpoint/recipe VLLM_QSA_KV_SCALES sidecar; BF16 evidence does not qualify FP8."
    ],
    "checkpoint": "swift1.5"
   },
@@ -4205,14 +4620,29 @@
      24.8,
      24.8,
      24.8,
-     33.0
+     33
+    ]
+   },
+   "capacity_fp8_opt_in": {
+    "estimate": true,
+    "basis": "FP8 opt-in engine-fit estimate, not measured on sm_80: same per-card pin 11626610688 B; binding block 17825792 B (652 blocks). Arithmetic follows get_kv_cache_configs/get_kv_cache_capacity: reserve one shared ring block (null-block admission is checked separately), 72 blocks per 262K request and 40 per 131K request. BF16 main pages shrink to E4M3 bytes; compressed BF16 indexer pages and ring state keep their dtype. Covered by the CPU engine-capacity harness; not yet run by us on sm_80.",
+    "pin_gib": 10.83,
+    "kv_blocks": 652,
+    "pool_tokens": 2370218,
+    "fit_262k": 9,
+    "fit_131k": 16,
+    "bytes_per_block_mib": [
+     12.75,
+     12.75,
+     12.75,
+     17
     ]
    },
    "evidence": [
     "None: swift1.5 has not run on this hardware (the vanilla row fn-sm80-32g-x4-pp4 is itself untested)."
    ],
    "notes": [
-    "swift1.5 on the fn-sm80-32g-x4-pp4 layout: same pin, KV dtype and concurrency; its own scales and served names. Untested / community-validated."
+    "BF16 KV stays the default on sm_80: pool 1,219,697 tokens = 4 x 262K / 8 x 131K. KV_DTYPE=fp8 opts into the byte decoder with the same pin and admission cap; its engine-fit estimate is 2,370,218 tokens = 9 x 262K / 16 x 131K (capacity_fp8_opt_in), not a measured pool. FP8 status: ⚫ untested (a profile ships, not yet run by us, expected to work). Only FP8 exports the checkpoint/recipe VLLM_QSA_KV_SCALES sidecar; BF16 evidence does not qualify FP8."
    ],
    "checkpoint": "swift1.5"
   },
@@ -4294,16 +4724,30 @@
     "fit_262k": 1,
     "fit_131k": 3,
     "bytes_per_block_mib": [
-     33.0,
-     33.0,
+     33,
+     33,
      41.2
+    ]
+   },
+   "capacity_fp8_opt_in": {
+    "estimate": true,
+    "basis": "FP8 opt-in engine-fit estimate, not measured on sm_80: same per-card pin 5622988800 B; binding block 22282240 B (252 blocks). Arithmetic follows get_kv_cache_configs/get_kv_cache_capacity: reserve one shared ring block (null-block admission is checked separately), 72 blocks per 262K request and 40 per 131K request. BF16 main pages shrink to E4M3 bytes; compressed BF16 indexer pages and ring state keep their dtype. Covered by the CPU engine-capacity harness; not yet run by us on sm_80.",
+    "pin_gib": 5.24,
+    "kv_blocks": 252,
+    "pool_tokens": 913863,
+    "fit_262k": 3,
+    "fit_131k": 6,
+    "bytes_per_block_mib": [
+     17,
+     17,
+     21.25
     ]
    },
    "evidence": [
     "None: swift1.5 has not run on this hardware (the vanilla row fn-sm80-32g-x3-pp3 is itself untested)."
    ],
    "notes": [
-    "swift1.5 on the fn-sm80-32g-x3-pp3 layout: same pin, KV dtype and concurrency; its own scales and served names. Untested / community-validated."
+    "BF16 KV stays the default on sm_80: pool 469,674 tokens = 1 x 262K / 3 x 131K. KV_DTYPE=fp8 opts into the byte decoder with the same pin and admission cap; its engine-fit estimate is 913,863 tokens = 3 x 262K / 6 x 131K (capacity_fp8_opt_in), not a measured pool. FP8 status: ⚫ untested (a profile ships, not yet run by us, expected to work). Only FP8 exports the checkpoint/recipe VLLM_QSA_KV_SCALES sidecar; BF16 evidence does not qualify FP8."
    ],
    "checkpoint": "swift1.5"
   },
@@ -4395,14 +4839,29 @@
      24.8,
      24.8,
      24.8,
-     33.0
+     33
+    ]
+   },
+   "capacity_fp8_opt_in": {
+    "estimate": true,
+    "basis": "FP8 opt-in engine-fit estimate, not measured on sm_80: same per-card pin 20208156672 B; binding block 17825792 B (1133 blocks). Arithmetic follows get_kv_cache_configs/get_kv_cache_capacity: reserve one shared ring block (null-block admission is checked separately), 72 blocks per 262K request and 40 per 131K request. BF16 main pages shrink to E4M3 bytes; compressed BF16 indexer pages and ring state keep their dtype. Covered by the CPU engine-capacity harness; not yet run by us on sm_80.",
+    "pin_gib": 18.82,
+    "kv_blocks": 1133,
+    "pool_tokens": 4121486,
+    "fit_262k": 15,
+    "fit_131k": 28,
+    "bytes_per_block_mib": [
+     12.75,
+     12.75,
+     12.75,
+     17
     ]
    },
    "evidence": [
     "None: swift1.5 has not run on this hardware (the vanilla row fn-sm80-40g-x4-pp4 is itself untested)."
    ],
    "notes": [
-    "swift1.5 on the fn-sm80-40g-x4-pp4 layout: same pin, KV dtype and concurrency; its own scales and served names. Untested / community-validated."
+    "BF16 KV stays the default on sm_80: pool 2,122,638 tokens = 7 x 262K / 14 x 131K. KV_DTYPE=fp8 opts into the byte decoder with the same pin and admission cap; its engine-fit estimate is 4,121,486 tokens = 15 x 262K / 28 x 131K (capacity_fp8_opt_in), not a measured pool. FP8 status: ⚫ untested (a profile ships, not yet run by us, expected to work). Only FP8 exports the checkpoint/recipe VLLM_QSA_KV_SCALES sidecar; BF16 evidence does not qualify FP8."
    ],
    "checkpoint": "swift1.5"
   },
@@ -4487,7 +4946,7 @@
     "fit_262k": 5,
     "fit_131k": 9,
     "bytes_per_block_mib": [
-     28.0,
+     28,
      29.8
     ]
    },
@@ -4586,7 +5045,7 @@
     "fit_262k": 25,
     "fit_131k": 46,
     "bytes_per_block_mib": [
-     14.0,
+     14,
      15.8
     ]
    },
@@ -4675,15 +5134,28 @@
     "fit_262k": 1,
     "fit_131k": 3,
     "bytes_per_block_mib": [
-     28.0,
+     28,
      29.8
+    ]
+   },
+   "capacity_fp8_opt_in": {
+    "estimate": true,
+    "basis": "FP8 opt-in engine-fit estimate, not measured on sm_80: same per-card pin 4086562816 B; binding block 16515072 B (247 blocks). Arithmetic follows get_kv_cache_configs/get_kv_cache_capacity: reserve one shared ring block (null-block admission is checked separately), 70 blocks per 262K request and 38 per 131K request. BF16 main pages shrink to E4M3 bytes; compressed BF16 indexer pages and ring state keep their dtype. Covered by the CPU engine-capacity harness; not yet run by us on sm_80.",
+    "pin_gib": 3.81,
+    "kv_blocks": 247,
+    "pool_tokens": 921248,
+    "fit_262k": 3,
+    "fit_131k": 6,
+    "bytes_per_block_mib": [
+     14,
+     15.75
     ]
    },
    "evidence": [
     "None: swift1.5-huihui has not run on this hardware (the vanilla row fn-quad-24g-sm80 is itself untested)."
    ],
    "notes": [
-    "swift1.5-huihui on the fn-quad-24g-sm80 layout: same pin, KV dtype and concurrency; its own scales and served names. Untested / community-validated."
+    "BF16 KV stays the default on sm_80: pool 486,838 tokens = 1 x 262K / 3 x 131K. KV_DTYPE=fp8 opts into the byte decoder with the same pin and admission cap; its engine-fit estimate is 921,248 tokens = 3 x 262K / 6 x 131K (capacity_fp8_opt_in), not a measured pool. FP8 status: ⚫ untested (a profile ships, not yet run by us, expected to work). Only FP8 exports the checkpoint/recipe VLLM_QSA_KV_SCALES sidecar; BF16 evidence does not qualify FP8."
    ],
    "checkpoint": "swift1.5-huihui"
   },
@@ -4745,11 +5217,23 @@
      107.2
     ]
    },
+   "capacity_fp8_opt_in": {
+    "estimate": true,
+    "basis": "FP8 opt-in engine-fit estimate, not measured on sm_80: same per-card pin 10458759168 B; binding block 57933824 B (180 blocks). Arithmetic follows get_kv_cache_configs/get_kv_cache_capacity: reserve one shared ring block (null-block admission is checked separately), 70 blocks per 262K request and 38 per 131K request. BF16 main pages shrink to E4M3 bytes; compressed BF16 indexer pages and ring state keep their dtype. Covered by the CPU engine-capacity harness; not yet run by us on sm_80.",
+    "pin_gib": 9.74,
+    "kv_blocks": 180,
+    "pool_tokens": 670339,
+    "fit_262k": 2,
+    "fit_131k": 4,
+    "bytes_per_block_mib": [
+     55.25
+    ]
+   },
    "evidence": [
     "None: swift1.5-huihui has not run on this hardware (the vanilla row fn-sm80-80g-x1 is itself untested)."
    ],
    "notes": [
-    "swift1.5-huihui on the fn-sm80-80g-x1 layout: same pin, KV dtype and concurrency; its own scales and served names. Untested / community-validated."
+    "BF16 KV stays the default on sm_80: pool 344,532 tokens = 1 x 262K / 2 x 131K. KV_DTYPE=fp8 opts into the byte decoder with the same pin and admission cap; its engine-fit estimate is 670,339 tokens = 2 x 262K / 4 x 131K (capacity_fp8_opt_in), not a measured pool. FP8 status: ⚫ untested (a profile ships, not yet run by us, expected to work). Only FP8 exports the checkpoint/recipe VLLM_QSA_KV_SCALES sidecar; BF16 evidence does not qualify FP8."
    ],
    "checkpoint": "swift1.5-huihui"
   },
@@ -4828,7 +5312,7 @@
    "capacity": {
     "estimate": true,
     "basis": "The fn-sm80-80g-x2-tp2 layout and pin; swift1.5-huihui has the same weights shape. Not measured. The prefix-cache block copy is a per-row copy with no temporary, so this row needs no copy reserve; pin rounded down to whole KV blocks (797 x 57,933,824 B); engine-truth probe 2,980,951 tokens, fit 11/20.",
-    "pin_gib": 43.0,
+    "pin_gib": 43,
     "kv_blocks": 797,
     "pool_tokens": 2980951,
     "fit_262k": 11,
@@ -4837,11 +5321,23 @@
      55.2
     ]
    },
+   "capacity_fp8_opt_in": {
+    "estimate": true,
+    "basis": "FP8 opt-in engine-fit estimate, not measured on sm_80: same per-card pin 46173257728 B; binding block 30670848 B (1505 blocks). Arithmetic follows get_kv_cache_configs/get_kv_cache_capacity: reserve one shared ring block (null-block admission is checked separately), 70 blocks per 262K request and 38 per 131K request. BF16 main pages shrink to E4M3 bytes; compressed BF16 indexer pages and ring state keep their dtype. Covered by the CPU engine-capacity harness; not yet run by us on sm_80.",
+    "pin_gib": 43,
+    "kv_blocks": 1505,
+    "pool_tokens": 5632351,
+    "fit_262k": 21,
+    "fit_131k": 39,
+    "bytes_per_block_mib": [
+     29.25
+    ]
+   },
    "evidence": [
     "None: swift1.5-huihui has not run on this hardware (the vanilla row fn-sm80-80g-x2-tp2 is itself untested)."
    ],
    "notes": [
-    "swift1.5-huihui on the fn-sm80-80g-x2-tp2 layout: same pin, KV dtype and concurrency; its own scales and served names. Untested / community-validated."
+    "BF16 KV stays the default on sm_80: pool 2,980,951 tokens = 11 x 262K / 20 x 131K. KV_DTYPE=fp8 opts into the byte decoder with the same pin and admission cap; its engine-fit estimate is 5,632,351 tokens = 21 x 262K / 39 x 131K (capacity_fp8_opt_in), not a measured pool. FP8 status: ⚫ untested (a profile ships, not yet run by us, expected to work). Only FP8 exports the checkpoint/recipe VLLM_QSA_KV_SCALES sidecar; BF16 evidence does not qualify FP8."
    ],
    "checkpoint": "swift1.5-huihui"
   },
@@ -4919,15 +5415,28 @@
     "fit_262k": 10,
     "fit_131k": 19,
     "bytes_per_block_mib": [
-     56.0,
+     56,
      57.8
+    ]
+   },
+   "capacity_fp8_opt_in": {
+    "estimate": true,
+    "basis": "FP8 opt-in engine-fit estimate, not measured on sm_80: same per-card pin 46203666432 B; binding block 31195136 B (1481 blocks). Arithmetic follows get_kv_cache_configs/get_kv_cache_capacity: reserve one shared ring block (null-block admission is checked separately), 70 blocks per 262K request and 38 per 131K request. BF16 main pages shrink to E4M3 bytes; compressed BF16 indexer pages and ring state keep their dtype. Covered by the CPU engine-capacity harness; not yet run by us on sm_80.",
+    "pin_gib": 43.03,
+    "kv_blocks": 1481,
+    "pool_tokens": 5542473,
+    "fit_262k": 21,
+    "fit_131k": 38,
+    "bytes_per_block_mib": [
+     28,
+     29.75
     ]
    },
    "evidence": [
     "None: swift1.5-huihui has not run on this hardware (the vanilla row fn-sm80-80g-x2-pp2 is itself untested)."
    ],
    "notes": [
-    "swift1.5-huihui on the fn-sm80-80g-x2-pp2 layout: same pin, KV dtype and concurrency; its own scales and served names. Untested / community-validated."
+    "BF16 KV stays the default on sm_80: pool 2,853,624 tokens = 10 x 262K / 19 x 131K. KV_DTYPE=fp8 opts into the byte decoder with the same pin and admission cap; its engine-fit estimate is 5,542,473 tokens = 21 x 262K / 38 x 131K (capacity_fp8_opt_in), not a measured pool. FP8 status: ⚫ untested (a profile ships, not yet run by us, expected to work). Only FP8 exports the checkpoint/recipe VLLM_QSA_KV_SCALES sidecar; BF16 evidence does not qualify FP8."
    ],
    "checkpoint": "swift1.5-huihui"
   },
@@ -5018,15 +5527,28 @@
     "fit_262k": 28,
     "fit_131k": 52,
     "bytes_per_block_mib": [
-     28.0,
+     28,
      29.8
+    ]
+   },
+   "capacity_fp8_opt_in": {
+    "estimate": true,
+    "basis": "FP8 opt-in engine-fit estimate, not measured on sm_80: same per-card pin 64199589888 B; binding block 16515072 B (3887 blocks). Arithmetic follows get_kv_cache_configs/get_kv_cache_capacity: reserve one shared ring block (null-block admission is checked separately), 70 blocks per 262K request and 38 per 131K request. BF16 main pages shrink to E4M3 bytes; compressed BF16 indexer pages and ring state keep their dtype. Covered by the CPU engine-capacity harness; not yet run by us on sm_80.",
+    "pin_gib": 59.79,
+    "kv_blocks": 3887,
+    "pool_tokens": 14552736,
+    "fit_262k": 55,
+    "fit_131k": 102,
+    "bytes_per_block_mib": [
+     14,
+     15.75
     ]
    },
    "evidence": [
     "None: swift1.5-huihui has not run on this hardware (the vanilla row fn-sm80-80g-x4-tp2pp2 is itself untested)."
    ],
    "notes": [
-    "swift1.5-huihui on the fn-sm80-80g-x4-tp2pp2 layout: same pin, KV dtype and concurrency; its own scales and served names. Untested / community-validated."
+    "BF16 KV stays the default on sm_80: pool 7,703,288 tokens = 28 x 262K / 52 x 131K. KV_DTYPE=fp8 opts into the byte decoder with the same pin and admission cap; its engine-fit estimate is 14,552,736 tokens = 55 x 262K / 102 x 131K (capacity_fp8_opt_in), not a measured pool. FP8 status: ⚫ untested (a profile ships, not yet run by us, expected to work). Only FP8 exports the checkpoint/recipe VLLM_QSA_KV_SCALES sidecar; BF16 evidence does not qualify FP8."
    ],
    "checkpoint": "swift1.5-huihui"
   },
@@ -5112,15 +5634,28 @@
     "fit_262k": 6,
     "fit_131k": 12,
     "bytes_per_block_mib": [
-     56.0,
+     56,
      57.8
+    ]
+   },
+   "capacity_fp8_opt_in": {
+    "estimate": true,
+    "basis": "FP8 opt-in engine-fit estimate, not measured on sm_80: same per-card pin 29005971456 B; binding block 31195136 B (929 blocks). Arithmetic follows get_kv_cache_configs/get_kv_cache_capacity: reserve one shared ring block (null-block admission is checked separately), 70 blocks per 262K request and 38 per 131K request. BF16 main pages shrink to E4M3 bytes; compressed BF16 indexer pages and ring state keep their dtype. Covered by the CPU engine-capacity harness; not yet run by us on sm_80.",
+    "pin_gib": 27.01,
+    "kv_blocks": 929,
+    "pool_tokens": 3475280,
+    "fit_262k": 13,
+    "fit_131k": 24,
+    "bytes_per_block_mib": [
+     28,
+     29.75
     ]
    },
    "evidence": [
     "None: swift1.5-huihui has not run on this hardware (the vanilla row fn-sm80-64g-x2-pp2 is itself untested)."
    ],
    "notes": [
-    "swift1.5-huihui on the fn-sm80-64g-x2-pp2 layout: same pin, KV dtype, chunk (2048, as measured on the vanilla row) and concurrency; its own scales and served names. Untested / community-validated."
+    "BF16 KV stays the default on sm_80: pool 1,790,069 tokens = 6 x 262K / 12 x 131K. KV_DTYPE=fp8 opts into the byte decoder with the same pin and admission cap; its engine-fit estimate is 3,475,280 tokens = 13 x 262K / 24 x 131K (capacity_fp8_opt_in), not a measured pool. FP8 status: ⚫ untested (a profile ships, not yet run by us, expected to work). Only FP8 exports the checkpoint/recipe VLLM_QSA_KV_SCALES sidecar; BF16 evidence does not qualify FP8."
    ],
    "checkpoint": "swift1.5-huihui"
   },
@@ -5209,14 +5744,29 @@
      24.8,
      24.8,
      24.8,
-     33.0
+     33
+    ]
+   },
+   "capacity_fp8_opt_in": {
+    "estimate": true,
+    "basis": "FP8 opt-in engine-fit estimate, not measured on sm_80: same per-card pin 11626610688 B; binding block 17825792 B (652 blocks). Arithmetic follows get_kv_cache_configs/get_kv_cache_capacity: reserve one shared ring block (null-block admission is checked separately), 72 blocks per 262K request and 40 per 131K request. BF16 main pages shrink to E4M3 bytes; compressed BF16 indexer pages and ring state keep their dtype. Covered by the CPU engine-capacity harness; not yet run by us on sm_80.",
+    "pin_gib": 10.83,
+    "kv_blocks": 652,
+    "pool_tokens": 2370218,
+    "fit_262k": 9,
+    "fit_131k": 16,
+    "bytes_per_block_mib": [
+     12.75,
+     12.75,
+     12.75,
+     17
     ]
    },
    "evidence": [
     "None: swift1.5-huihui has not run on this hardware (the vanilla row fn-sm80-32g-x4-pp4 is itself untested)."
    ],
    "notes": [
-    "swift1.5-huihui on the fn-sm80-32g-x4-pp4 layout: same pin, KV dtype and concurrency; its own scales and served names. Untested / community-validated."
+    "BF16 KV stays the default on sm_80: pool 1,219,697 tokens = 4 x 262K / 8 x 131K. KV_DTYPE=fp8 opts into the byte decoder with the same pin and admission cap; its engine-fit estimate is 2,370,218 tokens = 9 x 262K / 16 x 131K (capacity_fp8_opt_in), not a measured pool. FP8 status: ⚫ untested (a profile ships, not yet run by us, expected to work). Only FP8 exports the checkpoint/recipe VLLM_QSA_KV_SCALES sidecar; BF16 evidence does not qualify FP8."
    ],
    "checkpoint": "swift1.5-huihui"
   },
@@ -5298,16 +5848,30 @@
     "fit_262k": 1,
     "fit_131k": 3,
     "bytes_per_block_mib": [
-     33.0,
-     33.0,
+     33,
+     33,
      41.2
+    ]
+   },
+   "capacity_fp8_opt_in": {
+    "estimate": true,
+    "basis": "FP8 opt-in engine-fit estimate, not measured on sm_80: same per-card pin 5622988800 B; binding block 22282240 B (252 blocks). Arithmetic follows get_kv_cache_configs/get_kv_cache_capacity: reserve one shared ring block (null-block admission is checked separately), 72 blocks per 262K request and 40 per 131K request. BF16 main pages shrink to E4M3 bytes; compressed BF16 indexer pages and ring state keep their dtype. Covered by the CPU engine-capacity harness; not yet run by us on sm_80.",
+    "pin_gib": 5.24,
+    "kv_blocks": 252,
+    "pool_tokens": 913863,
+    "fit_262k": 3,
+    "fit_131k": 6,
+    "bytes_per_block_mib": [
+     17,
+     17,
+     21.25
     ]
    },
    "evidence": [
     "None: swift1.5-huihui has not run on this hardware (the vanilla row fn-sm80-32g-x3-pp3 is itself untested)."
    ],
    "notes": [
-    "swift1.5-huihui on the fn-sm80-32g-x3-pp3 layout: same pin, KV dtype and concurrency; its own scales and served names. Untested / community-validated."
+    "BF16 KV stays the default on sm_80: pool 469,674 tokens = 1 x 262K / 3 x 131K. KV_DTYPE=fp8 opts into the byte decoder with the same pin and admission cap; its engine-fit estimate is 913,863 tokens = 3 x 262K / 6 x 131K (capacity_fp8_opt_in), not a measured pool. FP8 status: ⚫ untested (a profile ships, not yet run by us, expected to work). Only FP8 exports the checkpoint/recipe VLLM_QSA_KV_SCALES sidecar; BF16 evidence does not qualify FP8."
    ],
    "checkpoint": "swift1.5-huihui"
   },
@@ -5399,14 +5963,29 @@
      24.8,
      24.8,
      24.8,
-     33.0
+     33
+    ]
+   },
+   "capacity_fp8_opt_in": {
+    "estimate": true,
+    "basis": "FP8 opt-in engine-fit estimate, not measured on sm_80: same per-card pin 20208156672 B; binding block 17825792 B (1133 blocks). Arithmetic follows get_kv_cache_configs/get_kv_cache_capacity: reserve one shared ring block (null-block admission is checked separately), 72 blocks per 262K request and 40 per 131K request. BF16 main pages shrink to E4M3 bytes; compressed BF16 indexer pages and ring state keep their dtype. Covered by the CPU engine-capacity harness; not yet run by us on sm_80.",
+    "pin_gib": 18.82,
+    "kv_blocks": 1133,
+    "pool_tokens": 4121486,
+    "fit_262k": 15,
+    "fit_131k": 28,
+    "bytes_per_block_mib": [
+     12.75,
+     12.75,
+     12.75,
+     17
     ]
    },
    "evidence": [
     "None: swift1.5-huihui has not run on this hardware (the vanilla row fn-sm80-40g-x4-pp4 is itself untested)."
    ],
    "notes": [
-    "swift1.5-huihui on the fn-sm80-40g-x4-pp4 layout: same pin, KV dtype and concurrency; its own scales and served names. Untested / community-validated."
+    "BF16 KV stays the default on sm_80: pool 2,122,638 tokens = 7 x 262K / 14 x 131K. KV_DTYPE=fp8 opts into the byte decoder with the same pin and admission cap; its engine-fit estimate is 4,121,486 tokens = 15 x 262K / 28 x 131K (capacity_fp8_opt_in), not a measured pool. FP8 status: ⚫ untested (a profile ships, not yet run by us, expected to work). Only FP8 exports the checkpoint/recipe VLLM_QSA_KV_SCALES sidecar; BF16 evidence does not qualify FP8."
    ],
    "checkpoint": "swift1.5-huihui"
   }
@@ -5417,7 +5996,6 @@
    "scales": "models/swift1.5/scales/kv_scales-swift-e4m3.json",
    "served_names": "flash-next-v2 flash-next flash-mtp flash-next-mtp",
    "reasoning_effort": "medium",
-   "draft_vocab_sha256": null,
    "checkpoint_marker": "config.json"
   },
   "swift1.5-huihui": {
@@ -5425,12 +6003,11 @@
    "scales": "models/swift1.5-huihui/scales/qsa_kv_scales_swift_huihui_dense.json",
    "served_names": "flash-next-swift-huihui flash-next-abliterated",
    "reasoning_effort": "medium",
-   "draft_vocab_sha256": null,
    "checkpoint_marker": "EDITED_TENSORS.txt"
   }
  },
  "launch": {
-  "note": "Every Flash-Next-family profile is launched by tools/merlin/launch.py (family shape: the v3.0.0 models/flash-next/serve.sh argv); the per-profile values are the rows below, the checkpoint rows add scales / names / effort / marker.",
+  "note": "Every Flash-Next-family profile is launched by tools/merlin/launch.py (family shape: the models/flash-next/serve.sh argv); the per-profile values are the rows below, the checkpoint rows add scales / names / effort / marker.",
   "toolchain": "full",
   "verify_tree": true
  }

@@ -28,24 +28,25 @@ The first lock copied the reference host's venv, which carried nvcc/crt/nvvm/nvJ
 requires `cuda-toolkit==13.0.3`, whose `nvcc` extra is 13.0.88, so nothing required 13.4.
 That mix fails: FlashInfer's bundled CCCL (`cuda/std/__cccl/cuda_toolkit.h:41`) stops every
 JIT compile with "CUDA compiler and CUDA toolkit headers are incompatible" (nvcc 13.4 vs
-CUDART 13.0). Builds then had to set `CUDA_HOME=/usr/local/cuda` (13.3.73) to avoid it. The lock
+CUDART 13.0). Builds then had to set `CUDA_HOME=/usr/local/cuda` (13.3.73) to avoid it; that override is now accepted only with a warning and is untested. The lock
 now holds one CUDA release: nvcc, crt, nvvm and nvJitLink 13.0.88, CCCL 13.0.85, runtime
 13.0.96. A 13.0 compiler is also below the reference driver's CUDA 13.3, so its PTX loads.
 
-Qualification status of this locked route: **compile-qualified on CPU, GPU serve pending.**
+Qualification status of this locked route on 2026-10-17: **compile-qualified on CPU, GPU serve pending.**
 On a CPU-only host, a venv built from this lock with `--require-hashes` compiled the
 FlashInfer 0.7.0.post1 JIT modules the served configurations build (batch prefill with FP8 E4M3 KV at
 head dim 128 and 256, and sampling) for sm_80, sm_86 and sm_89, and vLLM's Marlin and
 CUTLASS 2.x kernel sources for each of the three. The ReplaySSM `checkpointing_ssu`
 module does not compile for sm_86 on any toolkit (13.3 included); it needs sm_90.
-No GPU boot, first-request JIT run, or full vLLM native build has been done on this
-lock. `/usr/local/cuda` 13.3 remains a
-valid `CUDA_HOME` override.
+No GPU boot, first-request JIT run, or full vLLM native build had been done on this
+lock by then; the 2026-10-20 release-wheel installs below were then served on it.
 
 Select a host compiler supported by the toolkit; the container uses GCC/G++ 14.
-The locked wheels provide nvcc;
-`CUDA_HOME` can select an external toolkit compatible with both torch and the
-driver, with separate build and hardware qualification.
+The locked wheels provide nvcc. An inherited `CUDA_HOME` replaces them; CUDA 13.0 is the tested
+toolkit and passes silently. Any other 13.x (13.3 and 13.4 included) is accepted with a warning and is
+untested: a compiler newer than the 13.0 runtime headers can fail FlashInfer's CCCL version check.
+A non-13 toolkit (12.x, 14.x) is refused. Unset `CUDA_HOME` to use the locked toolkit. An external
+toolkit needs its own build and hardware qualification.
 Compilation covers sm_80, sm_86 and sm_89 (`TORCH_CUDA_ARCH_LIST=8.0;8.6;8.9`); `MAX_JOBS`
 limits build concurrency. With `MERLIN_WHEEL` set to the release wheel the installer
 compiles nothing: it checks the wheel against `release/merlin-wheel.sha256` and takes the
@@ -73,10 +74,13 @@ It also creates the CUDA `lib64` links and the `.build-products` /
 A failed install leaves the new venv and any build outputs for diagnosis.
 Choose a fresh venv path for a retry. Existing source checkouts are never deleted.
 
-The live tile proof is a second step because it needs a completed MTP generation,
-a checkpoint and GPUs. Installation prints `LIVE TILE PROOF PENDING`; it does not
-claim a live tile pass from import or patch hashes. For example, launch the 27B
-TP2 recipe with the newly installed venv and save the entire boot log:
+The live tile proof is a second step for the **27B lane only** because it needs a
+completed tile-enabled MTP generation, a checkpoint and GPUs. Installation prints
+`LIVE TILE PROOF PENDING (27B only)`; it does not claim a live tile pass from import
+or patch hashes. Non-27B lanes should use `--verify`: this proof checks the 27B
+FlashInfer FP8 small-q decode tile (`FLASHINFER_SM8X_FP8_SMALLQ`), which Flash-Next's
+QSA attention path does not exercise. Launch the 27B TP2 recipe with the newly
+installed venv and save the entire boot log:
 
 ```bash
 MODEL=/path/to/checkpoint VENV="$PWD/venv" TREE="$PWD" \
@@ -98,7 +102,10 @@ release/install-env.sh --verify "$PWD/venv"
 `--verify` rechecks the source identity, every dependency pin, exact installed
 tile hashes, import locations, dependency consistency and native product hashes.
 It refuses a pristine, missing or edited tile without changing installed files.
-This check does not establish live tile selection.
+This check does not establish live tile selection. Neither `--verify` nor `--check`
+requires uv on PATH: dependency consistency uses uv when available, otherwise the
+venv's Python checks installed package metadata and requirement markers with the
+locked `packaging` library (pip need not be installed). Installation still requires uv.
 
 Use q_len 4 or 5 and the server's actual TP size. The log must belong to this
 installation and its current boot. `--check` performs the same read-only

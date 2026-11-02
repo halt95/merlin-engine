@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by the Merlin project; see NOTICE.
 import asyncio
 import os
 import socket
@@ -50,11 +51,16 @@ from vllm.utils.async_utils import cancel_task_threadsafe
 from vllm.utils.collection_utils import as_list
 from vllm.v1.engine import EngineCoreRequest, PauseMode
 from vllm.v1.engine.admission_control import SharedAdmissionStats
-from vllm.v1.engine.core_client import EngineCoreClient
+from vllm.v1.engine.core_client import (
+    EngineCoreClient,
+    MPClient,
+)
 from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
+from vllm.v1.engine.health_stall import StallWatch
 from vllm.v1.engine.input_processor import InputProcessor
 from vllm.v1.engine.output_processor import OutputProcessor, RequestOutputCollector
 from vllm.v1.engine.parallel_sampling import ParentRequest
+from vllm.v1.engine.utils import CoreEngineProcManager
 from vllm.v1.executor import Executor
 from vllm.v1.fault_tolerance.utils import FaultToleranceRequest, FaultToleranceResult
 from vllm.v1.kv_hints import KvHintsEnvelope
@@ -83,6 +89,9 @@ class InputStreamError(Exception):
 
 class AsyncLLM(EngineClient):
     """An asynchronous wrapper for the vLLM engine."""
+
+    # Inert until __init__ builds the real one.
+    _stall = StallWatch(0)
 
     def __init__(
         self,
@@ -189,6 +198,18 @@ class AsyncLLM(EngineClient):
             client_count=client_count,
             client_index=client_index,
             renderer=renderer,
+        )
+
+        # /health answers 503 for a live engine
+        # that stops stepping; this frontend sees every step of its one engine only
+        # with stats on and as the only API server.
+        sees_every_step = (
+            self.log_stats
+            and client_count == 1
+            and len(self.engine_core.engine_ranks_managed) == 1
+        )
+        self._stall = StallWatch(
+            envs.VLLM_MERLIN_HEALTH_STALL_S if sees_every_step else 0
         )
 
         # Loggers.
@@ -540,6 +561,7 @@ class AsyncLLM(EngineClient):
             child_requests.append(child_request)
 
         self.check_admission(parent_params.n, parent_request.request_id)
+        self._stall.admit(not self.output_processor.has_unfinished_requests())
         try:
             for idx, child_request in enumerate(child_requests):
                 self.output_processor.add_request(
@@ -569,6 +591,7 @@ class AsyncLLM(EngineClient):
             self.check_admission(request_id=request.request_id)
 
         # Register locally before the first await so concurrent tasks see this request.
+        self._stall.admit(not self.output_processor.has_unfinished_requests())
         self.output_processor.add_request(request, prompt, parent_req, index, queue)
 
         # Add the EngineCoreRequest to EngineCore (separate process).
@@ -591,6 +614,7 @@ class AsyncLLM(EngineClient):
         session_id: str | None = None,
         kv_hints: KvHintsEnvelope | None = None,
     ) -> RequestOutputCollector:
+        self._validate_resumable_request()
         self._validate_streaming_input_sampling_params(sampling_params)
 
         inputs = dict(
@@ -673,6 +697,14 @@ class AsyncLLM(EngineClient):
 
         queue._input_stream_task = asyncio.create_task(handle_inputs())
         return queue
+
+    # Port of vllm#58778.
+    def _validate_resumable_request(self) -> None:
+        if self.vllm_config.is_mm_encoder_only or self.model_config.is_diffusion:
+            raise VLLMValidationError(
+                "Resumable requests are not supported for encoder-only or "
+                "diffusion models."
+            )
 
     @staticmethod
     def _validate_streaming_input_sampling_params(
@@ -807,16 +839,9 @@ class AsyncLLM(EngineClient):
         except Exception as e:
             if q is not None:
                 await self.abort(q.request_id, internal=True)
-            if self.log_requests:
-                try:
-                    s = f"{e.__class__.__name__}: {e}"
-                except Exception as e2:
-                    s = (
-                        f"{e.__class__.__name__}: "
-                        "error during printing an exception of class"
-                        + e2.__class__.__name__
-                    )
-                logger.info("Request %s failed due to %s.", request_id, s)
+            # The cause at ERROR whatever
+            # log_requests says; the client sees only EngineGenerateError's message.
+            logger.error("Request %s failed due to %r.", request_id, e)
             raise EngineGenerateError() from e
         finally:
             if q is not None:
@@ -830,6 +855,12 @@ class AsyncLLM(EngineClient):
         # Ensure that the task doesn't have a circular ref back to the AsyncLLM
         # object, or else it won't be garbage collected and cleaned up properly.
         engine_core = self.engine_core
+        # Core may drain before frontend shutdown.
+        engine_manager = (
+            engine_core.resources.engine_manager
+            if isinstance(engine_core, MPClient)
+            else None
+        )
         output_processor = self.output_processor
         log_stats = self.log_stats
         # We use a mutable list for logger_manager so that it can be updated
@@ -841,12 +872,14 @@ class AsyncLLM(EngineClient):
         # P0 multi-modal sender ("shadow") cache; None for text-only models.
         mm_processor_cache = renderer.mm_processor_cache
         chunk_size = envs.VLLM_V1_OUTPUT_PROC_CHUNK_SIZE
+        stall = self._stall
 
         async def output_handler():
             try:
                 while True:
                     # 1) Pull EngineCoreOutputs from the EngineCore.
                     outputs = await engine_core.get_output_async()
+                    stall.progress()
                     num_outputs = len(outputs.outputs)
 
                     iteration_stats = (
@@ -903,7 +936,16 @@ class AsyncLLM(EngineClient):
                             mm_cache_stats=renderer.stat_mm_cache(),
                         )
             except Exception as e:
-                logger.exception("AsyncLLM output_handler failed.")
+                # Require clean exits, not just intent.
+                if (
+                    isinstance(e, EngineDeadError)
+                    and isinstance(engine_manager, CoreEngineProcManager)
+                    and len(engine_core.core_engines) == len(engine_manager.processes)
+                    and engine_manager.is_clean_shutdown()
+                ):
+                    logger.info("AsyncLLM output handler stopped during shutdown.")
+                else:
+                    logger.exception("AsyncLLM output_handler failed.")
                 output_processor.propagate_error(e)
 
         self.output_handler = asyncio.create_task(output_handler())
@@ -1065,8 +1107,7 @@ class AsyncLLM(EngineClient):
         except Exception as e:
             if q is not None:
                 await self.abort(q.request_id, internal=True)
-            if self.log_requests:
-                logger.info("Request %s failed.", request_id)
+            logger.error("Request %s failed due to %r.", request_id, e)
             raise EngineGenerateError() from e
         finally:
             if q is not None:
@@ -1090,6 +1131,8 @@ class AsyncLLM(EngineClient):
         logger.debug("Called check_health.")
         if self.errored:
             raise self.dead_error
+        busy = self.output_processor.has_unfinished_requests()
+        await self._stall.check(busy, self.engine_core)
 
     async def start_profile(
         self,

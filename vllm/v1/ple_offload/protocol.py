@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright 2026 halt95 (Merlin modifications)
 """IPC message definitions for PLE CPU offload (host-mapped pull design).
 
 The offload process owns no CUDA context. Every GPU worker owns, per PLE

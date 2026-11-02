@@ -1,5 +1,6 @@
 /*
  * Modified by Neural Magic
+ * Modified by the Merlin project; see NOTICE.
  * Copyright (C) Marlin.2024 Elias Frantar
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -747,10 +748,8 @@ STABLE_TORCH_LIBRARY_IMPL(_moe_C, CUDA, m) {
   m.impl("moe_wna16_marlin_gemm", TORCH_BOX(&moe_wna16_marlin_gemm));
 }
 // merlin-hook: marlin-full-k
-
-// v2.2 -- defined and registered in this TU so the query exists exactly when
-// the static it reads does. Tensor-free, so CompositeExplicitAutograd (a CUDA
-// registration could never be dispatched to without a tensor argument).
+// Registered in this TU so the query exists exactly when its static does.
+// Tensor-free: CompositeExplicitAutograd, since CUDA dispatch needs a tensor.
 STABLE_TORCH_LIBRARY_FRAGMENT(_moe_C, m) {
   m.def("marlin_moe_full_k_state() -> int");
 }

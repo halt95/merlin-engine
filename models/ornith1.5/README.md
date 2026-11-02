@@ -11,7 +11,7 @@ The model's own chat template and sampling are served as shipped: T 0.6, top_p 0
 is `qwen3` and the tool-call parser `qwen3_coder`.
 
 > **Status: tested on the reference host** (registry profile `ornith-quad-3090`, 4 × RTX 3090 with P2P), and on a
-> 4 × RTX 3090 host without P2P (`ornith-quad-3090-nop2p`). The full bench card ran on the reference host on 2026-10-21.
+> 4 × RTX 3090 host without P2P (`ornith-quad-3090-nop2p`). The full 3.0.0 bench card ran on the reference host on 2026-10-21; the 3.0.1 card re-measured decode, prefill, agents and GSM8K at medium (2026-11-02).
 
 ```bash
 MODEL=/path/to/Ornith-1.5-122B-A10B-W4A16-Merlin PORT=8000 bash models/ornith1.5/serve.sh
@@ -41,23 +41,21 @@ Extra arguments go to `vllm serve` after the launcher's own flags; later flags w
 | `MAX_PIXELS` | `8388608` (at least 8,388,608) |
 | `UV` | `1` (uniform verify on; `0` = off) |
 
-## Merlin 3.0.0 bench card (2026-10-21)
+## Merlin 3.0.1 bench card (2026-11-02)
 
-Maintainer measurements on 4× RTX 3090 (220 W, PCIe Gen4 with P2P) with the Merlin 3.0.0 release install plus the Ornith engine changes (uniform verify on) and a prefill experiment that did not ship, one
-fresh boot per run (the full card, then a second boot for the identity check and GSM8K).
-Decode is one stream with thinking on, in tok/s after the first streamed token, median of 3. Prefill is one cold
-request.
+Maintainer measurements on 4× RTX 3090 (220 W, PCIe Gen4) with P2P (the aikitoria patched driver) and the Zagitta [gpu-unlock](https://github.com/Zagitta/gpu-unlock) kernel module, one fresh `merlin serve` boot per configuration, 2026-11-01 to 2026-11-02; method and every cell in the [bench card](benchmarks/2026-11-02/BENCH-CARD.md). Decode is one stream with thinking on at reasoning effort medium, the server default (tok/s after the first streamed token); prefill is one cold request. With thinking on, a 512-token agent follow-up may end inside the reasoning, and reasoning tokens count. Thinking-off GSM8K is from the 3.0.0 run. Rows marked (3.0.0 run) were not re-run for 3.0.1; they and the rest of the 3.0.0 figures are on the [3.0.0 bench card](benchmarks/2026-10-21/BENCH-CARD.md).
 
 | Measurement | Ornith 1.5 |
 |---|---|
-| Decode, 4K / 131K / 262K prompt (262K = exactly 261,888 prompt tokens + 128 out) | 144 / 106 / 100 tok/s |
-| Cold prefill, 10K / 100K prompt | 5,148 / 3,049 tok/s |
-| Prompts sent at once (not a residency test) | 3 × ~262K needle prompts (259,261-261,565 tokens) sent at once, every needle found |
-| Needles | 10/10 at 131K and 23/23 at 262K, exact |
-| Agent-trace replay (recorded tool-use sessions) | 52/52 tool calls valid, decode p50 149 tok/s |
-| GSM8K-200 (5-shot, thinking off; second boot) | 190/200 |
+| Decode, 4K / 131K / 262K prompt (262K = exactly 261,888 prompt tokens + 128 out) | 146 / 115 / 105 tok/s |
+| Cold prefill, 10K / 100K / 262K prompt | 6,218 / 3,994 / 2,261 tok/s |
+| Agents at once (8 × 16K conversations), total, thinking on / off | 528 / 486 tok/s |
+| GSM8K-200 (5-shot), correct of 200, thinking on at medium / thinking off | 196 / 190 |
+| Prompts sent at once (not a residency test) (3.0.0 run) | 3 × ~262K needle prompts (259,261-261,565 tokens) sent at once, every needle found |
+| Needles (3.0.0 run) | 10/10 at 131K and 23/23 at 262K, exact |
+| Agent-trace replay (recorded tool-use sessions) (3.0.0 run) | 52/52 tool calls valid, decode p50 149 tok/s |
 | KV pool | 894,618 tokens |
-| MTP acceptance (tokens per step, K=3, served sampling, thinking on) | prose 2.39-2.48, code 2.56, GSM8K 2.58 |
+| MTP acceptance (tokens per step, K=3, served sampling, thinking on) (3.0.0 run) | prose 2.39-2.48, code 2.56, GSM8K 2.58 |
 
 ## The recipe
 
@@ -85,10 +83,19 @@ request.
   RecoverSSM check on the no-P2P host matched at 6 sessions; at 1 session the outputs differed on 9 of 12 prompts (temperature-0
   drift).
 
+## Host-RAM KV cache
+
+`merlin serve ornith1.5 <dir> --kv-ram-cache SIZE` turns on the host-RAM KV cache: prefix KV blocks the GPU pool evicts
+are kept in host RAM and restored instead of recomputed. SIZE is GiB per server, split over the four TP2 x PP2 ranks
+(`--kv-ram-cache 48g` = 12 GiB per rank), pinned, on top of the server's own host RAM; it adds no context or sessions.
+The engine accepts it on Ornith's RecoverSSM path; the smallest size is `4g` (1 GiB per rank);
+whether that holds one 262K restore unit on Ornith is not yet verified. It is untested ⚫ on Ornith until its hardware qualification runs. See
+[SETUP](../../docs/SETUP.md).
+
 ## Launcher environment
 
 Besides the reference argv, the launcher sets `VLLM_CACHE_ROOT` / `TRITON_CACHE_DIR` under `CACHE_ROOT`, per-port
-`MASTER_PORT` / `VLLM_PORT`, `VLLM_NO_USAGE_STATS=1` / `DO_NOT_TRACK=1`, `VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=0` and the
+`MASTER_PORT` / `VLLM_PORT`, `VLLM_NO_USAGE_STATS=1` / `DO_NOT_TRACK=1`, `HF_HUB_OFFLINE=1`, `VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=0` and the
 venv-toolkit `CUDA_HOME` default, and it puts `TREE` first on `PYTHONPATH` while keeping an inherited `PYTHONPATH` behind it.
 
 ## Checkpoint

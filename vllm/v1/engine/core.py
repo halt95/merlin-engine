@@ -36,6 +36,7 @@ from vllm.envs import enable_envs_cache
 from vllm.logger import configure_logging, init_logger
 from vllm.logging_utils.dump_input import dump_engine_exception
 from vllm.lora.request import LoRARequest
+from vllm.merlin import kv_host_tier
 from vllm.multimodal.cache import (
     MultiModalCacheMissError,
     engine_receiver_cache_from_config,
@@ -139,7 +140,7 @@ class _TeardownSignalGuard:
     (PR_SET_PDEATHSIG) before its shutdown drain; see the finally block of
     EngineCoreProc.run_engine_core. The deferral is bounded two ways:
       - a SECOND late signal restores the default disposition and re-delivers
-        itself, so the process dies of it (the maintainer's escalation);
+        itself, so the process dies of it (an operator's deliberate escalation);
       - after the first deferred signal a watchdog ends the process with
         exit code 1 if teardown is still running _TEARDOWN_SIGNAL_BOUND_S later.
     """
@@ -428,7 +429,16 @@ class EngineCore:
         if max_model_len_after != max_model_len_before:
             self.collective_rpc("update_max_model_len", args=(max_model_len_after,))
 
-        scheduler_kv_cache_config = generate_scheduler_kv_cache_config(kv_cache_configs)
+        # a connector's host pool is sized from the
+        # widest PP stage (kv_host_tier.take_widest_stage_tensors).
+        scheduler_kv_cache_config = generate_scheduler_kv_cache_config(
+            kv_cache_configs,
+            widest_stage_tensors=vllm_config.kv_transfer_config is not None,
+        )
+        # All workers use the scheduler's count.
+        kv_host_tier.set_worker_block_count(
+            vllm_config, scheduler_kv_cache_config, kv_cache_configs
+        )
         vllm_config.cache_config.num_gpu_blocks = scheduler_kv_cache_config.num_blocks
         kv_cache_groups = scheduler_kv_cache_config.kv_cache_groups
         if kv_cache_groups:
@@ -1494,6 +1504,10 @@ class EngineCoreProc(EngineCore):
         engine_core: EngineCoreProc | None = None
         signal_callback: SignalCallback | None = None
         clean_shutdown = False
+        # A shared event that proves a clean shutdown; it is set only after
+        # teardown finishes.
+        shutdown_complete = kwargs.pop("shutdown_complete", None)
+        requested_exit = False
         try:
             parallel_config: ParallelConfig = vllm_config.parallel_config
             data_parallel = parallel_config.data_parallel_size > 1 or dp_rank > 0
@@ -1591,6 +1605,14 @@ class EngineCoreProc(EngineCore):
 
         except SystemExit as e:
             logger.info_once("[shutdown] EngineCore: exiting busy loop")
+            # a signal alone cannot excuse a crash.
+            requested_exit = (
+                engine_core is not None
+                and shutdown_requested
+                and e.code in (None, 0)
+                and engine_core.shutdown_state == EngineShutdownState.SHUTTING_DOWN
+                and not engine_core.has_work()
+            )
             clean_shutdown = (
                 e.code in (None, 0)
                 and engine_core is not None
@@ -1615,6 +1637,9 @@ class EngineCoreProc(EngineCore):
             try:
                 if engine_core is not None:
                     engine_core.shutdown()
+                # Failures above leave this clear.
+                if requested_exit and shutdown_complete is not None:
+                    shutdown_complete.set()
             finally:
                 signal.signal(signal.SIGTERM, signal.SIG_DFL)
                 signal.signal(signal.SIGINT, signal.SIG_DFL)

@@ -2,19 +2,18 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright 2026 halt95 (Merlin modifications)
 
-"""Turn the published Qwen3.8-Flash-Next-W4A16-Merlin checkpoint into the v2 serving copy.
+"""Turn the published Qwen3.8-Flash-Next-W4A16-Merlin checkpoint into the serving copy.
 
-The v2 tree keys the FP8 PLE (n-gram embedding) table on a checkpoint config field instead of the
-VLLM_PLE_FP8_GLOBAL_SCALE=1 environment variable the v1 tree used. The field is read from the model's
-*text* config (`vllm_config.model_config.hf_text_config`), so it has to live inside the `"text_config"`
-object of config.json, not at the top level. The reference host's serving copy differs from the published
-checkpoint in exactly that one key; every weight file is a hard link of the published one (verified on the
-reference host 2026-09-17: all 27 shards and the other 7 metadata files byte-identical). This script inserts
-the key as a targeted text edit (the rest of the file is byte-preserved), re-parses the result to prove the
-key landed where the engine reads it, writes a new file and renames it into place -- so a hard-linked
-config.json is un-linked rather than mutated in place -- and keeps a backup.
+The engine keys the FP8 PLE (n-gram embedding) table on the checkpoint config field
+text_config.ple_embedding_dtype. The field is read from the model's *text* config
+(`vllm_config.model_config.hf_text_config`), so it has to live inside the `"text_config"` object of
+config.json, not at the top level. The serving copy differs from the published checkpoint in exactly that
+one key; every weight file can stay a hard link of the published one. This script inserts the key as a
+targeted text edit (the rest of the file is byte-preserved), re-parses the result to prove the key landed
+where the engine reads it, writes a new file and renames it into place -- so a hard-linked config.json is
+un-linked rather than mutated in place -- and keeps a backup.
 
-    python3 scripts/make-e1-config.py /path/to/Qwen3.8-Flash-Next-W4A16-Merlin
+    python3 models/flash-next/make-e1-config.py /path/to/Qwen3.8-Flash-Next-W4A16-Merlin
 """
 import json, os, re, shutil, sys
 KEY, VAL = "ple_embedding_dtype", "float8_e4m3fn"

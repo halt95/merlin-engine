@@ -2639,6 +2639,9 @@ def _get_and_verify_max_len(
     # If the user specified a max length, make sure it is smaller than the
     # derived length from the HF model config.
     elif max_model_len > derived_max_model_len:
+        _refuse_past_rope_table(
+            hf_config, model_arch_config, rope_parameters, max_model_len
+        )
         # Some models might have a separate key for specifying model_max_length
         # that will be bigger than derived_max_model_len. We compare user input
         # with model_max_length and allow this override when it's smaller.
@@ -2666,3 +2669,53 @@ def _get_and_verify_max_len(
                     f"the env var VLLM_ALLOW_LONG_MAX_MODEL_LEN=1. {warning}"
                 )
     return int(max_model_len)
+
+
+def _refuse_past_rope_table(
+    hf_config: PreTrainedConfig,
+    model_arch_config: ModelArchitectureConfig,
+    rope_parameters: list[dict[str, Any]],
+    max_model_len: int,
+) -> None:
+    """Refuse a max_model_len past a non-YaRN rotary table, whatever the env.
+
+    A non-YaRN rope builds its cos/sin table for the config length (times a
+    linear/dynamic factor). M-RoPE's larger cache with video pruning is not
+    extra length: pruned video keeps the positions of the tokens it drops, so
+    that headroom is already spent and the same limit applies. Positions
+    past the table read outside it (the fused QK-norm rope and the QSA
+    indexer rope gather unchecked), so VLLM_ALLOW_LONG_MAX_MODEL_LEN cannot
+    make that safe. YaRN builds its table for original x factor and is left
+    to the existing check.
+    """
+    if not rope_parameters or any(
+        rp.get("rope_type") == "yarn" for rp in rope_parameters
+    ):
+        return
+    table, key = model_arch_config.derived_max_model_len_and_key
+    if table == float("inf"):
+        return
+    scaling_factor = 1.0
+    if "gemma3" not in hf_config.model_type:
+        for rp in rope_parameters:
+            if rp.get("rope_type") not in (
+                "su",
+                "longrope",
+                "llama3",
+                "deepseek_yarn",
+                "deepseek_llama_scaling",
+            ):
+                scaling_factor = rp.get("factor", scaling_factor) or 1.0
+    table = int(table * scaling_factor)
+    if max_model_len > table:
+        rope_types = sorted({str(rp.get("rope_type")) for rp in rope_parameters})
+        raise ValueError(
+            f"max_model_len ({max_model_len}) is past this model's rotary "
+            f"table ({table} positions from {key}, rope_type "
+            f"{', '.join(rope_types)}). Positions past the table read outside "
+            "the cos/sin cache, so VLLM_ALLOW_LONG_MAX_MODEL_LEN does not "
+            "apply. Lower --max-model-len, or extend the context with a YaRN "
+            "override, e.g. --hf-overrides with rope_type 'yarn', factor and "
+            "original_max_position_embeddings (and max_position_embeddings "
+            "= original x factor)."
+        )

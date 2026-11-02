@@ -19,9 +19,9 @@ at runtime and `lm_head` matches the explicit target (ParallelLMHead is not a `L
 GPTQ here is the standard column-wise error-feedback quantiser (Frantar et al.) with damp 1 %
 and Cholesky inverse, rows processed in chunks because rows are independent given H; asym
 per-group minmax scale/zero-point (matches philbert's asym g128 recipe; the MSE observer of the
-original AWQ pass is not reproduced - flagged in the audit line).
+original AWQ pass is not reproduced).
 
-    python3 quantize_head_mtp.py <src_ckpt> <dest_ckpt> --hessians ./mtpcal-out/hessians.pt [--dry-run] [--audit]
+    python3 quantize_head_mtp.py <src_ckpt> <dest_ckpt> --hessians ./mtpcal-out/hessians.pt [--dry-run]
 """
 import argparse, json, math, os, shutil, struct, sys, time
 from pathlib import Path
@@ -138,12 +138,12 @@ def pack_ct(prefix, Q, S, Z, shape):
     # compressed-tensors convention (int type, 4 bits, symmetric OR asymmetric): codes live in
     # the SIGNED range [-8, 7] and so does the zero point; dequant = (q - zp) * scale.
     # pack_to_int32 adds 2^(bits-1) before packing, so unsigned 0..15 codes overflow the nibble.
-    # An earlier build handed it 0..15 and produced garbage (acceptance 0.000, every answer at
-    # the length cap). Our minmax codes/zp are 0..15 -> shift both by -8 (dequant unchanged).
+    # Handing it 0..15 produces garbage (acceptance 0.000, every answer at the length cap).
+    # Our minmax codes/zp are 0..15 -> shift both by -8 (dequant unchanged).
     w_int = (Q.to(torch.int16) - 8).to(torch.int8)
     zp_int = (Z.to(torch.int16) - 8).to(torch.int8)
     # NOT PackedQuantizationCompressor.compress(): that takes the FLOAT weight and re-quantises
-    # it with its own observer (probe 2026-09-22: feeding it int8 codes returned different codes).
+    # it with its own observer (feeding it int8 codes returns different codes).
     # Our codes are GPTQ's; pack them directly with the same primitive compress() ends in.
     out = {
         "%s.weight_packed" % prefix: pack_to_int32(w_int, BITS),
@@ -200,7 +200,7 @@ def main():
         if hs["n"].get(k, 0) < 100_000:
             print("WARNING: only %d calibration rows for %s (want >= 100k)" % (hs["n"].get(k, 0), k))
 
-    index = json.loads((src / "model.safetensors.index.json").read_text()); wm = index["weight_map"]
+    index = json.loads((src / "model.safetensors.index.json").read_text(encoding="utf-8")); wm = index["weight_map"]
     targets = [t for t in TARGETS if (not a.only or t in a.only.split(","))]
     packed = {}   # tensor name -> tensor, per shard
     report = []
@@ -246,16 +246,16 @@ def main():
                 os.link(item, tmp / item.name)
             except OSError:
                 shutil.copy2(item, tmp / item.name)
-    cfg = json.load(open(src / "config.json")); patch_config(cfg)
-    json.dump(cfg, open(tmp / "config.json", "w"), indent=2)
+    cfg = json.load(open(src / "config.json", encoding="utf-8")); patch_config(cfg)
+    json.dump(cfg, open(tmp / "config.json", "w", encoding="utf-8"), indent=2)
     total = 0
     for f in sorted(set(new_wm.values())):
         for k, v in hdr(tmp / f).items():
             if k != "__metadata__":
                 total += v["data_offsets"][1] - v["data_offsets"][0]
     index["weight_map"] = new_wm; index.setdefault("metadata", {})["total_size"] = total
-    json.dump(index, open(tmp / "model.safetensors.index.json", "w"), indent=2)
-    (tmp / "QUANT-REPORT.txt").write_text("\n".join(report) + "\n")
+    json.dump(index, open(tmp / "model.safetensors.index.json", "w", encoding="utf-8"), indent=2)
+    (tmp / "QUANT-REPORT.txt").write_text("\n".join(report) + "\n", encoding="utf-8")
     tmp.rename(dest)
     print("done ->", dest, "total_size", total)
 

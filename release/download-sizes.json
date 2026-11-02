@@ -1,5 +1,5 @@
 {
-  "_comment": "Download sizes setup.sh shows when the Hugging Face API is unreachable (bytes; 2026-10-20; ornith1.5 and nemotron-super-vl 2026-10-22: the whole Hub repository at the pinned revision, from the Hugging Face API). pending_publication: the Hugging Face repository is not public yet, so there is no revision to pin; setup serves only a local copy (--models-dir) until the revision is recorded and the marker removed. checkpoints: the whole HF repository at the listed revision. packages: the Linux x86_64 / CPython 3.13 artifacts of release/requirements-0.32.lock (PyPI file sizes). wheel: release/merlin-wheel.sha256's wheel. venv_factor: installed size over download size, an estimate for the disk check.",
+  "_comment": "Download sizes setup.sh shows when the Hugging Face API is unreachable (bytes; 2026-10-20; ornith1.5 and nemotron-super-vl 2026-10-22: the whole Hub repository at the pinned revision, from the Hugging Face API). pending_publication: the Hugging Face repository is not public yet, so there is no revision to pin; setup serves only a local copy (--models-dir) until the revision is recorded and the marker removed. checkpoints: the whole HF repository at the listed revision. packages: the Linux x86_64 / CPython 3.13 artifacts of release/requirements-0.32.lock (PyPI file sizes). wheel: release/merlin-wheel.sha256's wheel. venv_factor: installed size over download size, an estimate for the disk check. drafters: the speculative drafter setup.sh --spec dflash2 fetches (the whole Hub repository at the pinned revision, 2026-10-23, from the Hugging Face API; its checksum list is models/flash-next/dflash2.sha256).",
   "wheel": {"bytes": 227044713},
   "packages": {"count": 222, "bytes": 3651502067},
   "venv_factor": 3,
@@ -11,5 +11,11 @@
     "27b-thinkingcap": {"repo": "halt95/ThinkingCap-Qwen3.8-27B-W4A16-Merlin", "files": 17, "bytes": 17049982310, "revision": "916246dd9059f3eee5d27b9c49b67f04bce363fb"},
     "nemotron-super-vl": {"repo": "halt95/Nemotron-3.5-Super-VL-120B-A12B-W4A16-Merlin", "files": 94, "bytes": 72924407986, "revision": "a0c5c92c01ac87bee8fd94299897970bc83072bf"},
     "ornith1.5": {"repo": "halt95/Ornith-1.5-122B-A10B-W4A16-Merlin", "files": 135, "bytes": 71339932687, "revision": "7116c9e4c469286850f46230ce266edab8206c3f"}
+  },
+  "drafters": {
+    "dflash2": {"repo": "incoai/Qwen3.8-Flash-Next-DFlash2", "files": 6, "bytes": 1206437758, "revision": "a22a1744e85c17364dcc54a6a420af7135d4c7f6"}
+  },
+  "ple_packs": {
+    "int6": {"_comment": "The Flash-Next family's one INT6 g32 PLE pack (8 shards + ple-int6-pack.json; models/flash-next/ple-int6-pack.sha256), laid over the FP8 checkpoint of each qualified member by setup (tools/merlin/ple_pack.py; flash-next and swift1.5; swift1.5-huihui is not qualified). Public on Hugging Face since 2026-11-02; the pinned revision carries the re-emitted manifest (ple-int6-pack.json, 34,695 bytes; the 8 shards are unchanged). files/bytes: 41,600,199,680 table bytes; 41,600,274,991 with headers and the manifest.", "family": "flash-next", "repo": "halt95/Qwen3.8-Flash-Next-PLE-INT6-Merlin", "files": 9, "bytes": 41600274991, "revision": "2a64e5e457f5dba28d88019fbb7bf687eb2d7410"}
   }
 }

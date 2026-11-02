@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright 2026 halt95 (Merlin modifications)
 """The logic behind ``./setup.sh``: host checks, a few questions, the download plan, install, checkpoint, start.
 
     setup.sh [--yes] [--model M] [--models-dir D] [--host H] [--api-key K] [--port P] [--tp N] [--instances N]
+             [--ple fp8|int6] [--kv-ram-cache SIZE] [--swarm | --no-swarm] [--spec mtp|dflash2]
              [--from-source] [--no-start] [--dry-run] [--reconfigure] [--rehash] [--simulate SPEC]
     merlin pull <model> [--models-dir D] [--rehash]        (download + verify only; no GPU needed)
 
@@ -16,6 +17,8 @@ Python 3.13 and the venv's ``hf`` does the (resumable) checkpoint download.
 from __future__ import annotations
 
 import argparse
+import contextlib
+import errno
 import hashlib
 import json
 import os
@@ -25,6 +28,8 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
+import textwrap
 import time
 import urllib.request
 from dataclasses import dataclass, field, replace
@@ -33,12 +38,17 @@ from typing import Any, Callable
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import launch as L  # noqa: E402
+import ple_pack as PP  # noqa: E402
 import preflight as pf  # noqa: E402
 import registry as R  # noqa: E402
 import serve_cli as S  # noqa: E402
 
 REPO = Path(__file__).resolve().parents[2]
-MODELS = list(L.CHECKPOINTS)  # flash-next, swift1.5, swift1.5-huihui, 27b, 27b-thinkingcap, nemotron-super-vl, ornith1.5
+# Checkpoints the launcher serves that setup cannot install or verify yet: no checkpoint.sha256 in the engine (it is written
+# when the checkpoint is staged for publication). `merlin serve <name> <dir>` still serves a local copy.
+SETUP_WITHHELD: dict[str, str] = {}  # none in this release
+# flash-next, swift1.5, swift1.5-huihui, 27b, 27b-thinkingcap, nemotron-super-vl, ornith1.5
+MODELS = [m for m in L.CHECKPOINTS if m not in SETUP_WITHHELD]
 FAMILY = {k: v[0] for k, v in L.CHECKPOINTS.items()}
 RECIPE = {k: v[1] for k, v in L.CHECKPOINTS.items()}
 FAMILY_DIR = {k: Path(v[1]).name for k, v in L.CHECKPOINTS.items()}
@@ -54,8 +64,9 @@ TITLE = {
 WHEEL_RELEASE_URL = "https://github.com/halt95/merlin-engine/releases/download/merlin-v{version}/{wheel}"
 SETUP_JSON = "setup.json"
 STATE_JSON = "state.json"
+SETUP_LOCK = "setup.lock"  # held for the whole engine install
 KEY_FILE = "api-key"
-VERIFIED_MARKER = ".merlin-verified.json"
+VERIFIED_MARKER = L.VERIFIED_MARKER
 MIN_GCC = 13
 GCC_CANDIDATES = ("14", "13", "15")  # gcc-N / g++-N looked up on PATH when cc is too old
 RAM_OTHER_WARN_GIB = 32.0  # 27B / Super VL / Ornith: no measured host-RAM floor; below this the load is unproven
@@ -64,6 +75,43 @@ NOP2P_TP1_WHY = ("P2P is off among these cards: the measured best aggregate with
                  "(measured on 4 x CMP 170HX: TP1 x 4 = 873 tok/s, TP2 x 2 = 523, TP4 = 371), so setup recommends "
                  "--tp 1 --instances {n}; `merlin serve` alone would start one TP1 server on GPU {g}. Each single-card "
                  "server takes images up to 4 MP (the multi-card layouts take 8 MP)")
+
+
+@dataclass(frozen=True)
+class PleTable:
+    """One of Flash-Next's PLE ("n-gram") embedding tables, held in host RAM (one copy per server)."""
+    key: str  # the saved answer (setup.json ple_table); --ple fp8|int6 picks it
+    dtype: str  # text_config.ple_embedding_dtype of a checkpoint carrying it
+    gib: float  # the table alone in host RAM
+    title: str
+
+
+# FP8 is the default PLE table and nothing is asked; INT6 g32 is an opt-in flag (--ple int6), refused (int6_reason)
+# unless the engine has its loader (ple_formats.py, booted by launch.py as PLE_OPT_IN_TABLES, not a test table) and
+# the family's INT6 PLE pack is recorded (release/download-sizes.json ple_packs.int6 +
+# models/flash-next/ple-int6-pack.sha256). There is no second checkpoint per model: setup lays the one pack over the
+# user's verified FP8 checkpoint (ple_pack.py). No INT4, no table reads from disk or page cache. INT6 g32 measured no
+# quality loss vs FP8 and is the route for smaller hosts.
+PLE_TABLES = {
+    "fp8": PleTable("fp8", "float8_e4m3fn", pf.FN_PLE_TABLE_GIB, "FP8 (the shipped table)"),
+    "int6": PleTable("int6", "int6_g32", 38.74, "INT6 g32 (same quality and speed as FP8 in a side-by-side comparison)"),
+}
+PLE_DEFAULT = "fp8"
+# The members whose checksum lists carry the ten model-plefp8-* shards the pack replaces, byte for byte (the same sha256
+# in each list; int6_reason re-checks it).
+PLE_INT6_MODELS = ("flash-next", "swift1.5")
+# Members whose FP8 PLE shards are the pack's but whose INT6 boot failed a quality gate: refused with the reason (Huihui's
+# INT6 MTP acceptance was 3.253 against FP8's 3.399 on the qualification run, past the -0.10 bar; the pack is unchanged).
+# One table, shared with the launcher, which refuses the same checkpoints.
+PLE_INT6_UNQUALIFIED = L.PLE_INT6_UNQUALIFIED
+# The KV RAM cache = the KV host tier: off unless --kv-ram-cache SIZE, host RAM per server, which merlin serve splits
+# evenly over the server's ranks (TP x PP) into this engine knob (GiB per rank). Setup never exports the knob itself.
+KV_TIER_ENV = L.FN_KV_HOST_TIER
+# The drafter: MTP by default; --spec dflash2 (or the one Drafter question, asked only on
+# Flash-Next rows with a qualified DFlash2 geometry) downloads incoai's DFlash2 drafter and serves with it.
+SPEC_DEFAULT = "mtp"
+DFLASH2_TITLES = {"mtp": "MTP (recommended): bigger pool: 6x131K or 3x262K",
+                  "dflash2": "DFlash2: +5-18 % decode, 3x262K only; downloads the drafter"}
 
 
 class SetupError(Exception):
@@ -85,6 +133,46 @@ def gib(n: int | float | None) -> str:
     return f"{n / (1 << 30):.1f} GiB"
 
 
+WIDTH = 100  # the output width (a terminal narrower than this wraps at its own width)
+
+
+def wrap(text: str, width: int, first: str = "", rest: str | None = None) -> list[str]:
+    """``text`` wrapped to ``width`` after the prefix ``first``; continuation lines start with ``rest`` (default:
+    spaces as wide as ``first``). Words never break, so URLs, paths and profile names stay whole; each line of a
+    multi-line text keeps its own leading spaces under the hanging indent. ``width`` 0: no wrapping."""
+    rest = " " * len(first) if rest is None else rest
+    out: list[str] = []
+    for i, line in enumerate(text.split("\n")):
+        body = line.lstrip(" ")
+        own = line[: len(line) - len(body)]
+        lead, sub = (first, rest) if i == 0 else (rest + own, rest + own + ("  " if own else ""))
+        if width <= 0:
+            out.append((lead + body).rstrip())
+            continue
+        out += textwrap.wrap(body, max(width, len(lead) + 20), initial_indent=lead, subsequent_indent=sub,
+                             break_long_words=False, break_on_hyphens=False) or [lead.rstrip()]
+    return out
+
+
+def shell_wrap(words: list[str], width: int, indent: str = "  ", cont: str = "      ") -> list[str]:
+    """A shell command over several lines joined by `` \\`` continuations when it is wider than ``width``; a
+    ``-flag`` stays with its value and no word is split (pasted back, it is the same command)."""
+    units: list[str] = []
+    for w in words:
+        if units and units[-1].startswith("-") and " " not in units[-1] and not w.startswith("-"):
+            units[-1] += " " + w
+        else:
+            units.append(w)
+    lines, cur = [], ""
+    for u in units:
+        if cur and len(cur) + 1 + len(u) + 2 > width:
+            lines.append(cur + " \\")
+            cur = cont + u
+        else:
+            cur = (cur + " " + u) if cur else indent + u
+    return lines + [cur]
+
+
 def sha256_file(path: Path) -> str:
     h = hashlib.sha256()
     with open(path, "rb") as f:
@@ -94,7 +182,7 @@ def sha256_file(path: Path) -> str:
 
 
 def release_version(repo: Path = REPO) -> str:
-    """The release line of docs/CHANGELOG.md (``## Merlin 3.0.0``) names the GitHub release tag ``merlin-v<version>``."""
+    """The release line of docs/CHANGELOG.md (``## Merlin <version>``) names the GitHub release tag ``merlin-v<version>``."""
     env = os.environ.get("MERLIN_RELEASE_VERSION")
     if env:
         return env
@@ -135,12 +223,104 @@ def sizes_table(repo: Path = REPO) -> dict[str, Any]:
     return json.loads((repo / "release" / "download-sizes.json").read_text(encoding="utf-8"))
 
 
+def fn_family(model: str | None) -> bool:
+    return bool(model) and FAMILY.get(model) == "flash-next"
+
+
+def tier_family(model: str | None) -> bool:
+    """The models --kv-ram-cache applies to: the Flash-Next family, the 27B and Ornith 1.5 (the last two
+    untested until their qualification runs)."""
+    return bool(model) and FAMILY.get(model) in S.KV_TIER_FAMILIES
+
+
+def swarm_family(model: str | None) -> bool:
+    """The models --swarm applies to: the families with rows that have a qualified swarm cap: Flash-Next and the 27B."""
+    return bool(model) and FAMILY.get(model) in S.SWARM_FAMILIES
+
+
+def is_variant(ple: str | None) -> bool:
+    """A PLE table other than the one the model's own checkpoint carries (FP8)."""
+    return ple not in (None, PLE_DEFAULT)
+
+
+def ck_entry(model: str, table: dict[str, Any]) -> dict[str, Any]:
+    """The release/download-sizes.json entry of the model's checkpoint (the FP8 one: the INT6 table is a pack laid over
+    it, never a checkpoint of its own)."""
+    return table["checkpoints"][model]
+
+
 def hf_repo(model: str, repo: Path = REPO) -> str:
-    return sizes_table(repo)["checkpoints"][model]["repo"]
+    return ck_entry(model, sizes_table(repo))["repo"]
 
 
 def checksum_list(model: str, repo: Path = REPO) -> Path:
     return repo / RECIPE[model] / "checkpoint.sha256"
+
+
+def pack_entry(table: dict[str, Any]) -> dict[str, Any] | None:
+    """release/download-sizes.json ``ple_packs.int6``: the Flash-Next family's INT6 PLE pack (None when not recorded)."""
+    e = (table.get("ple_packs") or {}).get(PP.PACK_KEY)
+    return e if isinstance(e, dict) else None
+
+
+def pack_list(repo: Path = REPO) -> Path:
+    return repo / PP.PACK_LIST
+
+
+def fp8_ple_sums(model: str, repo: Path = REPO) -> dict[str, str]:
+    """The model-plefp8-* lines of a model's checksum list ({} without a list)."""
+    lst = checksum_list(model, repo)
+    return {n: h for n, h in parse_checksums(lst)[0].items() if n.startswith(PP.FP8_SHARD_PREFIX)} if lst.is_file() else {}
+
+
+def int6_engine_reason(repo: Path = REPO) -> str | None:
+    """Why this checkout cannot serve an INT6 g32 table (None when it can): the loader is not in this release, and its
+    launcher boots the format only as an opt-in test table until it is promoted."""
+    try:
+        loader = (repo / "vllm" / "models" / "qwen4_exp" / "nvidia" / "ple_formats.py").read_text(encoding="utf-8")
+    except OSError:
+        loader = ""
+    if "int6_g32" not in loader:
+        return "this engine has no INT6 g32 PLE loader (the engine build is older than the INT6 table)"
+    if "int6_g32" in getattr(L, "PLE_TEST_TABLES", {}):
+        return "the launcher still treats int6_g32 as a test table (MERLIN_PLE_TEST_TABLE), not a shipped one"
+    return None
+
+
+def int6_reason(model: str | None, repo: Path = REPO, table: dict[str, Any] | None = None) -> str | None:
+    """Why the INT6 g32 table cannot be chosen for ``model`` here; None when it can (the pack may still be pending
+    publication: a local copy then serves)."""
+    why = L.int6_unqualified_reason(model)
+    if why:
+        return why
+    if model not in PLE_INT6_MODELS:
+        return f"the INT6 g32 PLE pack does not cover {model} (it covers {', '.join(PLE_INT6_MODELS)})"
+    why = int6_engine_reason(repo)
+    if why:
+        return why
+    if pack_entry(table or sizes_table(repo)) is None or not pack_list(repo).is_file():
+        return (f"the INT6 g32 PLE pack is not recorded in this release (release/download-sizes.json has no ple_packs.{PP.PACK_KEY} "
+                f"entry or {PP.PACK_LIST} is missing)")
+    problem = checksum_list_problem(pack_list(repo))
+    if problem:
+        return problem
+    ref = fp8_ple_sums("flash-next", repo)
+    if not ref or fp8_ple_sums(model, repo) != ref:
+        return (f"{model}'s FP8 PLE shards ({PP.FP8_SHARD_PREFIX}* in {RECIPE[model]}/checkpoint.sha256) are not the ones the "
+                "pack replaces, so the pack does not apply to it")
+    return None
+
+
+def int6_checkpoint_reason(ckpt_dir: Path) -> str | None:
+    """Why the checkpoint in ``ckpt_dir`` does not carry the INT6 g32 table (None when its config.json says it does)."""
+    cfg = read_json(ckpt_dir / "config.json") or {}
+    dtype = (cfg.get("text_config") or cfg).get("ple_embedding_dtype")
+    if dtype != PLE_TABLES["int6"].dtype:
+        return f"{ckpt_dir} carries the {dtype or 'FP8'} PLE table, not INT6 g32 (ple_embedding_dtype in its config.json)"
+    return None
+
+
+CHECKSUM_LINE = re.compile(r"^([0-9a-fA-F]{64})\s+\*?(.+?)\s*$")
 
 
 def parse_checksums(path: Path) -> tuple[dict[str, str], str | None]:
@@ -153,16 +333,28 @@ def parse_checksums(path: Path) -> tuple[dict[str, str], str | None]:
             if m:
                 rev = m[1]
             continue
-        m = re.match(r"^([0-9a-f]{64})\s+\*?(.+?)\s*$", line)
+        m = CHECKSUM_LINE.match(line)
         if m:
-            sums[m[2]] = m[1]
+            sums[m[2]] = m[1].lower()
     return sums, rev
+
+
+def checksum_list_problem(path: Path) -> str | None:
+    """Why ``path`` cannot verify anything (None when every non-comment line parses and at least one does): an empty,
+    truncated or LFS-stub list would otherwise hash nothing and still report the checkpoint as verified."""
+    lines = [l for l in path.read_text(encoding="utf-8").splitlines() if l.strip() and not l.startswith("#")]
+    bad = [l for l in lines if not CHECKSUM_LINE.match(l)]
+    if bad:
+        return f"{path} has {len(bad)} line(s) that are not '<sha256>  <file>' (first: {bad[0][:60]!r})"
+    if not lines:
+        return f"{path} lists no files"
+    return None
 
 
 def pending_publication(model: str, repo: Path = REPO, table: dict[str, Any] | None = None) -> bool:
     """True for a checkpoint whose Hugging Face repository is not public yet (release/download-sizes.json
     ``pending_publication``). The marker is only valid with no recorded revision: a pinned revision means it is published."""
-    ck = (table or sizes_table(repo))["checkpoints"][model]
+    ck = ck_entry(model, table or sizes_table(repo))
     if not ck.get("pending_publication"):
         return False
     if ck.get("revision") or pinned_revision(model, repo, table):
@@ -180,7 +372,7 @@ def pinned_revision(model: str, repo: Path = REPO, table: dict[str, Any] | None 
     present and different is an inconsistency in the repository. None for a repository whose revision is not recorded
     yet (pending_publication): the plan then resolves it through the Hugging Face API or refuses."""
     _, rev = parse_checksums(checksum_list(model, repo))
-    table_rev = (table or sizes_table(repo))["checkpoints"][model].get("revision")
+    table_rev = ck_entry(model, table or sizes_table(repo)).get("revision")
     if rev and table_rev and rev != table_rev:
         raise SetupError(f"{model}: checkpoint.sha256 names revision {rev} but release/download-sizes.json {table_rev}")
     return rev or table_rev
@@ -206,15 +398,22 @@ def write_private(path: Path, text: str, mode: int = 0o600) -> None:
             os.chmod(path.parent, 0o700)
         except OSError:
             pass
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
-    with os.fdopen(fd, "w", encoding="utf-8") as f:
-        f.write(text)
+    # a unique temp file per writer (mkstemp creates it 0600): concurrent writers never share an inode
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=path.name + ".", suffix=".tmp")
     try:
-        os.chmod(tmp, mode)  # the creation mode is filtered by the umask; the file is ours, so set it exactly
-    except OSError:
-        pass
-    os.replace(tmp, path)
+        try:
+            os.fchmod(fd, mode)  # mkstemp's mode is 0600; the file is ours, so set exactly what was asked
+        except (OSError, AttributeError):
+            pass
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def which(name: str, env: dict[str, str] | None = None) -> str | None:
@@ -270,7 +469,7 @@ def uv_cache_dir() -> Path:
 # --------------------------------------------------------------------------------------------
 # Arguments and saved answers (per model)
 # --------------------------------------------------------------------------------------------
-PER_MODEL = ("models_dir", "port", "tp", "instances")
+PER_MODEL = ("models_dir", "port", "tp", "instances", "ple_table", "kv_ram_cache_gib", "spec", "swarm")
 
 
 @dataclass
@@ -285,9 +484,39 @@ class Answers:
     from_source: bool = False
     cc: str | None = None
     cxx: str | None = None
+    ple_table: str | None = None  # Flash-Next family: fp8, or int6 with --ple int6 (None elsewhere)
+    kv_ram_cache_gib: int | None = None  # Flash-Next, 27B, Ornith: --kv-ram-cache, GiB per server, 0 = off (else None)
+    spec: str | None = None  # Flash-Next family: the drafter, mtp / dflash2 (None elsewhere: their MTP head)
+    swarm: bool | None = None  # Flash-Next, 27B: --swarm, the row's tested high-concurrency cap (False = the default cap; else None)
+
+    def base_dir(self) -> Path:
+        """The FP8 checkpoint folder (--models-dir, else ~/models/<model>), with --ple int6 too: the overlay is built
+        beside it and the base is never written."""
+        return Path(self.models_dir or default_dir(self.model)).expanduser()
 
     def checkpoint_dir(self) -> Path:
-        return Path(self.models_dir or f"~/models/{self.model}").expanduser()
+        """The folder merlin serve gets: the base checkpoint, or with --ple int6 its overlay ``<base>-int6``."""
+        return PP.overlay_dir(self.base_dir()) if fn_family(self.model) and is_variant(self.ple_table) else self.base_dir()
+
+    def pack_dir(self) -> Path:
+        return PP.pack_dir(self.base_dir())
+
+
+def default_dir(model: str | None) -> str:
+    return f"~/models/{model}"
+
+
+def normalize_fn(a: Answers) -> Answers:
+    """The PLE table belongs to the Flash-Next family, the KV tier to it, the 27B and Ornith: FP8 and the tier off
+    unless a flag (or a saved flag) says otherwise, never asked; nothing elsewhere."""
+    if fn_family(a.model):
+        a.ple_table = a.ple_table or PLE_DEFAULT
+        a.spec = a.spec or SPEC_DEFAULT
+    else:
+        a.ple_table = a.spec = None
+    a.kv_ram_cache_gib = (a.kv_ram_cache_gib or 0) if tier_family(a.model) else None
+    a.swarm = bool(a.swarm) if swarm_family(a.model) else None
+    return a
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -297,12 +526,27 @@ def build_parser() -> argparse.ArgumentParser:
     )
     ap.add_argument("--yes", "-y", action="store_true", help="no questions: the recommended (or given) answers, downloads confirmed")
     ap.add_argument("--model", choices=MODELS, help="checkpoint to install and serve")
-    ap.add_argument("--models-dir", metavar="DIR", help="checkpoint folder (default ~/models/<model>; an existing verified copy is reused)")
+    ap.add_argument("--models-dir", metavar="DIR", help="checkpoint folder (default ~/models/<model>; an existing verified copy is reused). "
+                    "With --ple int6 it is still the FP8 checkpoint: the INT6 overlay is DIR-int6 and the pack is shared beside it")
     ap.add_argument("--host", help="127.0.0.1 (this machine only, default) or 0.0.0.0 (network: needs --api-key or one is generated)")
     ap.add_argument("--api-key", metavar="KEY", help="bearer key the server requires (stored in .merlin/api-key, 0600)")
     ap.add_argument("--port", type=int, help="HTTP port (default: the model's, 8000 Flash-Next / Super VL, 8100 27B)")
     ap.add_argument("--tp", type=int, help="pick the layout with this tensor-parallel size")
     ap.add_argument("--instances", type=int, help="start N servers on N disjoint card sets")
+    ap.add_argument("--ple", choices=list(PLE_TABLES), default=None,
+                    help=f"Flash-Next: the PLE table in host RAM, fp8 ({PLE_TABLES['fp8'].gib} GiB, the default) or int6 "
+                    f"(INT6 g32, {PLE_TABLES['int6'].gib} GiB): one pack for the family, downloaded once beside the FP8 checkpoint, "
+                    "which stays untouched; the served folder is <checkpoint>-int6 (links + a generated config.json and index)")
+    ap.add_argument("--kv-ram-cache", metavar="SIZE", help="Flash-Next (experimental in 3.0.1, MTP only), 27B (experimental in 3.0.1) and Ornith 1.5 (untested): a host-RAM cache for prefix KV blocks the GPU pool "
+                    "evicts (restored instead of recomputed; adds no context and does not change the session cap (--swarm does); RAM only, never disk; ~66K tokens/GiB on Flash-Next TP2xPP2; needs memlock: LimitMEMLOCK=infinity or ulimit -l unlimited). SIZE = "
+                    "host RAM per server (24g, 24gib or 24 = GiB; 0 = off, the default), split over its TP x PP ranks (rounded down to whole GiB per rank)")
+    ap.add_argument("--swarm", action=argparse.BooleanOptionalAction, default=None,
+                    help="the row's tested high-concurrency cap instead of its default (experimental): the Flash-Next 4 x 3090 profiles 24 "
+                    "sessions (default 8), the 27B 4 x 3090 (TP4) profiles 32 (default 24). Needs the KV RAM cache at the size that cap was "
+                    "qualified at (48g per server): without --kv-ram-cache the cache is set to that size, a smaller one is refused. Asked once, "
+                    "default no, on rows that have a swarm cap; --no-swarm turns a saved one off. An exported SEQS still wins over every cap")
+    ap.add_argument("--spec", choices=S.SPEC_CHOICES, help="Flash-Next: the drafter, mtp (default; bigger pool: 6 x 131K or "
+                    f"3 x 262K) or dflash2 ({S.DFLASH2_WHY.replace(chr(37), chr(37) * 2)}; downloads {S.DFLASH2_REPO})")
     ap.add_argument("--from-source", action="store_true", help="compile the engine instead of taking the release wheel")
     ap.add_argument("--no-start", action="store_true", help="install and download, then stop before `merlin serve`")
     ap.add_argument("--dry-run", action="store_true", help="print checks, answers, download plan and serve command; download and write nothing")
@@ -324,6 +568,26 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         raise SetupError(f"--port {args.port}: 1..65535", 2)
     if args.tp is not None and args.tp < 1 or args.instances is not None and args.instances < 1:
         raise SetupError("--tp and --instances take whole numbers >= 1", 2)
+    args.ple_table = args.ple
+    try:
+        args.kv_ram_cache_gib = None if args.kv_ram_cache is None else S.parse_kv_ram_cache(args.kv_ram_cache)
+    except S.CliError as e:
+        raise SetupError(str(e), 2) from None
+    if args.model and not fn_family(args.model) and args.spec == "dflash2":
+        raise SetupError(f"--spec dflash2: DFlash2 is only available for the Flash-Next family ({L.FN_FAMILY_NAMES}); "
+                         f"{args.model} uses its MTP head", 2)
+    if args.model and not fn_family(args.model) and is_variant(args.ple):
+        raise SetupError(f"--ple int6 applies to the Flash-Next family only, not {args.model}", 2)
+    if args.model and not tier_family(args.model) and args.kv_ram_cache_gib:
+        raise SetupError(f"--kv-ram-cache applies to the Flash-Next family, the 27B and Ornith 1.5 only, not {args.model}", 2)
+    if args.swarm:
+        if args.model and not swarm_family(args.model):
+            raise SetupError(f"--swarm applies to the Flash-Next family and the 27B only, not {args.model}", 2)
+        if args.kv_ram_cache_gib == 0:
+            raise SetupError("--swarm needs the KV RAM cache (it is sized for the swarm cap when --kv-ram-cache is not given); "
+                             "--kv-ram-cache 0 turns it off", 2)
+        if args.spec == "dflash2":
+            raise SetupError("--swarm with --spec dflash2: the KV RAM cache --swarm needs is qualified with MTP only in 3.0.1", 2)
     return args
 
 
@@ -353,6 +617,15 @@ def _valid_saved(saved: dict[str, Any] | None) -> dict[str, Any]:
                     v = block.get(k)
                     if isinstance(v, int) and not isinstance(v, bool) and v >= 1 and (k != "port" or v <= 65535):
                         b[k] = v
+                if fn_family(m) and isinstance(block.get("ple_table"), str) and block["ple_table"] in PLE_TABLES:
+                    b["ple_table"] = block["ple_table"]
+                if fn_family(m) and block.get("spec") in S.SPEC_CHOICES:
+                    b["spec"] = block["spec"]
+                v = block.get("kv_ram_cache_gib")
+                if tier_family(m) and isinstance(v, int) and not isinstance(v, bool) and v >= 0:
+                    b["kv_ram_cache_gib"] = v
+                if swarm_family(m) and isinstance(block.get("swarm"), bool):
+                    b["swarm"] = block["swarm"]
                 out["models"][m] = b
     return out
 
@@ -367,13 +640,13 @@ def merge_answers(saved: dict[str, Any] | None, args: argparse.Namespace, key: s
     a.api_key = key
     for k in PER_MODEL:
         setattr(a, k, block.get(k))
-    for k in ("models_dir", "host", "api_key", "port", "tp", "instances"):
+    for k in ("models_dir", "host", "api_key", "port", "tp", "instances", "ple_table", "kv_ram_cache_gib", "spec", "swarm"):
         v = getattr(args, k)
         if v is not None:
             setattr(a, k, v)
     if args.from_source:
         a.from_source = True
-    return a
+    return normalize_fn(a)
 
 
 def saved_block(a: Answers) -> dict[str, Any]:
@@ -507,22 +780,90 @@ def source_build_problems(run: Callable[[list[str]], str | None], env: dict[str,
     return out
 
 
-def ram_problem(model: str, inv: pf.Inventory, cards: int) -> Problem | None:
-    ram = inv.host.ram_mib
-    if ram is None:
-        return Problem("WARN", "ram", "host RAM unknown")
-    have = pf._gib(ram)
-    if FAMILY[model] == "flash-next":
-        floor = pf.ram_floor_gib(cards)
-        if have < floor:
-            return Problem("FAIL", "ram", f"host RAM {have:.0f} GiB is below Flash-Next's ~{floor:.0f} GiB resident floor "
-                           "(a ~47.7 GiB pinned PLE table): the load would be OOM-killed",
-                           "add RAM, or choose 27b (--model 27b), which needs no PLE table")
+def ram_budget(inv: pf.Inventory, avail: Callable[[], int | None] | None = None) -> tuple[float | None, str]:
+    """(GiB, what it is) a new server can have: host RAM (MemTotal, lowered to a cgroup memory.max), and on a probed
+    host also what is free now (MemAvailable, capped by what the cgroup has left), whichever is smaller."""
+    total = pf._gib(inv.host.ram_mib) if inv.host.ram_mib is not None else None
+    if inv.source != "probe":
+        return total, "host RAM"
+    now = (avail or pf.mem_available_mib)()
+    if now is not None and (total is None or pf._gib(now) < total):
+        return pf._gib(now), "host memory available now (MemAvailable, capped by the cgroup)"
+    return total, "host RAM (MemTotal or the cgroup memory.max)"
+
+
+def fn_ram_need_gib(ple: str | None, tier_gib: int | None, sizes: list[int]) -> float:
+    """Resident host RAM of Flash-Next servers with ``sizes`` workers each (TP x PP; one entry per --instances
+    server): per server the measured floor with the FP8 table swapped for ``ple``'s, plus the KV tier's arena of
+    ``tier_gib`` per rank. The floor is preflight's (69 GiB at four workers, +2 GiB per worker above four)."""
+    delta = PLE_TABLES[ple or PLE_DEFAULT].gib - PLE_TABLES[PLE_DEFAULT].gib
+    return sum(pf.ram_floor_gib(n, tier_gib or 0) + delta for n in sizes)  # the floor serve's gates use, tier included
+
+
+def fn_ram_parts(ple: str | None, tier_gib: int | None, sizes: list[int]) -> str:
+    t = PLE_TABLES[ple or PLE_DEFAULT]
+    per = f"{len(sizes)} servers x " if len(sizes) > 1 else ""
+    parts = f"{per}{t.key.upper()} PLE table {t.gib:.1f} GiB + the rest of the server ~{fn_ram_need_gib(PLE_DEFAULT, 0, sizes) / len(sizes) - PLE_TABLES[PLE_DEFAULT].gib:.0f} GiB"
+    if tier_gib:
+        parts += f", KV host tier {tier_gib * sizes[0]} GiB per server ({tier_gib} GiB x {sizes[0]} ranks)"
+    return parts
+
+
+def max_kv_ram_cache_gib(ple: str | None, sizes: list[int], have: float | None) -> int | None:
+    """The largest --kv-ram-cache (GiB per server, a whole number of GiB per rank) that fits ``have`` beside the servers;
+    None when RAM is unknown."""
+    if have is None:
+        return None
+    per_rank = max(0, int((have - fn_ram_need_gib(ple, 0, sizes)) // max(1, sum(sizes))))
+    return per_rank * (sizes[0] if sizes else 4)
+
+
+def ram_problem(model: str, inv: pf.Inventory, cards: int, ple: str | None = None, tier_gib: int | None = None,
+                sizes: list[int] | None = None, budget: tuple[float | None, str] | None = None,
+                int6_why: str | None = "not checked") -> Problem | None:
+    """The host-RAM check of the chosen flags (nothing is picked here). Flash-Next: the servers' resident need for the
+    PLE table (FP8, or INT6 with --ple int6) and the KV tier (``tier_gib`` = GiB per rank, from --kv-ram-cache) against
+    ``ram_budget`` (FAIL when it cannot fit, with what would); other models: a warning below 32 GiB."""
+    if not fn_family(model):
+        ram = inv.host.ram_mib
+        tier = (tier_gib or 0) * sum(sizes or [cards])  # 27B / Ornith KV RAM cache, pinned, on an unmeasured floor
+        if ram is None:
+            return Problem("WARN", "ram", "host RAM unknown" + (f"; the KV RAM cache needs {tier} GiB of it" if tier else ""))
+        if tier and pf._gib(ram) < tier:
+            return Problem("FAIL", "ram", f"host RAM {pf._gib(ram):.0f} GiB is below the {tier} GiB the KV RAM cache pins",
+                           "a smaller --kv-ram-cache, or --kv-ram-cache 0 (off)")
+        if tier and pf._gib(ram) < RAM_OTHER_WARN_GIB + tier:
+            return Problem("WARN", "ram", f"host RAM {pf._gib(ram):.0f} GiB: {model} is unmeasured below {RAM_OTHER_WARN_GIB:.0f} GiB "
+                           f"plus the {tier} GiB KV RAM cache")
+        if pf._gib(ram) < RAM_OTHER_WARN_GIB:
+            return Problem("WARN", "ram", f"host RAM {pf._gib(ram):.0f} GiB: {model} is unmeasured below {RAM_OTHER_WARN_GIB:.0f} GiB")
+        return None
+    sizes = sizes or [cards]
+    ple, tier_gib = ple or PLE_DEFAULT, tier_gib or 0
+    have, what = budget or ram_budget(inv)
+    if have is None:
+        return Problem("WARN", "ram", f"host RAM unknown; Flash-Next needs ~{fn_ram_need_gib(ple, tier_gib, sizes):.0f} GiB resident here")
+    need = fn_ram_need_gib(ple, tier_gib, sizes)
+    if have < need:
+        fixes = []
+        if tier_gib:
+            top = max_kv_ram_cache_gib(ple, sizes, have)
+            fixes.append(f"a smaller KV host tier (--kv-ram-cache {top}g or less)" if top else "the KV host tier off (--kv-ram-cache 0)")
+        if ple == "fp8" and int6_why is None and have >= fn_ram_need_gib("int6", tier_gib, sizes):
+            fixes.append(f"the INT6 g32 PLE table (--ple int6, ~{fn_ram_need_gib('int6', tier_gib, sizes):.0f} GiB)")
+        fixes += ["add RAM (or raise the container's memory limit)", "choose 27b (--model 27b), which needs no PLE table"]
+        return Problem("FAIL", "ram", f"{what} {have:.0f} GiB is below the ~{need:.0f} GiB Flash-Next needs resident here "
+                       f"({fn_ram_parts(ple, tier_gib, sizes)}): the load would be OOM-killed", "; or ".join(fixes))
+    if ple == PLE_DEFAULT and not tier_gib:
         if have < pf.RAM_WARN_GIB:
-            return Problem("WARN", "ram", f"host RAM {have:.0f} GiB is below the qualified {pf.RAM_WARN_GIB:.0f} GiB "
-                           f"(floor ~{floor:.0f} GiB; the boot peak is unmeasured)")
-    elif have < RAM_OTHER_WARN_GIB:
-        return Problem("WARN", "ram", f"host RAM {have:.0f} GiB: {model} is unmeasured below {RAM_OTHER_WARN_GIB:.0f} GiB")
+            return Problem("WARN", "ram", f"{what} {have:.0f} GiB is below the qualified {pf.RAM_WARN_GIB:.0f} GiB "
+                           f"(floor ~{need:.0f} GiB; the boot peak is unmeasured)")
+        return None
+    margin = pf.RAM_WARN_GIB - pf.RAM_FLOOR_GIB  # the qualified allocation's headroom over the FP8 floor
+    if have < need + margin:
+        return Problem("WARN", "ram", f"{what} {have:.0f} GiB holds the ~{need:.0f} GiB estimate for {fn_ram_parts(ple, tier_gib, sizes)}, "
+                       f"but not the {margin:.0f} GiB headroom the qualified {pf.RAM_WARN_GIB:.0f} GiB gives the FP8 table: this "
+                       "combination has no capped-container boot record yet (the boot peak is unmeasured)")
     return None
 
 
@@ -536,24 +877,9 @@ def _choose(model: str, inv: pf.Inventory, tp: int | None = None) -> S.Choice | 
         return None
 
 
-THINKINGCAP_WHY = ("the fastest 27B-family checkpoint on this hardware (2026-10-20 bench cards, 1 stream, thinking on, 4K / 131K / "
-                   "262K: ThinkingCap TP4 253 / 255 / 248 tok/s vs 27B TP4 250 / 235 / 215); separate weight licence, see "
-                   "models/thinkingcap/licenses/")
 THINKINGCAP_LICENCE = ("ThinkingCap's weights are BottleCap AI's, under the PolyForm Small Business 1.0.0 licence plus their personal-use "
                        "permission (not Apache-2.0): models/thinkingcap/licenses/ and the Hugging Face card state the terms; "
                        "downloading them means accepting those terms.")
-
-
-def thinkingcap_tp4(inv: pf.Inventory) -> S.Choice | None:
-    """The ThinkingCap TP4 pick when its 4 x 24 GB 3090-class row fits this host with P2P (the 4 x 3090
-    27B-family default); None elsewhere (2 cards, no P2P, other classes)."""
-    tc = _choose("27b-thinkingcap", inv)
-    if tc is None:
-        return None
-    m = tc.prof["match"]
-    if m["cards"] == 4 and m["arch"] == ["sm_86"] and m["vram_gib"] == 24 and _profile_tp(tc.prof) == 4 and tc.rep.effective_p2p == "on":
-        return tc
-    return None
 
 
 def recommend(inv: pf.Inventory) -> tuple[str | None, str]:
@@ -575,9 +901,6 @@ def recommend(inv: pf.Inventory) -> tuple[str | None, str]:
             why = f"{cards} fit Flash-Next ({fn.prof['id']}) but {ram_s} is below its qualified {pf.RAM_WARN_GIB:.0f} GiB"
         else:
             why = f"{cards} hold no Flash-Next layout (it needs 4 x 24 GB or 2 x 48 GB)"
-        tc = thinkingcap_tp4(inv)
-        if tc is not None:  # the 4 x 3090 27B-family default: ThinkingCap TP4 with P2P
-            return "27b-thinkingcap", f"{why}; ThinkingCap {tc.prof['id']} [{tc.rep.status}] fits, {ram_s}: {THINKINGCAP_WHY}"
         return "27b", f"{why}; 27B {b27.prof['id']} [{b27.rep.status}] fits, {ram_s}"
     if fn is not None:
         return "flash-next", (f"{cards} fit {fn.prof['id']} but {ram_s} is below the ~{pf.ram_floor_gib(len(fn.cards)):.0f} GiB "
@@ -653,6 +976,13 @@ def layouts(model: str, inv: pf.Inventory, repo: Path = REPO) -> list[Layout]:
 
 def serve_plan(a: Answers, inv: pf.Inventory, repo: Path = REPO) -> list[S.Plan]:
     env = serve_env(a)
+    if fn_family(a.model):  # the table the served folder will carry (an INT6 overlay may not be built yet)
+        inv = replace(inv, ple_table_gib=PLE_TABLES[a.ple_table or PLE_DEFAULT].gib)
+    # the layout is resolved with the KV host tier off: ram_problem counts the tier (and the table) itself and names the
+    # fixes, which serve's tier-aware RAM gates would otherwise pre-empt with a bare layout refusal
+    env.pop(KV_TIER_ENV, None)
+    for k in L.FN_KV_HOST_TIER_NEEDS_ON:  # refused with the tier off; serve checks them against the real size
+        env.pop(k, None)
     if a.instances and a.instances > 1:
         return S.plan_instances(a.model, str(a.checkpoint_dir()), None, inv, [], a.instances, repo, env, tp=a.tp)
     return [S.resolve(a.model, str(a.checkpoint_dir()), None, inv, [], repo, env, tp=a.tp)]
@@ -665,6 +995,13 @@ def serve_env(a: Answers) -> dict[str, str]:
         env["PORT"] = str(a.port)
     if a.api_key:
         env["VLLM_API_KEY"] = a.api_key
+    if tier_family(a.model):  # the tier comes from the answers (serve's --kv-ram-cache), never from a stale export
+        env.pop(KV_TIER_ENV, None)
+        env.pop(L.SWARM_ENV, None)  # so does the swarm cap (serve's --swarm)
+    if fn_family(a.model):
+        env["SPEC"] = a.spec or SPEC_DEFAULT  # the resolved choice wins over an ambient SPEC (serve_plan resolves from this env)
+        if a.spec == "dflash2":
+            env["DFLASH2_MODEL"] = str(drafter_dir())  # the copy setup downloaded and verified
     env["MERLIN_HOME"] = str(REPO)
     return env
 
@@ -675,12 +1012,23 @@ def serve_argv(a: Answers, repo: Path = REPO) -> list[str]:
         argv += ["--tp", str(a.tp)]
     if a.instances and a.instances > 1:
         argv += ["--instances", str(a.instances)]
+    if fn_family(a.model) and is_variant(a.ple_table):
+        argv += ["--ple", a.ple_table]
+    if tier_family(a.model) and a.kv_ram_cache_gib:
+        argv += ["--kv-ram-cache", f"{a.kv_ram_cache_gib}g"]
+    if swarm_family(a.model) and a.swarm:
+        argv += ["--swarm"]
+    if fn_family(a.model):
+        argv += ["--spec", a.spec or SPEC_DEFAULT]
     return argv
 
 
-def serve_line(a: Answers, repo: Path = REPO) -> str:
-    pre = f"HOST={a.host} PORT={a.port}" + (" VLLM_API_KEY=\"$(cat .merlin/api-key)\"" if a.api_key else "")
-    return pre + " " + " ".join(shlex.quote(x) for x in serve_argv(a, repo))
+def serve_words(a: Answers, repo: Path = REPO) -> list[str]:
+    """The serve command's shell words (environment first; the key is read from its file, never printed)."""
+    pre = [f"HOST={a.host}", f"PORT={a.port}"] + (["VLLM_API_KEY=\"$(cat .merlin/api-key)\""] if a.api_key else [])
+    if fn_family(a.model) and a.spec == "dflash2":
+        pre.append(f"DFLASH2_MODEL={shlex.quote(str(drafter_dir()))}")
+    return pre + [shlex.quote(x) for x in serve_argv(a, repo)]
 
 
 def default_port(model: str) -> int:
@@ -721,11 +1069,17 @@ def venv_current(repo: Path, want: dict[str, Any], saved: dict[str, Any] | None)
     return (venv / "bin" / "vllm").exists() and (venv / "bin" / "python").exists()
 
 
-def marker_data(ckpt_dir: Path, model: str, sums: dict[str, str], list_sha: str) -> dict[str, Any]:
+def marker_data(ckpt_dir: Path, model: str, sums: dict[str, str], list_sha: str,
+                stats: dict[str, tuple[int, int]] | None = None) -> dict[str, Any]:
+    """The verified marker. ``stats`` (name -> (size, mtime_ns)) must be taken before the files were hashed, so a file
+    replaced during verification is never certified with its new size and mtime; without it the files are stat'ed now."""
     files = {}
     for name in sorted(sums):
-        st = (ckpt_dir / name).stat()
-        files[name] = [st.st_size, st.st_mtime_ns]
+        if stats is not None and name in stats:
+            files[name] = list(stats[name])
+        else:
+            st = (ckpt_dir / name).stat()
+            files[name] = [st.st_size, st.st_mtime_ns]
     return {"model": model, "list_sha256": list_sha, "files": files, "verified_at": int(time.time())}
 
 
@@ -734,9 +1088,13 @@ def marker_ok(ckpt_dir: Path, model: str, sums: dict[str, str], list_sha: str) -
     mtime. A trade-off for speed (a 115 GiB re-hash takes minutes): same-size, same-mtime corruption passes until
     ``--rehash``; a changed list, file set, size or mtime re-hashes."""
     m = read_json(ckpt_dir / VERIFIED_MARKER)
-    if not m or m.get("model") != model or m.get("list_sha256") != list_sha or set(m.get("files", {})) != set(sums):
+    files = m.get("files") if m else None
+    if not m or m.get("model") != model or m.get("list_sha256") != list_sha or not isinstance(files, dict) or set(files) != set(sums):
         return False
-    for name, (size, mtime) in m["files"].items():
+    for name, rec in files.items():
+        if not (isinstance(rec, (list, tuple)) and len(rec) == 2):
+            return False  # a malformed record re-hashes
+        size, mtime = rec
         try:
             st = (ckpt_dir / name).stat()
         except OSError:
@@ -749,27 +1107,47 @@ def marker_ok(ckpt_dir: Path, model: str, sums: dict[str, str], list_sha: str) -
 def verify_checkpoint(ckpt_dir: Path, list_path: Path, say: Callable[[str], None] = print, model: str = "",
                       rehash: bool = False) -> tuple[bool, list[str]]:
     """Hash every listed file (skipped when the marker is current, unless ``rehash``). (ok, missing-or-wrong files)."""
+    problem = checksum_list_problem(list_path)
+    if problem:
+        return False, [problem]
     sums, _ = parse_checksums(list_path)
     list_sha = sha256_file(list_path)
     if not rehash and marker_ok(ckpt_dir, model, sums, list_sha):
         say(f"checkpoint {ckpt_dir}: verified earlier ({len(sums)} files unchanged; --rehash hashes them again)")
         return True, []
     bad = []
+    stats: dict[str, tuple[int, int]] = {}
     for i, (name, want) in enumerate(sorted(sums.items()), 1):
         p = ckpt_dir / name
         if not p.is_file():
             bad.append(f"{name}: missing")
             continue
-        say(f"  hashing {i}/{len(sums)} {name} ({gib(p.stat().st_size)})")
+        before = p.stat()  # stat before hashing; the marker records this, and the file is re-checked afterwards
+        say(f"  hashing {i}/{len(sums)} {name} ({gib(before.st_size)})")
         if sha256_file(p) != want:
             bad.append(f"{name}: sha256 differs")
+            continue
+        try:
+            after = p.stat()
+        except OSError:
+            bad.append(f"{name}: changed while it was being verified")
+            continue
+        if (after.st_size, after.st_mtime_ns) != (before.st_size, before.st_mtime_ns):
+            bad.append(f"{name}: changed while it was being verified")
+            continue
+        stats[name] = (before.st_size, before.st_mtime_ns)
     if bad:
         try:
             (ckpt_dir / VERIFIED_MARKER).unlink()
         except OSError:
             pass
         return False, bad
-    write_json(ckpt_dir / VERIFIED_MARKER, marker_data(ckpt_dir, model, sums, list_sha))
+    try:
+        write_json(ckpt_dir / VERIFIED_MARKER, marker_data(ckpt_dir, model, sums, list_sha, stats))
+    except OSError as e:
+        if e.errno not in (errno.EROFS, errno.EACCES):
+            raise
+        say(f"checkpoint {ckpt_dir}: verified, but {VERIFIED_MARKER} cannot be written there ({e.strerror}); later checks will rehash")
     return True, []
 
 
@@ -779,23 +1157,122 @@ def checkpoint_missing(ckpt_dir: Path, list_path: Path) -> list[str]:
 
 
 def folder_conflict(ckpt_dir: Path, model: str, repo: Path = REPO) -> str | None:
-    """Why ``ckpt_dir`` must not receive ``model``: it holds another checkpoint (its config.json or verified marker
-    belongs to another model, or to no known revision). None when the folder is empty, missing, or this model's."""
+    """Why ``ckpt_dir`` must not receive the FP8 checkpoint of ``model``: it holds another checkpoint (its config.json
+    or verified marker belongs to another model, or to no known revision) or an INT6 overlay. None when the folder is
+    empty, missing, or this checkpoint's."""
     if not ckpt_dir.is_dir():
         return None
+    if (ckpt_dir / PP.OVERLAY_MARKER).is_file():
+        return "holds an INT6 overlay (links over another folder), not a checkpoint"
+    key = model
     m = read_json(ckpt_dir / VERIFIED_MARKER)
-    if m and m.get("model") and m["model"] != model:
+    if m and m.get("model") and m["model"] != key:
         return f"holds a verified {m['model']} checkpoint"
     cfg = ckpt_dir / "config.json"
     if cfg.is_file():
         digest = sha256_file(cfg)
-        owners = [o for o in MODELS if parse_checksums(checksum_list(o, repo))[0].get("config.json") == digest]
-        if model in owners:
+        lists = [(o, checksum_list(o, repo)) for o in MODELS]
+        owners = [o for o, lst in lists if lst.is_file() and parse_checksums(lst)[0].get("config.json") == digest]
+        if key in owners:
             return None
         if owners:
             return f"holds a {' / '.join(owners)} checkpoint (its config.json)"
         return "holds a checkpoint that is not this release's revision of any Merlin model (its config.json matches none)"
     return None
+
+
+# --------------------------------------------------------------------------------------------
+# The INT6 PLE pack and the overlay
+# --------------------------------------------------------------------------------------------
+def overlay_sources(model: str, base: Path, pack: Path, repo: Path = REPO) -> PP.Sources:
+    lst, plst = checksum_list(model, repo), pack_list(repo)
+    return PP.Sources(model=model, base=base, pack=pack, base_files=sorted(parse_checksums(lst)[0]),
+                      base_list_sha256=sha256_file(lst), pack_list_sha256=sha256_file(plst),
+                      pack_files=sorted(parse_checksums(plst)[0]))
+
+
+def pack_marker_ok(pack: Path, repo: Path = REPO) -> bool:
+    plst = pack_list(repo)
+    return plst.is_file() and marker_ok(pack, PP.PACK_MARKER_MODEL, parse_checksums(plst)[0], sha256_file(plst))
+
+
+def overlay_reason(model: str, out: Path, repo: Path = REPO) -> str | None:
+    """Why the INT6 overlay ``out`` cannot be served as ``model`` (None when it can): not an overlay, built for another
+    model, its base or pack not verified (current marker), or stale against them (ple_pack.overlay_problems)."""
+    m = PP.read_overlay_marker(out)
+    if m is None:
+        return f"{out} is not an INT6 overlay (no {PP.OVERLAY_MARKER}); setup builds one: ./setup.sh --model {model} --ple int6"
+    if m.get("model") != model:
+        return f"{out} is the INT6 overlay of {m.get('model')}, not {model}"
+    base, pack = Path(str(m.get("base"))), Path(str(m.get("pack")))
+    fix = f"merlin pull {model} --models-dir {shlex.quote(str(base))} --ple int6 rebuilds it"
+    lst = checksum_list(model, repo)
+    if not marker_ok(base, model, parse_checksums(lst)[0], sha256_file(lst)):
+        return f"its FP8 base {base} is not verified as {model} (no current marker); {fix}"
+    if not pack_marker_ok(pack, repo):
+        return f"its INT6 pack {pack} is not verified (no current marker); {fix}"
+    probs = PP.overlay_problems(out, overlay_sources(model, base, pack, repo))
+    if probs:
+        return f"{out} is stale ({'; '.join(probs[:3])}); {fix}"
+    return None
+
+
+def pack_item(a: Answers, repo: Path, table: dict[str, Any], fetch: Callable[[str], bytes] | None,
+              online: bool) -> tuple[Download, bool, int | None]:
+    """The pack's plan line: (item, needs download, remaining bytes or None when unknown)."""
+    d, e = a.pack_dir(), pack_entry(table) or {}
+    sums, rev = parse_checksums(pack_list(repo))
+    missing = [n for n in sums if not (d / n).is_file()]
+    what = "INT6 PLE pack (Flash-Next family)"
+    if not missing:
+        return Download(what, str(d), 0, "models", "present; verified before the overlay is built"), False, 0
+    if e.get("pending_publication") or not e.get("repo"):
+        return (Download(what, f"local copy only -> {d}", None, "models", pack_not_published_msg(d)), True, None)
+    rev = rev or e.get("revision")
+    present = sum((d / n).stat().st_size for n in sums if (d / n).is_file())
+    remaining = max(0, int(e.get("bytes") or 0) - present) if e.get("bytes") else None
+    note = f"{e.get('files', len(sums))} files, {gib(e.get('bytes'))} in all, once for every family member using {d}"
+    return Download(what, f"hf download {e['repo']} --revision {rev} -> {d}", remaining, "models", note), True, remaining
+
+
+def pack_not_published_msg(d: Path) -> str:
+    return (f"the INT6 PLE pack is not on Hugging Face yet; put a local copy (the files {PP.PACK_LIST} lists) in {d} "
+            f"({PP.PACK_DIR_ENV}=<folder> names another place)")
+
+
+def pull_pack(repo: Path, a: Answers, env: dict[str, str], table: dict[str, Any], rehash: bool = False,
+              runner: Callable[..., int] | None = None) -> None:
+    """--ple int6: the pack into its shared folder (once), verified against models/flash-next/ple-int6-pack.sha256."""
+    runner = runner or sh
+    d, e, lst = a.pack_dir(), pack_entry(table) or {}, pack_list(repo)
+    if checkpoint_missing(d, lst):
+        if e.get("pending_publication") or not e.get("repo"):
+            raise SetupError(pack_not_published_msg(d))
+        _, rev = parse_checksums(lst)
+        rev = rev or e.get("revision")
+        if not rev:
+            raise SetupError("the INT6 PLE pack has no pinned revision (record it in release/download-sizes.json); nothing downloaded")
+        hf = hf_tool(repo, env, runner)
+        d.mkdir(parents=True, exist_ok=True)
+        rc = runner([str(hf), "download", e["repo"], "--revision", rev, "--local-dir", str(d)], env={**env, "HF_HUB_DISABLE_TELEMETRY": "1"})
+        if rc != 0:
+            raise SetupError(f"hf download of the INT6 PLE pack failed (rc {rc}); run again to resume")
+    ok, bad = verify_checkpoint(d, lst, model=PP.PACK_MARKER_MODEL, rehash=rehash)
+    if not ok:
+        raise SetupError(f"INT6 PLE pack verification failed in {d}:\n  " + "\n  ".join(bad)
+                         + "\n  delete the listed files and run again")
+    print(f"setup: INT6 PLE pack verified in {d}", flush=True)
+
+
+def build_int6_overlay(repo: Path, a: Answers) -> Path:
+    """The overlay ``<base>-int6`` over the verified base and pack (built, rebuilt when stale, or kept when current)."""
+    out = a.checkpoint_dir()
+    try:
+        how = PP.build_overlay(out, overlay_sources(a.model, a.base_dir(), a.pack_dir(), repo))
+    except PP.PackError as e:
+        raise SetupError(f"--ple int6: {e}; the FP8 checkpoint is unchanged") from None
+    print(f"setup: INT6 overlay {how}: {out} (FP8 {a.base_dir()} + pack {a.pack_dir()})", flush=True)
+    return out
 
 
 # --------------------------------------------------------------------------------------------
@@ -869,15 +1346,16 @@ def hf_info(repo_id: str, revision: str | None, fetch: Callable[[str], bytes] | 
 def checkpoint_item(model: str, ckpt_dir: Path, repo: Path, table: dict[str, Any], fetch: Callable[[str], bytes] | None,
                     online: bool) -> tuple[Download, bool, str | None, int | None]:
     """The checkpoint's plan line: (item, needs download, pinned revision, remaining bytes or None when unknown)."""
-    ck = table["checkpoints"][model]
+    what = f"checkpoint {model}"
     list_path = checksum_list(model, repo)
+    ck = ck_entry(model, table)
     sums, _ = parse_checksums(list_path)
     missing = [n for n in sums if not (ckpt_dir / n).is_file()] if ckpt_dir.is_dir() else list(sums)
     rev = pinned_revision(model, repo, table)
     if not missing:
-        return Download(f"checkpoint {model}", str(ckpt_dir), 0, "models", "present; verified before serving"), False, rev, 0
+        return Download(what, str(ckpt_dir), 0, "models", "present; verified before serving"), False, rev, 0
     if pending_publication(model, repo, table):
-        return (Download(f"checkpoint {model}", f"local copy only -> {ckpt_dir}", None, "models", not_published_msg(model)),
+        return (Download(what, f"local copy only -> {ckpt_dir}", None, "models", not_published_msg(model)),
                 True, None, None)
     info = hf_info(ck["repo"], rev, fetch) if online else None
     if rev is None and info is not None and info.sha:
@@ -898,7 +1376,7 @@ def checkpoint_item(model: str, ckpt_dir: Path, repo: Path, table: dict[str, Any
     if len(missing) < len(sums):
         note += f"; {len(missing)} of {len(sums)} listed files still missing in {ckpt_dir} (the download resumes)"
     cmd = f"hf download {ck['repo']}" + (f" --revision {rev}" if rev else " (no pinned revision yet)") + f" -> {ckpt_dir}"
-    return Download(f"checkpoint {model}", cmd, remaining, "models", note), True, rev, remaining
+    return Download(what, cmd, remaining, "models", note), True, rev, remaining
 
 
 def download_plan(a: Answers, repo: Path, state: dict[str, Any] | None, commit: str | None,
@@ -930,14 +1408,83 @@ def download_plan(a: Answers, repo: Path, state: dict[str, Any] | None, commit: 
                                    pk["bytes"], "repo", f"about {gib(pk['bytes'] * factor)} installed"))
         plan.disk.append(DiskNeed(uv_cache_dir(), pk["bytes"], "uv's package cache (up to; less when it already holds them)"))
         plan.disk.append(DiskNeed(venv, pk["bytes"] * factor, "the new venv"))
-        if venv.exists():
-            plan.disk.append(DiskNeed(venv, pk["bytes"] * factor, "the previous venv, kept until the new one verifies"))
-    item, need, rev, remaining = checkpoint_item(a.model, a.checkpoint_dir(), repo, table, fetch, online)
+        # the previous venv is moved aside into .merlin (a rename on the same filesystem: it already occupies its space),
+        # so it adds a need only when .merlin is on another device and the move copies it there
+        if venv.exists() and device_of(repo / ".merlin") != device_of(venv):
+            plan.disk.append(DiskNeed(repo / ".merlin", pk["bytes"] * factor, "the previous venv, kept until the new one verifies"))
+    item, need, rev, remaining = checkpoint_item(a.model, a.base_dir(), repo, table, fetch, online)
     plan.items.append(item)
     plan.need_checkpoint, plan.revision = need, rev
     if need and remaining:
-        plan.disk.append(DiskNeed(a.checkpoint_dir(), remaining, f"the rest of the {a.model} checkpoint"))
+        plan.disk.append(DiskNeed(a.base_dir(), remaining, f"the rest of the {a.model} checkpoint"))
+    if fn_family(a.model) and is_variant(a.ple_table) and not int6_reason(a.model, repo, table):
+        item, need, remaining = pack_item(a, repo, table, fetch, online)
+        plan.items.append(item)
+        if need and remaining:
+            plan.disk.append(DiskNeed(a.pack_dir(), remaining, "the INT6 PLE pack"))
+        plan.items.append(Download("INT6 overlay", f"links -> {a.checkpoint_dir()}", 0, "models",
+                                   "links to the FP8 checkpoint and the pack + a generated config.json and index; the FP8 files are not changed"))
+    if fn_family(a.model) and a.spec == "dflash2":
+        d, ck = drafter_dir(), dflash2_entry(table)
+        if not dflash2_present(d, repo):
+            plan.items.append(Download("drafter DFlash2", f"hf download {ck['repo']} --revision {ck['revision']} -> {d}", ck["bytes"],
+                                       "models", f"{ck['files']} files; config.json and model.safetensors checked ({DFLASH2_LIST})"))
+            plan.disk.append(DiskNeed(d, ck["bytes"], "the DFlash2 drafter"))
+        else:
+            plan.items.append(Download("drafter DFlash2", str(d), 0, "models", "present; verified before serving"))
     return plan
+
+
+DFLASH2_LIST = "models/flash-next/dflash2.sha256"
+
+
+def dflash2_entry(table: dict[str, Any]) -> dict[str, Any]:
+    """release/download-sizes.json's pinned DFlash2 drafter (repo, revision, files, bytes)."""
+    ck = (table.get("drafters") or {}).get("dflash2")
+    if not ck or not ck.get("revision"):
+        raise SetupError("release/download-sizes.json has no pinned drafters.dflash2 entry; --spec dflash2 cannot download it")
+    return ck
+
+
+def drafter_dir() -> Path:
+    return S.dflash2_dir()
+
+
+def dflash2_present(d: Path, repo: Path = REPO) -> bool:
+    return d.is_dir() and not checkpoint_missing(d, repo / DFLASH2_LIST)
+
+
+def pull_drafter(repo: Path, a: Answers, env: dict[str, str], table: dict[str, Any], rehash: bool = False,
+                 runner: Callable[..., int] | None = None) -> None:
+    """--spec dflash2: the drafter at its pinned revision, verified against models/flash-next/dflash2.sha256."""
+    if not (fn_family(a.model) and a.spec == "dflash2"):
+        return
+    runner = runner or sh
+    d, ck, lst = drafter_dir(), dflash2_entry(table), repo / DFLASH2_LIST
+    if checkpoint_missing(d, lst):
+        hf = hf_tool(repo, env, runner)
+        d.mkdir(parents=True, exist_ok=True)
+        rc = runner([str(hf), "download", ck["repo"], "--revision", ck["revision"], "--local-dir", str(d)],
+                    env={**env, "HF_HUB_DISABLE_TELEMETRY": "1"})
+        if rc != 0:
+            raise SetupError(f"hf download of the DFlash2 drafter failed (rc {rc}); run again to resume")
+    ok, bad = verify_checkpoint(d, lst, model="dflash2-drafter", rehash=rehash)
+    if not ok:
+        raise SetupError(f"DFlash2 drafter verification failed in {d}:\n  " + "\n  ".join(bad)
+                         + "\n  delete the listed files and run again (hf download fetches them anew)")
+    print(f"setup: DFlash2 drafter verified in {d}", flush=True)
+
+
+def dflash2_qualified(a: Answers, inv: pf.Inventory, repo: Path = REPO) -> bool:
+    """A Flash-Next-family layout whose every server row has a qualified DFlash2 geometry (serve.dflash2)."""
+    if not fn_family(a.model):
+        return False
+    try:
+        plans = serve_plan(a, inv, repo)
+    except (S.CliError, R.ProfileError):
+        return False
+    rows = set(L.dflash2_rows(R.load_registry("flash-next")))
+    return bool(plans) and all(p.profile_id in rows for p in plans)
 
 
 def disk_problems(plan: DownloadPlan, free: Callable[[Path], int | None] | None = None,
@@ -959,16 +1506,46 @@ def disk_problems(plan: DownloadPlan, free: Callable[[Path], int | None] | None 
     return out
 
 
-def render_plan(plan: DownloadPlan) -> str:
+def short_source(src: str) -> str:
+    """A plan line's source as a reader needs it: the release or the repository and revision, not the full URL or
+    command (``--dry-run`` and the command a run prints carry those)."""
+    m = re.fullmatch(r"https://github\.com/([^/]+/[^/]+)/releases/download/([^/]+)/[^/]+", src)
+    if m:
+        return f"github.com/{m[1]} release {m[2]}"
+    m = re.fullmatch(r"hf download (\S+) --revision ([0-9a-f]{7})[0-9a-f]* -> (.+)", src)
+    if m:
+        return f"Hugging Face {m[1]} @ {m[2]} -> {m[3]}"
+    m = re.fullmatch(r"hf download (\S+) (\(no pinned revision yet\)) -> (.+)", src)
+    if m:
+        return f"Hugging Face {m[1]} {m[2]} -> {m[3]}"
+    return src
+
+
+def render_plan(plan: DownloadPlan, detail: bool = False, color: bool = False, width: int = WIDTH) -> str:
+    """The download table: item and size, the source and note on dimmer lines below, a total under a rule.
+    ``detail`` (--dry-run) adds the full URL / command under a shortened source."""
     if not plan.pending():
         return "Nothing to download: the engine and the checkpoint are in place.\n"
-    lines = ["Downloads:"]
-    for d in plan.items:
-        size = gib(d.bytes) if d.bytes else ("-" if d.bytes == 0 else "size unknown")
-        lines.append(f"  {d.what:<58} {size:>12}")
-        lines.append(f"      {d.source}" + (f"  ({d.note})" if d.note else ""))
+
+    def sgr(t: str, code: str) -> str:
+        return f"\033[{code}m{t}\033[0m" if color and t else t
+
+    sizes = [gib(d.bytes) if d.bytes else ("-" if d.bytes == 0 else "size unknown") for d in plan.items]
     total = gib(plan.known_total()) + (f" + {plan.unknown()} of unknown size" if plan.unknown() else "")
-    lines.append(f"  {'total':<58} {total:>12}")
+    iw = max(len(x) for x in [d.what for d in plan.items] + ["total"])
+    sw = max(len(x) for x in sizes + [total])
+    lines = [sgr("Downloads", "1")]
+    for d, size in zip(plan.items, sizes):
+        lines.append(f"  {d.what:<{iw}}  {size:>{sw}}")
+        src = short_source(d.source)
+        info = [src] + ([d.note] if d.note else [])
+        joined = "; ".join(info)
+        for part in [joined] if len(joined) + 4 <= width else info:
+            lines += [sgr(x, "2") for x in wrap(part, width, "    ")]
+        if detail and src != d.source:  # whole, on one line: a URL or command is copied, not read
+            lines.append(sgr(f"    {d.source}", "2"))
+    lines.append("  " + "-" * (iw + 2 + sw))
+    lines.append(f"  {'total':<{iw}}  {total:>{sw}}")
     return "\n".join(lines) + "\n"
 
 
@@ -1003,11 +1580,72 @@ def fetch_wheel(urls: list[str], dest: Path, sha: str, runner: Callable[[list[st
     return dest
 
 
+_LOCKS_HELD: set[str] = set()  # lock files this process holds (install_lock is re-entrant within one process)
+
+
+def _try_lock(fd: int) -> bool:
+    """An exclusive, non-blocking lock on ``fd``; False when another open file holds it. ``flock`` on Linux (the
+    kernel drops it when the holder exits, however it exits); a byte lock elsewhere, so the contract is the same."""
+    try:
+        import fcntl
+    except ImportError:  # not Linux: only the CPU tests get here
+        import msvcrt
+        try:
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+        except OSError:
+            return False
+        return True
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return False
+    return True
+
+
+@contextlib.contextmanager
+def install_lock(merlin_dir: Path):
+    """Hold ``.merlin/setup.lock`` exclusively, or fail fast: two overlapping installs would move each other's venv
+    aside and delete each other's rollback copy. Re-entrant within one process."""
+    path = merlin_dir / SETUP_LOCK
+    key = str(path.resolve())
+    if key in _LOCKS_HELD:
+        yield
+        return
+    merlin_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        if not _try_lock(fd):
+            holder = ""
+            try:
+                with open(path, encoding="utf-8") as f:
+                    pid = f.read().strip()
+                holder = f", held by pid {pid}" if pid.isdigit() else ""
+            except OSError:
+                pass
+            raise SetupError(f"another ./setup.sh is installing the engine in this checkout ({path} is locked{holder}); "
+                             "wait for it to finish, then run ./setup.sh again", 1)
+        os.ftruncate(fd, 0)
+        os.write(fd, f"{os.getpid()}\n".encode())
+        _LOCKS_HELD.add(key)
+        try:
+            yield
+        finally:
+            _LOCKS_HELD.discard(key)
+    finally:
+        os.close(fd)  # closing the descriptor releases the lock
+
+
 def install_engine(repo: Path, a: Answers, env: dict[str, str], runner: Callable[..., int] = sh) -> None:
-    """install-env.sh into ``venv`` then ``--verify``. An existing venv is moved aside first (the editable install
-    binds the venv to its path, so the new one must take that path), and comes back when the install or the verify
-    fails: a failed update never leaves the host without its working engine. Success removes the old one and any
-    ``venv-old-*`` left by an interrupted earlier run."""
+    """install-env.sh into ``venv`` then ``--verify``, holding ``.merlin/setup.lock`` throughout. An existing venv is
+    moved aside first (the editable install binds the venv to its path, so the new one must take that path), and
+    comes back when the install or the verify fails: a failed update never leaves the host without its working
+    engine. Success removes only this run's old venv; a ``venv-old-*`` an interrupted earlier run left is named,
+    not deleted (it may be someone's only rollback copy)."""
+    with install_lock(repo / ".merlin"):
+        _install_engine_locked(repo, a, env, runner)
+
+
+def _install_engine_locked(repo: Path, a: Answers, env: dict[str, str], runner: Callable[..., int]) -> None:
     sha, wheel = wheel_record(repo)
     venv = repo / "venv"
     old_dir = repo / ".merlin"
@@ -1024,7 +1662,7 @@ def install_engine(repo: Path, a: Answers, env: dict[str, str], runner: Callable
         if not a.from_source:
             local = os.environ.get("MERLIN_WHEEL")
             if local and Path(local).is_file():
-                path = Path(local)
+                path = Path(local).resolve()  # install-env.sh runs from another cwd, so the path must be absolute
             else:
                 path = fetch_wheel(wheel_urls(repo), repo / ".merlin" / "downloads" / wheel, sha)
             env["MERLIN_WHEEL"] = str(path)
@@ -1046,8 +1684,12 @@ def install_engine(repo: Path, a: Answers, env: dict[str, str], runner: Callable
             raise SetupError(str(e) + msg, e.code) from None
         print(f"setup: install interrupted{msg}", file=sys.stderr, flush=True)
         raise
-    for stale in old_dir.glob("venv-old-*"):
-        shutil.rmtree(stale, ignore_errors=True)
+    if old is not None:
+        shutil.rmtree(old, ignore_errors=True)
+    left = sorted(p.name for p in old_dir.glob("venv-old-*"))
+    if left:
+        print(f"setup: note: {', '.join(left)} in {old_dir} left by an earlier interrupted install; remove them once "
+              "no rollback is needed", flush=True)
     print(f"setup: engine installed and verified in {time.time() - t0:.0f} s -> {venv}", flush=True)
 
 
@@ -1080,14 +1722,20 @@ def hf_tool(repo: Path, env: dict[str, str], runner: Callable[..., int] = sh) ->
 
 def pull_checkpoint(repo: Path, a: Answers, env: dict[str, str], revision: str | None, rehash: bool = False,
                     runner: Callable[..., int] = sh) -> None:
-    ckpt_dir = a.checkpoint_dir()
+    """The FP8 checkpoint (downloaded or reused, verified); with --ple int6 then the pack and the overlay over both."""
+    ckpt_dir = a.base_dir()
+    int6 = fn_family(a.model) and is_variant(a.ple_table)
+    if int6 and int6_reason(a.model, repo):
+        raise SetupError(f"{a.model} with the {a.ple_table} PLE table: {int6_reason(a.model, repo)}; nothing downloaded")
+    if int6 and PP.overlay_conflict(a.checkpoint_dir()):
+        raise SetupError(f"{PP.overlay_conflict(a.checkpoint_dir())}; nothing downloaded. Choose another folder (--models-dir) or remove it.")
     list_path = checksum_list(a.model, repo)
     conflict = folder_conflict(ckpt_dir, a.model, repo)
     if conflict:
         raise SetupError(f"{ckpt_dir} {conflict}; nothing downloaded there. Choose another folder (--models-dir) or remove it.")
     sums, _ = parse_checksums(list_path)
     if checkpoint_missing(ckpt_dir, list_path):
-        if pending_publication(a.model, repo):
+        if pending_publication(a.model, repo, None):
             raise SetupError(not_published_msg(a.model))
         if not revision:
             raise SetupError(f"{a.model} has no pinned revision (record it in release/download-sizes.json when its Hugging Face "
@@ -1103,6 +1751,9 @@ def pull_checkpoint(repo: Path, a: Answers, env: dict[str, str], revision: str |
         raise SetupError(f"checkpoint verification failed in {ckpt_dir}:\n  " + "\n  ".join(bad)
                          + "\n  delete the listed files and run again (hf download fetches them anew)")
     print(f"setup: checkpoint verified: {len(sums)} files in {ckpt_dir}", flush=True)
+    if int6:
+        pull_pack(repo, a, env, sizes_table(repo), rehash, runner)
+        build_int6_overlay(repo, a)
 
 
 # --------------------------------------------------------------------------------------------
@@ -1113,24 +1764,72 @@ class Asker:
         self.yes = yes
         self.inp = inp or sys.stdin
         self.out = out or sys.stdout
+        try:
+            tty = bool(self.out.isatty())
+        except (AttributeError, ValueError):
+            tty = False
+        # bold / dim only on a terminal, never in a pipe or a log; NO_COLOR (any value) and TERM=dumb turn it off
+        self.color = tty and "NO_COLOR" not in os.environ and os.environ.get("TERM") != "dumb"
+        # tables and commands fit WIDTH (or a narrower terminal); messages wrap only on a terminal: in a pipe or a log
+        # each stays one line (grep finds it whole)
+        self.width = max(60, min(WIDTH, shutil.get_terminal_size((WIDTH, 24)).columns)) if tty else WIDTH
+        self.prose = self.width if tty else 0
+        self._blank = True  # the last line written was blank (or nothing is written yet): gap() adds none
 
     def say(self, text: str = "") -> None:
         self.out.write(text + "\n")
         self.out.flush()
+        self._blank = text == "" or text.endswith("\n")
+
+    def style(self, text: str, code: str = "1") -> str:
+        """Bold (1) or dim (2) on a terminal; the text unchanged otherwise."""
+        return f"\033[{code}m{text}\033[0m" if self.color and text else text
+
+    def gap(self) -> None:
+        """One blank line, unless the last line already is one."""
+        if not self._blank:
+            self.say()
+
+    def section(self, title: str, hint: str = "") -> None:
+        self.gap()
+        self.say(self.style(title) + (f"  {hint}" if hint else ""))
+
+    def para(self, text: str, first: str = "", rest: str | None = None, code: str = "", head: bool = False) -> None:
+        """``text`` wrapped to the width with a hanging indent; ``code`` styles every line, ``head`` bolds the
+        prefix word of the first line."""
+        lines = wrap(text, self.prose, first, rest)
+        word = first.strip()
+        for i, line in enumerate(lines):
+            if head and i == 0 and word and line.startswith(word):
+                self.say(self.style(word) + line[len(word):])
+            else:
+                self.say(self.style(line, code) if code else line)
+
+    def row(self, key: str, value: str, width: int = 12, code: str = "") -> None:
+        """A key / value row (``key`` padded to ``width``), the value wrapped under itself."""
+        self.para(value, f"{key:<{width}} ", None, code)
+
+    def note(self, level: str, text: str, fix: str = "") -> None:
+        """FAIL / WARN / NOTE: the level, the text wrapped under itself, the fix one step further in."""
+        self.para(text, f"{level} ", " " * (len(level) + 1), head=True)
+        if fix:
+            self.para(f"fix: {fix}", " " * (len(level) + 1), " " * (len(level) + 6))
 
     def ask(self, prompt: str, default: str, choices: list[str] | None = None) -> str:
         if self.yes:
             return default
         tty = getattr(self.inp, "isatty", lambda: False)()
+        self.gap()
         while True:
             self.out.write(f"{prompt} [{default}]: ")
             self.out.flush()
+            self._blank = False
             line = self.inp.readline()
             if not line:  # EOF: the default
                 self.out.write(default + "\n")
                 return default
             v = line.strip() or default
-            if choices and v.isdigit() and 1 <= int(v) <= len(choices):
+            if choices and v.isascii() and v.isdigit() and len(v) < 6 and 1 <= int(v) <= len(choices):
                 v = choices[int(v) - 1]
             if not tty:  # piped answers: show what was taken, as a terminal would
                 self.out.write(v + "\n")
@@ -1159,20 +1858,129 @@ def ask_questions(a: Answers, inv: pf.Inventory, ui: Asker, args: argparse.Names
         a = _ask_model(a, inv, ui, args, table, saved)
     if want("layout"):
         a = _ask_layout(a, inv, ui, args, repo)
+    a = normalize_fn(a)  # the PLE table and the KV tier are flags only (--ple, --kv-ram-cache): never asked
+    if want("drafter"):
+        a = _ask_spec(a, inv, ui, args, repo)
+    if want("swarm"):
+        a = _ask_swarm(a, inv, ui, args, repo)
     if want("folder") and args.models_dir is None:
-        a.models_dir = ui.ask("Models folder (an existing download is reused)", a.models_dir or f"~/models/{a.model}")
-    if want("folder"):
+        a.models_dir = ui.ask("Models folder (an existing download is reused)", a.models_dir or default_dir(a.model))
+    if want("folder") and not ui.yes:  # --yes: the folder is in the answers block below
         ui.say(f"  checkpoint -> {a.checkpoint_dir()}")
     if want("access"):
         a = _ask_access(a, ui, args, key_path)
     if want("port") and args.port is None:
         p = ui.ask("Port", str(a.port or default_port(a.model)))
-        if not p.isdigit() or not 1 <= int(p) <= 65535:
+        if not (p.isascii() and p.isdigit() and len(p) <= 5) or not 1 <= int(p) <= 65535:
             raise SetupError(f"port {p!r}: 1..65535", 2)
         a.port = int(p)
     if ui.yes:
-        ui.say(f"Answers: {a.model}, {layout_label(a)}, {a.checkpoint_dir()}, {a.host}:{a.port}" + (", API key" if a.api_key else ""))
+        answers_block(a, inv, ui, "Answers", repo=repo)
     return a
+
+
+def _ask_spec(a: Answers, inv: pf.Inventory, ui: Asker, args: argparse.Namespace, repo: Path) -> Answers:
+    """The one Drafter question: Flash-Next rows with a qualified DFlash2 geometry only, never under --yes or with
+    --spec; elsewhere MTP (the only drafter there)."""
+    if not fn_family(a.model) or args.spec is not None:
+        return a
+    qualified = dflash2_qualified(a, inv, repo)
+    if ui.yes or not qualified:
+        a.spec = "dflash2" if a.spec == "dflash2" and qualified else SPEC_DEFAULT  # a saved DFlash2 answer stays where it can run
+        return a
+    ui.section("Drafter", "(Enter = recommended)")
+    for i, k in enumerate(S.SPEC_CHOICES, 1):
+        first = f"  {i}) {k:<8} "
+        ui.para(DFLASH2_TITLES[k], first, " " * len(first))
+    a.spec = ui.ask("Drafter", a.spec or SPEC_DEFAULT, list(S.SPEC_CHOICES))
+    return a
+
+
+def swarm_row(a: Answers, inv: pf.Inventory, repo: Path = REPO) -> tuple[dict[str, Any], dict[str, Any]] | None:
+    """(profile, swarm cap block) when every server this layout starts is a row that has a qualified swarm cap, else None."""
+    if not swarm_family(a.model):
+        return None
+    try:
+        plans = serve_plan(a, inv, repo)
+    except (S.CliError, R.ProfileError):
+        return None
+    profs = [p.vllm.profile for p in plans if p.vllm is not None]
+    if not profs or len(profs) != len(plans) or not all(L.swarm_gate(pr) for pr in profs):
+        return None
+    return profs[0], L.swarm_gate(profs[0])
+
+
+def _ask_swarm(a: Answers, inv: pf.Inventory, ui: Asker, args: argparse.Namespace, repo: Path) -> Answers:
+    """The one Swarm question: asked only on rows that have a swarm cap (and not beside DFlash2, whose cache is
+    refused), never under --yes or with --swarm / --no-swarm / an explicit --kv-ram-cache 0; default no. When the questions run
+    (first run, --reconfigure) a saved swarm answer stays where its row has a cap and is reset to no where it has none; a
+    saved set that skips the questions reaches the plan check instead, which refuses a swarm answer on a row without a cap
+    (fails closed: nothing starts at a cap the user did not choose)."""
+    if not swarm_family(a.model) or args.swarm is not None or args.kv_ram_cache_gib == 0:
+        return a  # a flag decided it, or --kv-ram-cache 0 turned the cache (which the swarm cap needs) off on purpose
+    row = swarm_row(a, inv, repo)
+    if row is None or a.spec == "dflash2":
+        a.swarm = False
+        return a
+    if ui.yes:
+        return a
+    prof, gate = row
+    cap, need, ranks = int(gate["max_num_seqs"]), int(gate["min_gib_per_rank"]), int(prof["match"]["cards"])
+    ui.section("Swarm", "(experimental)")
+    ui.para(f"Up to {cap} sessions at once instead of {prof['serve']['max_num_seqs']}. Needs the KV RAM cache at {need * ranks}g of host "
+            f"RAM per server ({need} GiB per rank over {ranks} ranks), which setup sets for you unless --kv-ram-cache says more.", "  ")
+    a.swarm = ui.ask("Swarm mode? (y/n)", "y" if a.swarm else "n", ["y", "n", "yes", "no"]) in ("y", "yes")
+    return a
+
+
+def flag_rows(a: Answers, inv: pf.Inventory, repo: Path = REPO) -> list[tuple[str, str, str]]:
+    """The Flash-Next answers set by flags (or the Drafter question): (name, value, the flag that changes it); for the
+    27B and Ornith 1.5 only the KV RAM cache, and only when it is on (untested)."""
+    swarm_rows = [("Swarm", "on (experimental)", "--no-swarm for the default session cap")] if swarm_family(a.model) and a.swarm else []
+    if not fn_family(a.model):
+        rows = []
+        if tier_family(a.model) and a.kv_ram_cache_gib:
+            label = "untested ⚫ on Ornith 1.5" if FAMILY[a.model] == "ornith" else "experimental"  # 27B
+            rows.append(("KV RAM cache", f"{a.kv_ram_cache_gib}g per server ({label})", "--kv-ram-cache 0 to turn it off"))
+        return rows + swarm_rows
+    spec = "DFlash2" if a.spec == "dflash2" else "MTP"
+    if a.spec == "dflash2":
+        spec_hint = "--spec mtp for the bigger pool (6x131K)"
+    else:
+        spec_hint = "--spec dflash2 for faster decode (3x262K)" if dflash2_qualified(a, inv, repo) else ""
+    if a.kv_ram_cache_gib:
+        cache = f"{a.kv_ram_cache_gib}g per server" + (f" (untested \u26ab above {S.KV_RAM_CACHE_TESTED_GIB}g)"
+                                                      if S.kv_ram_cache_untested(a.kv_ram_cache_gib) else " (experimental)")
+        cache_hint = "--kv-ram-cache 0 to turn it off"
+    elif a.swarm:
+        cache, cache_hint = "sized by --swarm", "--kv-ram-cache SIZE to set another size"
+    else:
+        # The cache is qualified with MTP only in 3.0.1: no hint to turn it on beside DFlash2.
+        cache, cache_hint = "off", "" if a.spec == "dflash2" else "--kv-ram-cache 24g to keep evicted prefixes in RAM"
+    ple = "INT6 g32" if is_variant(a.ple_table) else "FP8"
+    return [("Drafter", spec, spec_hint), ("KV RAM cache", cache, cache_hint), *swarm_rows,
+            ("PLE table", ple, "--ple fp8 for the FP8 table" if is_variant(a.ple_table) else "")]
+
+
+def say_flag_rows(a: Answers, inv: pf.Inventory, ui: Asker, repo: Path = REPO) -> None:
+    rows = flag_rows(a, inv, repo)
+    if not rows:
+        return
+    vw = max(len(v) for _, v, _ in rows)
+    for k, v, hint in rows:
+        ui.row(f"  {k}", f"{v:<{vw}}  {hint}".rstrip(), 14)
+
+
+def answers_block(a: Answers, inv: pf.Inventory, ui: Asker, title: str, hint: str = "", repo: Path = REPO) -> None:
+    """The answers as aligned rows (the --yes summary and a saved re-run); for Flash-Next also the drafter, KV RAM
+    cache and PLE table rows with the flag that changes each."""
+    access = "local (127.0.0.1)" if a.host == "127.0.0.1" else f"network ({a.host})"
+    ui.section(title, hint)
+    rows = [("model", a.model), ("layout", layout_label(a))]
+    rows += [("folder", str(a.checkpoint_dir())), ("access", access + (", API key" if a.api_key else "")), ("port", str(a.port))]
+    for k, v in rows:
+        ui.row(f"  {k}", v or "", 14 if fn_family(a.model) else 9)
+    say_flag_rows(a, inv, ui, repo)
 
 
 def _ask_model(a: Answers, inv: pf.Inventory, ui: Asker, args: argparse.Namespace, table: dict[str, Any],
@@ -1180,11 +1988,16 @@ def _ask_model(a: Answers, inv: pf.Inventory, ui: Asker, args: argparse.Namespac
     rec, why = recommend(inv)
     menus = not ui.yes and args.model is None
     if menus:
-        ui.say("Model (Enter = recommended):")
+        ui.section("Model", "(Enter = recommended)")
+        sizes = {m: gib(table["checkpoints"][m].get("bytes")) if table["checkpoints"][m].get("bytes") else "" for m in MODELS}
+        nw, sw, iw = max(map(len, MODELS)), max(map(len, sizes.values())), len(f"{len(MODELS)})")
         for i, m in enumerate(MODELS, 1):
-            size = table["checkpoints"][m].get("bytes")
-            ui.say(f"  {i}) {m:<18} {TITLE[m]:<70} {gib(size) if size else '':>10}")
-    ui.say(f"  recommended: {rec} ({why})" if rec else f"  no recommendation: {why}")
+            first = f"  {f'{i})':>{iw}} {m:<{nw}}  {sizes[m]:>{sw}}  "
+            ui.para(TITLE[m] + ("  (recommended)" if m == rec else ""), first, " " * len(first))
+        ui.para(f"why {rec}: {why}" if rec else f"no recommendation: {why}", " " * (iw + 3), code="2")
+    else:
+        ui.gap()
+        ui.row("Recommended", f"{rec} - {why}" if rec else f"none - {why}")
     if args.model is None:
         before = a.model
         a.model = ui.ask("Model", a.model or rec or "27b", MODELS)
@@ -1194,9 +2007,9 @@ def _ask_model(a: Answers, inv: pf.Inventory, ui: Asker, args: argparse.Namespac
                 if getattr(args, k) is None:  # a flag given on the command line stays
                     setattr(a, k, block.get(k))
     else:
-        ui.say(f"Model: {a.model} (--model)")
+        ui.row("Model", f"{a.model} (--model)")
     if _choose(a.model, inv) is None:
-        ui.say(f"  note: no {a.model} layout fits this hardware (merlin doctor --model {FAMILY[a.model]} explains)")
+        ui.note("NOTE", f"no {a.model} layout fits this hardware (merlin doctor --model {FAMILY[a.model]} explains)")
     return a
 
 
@@ -1206,38 +2019,44 @@ def _ask_layout(a: Answers, inv: pf.Inventory, ui: Asker, args: argparse.Namespa
         labels = [o.label for o in opts]
         rec_opt = next(o for o in opts if o.recommended)
         if ui.yes:
-            ui.say(f"Layout: {rec_opt.label}: {rec_opt.text} ({rec_opt.why}" + (f"; {len(opts) - 1} other option(s) with --reconfigure)" if len(opts) > 1 else ")"))
+            ui.row("Layout", f"{rec_opt.label}: {rec_opt.text} ({rec_opt.why}"
+                   + (f"; {len(opts) - 1} other option(s) with --reconfigure)" if len(opts) > 1 else ")"))
         else:
-            ui.say("Layout (Enter = recommended):")
+            ui.section("Layout", "(Enter = recommended)")
+            lw, iw = max(len(o.label) for o in opts), len(f"{len(opts)})")
             for i, o in enumerate(opts, 1):
-                ui.say(f"  {i}) {o.label:<22} {o.text}" + ("  <- recommended" if o.recommended else ""))
-            ui.say(f"  recommended: {rec_opt.label} ({rec_opt.why})")
+                first = f"  {f'{i})':>{iw}} {o.label:<{lw}}  "
+                ui.para(o.text + ("  (recommended)" if o.recommended else ""), first, " " * len(first))
+            ui.para(f"why {rec_opt.label}: {rec_opt.why}", " " * (iw + 3), code="2")
         cur = layout_label(a) if (a.tp or a.instances) else rec_opt.label  # a saved layout stays the default; else the recommendation
         pick = ui.ask("Layout", cur if cur in labels else rec_opt.label, labels)
         chosen = next(o for o in opts if o.label == pick)
         a.tp, a.instances = chosen.tp, chosen.instances
     elif args.tp is not None or args.instances is not None:
-        ui.say(f"Layout: {layout_label(a)} (flags)")
-    for note in layout_notes(a, inv, repo):
-        if note.startswith("P2P is off"):  # the selector's measured note; every note repeats under the serve line
-            ui.say(f"  NOTE {note}")
+        ui.row("Layout", f"{layout_label(a)} (flags)")
+    notes = [n for n in layout_notes(a, inv, repo) if n.startswith("P2P is off")]  # the selector's measured note
+    if notes:  # every note repeats under the serve command
+        ui.gap()
+    for note in notes:
+        ui.note("NOTE", note)
     return a
 
 
 def _ask_access(a: Answers, ui: Asker, args: argparse.Namespace, key_path: Path) -> Answers:
     if args.host is None:
         if not ui.yes:
-            ui.say("Access:")
+            ui.section("Access")
             ui.say("  1) local    this machine only (127.0.0.1)")
-            ui.say("  2) network  every host that can reach this machine (0.0.0.0), an API key is required")
+            ui.para("every host that can reach this machine (0.0.0.0), an API key is required", "  2) network  ")
         cur = "local" if a.host == "127.0.0.1" else "network"
         pick = ui.ask("Access", cur, ["local", "network"])
         a.host = "127.0.0.1" if pick == "local" else "0.0.0.0"
     if a.host != "127.0.0.1" and not a.api_key:
         a.api_key = secrets.token_urlsafe(32)
-        ui.say(f"  API key generated; it is shown this once and kept in {key_path} (mode 0600).")
-        ui.say(f"  Clients send `Authorization: Bearer <key>`; `cat {key_path}` prints it again.")
-        ui.say(f"  {a.api_key}")
+        ui.gap()
+        ui.para(f"API key, shown this once (kept in {key_path}, mode 0600):", "  ")
+        ui.say("      " + ui.style(a.api_key))
+        ui.para("Clients send `Authorization: Bearer <key>`; `cat` that file prints it again.", "  ")
     if a.host == "127.0.0.1" and not args.api_key:
         a.api_key = None
     return a
@@ -1260,19 +2079,147 @@ def review_answers(a: Answers, inv: pf.Inventory, ui: Asker, args: argparse.Name
         open_ = [k for k in REVIEW_ITEMS if not flagged[k]]
         if not open_:
             return a
-        ui.say("Your answers (nothing is downloaded or saved yet):")
+        ui.section("Your answers", "(nothing is downloaded or saved yet)")
         for i, k in enumerate(open_, 1):
             ui.say(f"  {i}) {k:<7} {values[k]}")
         for k in REVIEW_ITEMS:
             if flagged[k]:
                 ui.say(f"     {k:<7} {values[k]} (flag)")
+        say_flag_rows(a, inv, ui, repo)
         pick = ui.ask(f"Change an answer? (Enter = no, or 1-{len(open_)})", "no", open_ + ["no", "n"])
         if pick in ("no", "n"):
             return a
         before = a.model
         a = ask_questions(a, inv, ui, args, repo, table, saved, key_path, only={pick})
         if pick == "model" and a.model != before:
-            a = ask_questions(a, inv, ui, args, repo, table, saved, key_path, only={"layout", "folder", "port"})
+            a = ask_questions(a, inv, ui, args, repo, table, saved, key_path, only={"layout", "drafter", "swarm", "folder", "port"})
+        elif pick == "layout":
+            a = ask_questions(a, inv, ui, args, repo, table, saved, key_path, only={"drafter", "swarm"})  # the row may have changed
+
+
+def kv_ram_cache_per_rank(a: Answers, sizes: list[int], rows: list[str] | None = None) -> int:
+    """--kv-ram-cache as the engine's GiB per rank over ``sizes`` (TP x PP of each server), rounded down; 0 when off or
+    below one 262K restore unit on the ``rows`` (profile ids) the layout starts (ple_tier_problems refuses that)."""
+    if not tier_family(a.model) or not a.kv_ram_cache_gib:
+        return 0
+    try:
+        return S.kv_ram_cache_per_rank(a.kv_ram_cache_gib, sizes, restore_unit_minimum(a.model, rows, sizes))
+    except S.CliError:
+        return 0
+
+
+def restore_unit_minimum(model: str | None, rows: list[str] | None, sizes: list[int]) -> int | None:
+    """GiB per rank one 262K restore unit needs on every row (profile id) the layout starts, on the KV dtype serve will
+    use (an exported KV_DTYPE=fp8 swaps in the row's FP8 capacity, as serve_plan does); None (serve's 4 GiB per server
+    rule) when the rows are not known."""
+    family = S.CHECKPOINTS.get(model or "")
+    if not rows or not family:
+        return None
+    try:
+        reg = R.with_kv_dtype(R.load_registry(family), os.environ.get("KV_DTYPE"))
+        return max(R.restore_unit_min_gib_per_rank(family, R.get_profile(reg, pid), n) for pid, n in zip(rows, sizes))
+    except (R.ProfileError, OSError, ValueError):
+        return None
+
+
+DFLASH2_TIER_FIX = "--kv-ram-cache 0 (off; it also drops a saved size), or --spec mtp (the default)"
+
+
+def dflash2_tier_text(a: Answers, args: argparse.Namespace | None = None) -> str:
+    """Why a KV RAM cache with --spec dflash2 is refused: 3.0.1 qualifies the cache with MTP only, and
+    merlin serve refuses the pair, so setup says so before anything downloads."""
+    saved = " (saved)" if args is None or getattr(args, "kv_ram_cache_gib", None) is None else ""
+    return (f"--kv-ram-cache {a.kv_ram_cache_gib}g{saved} with --spec dflash2: the KV RAM cache is qualified with MTP "
+            "only in 3.0.1; merlin serve refuses the pair")
+
+
+def ple_tier_problems(a: Answers, args: argparse.Namespace, repo: Path, table: dict[str, Any], sizes: list[int],
+                      rows: list[str] | None = None) -> list[Problem]:
+    """--ple int6 / --kv-ram-cache (given now or saved) refused before anything downloads: INT6 where this build cannot serve
+    it (int6_reason), a tier too small for one 262K restore unit over ``sizes`` (TP x PP of each server), and
+    either flag on a model outside the Flash-Next family."""
+    out = []
+    if not fn_family(a.model):
+        if is_variant(args.ple) or (args.kv_ram_cache_gib and not tier_family(a.model)):
+            flag = "--ple int6" if is_variant(args.ple) else "--kv-ram-cache"
+            out.append(Problem("FAIL", "ple", f"{flag} does not apply to {a.model}",
+                               "drop the flag, or choose " + " / ".join(PLE_INT6_MODELS if is_variant(args.ple)
+                                                                         else ("flash-next", "swift1.5", "swift1.5-huihui"))))
+            return out
+        if a.kv_ram_cache_gib:
+            try:
+                S.kv_ram_cache_per_rank(a.kv_ram_cache_gib, sizes, restore_unit_minimum(a.model, rows, sizes))
+            except S.CliError as e:
+                out.append(Problem("FAIL", "kv-tier", str(e).removesuffix(" Nothing started."),
+                                   "give a larger size, or --kv-ram-cache 0 (off)"))
+        return out
+    if is_variant(a.ple_table):
+        why = int6_reason(a.model, repo, table)
+        if why:
+            out.append(Problem("FAIL", "ple", f"--ple int6: the INT6 g32 PLE table cannot be served here: {why}",
+                               "--ple fp8 (the default; it also drops a saved int6)"))
+    qualified = L.dflash2_rows(R.load_registry("flash-next"))
+    if a.spec == "dflash2" and not all(r in qualified for r in rows or []):
+        out.append(Problem("FAIL", "spec", f"--spec dflash2: {', '.join(rows or [])} has no qualified DFlash2 geometry (its KV pin "
+                           f"is the MTP one); DFlash2 rows: {', '.join(qualified)}", "--spec mtp (the default) on this hardware"))
+    if a.spec == "dflash2" and a.kv_ram_cache_gib:
+        out.append(Problem("FAIL", "kv-tier", dflash2_tier_text(a, args), DFLASH2_TIER_FIX))
+    if a.kv_ram_cache_gib:
+        try:
+            S.kv_ram_cache_per_rank(a.kv_ram_cache_gib, sizes, restore_unit_minimum(a.model, rows, sizes))
+        except S.CliError as e:
+            out.append(Problem("FAIL", "kv-tier", str(e).removesuffix(" Nothing started."),
+                               "give a larger size, or --kv-ram-cache 0 (off)"))
+    return out
+
+
+def cache_explicitly_off(args: argparse.Namespace | None) -> bool:
+    """--kv-ram-cache 0 was given on this command line: an explicit cache-off, which is not the same as no cache given (the
+    answers carry 0 for both, so the difference lives in the flag)."""
+    return args is not None and getattr(args, "kv_ram_cache_gib", None) == 0
+
+
+def effective_answers(a: Answers, plans: list[S.Plan], sizes: list[int], args: argparse.Namespace | None = None) -> Answers:
+    """The answers as merlin serve will run them: --swarm without --kv-ram-cache gets the KV RAM cache sized for the cap
+    (never when the cache was explicitly turned off: swarm_problems refuses that pair)."""
+    if not a.swarm or a.kv_ram_cache_gib or len(set(sizes)) != 1 or cache_explicitly_off(args):
+        return a
+    gates = [L.swarm_gate(p.vllm.profile) for p in plans if p.vllm is not None]
+    if not gates or not all(gates):
+        return a
+    return replace(a, kv_ram_cache_gib=int(gates[0]["min_gib_per_rank"]) * sizes[0])
+
+
+SWARM_RAM_FIX = "--no-swarm (the default session cap needs no KV RAM cache); or add RAM (or raise the container's memory limit)"
+
+
+def swarm_problems(a: Answers, plans: list[S.Plan], sizes: list[int], args: argparse.Namespace | None = None) -> list[Problem]:
+    """--swarm refused before anything downloads, after the saved answers, the flags and the questions are merged: an explicit
+    ``--kv-ram-cache 0`` beside swarm mode (a saved answer, --swarm or the question: the user is not silently given a 48g
+    cache, nor silently dropped to the default cap), a row with no swarm cap (naming the rows that have one), DFlash2 (whose
+    cache is refused), or a --kv-ram-cache under the size the cap was qualified with (never raised)."""
+    if not a.swarm:
+        return []
+    if cache_explicitly_off(args):
+        src = "--swarm" if getattr(args, "swarm", None) else "your saved answer"
+        return [Problem("FAIL", "swarm", f"--kv-ram-cache 0 turns the KV RAM cache off, but swarm mode is on ({src}) and its session cap "
+                        "needs the cache (tested with 48g); nothing is changed for you",
+                        "--no-swarm to keep the cache off at the default session cap, or leave out --kv-ram-cache 0 "
+                        "(the cache is then sized for the swarm cap) or give --kv-ram-cache 48g or more")]
+    profs = [p.vllm.profile for p in plans if p.vllm is not None]
+    for pr in profs:
+        if not L.swarm_gate(pr):
+            return [Problem("FAIL", "swarm", L.swarm_not_qualified(pr["id"]), "--no-swarm (the default session cap), or a layout whose row has a swarm cap")]
+    out = []
+    if a.spec == "dflash2":
+        out.append(Problem("FAIL", "swarm", "--swarm with --spec dflash2: the KV RAM cache --swarm needs is qualified with MTP only in 3.0.1",
+                           "--no-swarm, or --spec mtp (the default)"))
+    if a.kv_ram_cache_gib and profs and len(set(sizes)) == 1:
+        need = int(L.swarm_gate(profs[0])["min_gib_per_rank"])
+        if a.kv_ram_cache_gib // sizes[0] < need:
+            out.append(Problem("FAIL", "swarm", L.swarm_cache_refusal(profs[0], a.kv_ram_cache_gib // sizes[0]),
+                               f"--kv-ram-cache {need * sizes[0]}g or more, or --no-swarm"))
+    return out
 
 
 def layout_notes(a: Answers, inv: pf.Inventory, repo: Path) -> list[str]:
@@ -1292,16 +2239,17 @@ def host_report(inv: pf.Inventory, ui: Asker) -> None:
         names[g.name] = names.get(g.name, 0) + 1
     cards = ", ".join(f"{n} x {k} ({pf._gib(next(g.vram_mib for g in inv.gpus if g.name == k)):.0f} GB)" for k, n in names.items()) or "none"
     ram = f"{pf._gib(inv.host.ram_mib):.0f} GiB" if inv.host.ram_mib else "unknown"
-    ui.say(f"Host: GPUs {cards}; P2P {inv.p2p}; driver {inv.host.driver or 'unknown'}; RAM {ram}"
-           + (f"; {inv.source}" if inv.source != "probe" else ""))
+    ui.row("  host", f"GPUs {cards}, P2P {inv.p2p}, driver {inv.host.driver or 'unknown'}, RAM {ram}", 10)
+    if inv.source != "probe":
+        ui.row("  source", inv.source, 10)
 
 
 def report_problems(problems: list[Problem], ui: Asker) -> bool:
     """Print; True when a FAIL is among them."""
+    if problems:
+        ui.gap()
     for p in problems:
-        ui.say(f"{p.level} {p.code}: {p.text}")
-        if p.fix:
-            ui.say(f"     fix: {p.fix}")
+        ui.note(p.level, f"{p.code}: {p.text}", p.fix)
     return any(p.level == "FAIL" for p in problems)
 
 
@@ -1332,7 +2280,8 @@ def _main(argv: list[str], inp: Any, out: Any, run: Callable[[list[str]], str | 
     if args.pull_only:
         return pull_main(args, a, repo, table, ui)
     inv = pf.simulate(args.simulate) if args.simulate else pf.probe()
-    ui.say(f"Merlin {release_version(repo)} (by Halt95) setup ({repo})")
+    ui.say(ui.style(f"Merlin {release_version(repo)} setup") + " (by Halt95)")
+    ui.row("  repo", str(repo), 10)
     host_report(inv, ui)
 
     # Host checks that cost no download.
@@ -1341,10 +2290,11 @@ def _main(argv: list[str], inp: Any, out: Any, run: Callable[[list[str]], str | 
     if a.from_source:
         problems += source_build_problems(run, env)
     if report_problems(problems, ui):
+        ui.gap()
         ui.say("setup: fix the FAIL lines above and run ./setup.sh again; nothing was downloaded.")
         return 1
     if a.cc and not os.environ.get("CC"):
-        ui.say(f"Compiler: {a.cc} / {a.cxx} (remembered in .merlin/setup.json)")
+        ui.row("  compiler", f"{a.cc} / {a.cxx} (remembered in .merlin/setup.json)", 10)
 
     # Questions (a complete saved set for this model is reused unless --reconfigure).
     asked = False
@@ -1354,8 +2304,7 @@ def _main(argv: list[str], inp: Any, out: Any, run: Callable[[list[str]], str | 
             a = review_answers(a, inv, ui, args, repo, table, saved, key_path)
         asked = True
     else:
-        ui.say(f"Saved answers from .merlin/setup.json (--reconfigure asks again): {a.model}, {layout_label(a)}, "
-               f"{a.checkpoint_dir()}, {a.host}:{a.port}" + (", API key" if a.api_key else ""))
+        answers_block(a, inv, ui, "Saved answers", "(from .merlin/setup.json; --reconfigure asks again)", repo)
     if a.port is None:
         a.port = default_port(a.model)
 
@@ -1363,33 +2312,73 @@ def _main(argv: list[str], inp: Any, out: Any, run: Callable[[list[str]], str | 
     try:
         plans = serve_plan(a, inv, repo)
     except S.CliError as e:
-        ui.say(f"FAIL layout: {a.model} with {layout_label(a)} does not fit this host: {e}")
-        ui.say("     fix: ./setup.sh --reconfigure picks a layout for the hardware found now")
+        report_problems([Problem("FAIL", "layout", f"{a.model} with {layout_label(a)} does not fit this host: {e}",
+                                 "--spec mtp (the default) on this hardware" if fn_family(a.model) and a.spec == "dflash2"
+                                 else "./setup.sh --reconfigure picks a layout for the hardware found now")], ui)
         return 3
     cards = len(plans[0].cards)
-    more = [p for p in [ram_problem(a.model, inv, cards)] if p]
+    sizes = [len(p.cards) for p in plans]  # one table and one tier arena per server
+    a_run = effective_answers(a, plans, sizes, args)  # --swarm without --kv-ram-cache: the cache sized for the cap
+    swarm_probs = swarm_problems(a, plans, sizes, args)
+    flag_problems = ple_tier_problems(a, args, repo, table, sizes, [p.profile_id for p in plans]) + swarm_probs
+    per_rank = kv_ram_cache_per_rank(a_run, sizes, [p.profile_id for p in plans])
+    ram = ram_problem(a.model, inv, cards, a.ple_table, per_rank, sizes,
+                      int6_why=int6_reason(a.model, repo, table) if fn_family(a.model) else None)
+    if ram is not None and ram.level == "FAIL" and a.swarm and not a.kv_ram_cache_gib:
+        ram = replace(ram, fix=SWARM_RAM_FIX)  # the cache is the one --swarm sized: a smaller one would not serve the swarm cap
+    # which session cap applies and why (default / --swarm), as the launcher says it at boot
+    cap_said = [] if plans[0].vllm is None or any(p.code == "swarm" for p in swarm_probs) else \
+        L.cap_report(plans[0].vllm.profile, bool(a.swarm), "", per_rank)[1]
+    more = ([ram] if ram else []) + flag_problems + [Problem("WARN", "swarm", n.removeprefix("WARNING: ")) for n in cap_said
+                                                      if n.startswith("WARNING: ")]
     for w in dict.fromkeys(w for p in plans for w in p.warnings):  # once each: instances repeat their row's warnings
+        # Setup already reports its RAM check; preflight also carries it in the serve plan.
+        if ram is not None and w.startswith("ram: "):
+            continue
         more.append(Problem("WARN", *w.split(": ", 1)) if ": " in w else Problem("WARN", "serve", w))
-    conflict = folder_conflict(a.checkpoint_dir(), a.model, repo)
+    conflict = folder_conflict(a.base_dir(), a.model, repo)
     if conflict:
-        more.append(Problem("FAIL", "folder", f"{a.checkpoint_dir()} {conflict}; nothing is downloaded over another checkpoint",
+        more.append(Problem("FAIL", "folder", f"{a.base_dir()} {conflict}; nothing is downloaded over another checkpoint",
                             "choose another folder (--models-dir, or --reconfigure) or remove that one"))
+    if fn_family(a.model) and is_variant(a.ple_table) and PP.overlay_conflict(a.checkpoint_dir()):
+        more.append(Problem("FAIL", "folder", f"--ple int6: {PP.overlay_conflict(a.checkpoint_dir())}",
+                            "move that folder away, or choose another FP8 checkpoint folder (--models-dir)"))
     commit = head_commit(repo, run)
     state = read_json(merlin_dir / STATE_JSON)
     plan = download_plan(a, repo, state, commit, table=table)
     more += disk_problems(plan)
     failed = report_problems(more, ui)
-    ui.say(render_plan(plan))
-    ui.say("Serve: " + serve_line(a, repo))
-    for p in plans:
-        for n in p.notes:
-            ui.say(f"  NOTE {n}")
+    ui.gap()
+    ui.say(render_plan(plan, args.dry_run, ui.color, ui.width).rstrip("\n"))
+    ui.section("Serve")
+    for line in shell_wrap(serve_words(a, repo), ui.width):
+        ui.say(line)
+    notes = [n for p in plans for n in p.notes]
+    if tier_family(a.model) and a_run.kv_ram_cache_gib and per_rank:
+        notes.append(S.kv_ram_cache_text(a_run.kv_ram_cache_gib, per_rank, sizes[0], len(sizes)))
+        if a.swarm and not a.kv_ram_cache_gib and plans[0].vllm is not None and L.swarm_gate(plans[0].vllm.profile):
+            gate = L.swarm_gate(plans[0].vllm.profile)
+            notes.append(S.swarm_cache_set_text(a_run.kv_ram_cache_gib, int(gate["min_gib_per_rank"]), sizes[0], int(gate["max_num_seqs"])))
+        if S.kv_ram_cache_untested(a_run.kv_ram_cache_gib):
+            notes.append(S.kv_ram_cache_untested(a_run.kv_ram_cache_gib))
+        if FAMILY[a.model] in S.KV_TIER_UNTESTED:
+            notes.append(S.KV_TIER_UNTESTED[FAMILY[a.model]])
+    notes += [n.removeprefix("note: ") for n in cap_said if n.startswith("note: ")]
+    if fn_family(a.model) and a.spec == "dflash2":
+        notes.append(f"--spec dflash2: drafter {S.DFLASH2_REPO} -> {drafter_dir()}; {S.DFLASH2_WHY}")
+    if notes:
+        ui.gap()
+    for n in notes:
+        ui.note("NOTE", n)
     if failed:
+        ui.gap()
         ui.say("setup: fix the FAIL lines above and run ./setup.sh again; nothing was downloaded.")
         return 1
     if a.model == "27b-thinkingcap":
-        ui.say(f"Licence: {THINKINGCAP_LICENCE}")
+        ui.gap()
+        ui.para(f"Licence: {THINKINGCAP_LICENCE}", "", " " * 9)
     if args.dry_run:
+        ui.gap()
         ui.say("Dry run: nothing downloaded, nothing installed, nothing written, nothing started.")
         return 0
     # Confirmation: once, after the questions; a saved re-run asks nothing (--yes neither).
@@ -1403,18 +2392,22 @@ def _main(argv: list[str], inp: Any, out: Any, run: Callable[[list[str]], str | 
     # Install, checkpoint, state.
     env["PATH"] = f"{merlin_dir / 'bin'}:{env.get('PATH', '')}"
     if plan.need_install:
-        install_engine(repo, a, env)
-        write_json(merlin_dir / STATE_JSON, {**install_state(repo, a.from_source, commit), "installed_at": int(time.time())})
+        with install_lock(merlin_dir):  # the install record is written under the same lock as the venv it describes
+            install_engine(repo, a, env)
+            write_json(merlin_dir / STATE_JSON, {**install_state(repo, a.from_source, commit), "installed_at": int(time.time())})
     else:
-        ui.say("Engine: venv is current (wheel + lock + commit unchanged since the last install); nothing to install.")
+        ui.gap()
+        ui.para("Engine: venv is current (wheel + lock + commit unchanged since the last install); nothing to install.")
     pull_checkpoint(repo, a, env, plan.revision, args.rehash)
+    pull_drafter(repo, a, env, table, args.rehash)
     if args.no_start:
+        ui.gap()
         ui.say("Done. Start it with ./setup.sh")
         return 0
 
     # Doctor, endpoint, start.
     ui.say("")
-    ui.say(f"merlin doctor --model {FAMILY[a.model]}:")
+    ui.say(ui.style(f"merlin doctor --model {FAMILY[a.model]}"))
     S.main(["doctor", "--model", FAMILY[a.model]], out)
     print_endpoint(a, ui, key_path)
     sys.stdout.flush()
@@ -1423,25 +2416,33 @@ def _main(argv: list[str], inp: Any, out: Any, run: Callable[[list[str]], str | 
 
 
 def pull_main(args: argparse.Namespace, a: Answers, repo: Path, table: dict[str, Any], ui: Asker) -> int:
-    """``merlin pull <model> [--models-dir D]``: the checkpoint only. No GPU, driver or compiler check, no serving
-    choice; the folder is this model's (saved or default) unless --models-dir names another."""
+    """``merlin pull <model> [--models-dir D] [--spec dflash2]``: the checkpoint and requested drafter. No GPU,
+    driver or compiler check, no serving choice; the folder is this model's unless --models-dir names another."""
     if not a.model:
         raise SetupError("merlin pull needs a model name", 2)
     ckpt_dir = a.checkpoint_dir()
-    ui.say(f"Merlin {release_version(repo)} pull: {a.model} -> {ckpt_dir}")
-    conflict = folder_conflict(ckpt_dir, a.model, repo)
+    ui.say(ui.style(f"Merlin {release_version(repo)} pull") + f": {a.model} -> {ckpt_dir}")
+    conflict = folder_conflict(a.base_dir(), a.model, repo)
     if conflict:
-        ui.say(f"FAIL folder: {ckpt_dir} {conflict}")
-        ui.say("     fix: choose another folder (--models-dir) or remove that one")
+        report_problems([Problem("FAIL", "folder", f"{a.base_dir()} {conflict}",
+                                 "choose another folder (--models-dir) or remove that one")], ui)
         return 1
+    if fn_family(a.model) and is_variant(a.ple_table):
+        why = int6_reason(a.model, repo, table) or PP.overlay_conflict(ckpt_dir)
+        if why:
+            report_problems([Problem("FAIL", "ple", f"--ple int6: {why}", "--ple fp8 (the default)")], ui)
+            return 1
     plan = download_plan(a, repo, None, None, table=table, engine=False)
     failed = report_problems(disk_problems(plan), ui)
-    ui.say(render_plan(plan))
+    ui.gap()
+    ui.say(render_plan(plan, args.dry_run, ui.color, ui.width).rstrip("\n"))
     if failed:
         return 1
     if a.model == "27b-thinkingcap":
-        ui.say(f"Licence: {THINKINGCAP_LICENCE}")
+        ui.gap()
+        ui.para(f"Licence: {THINKINGCAP_LICENCE}", "", " " * 9)
     if args.dry_run:
+        ui.gap()
         ui.say("Dry run: nothing downloaded.")
         return 0
     if not ui.yes and plan.pending() and ui.ask("Proceed with the download above? (y/n)", "y", ["y", "n", "yes", "no"]) in ("n", "no"):
@@ -1450,30 +2451,37 @@ def pull_main(args: argparse.Namespace, a: Answers, repo: Path, table: dict[str,
     env = dict(os.environ)
     env["PATH"] = f"{repo / '.merlin' / 'bin'}:{env.get('PATH', '')}"
     pull_checkpoint(repo, a, env, plan.revision, args.rehash)
+    pull_drafter(repo, a, env, table, args.rehash)
+    ui.gap()
     ui.say("Done.")
     return 0
 
 
 def print_endpoint(a: Answers, ui: Asker, key_path: Path) -> None:
     host = "127.0.0.1" if a.host in ("0.0.0.0", "::") else a.host
-    auth = f' -H "Authorization: Bearer $(cat {shlex.quote(str(key_path))})"' if a.api_key else ""
+    auth = ["-H", f'"Authorization: Bearer $(cat {shlex.quote(str(key_path))})"'] if a.api_key else []
     n = a.instances if a.instances and a.instances > 1 else 1
     ports = ", ".join(str(a.port + i) for i in range(n))
     body = json.dumps({"model": served_name(a.model), "messages": [{"role": "user", "content": "Say hello."}], "max_tokens": 32})
-    ui.say("")
-    ui.say(f"Endpoint: http://{host}:{a.port}/v1  (OpenAI-compatible; /v1/messages for /v1/messages clients)"
-           + (f"; instances on ports {ports}" if n > 1 else ""))
+    ui.gap()
+    ui.para(f"http://{host}:{a.port}/v1  (OpenAI-compatible; /v1/messages for /v1/messages clients)"
+            + (f"; instances on ports {ports}" if n > 1 else ""), "Endpoint  ", head=True)
     if a.host == "0.0.0.0":
-        ui.say(f"  reachable from the network on every address of this machine, port {a.port}; the API key is in {key_path} (0600)")
-    ui.say("Test (once the log says `Application startup complete`):")
-    ui.say(f"  curl -s http://{host}:{a.port}/v1/chat/completions -H 'Content-Type: application/json'{auth} -d {shlex.quote(body)}")
+        ui.para(f"reachable from the network on every address of this machine, port {a.port}; the API key is in {key_path} (0600)",
+                " " * 10)
+    ui.section("Test", "(once the log says `Application startup complete`)")
+    for line in shell_wrap(["curl", "-s", f"http://{host}:{a.port}/v1/chat/completions", "-H", "'Content-Type: application/json'",
+                            *auth, "-d", shlex.quote(body)], ui.width):
+        ui.say(line)
+    ui.gap()
     if n > 1:
-        ui.say(f"--instances {n}: the servers start in the background (own process groups), logs merlin-<profile>-<port>.log in the "
-               "current directory; stop them by PID.")
+        ui.para(f"--instances {n}: the servers start in the background (own process groups), logs merlin-<profile>-<port>.log in the "
+                "current directory; stop them by PID.")
     else:
         ui.say("Ctrl+C stops the server; ./setup.sh starts it again without questions.")
     ui.say("")
 
 
 if __name__ == "__main__":
+    R.safe_stdio()
     sys.exit(main())

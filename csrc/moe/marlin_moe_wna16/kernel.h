@@ -1,3 +1,4 @@
+// Modified by the Merlin project; see NOTICE.
 
 #ifndef MARLIN_NAMESPACE_NAME
   #define MARLIN_NAMESPACE_NAME marlin_moe_wna16

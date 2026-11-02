@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright 2026 halt95 (Merlin modifications)
 """Merlin (fork) environment registry, moved out of vllm/envs.py.
 
 Declarations (TYPE_CHECKING), the fork parsers, the fork getters
@@ -18,12 +18,18 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
+    # API-server request limits only. AOT: no. CAPTURE: no.
+    MERLIN_GENERATIVE_SCORING_MAX_ITEMS: int = 32
+    MERLIN_GENERATIVE_SCORING_MAX_TOKENS: int = 32768
     # Lower-peak eager Qwen3 vision tower (exactly "1"; default off).
     # AOT: no -- eager tower dispatch; compiled vision blocks keep the plain path.
     # CAPTURE: no -- metadata-only encoder graphs keep the plain path.
     VLLM_MERLIN_VISION_PEAK: bool = False
     # Prompt scoring runs eagerly after forward, outside AOT and CUDA graphs.
     VLLM_MERLIN_PROMPT_LOGPROBS_CHUNK_SIZE: int = 256
+    # API server: /health answers 503 after this many seconds without an
+    # EngineCore step while requests are in flight; 0 = off.
+    VLLM_MERLIN_HEALTH_STALL_S: int = 120
     VLLM_MERLIN_PROMPT_LOGPROBS_TENSOR_BUDGET_MIB: int = 384
     # AOT: no -- eager tower dispatch, outside compiled decoder regions.
     # CAPTURE: no -- metadata-only encoder graphs keep the plain path.
@@ -47,10 +53,52 @@ if TYPE_CHECKING:
     # "1" turns the boot abort into a warning; default "0" aborts. AOT: no.
     # CAPTURE: no. Runtime-only (MERLIN_IGNORED).
     MERLIN_ALLOW_PROFILING_KV_RETENTION: bool = False
+    # Host-RAM KV tier (vllm/merlin/kv_host_tier.py): GiB of host memory PER
+    # RANK, 0 = off (the default). A positive value makes the engine configure
+    # MerlinKVHostTierConnector (a write-back SimpleCPUOffload) itself. Strict
+    # non-negative integer. AOT: no -- the connector's per-layer hooks are
+    # no-ops and the tier's KVTransferConfig is left out of the config hash.
+    # CAPTURE: no -- no op enters the forward. Runtime-only (MERLIN_IGNORED).
+    MERLIN_KV_HOST_TIER_GIB: int = 0
+    # Host admission policy for new copies, "off"/"lru" (plain
+    # LRU, the default) or "slru" (byte-weighted probation/protected);
+    # validated by kv_host_tier_policy.admission_mode. Runtime-only.
+    MERLIN_KV_HOST_TIER__ADMISSION: str | None = None
+    # Write-back pacing: copy credits, admission escape steps, the
+    # restores-in-flight cap and units assembling at once (see the getters).
+    # Runtime-only: scheduler-side copy issue.
+    MERLIN_KV_HOST_TIER__COPY_CREDITS: int = 32
+    MERLIN_KV_HOST_TIER__ESCAPE_STEPS: int = 8
+    MERLIN_KV_HOST_TIER__N_RESTORE: int = 2
+    MERLIN_KV_HOST_TIER__MAX_ASSEMBLING: int = 2
+    # Demotion-direction DMA credits (rows; default = the
+    # shared COPY_CREDITS) and an optional byte cap per rank in MiB (0 = rows
+    # only). Runtime-only: scheduler-side copy issue.
+    MERLIN_KV_HOST_TIER__COPY_CREDITS_D: int = 32
+    MERLIN_KV_HOST_TIER__COPY_BYTES_D_MIB: int = 0
+    # DEBUG ONLY: the tier census (unit directory, proofs, histograms and the
+    # per-request "tier return" lines a test run reads); 0/unset = off. The
+    # per-rank store-copy timings behind the copy-cost metric
+    # (vllm:merlin_kv_host_tier_copy_ms_per_block) are collected whenever the
+    # tier is on, whatever this knob says: one pooled CUDA event pair per
+    # store batch, with no extra synchronisation.
+    # Runtime-only: AOT: no. CAPTURE: no.
+    MERLIN_KV_HOST_TIER_CENSUS: bool = False
+    # DEBUG ONLY: fail the first N restore transfers per rank (0/unset = off).
+    # Requires the host tier on. Runtime-only: AOT: no. CAPTURE: no.
+    MERLIN_KV_HOST_TIER_FAIL_LOADS: int = 0
+    # DEBUG ONLY: fail the first N demotion (store) transfers per rank
+    # (0/unset = off). Requires the host tier on. Runtime-only: AOT: no.
+    # CAPTURE: no.
+    MERLIN_KV_HOST_TIER_FAIL_STORES: int = 0
     # --- 27B series knobs -------------------
     # Moved verbatim from the 27B series' vllm/envs.py registration (same
     # defaults). Hashed unless listed in MERLIN_IGNORED below.
     VLLM_FLASHINFER_PLAN_CACHE: bool = True
+    # Opt-in workload-selected FlashInfer verify tile (default off). Needs
+    # the 0001+0002 FlashInfer series (release/install-env.sh with this knob at 1).
+    # Hashed only when on (add_merlin_compile_factors): off keeps main's key.
+    MERLIN_FLASHINFER_WORKLOAD_TILE: bool = False
     VLLM_GDN_BA_SPLITK: bool = True
     VLLM_DRAFT_SEQ_LENS_NOSYNC: bool = True
     VLLM_DRAFT_SEQ_LENS_VERIFY: bool | None = None
@@ -83,6 +131,11 @@ if TYPE_CHECKING:
     # Ignored factor, so an A/B flip reuses one AOT cache. Unknown values raise at
     # boot.
     VLLM_RECOVERSSM_COMMIT_GRAPH: str = ""
+    # Debug only: assert the source-block ownership invariant on every
+    # Mamba2 RecoverSSM commit (a host sync per commit; never for serving).
+    # Strict "0"/"1", default off. AOT: no; CAPTURE: no -- a host-side check
+    # after the commit. Ignored factor.
+    VLLM_RECOVERSSM_CHECK_OWNERSHIP: bool = False
     # --- Opt-in Qwen3.5 MoE / single-card memory knobs (off by default) ----
     # FULL-graph MTP verify on Qwen3.5 MoE / sm_86
     # (v1/qwen35_series.uniform_verify_active). Runtime-only (MERLIN_IGNORED).
@@ -95,22 +148,10 @@ if TYPE_CHECKING:
     # ViT backend.
     VLLM_MERLIN_VISION_ROTARY_INPLACE: bool = False
     # -----------------------------------------------------------------------
-    # None selects the family default; explicit values retain exact "1" parsing.
+    # None selects the model/device default; explicit values retain exact "1" parsing.
     # None and False must be distinct compile factors.
     VLLM_HOST_EMBED_TABLE: bool | None = None
     VLLM_PLE_OFFLOAD_READY_TIMEOUT: float = 600.0
-    # "1" samples the MTP draft token from the draft's own
-    # softmax truncated to its top-k/top-p set under the request's sampling
-    # params, and caches that truncated distribution for the verifier. Exactly
-    # "0"/"1"; default OFF. Read once at speculator init (static).
-    # AOT: no -- sample_draft is outside the compiled model regions.
-    # CAPTURE: yes -- draft sampling is CAPTURED under FULL graphs (prefill,
-    # decode and fused decode), so the truncation kernel is baked into them;
-    # the draft top-k/top-p buffers it reads are persistent and refreshed by
-    # the runner before every propose. Graphs are per-boot (never persisted),
-    # so hashing would only cost an AOT miss on every configuration and could not
-    # protect in-process replay; the flag is frozen at init instead.
-    VLLM_SPEC_DRAFT_UNDER_TARGET_TOPK: bool = False
     # "1" keys the block-verification acceptance draws and
     # the draft Gumbel noise by round (anchor position + in-round offset)
     # instead of absolute position, which makes rejection_sample_method="block"
@@ -123,7 +164,7 @@ if TYPE_CHECKING:
     # CAPTURE: yes -- the draft sampler is CAPTURED under FULL draft graphs
     # with the STEP_KEYED constexpr; the keys it reads (positions, the
     # persistent current_draft_step, seeds) are device buffers, so replay needs
-    # no host RNG. Same shape as the draft top-k/top-p switch: frozen at init, graphs never persisted.
+    # no host RNG. Frozen at init, graphs never persisted.
     VLLM_SPEC_STEP_KEYED_RNG: bool = False
     # --- Flash-Next knobs ---------------------------------------------
     # Registered so compile_factors() hashes them; the read sites still parse
@@ -187,10 +228,8 @@ if TYPE_CHECKING:
     # AOT: no. CAPTURE: no. Strict "0"/"1", default off.
     VLLM_E2_PLE_EARLY_REQUEST: bool = False
     #
-    # The tie-determinism toggles are registered and
-    # classified in the "determinism toggles" block below, and the
-    # one knob still unclassified sits in that block's own fence, which
-    # tests/test_envs.py reads as a set of identifiers.
+    # The tie-determinism toggles are registered and classified in the
+    # "determinism toggles" block below.
     MERLIN_TOPK_EXACT_COUNTERS_LOG: int = 0
     # Pre-tie-determinism fallback for the counter reader's slot count; runtime-only
     # (ignored factor), never consulted on this build. See the dict entry.
@@ -264,8 +303,8 @@ if TYPE_CHECKING:
     #
     # Take the exact restart on an overflowing MEDIUM row:
     # MERLIN_TOPK_EXACT_MEDIUM. Declared ONCE, in the cross-change knob
-    # block above (same raw passthrough, same hashing); the 0.30 tree already
-    # carried that entry, so it is not repeated here.
+    # block above (same raw passthrough, same hashing), so it is not repeated
+    # here.
     # The same restart on an overflowing DECODE row.
     MERLIN_TOPK_EXACT_DECODE: str | None = None
     # Deterministic placement and tie membership on the LARGE path.
@@ -276,33 +315,6 @@ if TYPE_CHECKING:
     # extension, not by the AOT compiler); hashed conservatively like the
     # switches above.
     MERLIN_TOPK_DET_LARGE: str | None = None
-    #
-    # The large-path FAULT INJECTORS. TEST
-    # ONLY, and registered for exactly the same reason as the switches above,
-    # not because anything should set them in production:
-    #
-    #   * the shipped topk.cu folds both off (params.fault_inject_cta = -1,
-    #     fault_inject_emit = false: no variable is read); a test build that
-    #     wires them reaches the GPU through kernel launch arguments, so a
-    #     cudagraph BAKES THEM IN. An injected build and a clean build differ
-    #     in the captured graph while sharing a cache key -- which is the
-    #     failure mode: a graph captured under injection returns an all -1 row
-    #     for every deterministic large row, and on replay nothing re-reads the
-    #     environment to notice the variable has since been unset. FAULT_INJECT
-    #     was once "unregistered and capture-baked"; hashing
-    #     them is what stops a cached artifact crossing between the arms.
-    #   * compile_factors() is a deny-list, so a name it does not know cannot
-    #     be hashed at all. Neither is in ignored_factors.
-    #
-    # Raw passthroughs, like the switches. Do not parse them here.
-    #
-    # Which CTA of the group has its fault predicate forced; unset / negative
-    # is off, and setting it also suppresses __trap().
-    MERLIN_TOPK_LARGE_FAULT_INJECT: str | None = None
-    # Which fault: unset / "pre" forces the pre-emission predicate caught at
-    # X3, "emit" forces the emission-bound slot check caught at X4. Ignored
-    # unless MERLIN_TOPK_LARGE_FAULT_INJECT names a CTA.
-    MERLIN_TOPK_LARGE_FAULT_KIND: str | None = None
     #
     # MERLIN_TOPK_SORTED_EMIT -- persistent_topk
     # emits every row in the canonical order MERLIN_QSA_SORT imposes
@@ -331,15 +343,14 @@ if TYPE_CHECKING:
     #
     # --- UNAUDITED: host-side knobs with no read site in this tree ----------
     # Names only, one per line, inside the fence; a knob leaves the fence when
-    # its AOT and capture identity are written down against its read site
-    # (tests/test_envs.py enforces this). MERLIN_PIN_BSM (Marlin block_size_m
-    # pinned to 64) is an unused alternative to the split-K toggle above.
+    # its AOT and capture identity are written down against its read site.
+    # The fence is empty in this release: every host-side knob has its
+    # identity written down.
     # --8<-- [start:unaudited-host-side-knobs]
-    #     MERLIN_PIN_BSM
     # --8<-- [end:unaudited-host-side-knobs]
 
 
-# Compat flag for the 0/1 switch family. False (3.0.0): a value outside
+# Compat flag for the 0/1 switch family. False (this release): a value outside
 # {"0", "1"} logs one warning naming the knob and the value, then keeps the
 # interpretation that knob had before the helper existed, so no served
 # behaviour changes. A later release flips this to True to make every
@@ -382,7 +393,7 @@ def _e2_strict_switch(
         import logging
 
         logging.getLogger(__name__).warning(
-            "%s; keeping the legacy reading (%s) for 3.0.0, "
+            "%s; keeping the legacy reading (%s) for this release, "
             "this becomes a boot error in a later release",
             msg,
             legacy,
@@ -411,6 +422,38 @@ def _e2_nonneg_int(name: str, default: int = 0) -> int:
     return int(raw)
 
 
+def _kv_host_tier_fault_quota(name: str) -> int:
+    value = _e2_nonneg_int(name)
+    if value and _e2_nonneg_int("MERLIN_KV_HOST_TIER_GIB") == 0:
+        raise ValueError(f"{name} requires MERLIN_KV_HOST_TIER_GIB > 0")
+    return value
+
+
+def kv_host_tier_admission() -> str | None:
+    """The host admission policy flag, normalised by
+    ``kv_host_tier_policy.admission_mode`` ("off" / "slru"); None when unset.
+    A bad value is a boot error."""
+    raw = os.environ.get("MERLIN_KV_HOST_TIER__ADMISSION")
+    if raw is None:
+        return None
+    from vllm.merlin.kv_host_tier_policy import admission_mode
+
+    return admission_mode(raw)
+
+
+def kv_host_tier_fail_loads() -> int:
+    """Debug fault injection: first N restore transfers per rank, never CUDA chunks.
+
+    Refuse a nonzero setting with the tier off, before any copy is issued.
+    """
+    return _kv_host_tier_fault_quota("MERLIN_KV_HOST_TIER_FAIL_LOADS")
+
+
+def kv_host_tier_fail_stores() -> int:
+    """Debug fault injection: first N demotion transfers per rank (same rules)."""
+    return _kv_host_tier_fault_quota("MERLIN_KV_HOST_TIER_FAIL_STORES")
+
+
 def _e2_positive_int(name: str, default: int) -> int:
     value = _e2_nonneg_int(name, default)
     if value == 0:
@@ -422,23 +465,31 @@ def _e2_positive_int(name: str, default: int) -> int:
 DRAFT_VOCAB_TABLE_FACTOR = "VLLM_DRAFT_VOCAB_FILE:table"
 
 
+# Architectures whose embedding tables may be kept in pinned host memory
+# (VLLM_HOST_EMBED_TABLE). Other architectures never take this path.
+HOST_EMBED_ARCHITECTURES: tuple[str, ...] = (
+    "Qwen3_5ForCausalLM",
+    "Qwen3_5ForConditionalGeneration",
+    "Qwen3_5MoeForCausalLM",
+    "Qwen3_5MoeForConditionalGeneration",
+    "NemotronH_Omni_Reasoning_V3",  # Nemotron 3.5 Super VL
+)
+
+
 def host_embed_table_enabled_for_model(architecture: str) -> bool:
-    """Resolve the single knob: on for Qwen3.5 (dense and MoE) and Nemotron 3.5 Super VL, off otherwise."""
-    # 27B series. Read through vllm.envs so the value comes
-    # from the same (possibly cached) module __getattr__ as every other reader;
-    # imported here, not at module level, to keep this module stdlib-only.
+    """Resolve VLLM_HOST_EMBED_TABLE for one architecture.
+
+    Only ``HOST_EMBED_ARCHITECTURES`` are eligible. For those, ``1`` turns
+    host embedding on, ``0`` turns it off and unset means on (the default).
+    """
+    if architecture not in HOST_EMBED_ARCHITECTURES:
+        return False
+    # Read through vllm.envs so the value comes from the same (possibly cached)
+    # module __getattr__ as every other reader; keep module imports stdlib-only.
     import vllm.envs as envs
 
     setting = envs.VLLM_HOST_EMBED_TABLE
-    if setting is not None:
-        return setting
-    return architecture in (
-        "Qwen3_5ForCausalLM",
-        "Qwen3_5ForConditionalGeneration",
-        "Qwen3_5MoeForCausalLM",
-        "Qwen3_5MoeForConditionalGeneration",
-        "NemotronH_Omni_Reasoning_V3",  # Nemotron 3.5 Super VL
-    )
+    return True if setting is None else setting
 
 
 # Shipped value of each determinism toggle. The registry getters default to
@@ -453,6 +504,13 @@ SHIPPED_KERNEL_TOGGLE_DEFAULTS: dict[str, str] = {
 }
 
 MERLIN_ENV: dict[str, Callable[[], Any]] = {
+    # Per-request scoring limits; zero cannot disable either guard.
+    "MERLIN_GENERATIVE_SCORING_MAX_ITEMS": lambda: _e2_positive_int(
+        "MERLIN_GENERATIVE_SCORING_MAX_ITEMS", 32
+    ),
+    "MERLIN_GENERATIVE_SCORING_MAX_TOKENS": lambda: _e2_positive_int(
+        "MERLIN_GENERATIVE_SCORING_MAX_TOKENS", 32768
+    ),
     "VLLM_MERLIN_VISION_PEAK": lambda: _e2_strict_switch(
         "VLLM_MERLIN_VISION_PEAK", default=False, legacy="eq1"
     ),
@@ -461,6 +519,10 @@ MERLIN_ENV: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_MERLIN_PROMPT_LOGPROBS_CHUNK_SIZE": lambda: _e2_positive_int(
         "VLLM_MERLIN_PROMPT_LOGPROBS_CHUNK_SIZE", 256
+    ),
+    # 0 disables the /health stall check; negative/malformed values fail closed.
+    "VLLM_MERLIN_HEALTH_STALL_S": lambda: _e2_nonneg_int(
+        "VLLM_MERLIN_HEALTH_STALL_S", 120
     ),
     # 0 disables chunking; negative/malformed values fail closed.
     "VLLM_MERLIN_VISION_CHUNK_ROWS": lambda: _e2_nonneg_int(
@@ -485,6 +547,9 @@ MERLIN_ENV: dict[str, Callable[[], Any]] = {
     # (not read from os.environ) so it is part of the compile cache key.
     "VLLM_FLASHINFER_PLAN_CACHE": lambda: _e2_strict_switch(
         "VLLM_FLASHINFER_PLAN_CACHE", default=True, legacy="int"
+    ),
+    "MERLIN_FLASHINFER_WORKLOAD_TILE": lambda: _e2_strict_switch(
+        "MERLIN_FLASHINFER_WORKLOAD_TILE", default=False
     ),
     # --- GDN in_proj_ba split-K (sm_86, small M) ---
     # Triton split-K GEMM for the unquantized GDN in_proj_ba at M <= 16 tokens. On by
@@ -558,6 +623,10 @@ MERLIN_ENV: dict[str, Callable[[], Any]] = {
     "VLLM_RECOVERSSM_COMMIT_GRAPH": lambda: os.getenv(
         "VLLM_RECOVERSSM_COMMIT_GRAPH", ""
     ).strip(),
+    # Debug-only RecoverSSM ownership check (see its declaration).
+    "VLLM_RECOVERSSM_CHECK_OWNERSHIP": lambda: _e2_strict_switch(
+        "VLLM_RECOVERSSM_CHECK_OWNERSHIP", default=False, legacy="int"
+    ),
     # --- end of the 27B series knobs ---
     # --- Opt-in Qwen3.5 MoE / single-card memory knobs (off by default) ---
     "MERLIN_MOE_UNIFORM_VERIFY": lambda: _e2_strict_switch("MERLIN_MOE_UNIFORM_VERIFY"),
@@ -573,10 +642,6 @@ MERLIN_ENV: dict[str, Callable[[], Any]] = {
     # Timeout for PLE weight loading and TP worker registration.
     "VLLM_PLE_OFFLOAD_READY_TIMEOUT": lambda: float(
         os.getenv("VLLM_PLE_OFFLOAD_READY_TIMEOUT", "600")
-    ),
-    # Draft top-k/top-p truncation switch; see the declaration.
-    "VLLM_SPEC_DRAFT_UNDER_TARGET_TOPK": lambda: _e2_strict_switch(
-        "VLLM_SPEC_DRAFT_UNDER_TARGET_TOPK", default=False
     ),
     # Step-keyed block-verification draws; see the declaration.
     "VLLM_SPEC_STEP_KEYED_RNG": lambda: _e2_strict_switch(
@@ -657,14 +722,6 @@ MERLIN_ENV: dict[str, Callable[[], Any]] = {
     # MERLIN_TOPK_EXACT_MEDIUM is registered once, earlier in this dict.
     "MERLIN_TOPK_EXACT_DECODE": lambda: os.getenv("MERLIN_TOPK_EXACT_DECODE", None),
     "MERLIN_TOPK_DET_LARGE": lambda: os.getenv("MERLIN_TOPK_DET_LARGE", None),
-    # Large-path fault injectors. TEST ONLY, hashed for
-    # the reason in the declaration block: both are capture-baked.
-    "MERLIN_TOPK_LARGE_FAULT_INJECT": lambda: os.getenv(
-        "MERLIN_TOPK_LARGE_FAULT_INJECT", None
-    ),
-    "MERLIN_TOPK_LARGE_FAULT_KIND": lambda: os.getenv(
-        "MERLIN_TOPK_LARGE_FAULT_KIND", None
-    ),
     # In-kernel canonical emission; see the declaration block. Hashed: it
     # changes the captured sequence.
     "MERLIN_TOPK_SORTED_EMIT": lambda: os.getenv(
@@ -688,13 +745,53 @@ MERLIN_ENV: dict[str, Callable[[], Any]] = {
     "MERLIN_ALLOW_PROFILING_KV_RETENTION": lambda: _e2_strict_switch(
         "MERLIN_ALLOW_PROFILING_KV_RETENTION"
     ),
+    # Host-RAM KV tier, GiB per rank (0 = off). Read in vllm/merlin/kv_host_tier.py.
+    "MERLIN_KV_HOST_TIER_GIB": lambda: _e2_nonneg_int("MERLIN_KV_HOST_TIER_GIB"),
+    # Host admission policy flag; None when unset.
+    "MERLIN_KV_HOST_TIER__ADMISSION": kv_host_tier_admission,
+    "MERLIN_KV_HOST_TIER_CENSUS": lambda: _e2_strict_switch(
+        "MERLIN_KV_HOST_TIER_CENSUS", default=False
+    ),
+    "MERLIN_KV_HOST_TIER_FAIL_LOADS": kv_host_tier_fail_loads,
+    "MERLIN_KV_HOST_TIER_FAIL_STORES": kv_host_tier_fail_stores,
+    # Host-tier write-back pacing (copy credits P, admission escape steps,
+    # the restores-in-flight cap N_restore, units assembling at once). Read
+    # in vllm/merlin/kv_host_tier_writeback.py (GATE_ENVS) and
+    # kv_host_tier_retention.RestoresInFlight; the defaults here are the
+    # ones they apply.
+    "MERLIN_KV_HOST_TIER__COPY_CREDITS": lambda: _e2_positive_int(
+        "MERLIN_KV_HOST_TIER__COPY_CREDITS", 32
+    ),
+    "MERLIN_KV_HOST_TIER__ESCAPE_STEPS": lambda: _e2_positive_int(
+        "MERLIN_KV_HOST_TIER__ESCAPE_STEPS", 8
+    ),
+    "MERLIN_KV_HOST_TIER__N_RESTORE": lambda: _e2_positive_int(
+        "MERLIN_KV_HOST_TIER__N_RESTORE", 2
+    ),
+    "MERLIN_KV_HOST_TIER__MAX_ASSEMBLING": lambda: _e2_positive_int(
+        "MERLIN_KV_HOST_TIER__MAX_ASSEMBLING", 2
+    ),
+    # Per-direction credits. The demotion rows default to the
+    # shared COPY_CREDITS; the byte cap is MiB per rank, 0 = rows only.
+    "MERLIN_KV_HOST_TIER__COPY_CREDITS_D": lambda: _e2_positive_int(
+        "MERLIN_KV_HOST_TIER__COPY_CREDITS_D",
+        _e2_positive_int("MERLIN_KV_HOST_TIER__COPY_CREDITS", 32),
+    ),
+    "MERLIN_KV_HOST_TIER__COPY_BYTES_D_MIB": lambda: _e2_nonneg_int(
+        "MERLIN_KV_HOST_TIER__COPY_BYTES_D_MIB", 0
+    ),
 }
 
 
 MERLIN_IGNORED: frozenset[str] = frozenset(
     {
+    # API-server admission limits; no compiled or captured operations.
+    "MERLIN_GENERATIVE_SCORING_MAX_ITEMS",
+    "MERLIN_GENERATIVE_SCORING_MAX_TOKENS",
     # Eager prompt scoring after forward; no compiled or captured operations.
     "VLLM_MERLIN_PROMPT_LOGPROBS_CHUNK_SIZE",
+    # API-server /health watchdog; no compiled or captured operations.
+    "VLLM_MERLIN_HEALTH_STALL_S",
     "VLLM_MERLIN_PROMPT_LOGPROBS_TENSOR_BUDGET_MIB",
     # AOT: no -- row slicing is eager, outside compiled decoder regions.
     # CAPTURE: no -- encoder graphs omit the grid and keep plain execution.
@@ -710,6 +807,11 @@ MERLIN_IGNORED: frozenset[str] = frozenset(
     # class and reorder threshold), outside compiled regions. CAPTURE: yes, like
     # VLLM_DRAFT_BOUNDED_PLAN.
     "MERLIN_MOE_UNIFORM_VERIFY",
+    # AOT: no -- read by the FlashInfer metadata builder and the V2 graph
+    # managers, outside compiled regions. CAPTURE: yes, so the ON value is added
+    # back as a compile factor by add_merlin_compile_factors; unset and 0 leave
+    # the key exactly as it is without the knob (knob-off parity).
+    "MERLIN_FLASHINFER_WORKLOAD_TILE",
     # AOT: no -- eager tower path only. CAPTURE: no -- encoder graphs keep the plain
     # path.
     "VLLM_MERLIN_VISION_ROTARY_INPLACE",
@@ -724,14 +826,13 @@ MERLIN_IGNORED: frozenset[str] = frozenset(
     # after load and before capture; the kernel reads them with
     # tl.load(k_scale_ptr), never as a constexpr.
     "VLLM_QSA_KV_SCALES",
-    # Guard telemetry: counter() returns a real [3] int64 view in every
-    # mode, so the Triton arguments and the captured graph are identical;
-    # the mode only gates the side reader thread and the check_pending
-    # raise, and the interval is that thread's poll cadence; the idle
-    # switch only decides whether that thread parks while idle.
     # Boot-time integrity check on the draft vocab file; the table content
     # is already keyed through DRAFT_VOCAB_TABLE_FACTOR.
     "VLLM_DRAFT_VOCAB_SHA256",
+    # Guard telemetry: counter() returns a real [3] int64 view in every
+    # mode, so the Triton arguments and the captured graph are identical;
+    # the mode only gates the side reader thread and the check_pending
+    # raise, and the interval is that thread's poll cadence.
     "VLLM_E2_GUARD_MODE",
     "VLLM_E2_GUARD_INTERVAL",
     # Transport only moves the counter buffer to mapped host memory: the
@@ -752,6 +853,24 @@ MERLIN_IGNORED: frozenset[str] = frozenset(
     # or captured artifact.
     "VLLM_SPEC_PROFILE_SHAPES",
     "MERLIN_ALLOW_PROFILING_KV_RETENTION",
+    # Host-RAM KV tier size: adds a scheduler/worker-side connector whose
+    # per-layer hooks are no-ops; the forward, its compiled artifacts and
+    # captured graphs are the same with the tier on or off.
+    "MERLIN_KV_HOST_TIER_GIB",
+    # Host admission policy flag (scheduler-side eviction only).
+    "MERLIN_KV_HOST_TIER__ADMISSION",
+    # Debug census of the tier (scheduler-side bookkeeping and log lines).
+    "MERLIN_KV_HOST_TIER_CENSUS",
+    # Debug copy-thread errors only; no compiled/captured operations.
+    "MERLIN_KV_HOST_TIER_FAIL_LOADS",
+    "MERLIN_KV_HOST_TIER_FAIL_STORES",
+    # Write-back pacing: scheduler-side copy issue and admission waits only.
+    "MERLIN_KV_HOST_TIER__COPY_CREDITS",
+    "MERLIN_KV_HOST_TIER__ESCAPE_STEPS",
+    "MERLIN_KV_HOST_TIER__N_RESTORE",
+    "MERLIN_KV_HOST_TIER__MAX_ASSEMBLING",
+    "MERLIN_KV_HOST_TIER__COPY_CREDITS_D",
+    "MERLIN_KV_HOST_TIER__COPY_BYTES_D_MIB",
     # Placement only: rewrites CUDA_VISIBLE_DEVICES for the PLE offload
     # child, and CUDA_VISIBLE_DEVICES is already ignored above.
     "VLLM_PLE_OFFLOAD_HOME_DEVICE",
@@ -775,13 +894,7 @@ MERLIN_IGNORED: frozenset[str] = frozenset(
     # kernel has the same shape, strides and dtype, so no compiled artifact
     # or captured graph depends on it.
     "VLLM_E2_QSA_LOGITS_GRANULE_MB",
-    # Draft top-k/top-p: AOT: no (sample_draft is outside the compiled regions). CAPTURE: yes
-    # (FULL draft graphs record the truncation), but the flag is read once at
-    # speculator init, before capture, and graphs are never persisted, so there
-    # is no cross-process artifact to key; hashing it would only force an AOT
-    # miss on every configuration. Kept ignored.
-    "VLLM_SPEC_DRAFT_UNDER_TARGET_TOPK",
-    # Step-keyed draws: identical classification to the draft top-k/top-p switch above. AOT: no (the rejection
+    # Step-keyed draws: AOT: no (the rejection
     # kernels and sample_draft are outside the compiled regions). CAPTURE: yes
     # (the FULL draft graphs record the STEP_KEYED draft sampler), but the flag
     # is read once at init, before capture, and graphs are never persisted, so
@@ -805,7 +918,7 @@ MERLIN_IGNORED: frozenset[str] = frozenset(
     # process, read on every call, and cudagraphs are never persisted, so there
     # is no cross-process artifact to key. Hashing it would only move the
     # release AOT cache key (even when unset) for no protection. Same argument
-    # as VLLM_SPEC_DRAFT_UNDER_TARGET_TOPK above.
+    # as VLLM_SPEC_STEP_KEYED_RNG above.
     "MERLIN_MARLIN_MOE_CFG",
     # --- 27B series knobs: the same ignored
     # set the series' compile_factors() listed, with its reasons. ---
@@ -816,6 +929,8 @@ MERLIN_IGNORED: frozenset[str] = frozenset(
     # compiled forward and its capture; the commit graphs it selects are
     # in-process and bit-identical to the eager chain (see its declaration).
     "VLLM_RECOVERSSM_COMMIT_GRAPH",
+    # Debug-only ownership assertion: a host-side check after the commit.
+    "VLLM_RECOVERSSM_CHECK_OWNERSHIP",
     # GDN metadata host trims: host-side builder work only. The staged
     # buffers keep their addresses and get the same values, and nothing
     # inside the compiled forward or a captured graph reads the flags.
@@ -842,6 +957,9 @@ MERLIN_IGNORED: frozenset[str] = frozenset(
 
 def add_merlin_compile_factors(factors: dict[str, object]) -> None:
     """Add the fork's derived compile factors to ``factors`` (in place)."""
+    # Workload tile: a conservative capture factor only when on.
+    if MERLIN_ENV["MERLIN_FLASHINFER_WORKLOAD_TILE"]():
+        factors["MERLIN_FLASHINFER_WORKLOAD_TILE"] = True
     # Draft vocab: the path alone does not identify the table (it can be replaced in
     # place), so key its content too. The fingerprint is the one recorded when
     # the table was loaded, else it is read from the file now.
@@ -852,6 +970,50 @@ def add_merlin_compile_factors(factors: dict[str, object]) -> None:
         factors[DRAFT_VOCAB_TABLE_FACTOR] = draft_vocab_table_factor(
             str(draft_vocab_file)
         )
+
+
+# Retired MERLIN_* knobs a published release read and this one ignores
+# (name -> reason). ``validate_environ`` names them retired instead of
+# suggesting a misspelling. None in this release. The launcher keeps its own
+# list of retired names it warns about before a boot; that list may hold
+# VLLM_* names too, which the engine reports through vLLM's own
+# unknown-variable check.
+MERLIN_RETIRED: dict[str, str] = {}
+
+
+# MERLIN_* names read by the Merlin command-line tools (launcher, setup,
+# release scripts), never by the engine. They may sit in the same shell as an
+# engine boot, so the engine neither warns about them nor calls them misspelt.
+MERLIN_TOOL_ONLY: frozenset[str] = frozenset({
+    "MERLIN_CHECKPOINT_DIR",
+    "MERLIN_HOME",
+    "MERLIN_LIBCUDA",
+    "MERLIN_LOG_DIR",
+    "MERLIN_MODEL",
+    "MERLIN_PLE_PACK_DIR",
+    "MERLIN_PLE_TEST_TABLE",
+    "MERLIN_PYTHON",
+    "MERLIN_RELEASE_VERSION",
+    "MERLIN_SKIP_PORT_CHECK",
+    "MERLIN_SKIP_RAM_CHECK",
+    "MERLIN_UV_VERSION",
+    "MERLIN_WHEEL",
+    "MERLIN_WHEEL_URL",
+})
+
+
+def unknown_merlin_env_warning(name: str) -> str | None:
+    """The boot warning for a MERLIN_* name no getter registers, or None for a
+    name only the Merlin tools read (``MERLIN_TOOL_ONLY``)."""
+    if name in MERLIN_TOOL_ONLY:
+        return None
+    why = MERLIN_RETIRED.get(name)
+    if why is not None:
+        return f"Retired Merlin environment variable detected: {name} is ignored ({why})"
+    return (
+        f"Unknown Merlin environment variable detected: {name} "
+        "(not a registered knob; check the spelling)"
+    )
 
 
 def read_registered(name: str) -> Any:

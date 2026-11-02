@@ -31,7 +31,6 @@ import torch
 import torch.nn as nn
 
 import vllm.envs as envs
-from vllm.v1.worker.gpu.target_seq_lens import TargetSeqLensSnapshot
 from vllm.compilation.counter import compilation_counter
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.compilation.wrapper import compile_model_with_stock_torch
@@ -44,6 +43,11 @@ from vllm.distributed.aux_output_connector.worker import (
 from vllm.distributed.parallel_state import get_dcp_group, get_pp_group
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
+from vllm.merlin import kv_commit_acks, kv_host_tier
+from vllm.merlin.flashinfer_smallq import (
+    note_event,
+    plan_identity,
+)
 from vllm.merlin.prompt_logprobs import prompt_logprobs_chunk_size
 from vllm.model_executor.layers.fused_moe.all2all_utils import get_ep_all2all_manager
 from vllm.model_executor.layers.mamba.ops.ssu_dispatch import (
@@ -164,9 +168,6 @@ from vllm.v1.worker.gpu.spec_decode.adaptive_verification import (
     maybe_create_adaptive_verification_manager,
     resolve_adaptive_cudagraph_mode,
 )
-from vllm.v1.worker.gpu.spec_decode.draft_truncation import (
-    check_draft_under_topk_sampler,
-)
 from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
     set_eagle3_aux_hidden_state_layers,
     verify_supports_aux_hidden_states_over_pp,
@@ -185,6 +186,9 @@ from vllm.v1.worker.gpu.structured_outputs import (
     StructuredOutputsWorker,
     grammar_invalid_drafts,
 )
+from vllm.v1.worker.gpu.target_seq_lens import (
+    TargetSeqLensSnapshot,
+)
 from vllm.v1.worker.gpu.ubatch_utils import (
     UBatchRunner,
     UBatchState,
@@ -202,9 +206,20 @@ from vllm.v1.worker.workspace import lock_workspace, use_workspace_lane
 
 logger = init_logger(__name__)
 
-# Issue the stage-0 PLE request right after prepare_inputs (default off; see
+# Issue the stage-0 PLE request
+# right after prepare_inputs (default off; see
 # GPUModelRunner._ple_early_request_eligible). Read once at import.
 _PLE_EARLY_REQUEST: bool = envs.VLLM_E2_PLE_EARLY_REQUEST
+
+
+_HOST_EMBED_PIN_HINT = (
+    "On WSL2: VLLM_WSL2_ENABLE_PIN_MEMORY=1 on a current kernel "
+    "(`wsl --update`; the Merlin launcher sets the variable). Otherwise turn "
+    "host embedding off: with the Merlin 27B launcher, VLLM_HOST_EMBED_TABLE=0 "
+    "KV_BYTES=auto (a smaller KV pool, not qualified); with vllm serve "
+    "directly, VLLM_HOST_EMBED_TABLE=0 and drop or lower "
+    "--kv-cache-memory-bytes (the table then takes VRAM)."
+)
 
 
 def _host_embed_tables(runner) -> None:
@@ -212,25 +227,38 @@ def _host_embed_tables(runner) -> None:
     from vllm import envs
     from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
 
-    architecture = runner.model_config.architecture
-    if architecture not in (
-        "Qwen3_5ForCausalLM",
-        "Qwen3_5ForConditionalGeneration",
-        "Qwen3_5MoeForCausalLM",
-        "Qwen3_5MoeForConditionalGeneration",
-        "NemotronH_Omni_Reasoning_V3",  # Nemotron 3.5 Super VL
+    # The architecture allow-list lives in vllm/merlin/envs.py
+    # (HOST_EMBED_ARCHITECTURES).
+    if not envs.host_embed_table_enabled_for_model(
+        runner.model_config.architecture
     ):
         return
-    if not envs.host_embed_table_enabled_for_model(architecture):
-        return
+    # An explicit VLLM_HOST_EMBED_TABLE=1 fails on a table it cannot host;
+    # with the default (unset) such a table is skipped and logged.
+    explicit = envs.VLLM_HOST_EMBED_TABLE is True
+
+    def skip(what: str, reason: str) -> None:
+        if explicit:
+            raise ValueError(
+                f"VLLM_HOST_EMBED_TABLE=1 cannot keep this model's embeddings "
+                f"in host memory: {what} has {reason}. Unset it or set it to 0."
+            )
+        logger.info("host-embed: skipping %s: %s", what, reason)
+
     config = runner.model_config.hf_text_config
     if getattr(config, "tie_word_embeddings", False):
-        raise ValueError("Host embedding requires untied word embeddings")
+        skip("target", "tied word embeddings")
+        return
 
     roots = [("target", runner.model)]
     draft_model = getattr(runner.speculator, "model", None)
     if draft_model is not None and draft_model is not runner.model:
         roots.append(("draft", draft_model))
+        draft_model_config = getattr(runner.speculator, "draft_model_config", None)
+        draft_config = getattr(draft_model_config, "hf_text_config", None)
+        if getattr(draft_config, "tie_word_embeddings", False):
+            skip("draft", "tied word embeddings")
+            return
 
     total = 0
     n_tables = 0
@@ -243,12 +271,35 @@ def _host_embed_tables(runner) -> None:
                 continue
             if p.device.type != "cuda":
                 continue
-            if type(mod.quant_method).__name__ != "UnquantizedEmbeddingMethod":
-                raise ValueError("Host embedding requires unquantized embeddings")
+            quant_method = type(getattr(mod, "quant_method", None)).__name__
+            if quant_method != "UnquantizedEmbeddingMethod":
+                skip(
+                    f"{label}/{name}",
+                    f"quantized or unsupported embeddings ({quant_method})",
+                )
+                continue
             nbytes = p.numel() * p.element_size()
-            cpu_data = p.detach().to(device="cpu").pin_memory()
+            # An actionable error instead of a
+            # raw pin/map failure (WSL2 turns pinned memory off)
+            from vllm.utils.platform_utils import is_pin_memory_available
+
+            if not is_pin_memory_available():
+                raise RuntimeError(
+                    "Host embedding (VLLM_HOST_EMBED_TABLE) needs pinned host "
+                    "memory, which vLLM reports unavailable here. "
+                    + _HOST_EMBED_PIN_HINT
+                )
+            try:
+                cpu_data = p.detach().to(device="cpu").pin_memory()
+                uva = get_accelerator_view_from_cpu_tensor(cpu_data)
+            except RuntimeError as e:
+                raise RuntimeError(
+                    f"Host embedding could not pin and map {label}/{name} "
+                    f"({nbytes / (1024**3):.2f} GiB): {e}. "
+                    + _HOST_EMBED_PIN_HINT
+                ) from e
             mod._host_embed_weight = cpu_data
-            p.data = get_accelerator_view_from_cpu_tensor(cpu_data)
+            p.data = uva
             p._vllm_is_uva_offloaded = True
             mod.use_fused_embedding = False
             total += nbytes
@@ -264,7 +315,9 @@ def _host_embed_tables(runner) -> None:
             "across %d table(s)", total / (1024**3), n_tables,
         )
     else:
-        raise RuntimeError("Host embedding enabled but no CUDA table was offloaded")
+        # Logged even for an explicit 1: a pipeline-parallel rank that holds
+        # no embedding table is expected.
+        logger.info("host-embed: skipping: no CUDA table was offloaded on this rank")
 
 
 class GPUModelRunner(LoRAModelRunnerMixin):
@@ -325,6 +378,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         # PP broadcast/recv helper. Runs the collective on a side stream.
         self.pp_handler: PPHandler | None = None
+        self.free_before_deferred_commit = kv_host_tier.free_before_deferred_commit(
+            vllm_config
+        )
 
         # Persistent buffer for intermediate tensors (non-first PP ranks).
         self.intermediate_tensors: IntermediateTensors | None = None
@@ -636,16 +692,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 logprobs_mode=self.model_config.logprobs_mode,
                 chunk_size=prompt_logprobs_chunk_size(self.vllm_config),
             )
-            if (
-                isinstance(self.speculator, DraftModelSpeculator)
-                and self.speculator.draft_under_target_topk
-            ):
-                # Only validated with the stock sampler; the draft's
-                # top-k/top-p reach it via _prepare_draft_sampling().
-                check_draft_under_topk_sampler(
-                    custom_sampler=bool(custom),
-                    watermark=isinstance(self.sampler, GPUWatermarkSampler),
-                )
             self.structured_outputs_worker = StructuredOutputsWorker(
                 max_num_logits=self.max_num_reqs * self.decode_query_len,
                 vocab_size=self.vocab_size,
@@ -1074,7 +1120,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     self.sampler, input_batch.idx_mapping
                 )
             with use_workspace_lane(self._draft_workspace_lane):
-                self._prepare_draft_sampling(input_batch, dummy_run=True)
                 self.speculator.propose(
                     input_batch=input_batch,
                     attn_metadata=attn_metadata,
@@ -1102,26 +1147,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         assert hidden_states is not None  # Last PP rank always has hidden_states
         sample_hidden_states = hidden_states[input_batch.logits_indices]
         return hidden_states, sample_hidden_states
-
-    def _prepare_draft_sampling(
-        self, input_batch: InputBatch, *, dummy_run: bool = False
-    ) -> None:
-        """Stage this step's per-request top-k/top-p for the draft.
-
-        Called right before every `speculator.propose()` -- eagerly, on the
-        proposal stream, outside any captured region -- so the persistent
-        draft buffers hold the CURRENT step's values when the draft graphs
-        replay. A no-op unless the flag is ON.
-        """
-        speculator = self.speculator
-        if (
-            isinstance(speculator, DraftModelSpeculator)
-            and speculator.draft_under_target_topk
-        ):
-            assert self.sampler is not None
-            speculator.prepare_draft_sampling(
-                self.sampler.sampling_states, input_batch, dummy_run=dummy_run
-            )
 
     @torch.inference_mode()
     def _dummy_sampler_run(self, hidden_states: torch.Tensor) -> None:
@@ -1316,13 +1341,18 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     if self.speculator is not None:
                         with use_workspace_lane(self._draft_workspace_lane):
                             self.speculator.capture()
-                    if self.adaptive_verification is not None:
+                    # Ports of vllm#63431 and vllm#61509: the memory-profiling
+                    # pass skips the cost profiling (throwaway KV cache; the real
+                    # capture recalibrates), and the profiling activations are
+                    # released so they are not counted as graph memory below.
+                    if self.adaptive_verification is not None and not profile_only:
                         with self.step_timing.collect() as timings:
                             for batch in self.adaptive_verification.batches_to_profile(
                                 self.cudagraph_manager.captured_token_counts()
                             ):
                                 self._dummy_run(**batch)
                         self.adaptive_verification.set_initial_cost_curves(timings)
+                        torch.accelerator.empty_cache()
                     self.kv_connector.reset_capture_state()
 
             if self._ple_offload_connector is not None and capture_decoder:
@@ -1395,7 +1425,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.model_state.restore_deferred_state(
                     outputs.pop("deferred_state", None)
                 )
+                # Certify after every deferred writer.
+                commit_ack = outputs.pop("commit_ack", None)
                 self.postprocess_sampled(**outputs)
+                if commit_ack is not None:
+                    commit_ack.finish()
 
     def add_requests(self, scheduler_output: SchedulerOutput) -> None:
         for new_req_data in scheduler_output.scheduled_new_reqs:
@@ -1827,8 +1861,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self, scheduler_step: int, input_batch: InputBatch
     ) -> None:
         # The handler stores a snapshot only for batches with structured-output
-        # requests, so the GPU gather runs only then (it used to be launched
-        # on every spec step).
+        # requests, so the GPU gather runs only then, not on every spec step.
         if not input_batch.has_structured_output_reqs:
             return
         self.draft_tokens_handler.snapshot_consumed_drafts(
@@ -2071,9 +2104,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         """Whether this step issues its PLE request right after prepare_inputs.
 
         Stage-0 graph stall: the in-graph PLE wait covers the
-        offload round trip with only layer 0 of GPU work, because the request
-        (D2H of input ids / query_start_loc / n-gram context) used to be staged
-        after prepare_attn, preprocess_state and model_state.prepare_inputs.
+        offload round trip with only layer 0 of GPU work when the request
+        (D2H of input ids / query_start_loc / n-gram context) is staged after
+        prepare_attn, preprocess_state and model_state.prepare_inputs.
         Every PLE source is final once prepare_inputs returns: nothing between
         the two points writes input_buffers.input_ids, input_batch.query_start_loc,
         input_batch.idx_mapping, req_states.num_computed_tokens or
@@ -2193,8 +2226,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # still uninitialised). One bool check once it has been emitted.
             e2_toggles.maybe_emit()
             # Update the request states.
-            self.update_pp_decode_requests()
-            self.finish_requests(scheduler_output)
+            # The deferred commit and the frees, in
+            # the order kv_host_tier.update_finished_and_deferred picks.
+            kv_host_tier.update_finished_and_deferred(self, scheduler_output)
             self.free_states(scheduler_output)
             self.add_requests(scheduler_output)
             self.update_requests(scheduler_output)
@@ -2398,6 +2432,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 for_capture=dummy_run and batch_desc.cg_mode == CUDAGraphMode.FULL,
             )
 
+        smallq_identity = ()
+        if (
+            envs.MERLIN_FLASHINFER_WORKLOAD_TILE
+            and batch_desc.cg_mode == CUDAGraphMode.FULL
+        ):
+            smallq_identity = plan_identity(attn_metadata)
+            assert self.cudagraph_manager is not None
+            if not self.cudagraph_manager.has_fullgraph(batch_desc, smallq_identity):
+                batch_desc = replace(batch_desc, cg_mode=CUDAGraphMode.NONE)
+                note_event("target FULL fallback to NONE", logger.info)
+
         input_ids = input_batch.input_ids
         inputs_embeds = None
         ec_connector_output = None
@@ -2489,7 +2534,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.kv_connector.pre_forward(
                 scheduler_output, input_batch, attn_metadata=attn_metadata
             )
-            model_output = self.cudagraph_manager.run_fullgraph(batch_desc)
+            if smallq_identity:
+                model_output = self.cudagraph_manager.run_fullgraph(
+                    batch_desc, identity=smallq_identity
+                )
+            else:
+                model_output = self.cudagraph_manager.run_fullgraph(batch_desc)
         else:
             # For piecewise and eager mode, just call model().
             batch_descriptor = BatchDescriptor(
@@ -2648,6 +2698,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.pp_handler.attach_deferred_state(
                 self.model_state.detach_deferred_state()
             )
+            # Keep the producing step on the PP slot.
+            kv_commit_acks.defer_step(self, input_batch)
             # Optimistically update num_computed_tokens for entire batch here.
             # Will be adjusted for rejections if necessary in update_requests.
             self.postprocess_num_computed_tokens(input_batch)
@@ -2782,7 +2834,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     self.sampler, input_batch.idx_mapping
                 )
             with use_workspace_lane(self._draft_workspace_lane):
-                self._prepare_draft_sampling(input_batch)
                 draft_tokens = self.speculator.propose(
                     input_batch,
                     attn_metadata,
@@ -2891,6 +2942,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     def shutdown(self) -> None:
         """Release GPU tensors (model weights, KV caches, workspace) so that
         memory is reclaimable when running in the same process."""
+        # a KV copy that missed its teardown
+        # deadline could hold a device-wide sync forever, and its DMA may still
+        # touch the GPU KV: keep every GPU tensor (the arenas stay referenced
+        # by worker._FAILED_SHUTDOWN_WORKERS) and skip the sync.
+        if kv_host_tier.copy_teardown_failed():
+            logger.error(
+                "model runner shutdown skipped: a KV copy did not finish "
+                "within its teardown deadline (GPU tensors kept)"
+            )
+            return
         torch.accelerator.synchronize()
         # The last window of a run is the one a cadence log always
         # misses; emit it before the device state goes away.

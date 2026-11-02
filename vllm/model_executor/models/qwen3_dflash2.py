@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by the Merlin project; see NOTICE.
 
 import torch
 import torch.nn.functional as F
@@ -11,8 +12,15 @@ from vllm.config import CacheConfig, VllmConfig
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
+from vllm.model_executor.layers.vocab_parallel_embedding import (
+    should_use_host_embed_table,
+)
 from vllm.triton_utils import tl, triton
-from vllm.utils.torch_utils import direct_register_custom_op
+from vllm.utils.torch_utils import (
+    PIN_MEMORY,
+    direct_register_custom_op,
+    get_accelerator_view_from_cpu_tensor,
+)
 
 from .qwen3_dflash import (
     DFlashQwen3DecoderLayer,
@@ -323,12 +331,28 @@ class CandidateSelector(nn.Module):
     ) -> None:
         super().__init__()
         self.top_k = top_k
+        # The two [vocab, rank] codebooks are only gathered (a few rows per step),
+        # never scanned, and are replicated on every rank of the last PP stage.
+        # Under VLLM_HOST_EMBED_TABLE they live in pinned host memory and are read
+        # through a UVA view, like the host embedding table (2 x 121.25 MiB =
+        # 242.5 MiB per rank at vocab 248,320 x rank 256 BF16 off the binding
+        # stage).
+        self.host_codebooks = should_use_host_embed_table()
+        host = (
+            {"device": "cpu", "pin_memory": PIN_MEMORY} if self.host_codebooks else {}
+        )
         self.predecessor_codebook = nn.Parameter(
-            torch.empty(vocab_size, rank, dtype=params_dtype), requires_grad=False
+            torch.empty(vocab_size, rank, dtype=params_dtype, **host),
+            requires_grad=False,
         )
         self.successor_codebook = nn.Parameter(
-            torch.empty(vocab_size, rank, dtype=params_dtype), requires_grad=False
+            torch.empty(vocab_size, rank, dtype=params_dtype, **host),
+            requires_grad=False,
         )
+        self._predecessor_view: torch.Tensor | None = None
+        self._successor_view: torch.Tensor | None = None
+        if self.host_codebooks:
+            self.refresh_host_views()
         self.hidden_projection = ReplicatedLinear(
             hidden_size,
             rank,
@@ -339,6 +363,36 @@ class CandidateSelector(nn.Module):
             return_bias=False,
         )
 
+    def refresh_host_views(self) -> None:
+        """(Re)build the UVA views of the pinned host codebooks; the weight loader
+        copies into the pinned storage in place, so the views stay valid."""
+        for name in ("predecessor_codebook", "successor_codebook"):
+            param = getattr(self, name)
+            if param.device.type != "cpu" or not param.is_pinned():
+                raise RuntimeError(
+                    f"DFlash2 host codebook {name} is not in pinned host memory"
+                )
+            setattr(
+                self,
+                f"_{name.split('_')[0]}_view",
+                get_accelerator_view_from_cpu_tensor(param.data),
+            )
+
+    def _apply(self, fn, recurse: bool = True):
+        # Device moves apply to the projection only; host codebooks stay pinned
+        # (their UVA views are bound to this storage). A dtype change would mix
+        # dtypes in _score_edges, so it is refused, as for the host embedding.
+        if not self.host_codebooks:
+            return super()._apply(fn, recurse)
+        codebook = self.predecessor_codebook
+        probe = torch.empty(0, dtype=codebook.dtype, device=codebook.device)
+        if fn(probe).dtype != codebook.dtype:
+            raise RuntimeError("DFlash2 host codebooks have a fixed dtype")
+        if recurse:
+            for module in self.children():
+                module._apply(fn)
+        return self
+
     def forward(
         self,
         candidate_ids: torch.Tensor,
@@ -347,9 +401,14 @@ class CandidateSelector(nn.Module):
         anchor_token_ids: torch.Tensor,
     ) -> torch.Tensor:
         hidden = self.hidden_projection(hidden_states)
+        if self.host_codebooks:
+            predecessor, successor = self._predecessor_view, self._successor_view
+            assert predecessor is not None and successor is not None
+        else:
+            predecessor, successor = self.predecessor_codebook, self.successor_codebook
         return _score_edges(
-            self.predecessor_codebook,
-            self.successor_codebook,
+            predecessor,
+            successor,
             candidate_ids,
             unary_logits,
             hidden,
@@ -404,6 +463,14 @@ class DFlash2Qwen3ForCausalLM(DFlashQwen3ForCausalLM):
             scale=float(draft_config.get("output_multiplier", 1.0)),
             soft_cap=softcap if softcap > 0 else None,
         )
+
+    def load_weights(self, weights):
+        loaded = super().load_weights(weights)
+        selector = self.model.candidate_selector
+        if selector.host_codebooks:
+            # Views of the loaded pinned storage (the loader copies in place).
+            selector.refresh_host_views()
+        return loaded
 
     def compute_candidates(
         self, hidden_states: torch.Tensor

@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright 2026 halt95 (Merlin modifications)
 """One family-name table for the Flash-Next (Qwen4Exp) model family.
 
-Every gate that used to spell ``"Qwen4ExpForCausalLM"`` / ``"qwen4_exp"`` as a
-literal reads this table instead, so a renamed upstream class is one edit here,
+Every gate that checks for ``"Qwen4ExpForCausalLM"`` / ``"qwen4_exp"`` reads
+this table rather than a literal, so a renamed upstream class is one edit here,
 or one env entry with no code change::
 
     VLLM_FLASHNEXT_FAMILY_ALIASES="Qwen4ForCausalLM=Qwen4ExpForCausalLM,qwen4=qwen4_exp"
@@ -12,7 +12,8 @@ Each ``alias=canonical`` entry makes ``alias`` behave exactly like ``canonical``
 at every site (model registry, config-class map, RecoverSSM allowlist, PLE
 n-gram layer fields, the speculative MTP rewrite, the graph-profile guards and the PLE
 pull-transport gate).  Unset, the resolved sets are exactly the historical
-literals, so Flash-Next behaviour is unchanged.
+literals, so Flash-Next behaviour is unchanged. Set the env before importing
+vLLM: HF config and model registries install aliases once at startup.
 
 This module is stdlib-only on purpose: it is imported by the config layer, the
 model registry and the worker, and must not create import cycles.
@@ -20,7 +21,7 @@ model registry and the worker, and must not create import cycles.
 
 import os
 from collections.abc import Iterable, Mapping
-from typing import Any, TypeVar
+from typing import TypeVar
 
 ENV_ALIASES = "VLLM_FLASHNEXT_FAMILY_ALIASES"
 
@@ -118,7 +119,3 @@ def expand_model_types(values: Mapping[str, _V]) -> dict[str, _V]:
         if canonical in values:
             out[alias] = values[canonical]
     return out
-
-
-def is_family_arch(architecture: Any, roles: Iterable[str] = ALL_ROLES) -> bool:
-    return architecture in archs(roles)

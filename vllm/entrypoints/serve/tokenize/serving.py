@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by the Merlin project; see NOTICE.
 from dataclasses import dataclass
 from typing import Any, Final
 
@@ -22,7 +23,10 @@ from vllm.entrypoints.serve.tokenize.protocol import (
 from vllm.entrypoints.serve.utils.request_logger import RequestLogger
 from vllm.inputs import TokensPrompt, tokens_input
 from vllm.logger import init_logger
-from vllm.renderers.chat_utils import ChatTemplateContentFormatOption
+from vllm.renderers.chat_utils import (
+    ChatTemplateContentFormatOption,
+    has_non_text_content,
+)
 from vllm.renderers.online_renderer import OnlineRenderer
 from vllm.tokenizers import TokenizerLike
 
@@ -68,6 +72,12 @@ class ServingTokenization(BaseServing):
         lora_request = self._maybe_get_adapters(request)
 
         if isinstance(request, TokenizeChatRequest):
+            # Reject media before chat preprocessing can create fetch tasks.
+            if has_non_text_content(request.messages):
+                return self.create_error_response(
+                    "/tokenize only supports text content; media inputs are disabled."
+                )
+
             tool_dicts = (
                 None
                 if request.tools is None

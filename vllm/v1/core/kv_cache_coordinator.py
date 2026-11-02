@@ -200,6 +200,17 @@ class KVCacheCoordinator(ABC):
             self.retention_interval, self.scheduler_block_size, kv_cache_config
         )
 
+    def find_longest_union_hit(
+        self, block_hashes, max_cache_hit_length, host_pool, *, version, epoch
+    ):
+        """Return typed absolute slots for the allocator's promotion plan."""
+        from vllm.merlin.kv_tier_lookup import find_longest_union_hit
+
+        return find_longest_union_hit(
+            self, block_hashes, max_cache_hit_length, host_pool,
+            version=version, epoch=epoch,
+        )
+
     def get_num_blocks_to_allocate(
         self,
         request_id: str,
@@ -287,6 +298,10 @@ class KVCacheCoordinator(ABC):
         num_local_computed_tokens: int,
         num_external_computed_tokens: int,
         skip_zeroing_group_ids: tuple[int, ...] = (),
+        # (group, table index) of a mixed
+        # two-tier hit whose entry is a null placeholder: each gets a private
+        # destination block for its host restore.
+        restore_slots: Sequence[tuple[int, int]] = (),
     ) -> None:
         """Add the new computed blocks to the request. Optionally allocate new
             blocks for external computed tokens (if any).
@@ -320,6 +335,15 @@ class KVCacheCoordinator(ABC):
                 new_computed_blocks[i],
                 num_local_computed_tokens,
                 num_external_computed_tokens,
+            )
+        # Second phase, after every group's
+        # GPU hits are touched (same rule as the external blocks below).
+        if restore_slots:
+            from vllm.merlin.kv_tier_lookup import place_restore_destinations
+
+            place_restore_destinations(
+                self, request_id, restore_slots, num_local_computed_tokens,
+                skip_zeroing_group_ids,
             )
         if num_external_computed_tokens > 0:
             for i, manager in enumerate(self.single_type_managers):
@@ -503,6 +527,11 @@ class KVCacheCoordinator(ABC):
         for manager in self.single_type_managers:
             manager.new_step_starts()
 
+    def invalidate_step_publications(self, request_id: str) -> None:
+        """Evict what ``request_id`` published this step, in every group."""
+        for manager in self.single_type_managers:
+            manager.invalidate_step_publications(request_id)
+
 
 class KVCacheCoordinatorNoPrefixCache(KVCacheCoordinator):
     """KV cache coordinator to use if prefix caching is disabled or unsupported.
@@ -657,6 +686,8 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         metrics_collector: KVCacheMetricsCollector | None = None,
         num_prefill_lookahead: int = 0,
         allow_partial_hash_hits: bool = True,
+        *,
+        causal_sliding_window_kv: bool,
     ):
         super().__init__(
             kv_cache_config,
@@ -719,6 +750,8 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                 hash_block_size,
                 dcp_world_size,
                 [type(manager) for manager in self.single_type_managers],
+                num_prefill_lookahead=num_prefill_lookahead,
+                causal_sliding_window_kv=causal_sliding_window_kv,
             )
         )
         cache_hit_alignment_tokens = self._cache_hit_alignment_tokens
@@ -920,7 +953,20 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                     ].pcp_world_size,
                 )
                 if drop_eagle_block:
-                    eagle_verified.add(idx)
+                    # A fine-grained sliding-window group proves a hit with a
+                    # key one hash unit past it in the block it ends in. When
+                    # a later group lowers the candidate, the block holding
+                    # the new endpoint may be a different one, so the proof
+                    # must be re-established there: never mark it verified,
+                    # it gets the margin and the drop on every pass (it still
+                    # returns at most the candidate, so the loop converges).
+                    if not (
+                        self.enable_partial_hash_hits
+                        and isinstance(spec, SlidingWindowSpec)
+                        and manager_cls.supports_fine_grained_hash_lookup
+                        and group_block_size > self.hash_block_size
+                    ):
+                        eagle_verified.add(idx)
                 elif _new_hit_length < curr_hit_length:
                     # length shrunk; invalidate previous eagle verifications
                     eagle_verified.clear()
@@ -1023,6 +1069,8 @@ def get_kv_cache_coordinator(
     metrics_collector: KVCacheMetricsCollector | None = None,
     num_prefill_lookahead: int = 0,
     allow_partial_hash_hits: bool = True,
+    *,
+    causal_sliding_window_kv: bool,
 ) -> KVCacheCoordinator:
     if not enable_caching:
         return KVCacheCoordinatorNoPrefixCache(
@@ -1067,4 +1115,5 @@ def get_kv_cache_coordinator(
         metrics_collector=metrics_collector,
         num_prefill_lookahead=num_prefill_lookahead,
         allow_partial_hash_hits=allow_partial_hash_hits,
+        causal_sliding_window_kv=causal_sliding_window_kv,
     )

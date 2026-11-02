@@ -94,6 +94,8 @@ from .model import (
     is_hc_sequence_parallel_enabled,
 )
 
+from .mtp_kv_scales import maybe_load_mtp_qsa_static_kv_scales
+
 logger = init_logger(__name__)
 
 
@@ -719,9 +721,11 @@ class Qwen4ExpMTP(
             self,
             ignore_unexpected_suffixes=_QWEN4_EXP_IGNORED_MISSING_SUFFIXES.copy(),
         )
+        # Before profiling/capture.
         loaded = loader.load_weights(remap_weight_names(), mapper=mapper)
         if owns_head:
             self._finalize_draft_head(loaded)
+        maybe_load_mtp_qsa_static_kv_scales(self)
         return loaded
 
     def _finalize_draft_head(self, loaded: set[str]) -> None:

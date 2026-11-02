@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright 2026 halt95 (Merlin modifications)
 """RecoverSSM post-sampling commit as a standalone CUDA graph.
 
-The commit chain of one decode step (per GDN group: plan, conv compaction, final
-fold, boundary fold, align postprocess) runs after sampling, outside the forward
-graph. Eagerly that is 5 Triton launches per group plus their Python checks. This
+The commit chain of one decode step (per GDN group: plan, conv compaction, fused
+final/boundary state fold, align postprocess) runs after sampling, outside the
+forward graph. The eager path launches these kernels with Python checks. This
 module replays the SAME chain from a CUDA graph: same kernels, same grids, same
 arguments, same order, on the same stream, so the committed state is bit-identical
 to the eager chain. The chain is rank-local (no collectives), so a rank replaying

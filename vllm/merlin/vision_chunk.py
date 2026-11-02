@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright 2026 halt95 (Merlin modifications)
 """Row-chunked Qwen3 vision tower.
 
 Only per-row operations are sliced. Each block still makes one attention call
-over the entire batch. Smaller GEMMs can change rounding: large-image release
-acceptance requires the numerics identity gate and the mixed-size memory sweep, not CPU allclose alone.
+over the entire batch. Smaller GEMMs can change rounding, so large-image
+support is qualified by a numerics identity check and a mixed-size memory
+sweep on the GPU, not by CPU allclose alone.
 """
 
 import logging

@@ -6,6 +6,7 @@ releases were measured on vLLM 0.28-0.30 when they shipped and are kept as publi
 
 | Release | Date | Engine | Models |
 |---|---|---|---|
+| [3.0.1](#merlin-301) | 2026-11-02 | vLLM 0.32.0 | Flash-Next, Swift1.5, Swift1.5-Huihui, Qwen3.8-27B, ThinkingCap, Nemotron 3.5 Super VL, Ornith 1.5 |
 | [3.0.0](#merlin-300) | 2026-10-22 | vLLM 0.32.0 | Flash-Next, Swift1.5, Swift1.5-Huihui, Qwen3.8-27B, ThinkingCap, Nemotron 3.5 Super VL, Ornith 1.5 |
 | [2.5.3](#v253) | 2026-10-12 | Merlin engine v2.5.2 (vLLM 0.30.0) | Flash-Next, Swift1.5-Huihui (new); Qwen3.8-27B v1.3.0 / v1.3.1 and ThinkingCap (new) |
 | [2.5.2](#v252) | 2026-10-12 | Merlin engine v2.5.2 (vLLM 0.30.0) | Flash-Next |
@@ -14,6 +15,253 @@ releases were measured on vLLM 0.28-0.30 when they shipped and are kept as publi
 | [2.0.1](#v201) | 2026-09-18 | vLLM pre-0.30 | Flash-Next |
 | [2](#v2) | 2026-09-17 | vLLM pre-0.30 | Flash-Next |
 | [1](#v1) | 2026-09 | vLLM 0.28.0 + patches | Flash-Next |
+
+## Merlin 3.0.1
+
+2026-11-02. Built on vLLM 0.32.0, with the same seven models as 3.0.0. Every speed figure was re-measured for this release with
+the GPU unlock and P2P (see below).
+
+### Highlights
+
+- **KV RAM cache (experimental).** `--kv-ram-cache 24g` keeps conversation prefixes that the GPU evicts in host RAM,
+  and restores them instead of recomputing them. A restore gives exactly the same output as a GPU cache hit. It works on
+  the Flash-Next family (MTP drafter only) and Qwen3.8-27B. It's off by default; Ornith 1.5 accepts it but is untested.
+  On Flash-Next a 262K restore takes 1.2–1.4 s instead of about 56 s to recompute. Known limits: a 262K session
+  evicted during heavy prefill may be recomputed instead of restored, and host memory grows in steps over the first
+  262K requests while the request history fills (bounded: about 70 MiB on Flash-Next, 280 MiB on the 27B; in our soaks
+  0.18–0.38 % per hour of resident-memory growth while it fills, above the 0.1 % per hour soak limit).
+- **More sessions with `--swarm` (experimental).** Raises the session cap on four RTX 3090s, with or without
+  P2P: from 8 to 24 on Flash-Next, Swift1.5 and Swift1.5-Huihui, and from 24 to 32 on Qwen3.8-27B and ThinkingCap. It
+  turns on a 48 GB KV RAM cache with it. Tested on Flash-Next and the 27B with P2P; Swift1.5 and Swift1.5-Huihui, and
+  every model without P2P, use the same cap untested (⚫, expected to work), and the server prints a warning on the
+  no-P2P rows. Default caps are unchanged, and other models and layouts don't have a swarm
+  cap yet.
+- **DFlash2 drafter for the Flash-Next family.** `--spec dflash2` on 4× 3090 with P2P. Decode is 5–18 % faster than MTP,
+  and the server holds three 262K sessions instead of six 131K ones. MTP stays the default.
+- **GPU unlock support.** [Zagitta's gpu-unlock](https://github.com/Zagitta/gpu-unlock) is documented as an optional
+  host upgrade, like P2P (proposed, with before/after measurements, by Sudzpel). In a stock-versus-unlocked A/B on the reference host at 220 W it measured about 16 % faster
+  prefill on Flash-Next and 29 % on Qwen3.8-27B (two cards, 262K), with decode unchanged and identical output. From 3.0.1 on, our bench numbers are
+  measured with it.
+- **Longer context with YaRN.** Flash-Next serves beyond 262K with a YaRN override, tested on the reference host at
+  393K and 524K (MTP and DFlash2) and 917K (MTP). The 1M recipe and YaRN on the 27B are untested. Asking for more than
+  262K without YaRN is now refused at startup. This applies to every model: a context longer than the model's RoPE
+  table without YaRN is refused, and `VLLM_ALLOW_LONG_MAX_MODEL_LEN` no longer overrides it.
+- **INT6 embedding table.** `--ple int6` loads a smaller embedding table for Flash-Next and Swift1.5, saving about
+  9 GiB of host RAM per server with quality checks passed. It is one shared pack laid over your FP8 checkpoint, which
+  stays untouched; `merlin verify <dir> --ple int6` checks it, and `MERLIN_PLE_PACK_DIR` points at a local copy. FP8
+  stays the default. Swift1.5-Huihui is refused everywhere (setup, pull, serve and its launcher) and serves with
+  `--ple fp8`, because its MTP acceptance drops too far.
+
+### Measured on Merlin 3.0.1
+
+4x RTX 3090 without NVLink, P2P on, Zagitta's gpu-unlock, 220 W, 2026-11-02 bench cards (runs measured 2026-11-01 to 2026-11-02 UTC). Decode: one stream, thinking on (reasoning effort medium, each checkpoint's default), median of 3, at a 4K / 131K prompt and the full 262,144-token context (261,888 prompt + 128 out). 8 agents: total throughput of eight simultaneous follow-ups on 16K conversations; with thinking on a 512-token follow-up may end inside the reasoning, and reasoning tokens count. GSM8K-200 is correct answers out of 200: thinking on at effort medium on this release (on four cards), thinking off from the 3.0.0 runs, as the weights are unchanged.
+
+| Checkpoint | GPUs | KV pool, tokens | Decode, tok/s, 4K / 131K / 262K | 262K prefill | 8 agents, tok/s, thinking on / off | GSM8K-200, thinking on / off |
+|---|---|---|---|---|---|---|
+| Flash-Next | 4x | 924,993 | 178 / 183 / 197 | 6,803 tok/s | 677 / 664 | 197 / 199 |
+| Swift1.5 | 4x | 924,993 | 176 / 186 / 186 | 6,783 tok/s | 673 / 650 | 199 / 197 |
+| Swift1.5-Huihui | 4x | 924,993 | 178 / 189 / 196 | 6,866 tok/s | 703 / 681 | 198 / 198 |
+| Qwen3.8-27B | 1x | 271,506 | 125 / 95 / 71 | 579 tok/s | n/a (two at most) | - / 195 |
+| Qwen3.8-27B | 2x | 826,689 | 210 / 182 / 143 | 1,115 tok/s | 705 / 615 | - / 194 |
+| Qwen3.8-27B | 4x | 2,012,105 | 251 / 243 / 238 | 2,101 tok/s | 954 / 854 | 198 / 197 |
+| ThinkingCap | 2x | 826,689 | 203 / 162 / 160 | 1,114 tok/s | 697 / 633 | - / 193 |
+| ThinkingCap | 4x | 2,012,105 | 244 / 230 / 238 | 2,099 tok/s | 952 / 832 | 198 / 195 |
+| Nemotron 3.5 Super VL | 4x | 1,856,367 (the shipped 1M context) | 103 / 102 / 93 | 3,916 tok/s | 432 / 432 | 197 / 195 |
+| Ornith 1.5 | 4x | 894,618 | 146 / 115 / 105 | 2,261 tok/s | 528 / 486 | 196 / 190 |
+
+Against 3.0.0, 262K prefill is 16-17 % faster on the Flash-Next family and 27-33 % faster on the other checkpoints, and four-card 27B time to first token at 262K is 125 s (164 s in 3.0.0). The four-card 27B and ThinkingCap agent totals and the two-card 27B thinking-on total come from overlap windows under 5 s; read them loosely, as on the 3.0.0 cards. Each checkpoint's card is under `models/<checkpoint>/benchmarks/2026-11-02/`, for example [Flash-Next](../models/flash-next/benchmarks/2026-11-02/BENCH-CARD.md) and [Qwen3.8-27B](../models/qwen38-27b/benchmarks/2026-11-02/BENCH-CARD.md).
+
+### Hardware
+
+- **More hardware.** On 4× RTX 3090 without P2P, Ornith 1.5 and Flash-Next's PP4 layout are tested; Flash-Next's
+  default layout and the 27B on four cards were boot-checked with `--swarm` (2026-11-01). 4× RTX 4090 and 2× / 4× CMP 170HX
+  64 GB are 🟡 testing: full model runs passed on cloud-hosted cards and kernel checks are still to run, so `merlin serve`
+  picks them like untested profiles. Tuning continues on all three. 4× CMP 170HX (`fn-sm80-64g-x4-pp4`) was 🟢 tested
+  in 3.0.0 and moves to 🟡 testing until its kernel checks run; on a host that matches both a tested and a testing
+  profile, `merlin serve` picks the tested one.
+- **Flash-Next PP4 on four cards without P2P**, by name: `--profile fn-quad-3090-nop2p-pp4`. Prefill is 47–53 % faster
+  and decode 14 % slower than the default TP2×PP2, which stays the default. Its KV pin is now 4.15 GiB per card: a
+  906,581-token pool that holds three 262K sessions (one before), tested on the reference host on 2026-10-19.
+  `--profile fn-quad-24g-sm89-pp4` is the same layout on 4× RTX 4090 without P2P, by name only and untested ⚫.
+- **4× RTX 4090 prefills in 2,048-token chunks** (`fn-quad-24g-sm89`; 1,024 before). On cloud-hosted 4090s this cut the
+  131K time to first token from 24.4–27.0 s to 22.5 s (about 15–20 % faster prefill), with decode unchanged. The 8 MP
+  image and 262K checks ran at 1,024 and have not run at 2,048 yet; `CHUNK=1024` goes back to the checked chunk.
+- **FP8 KV cache for the Flash-Next family on sm_80 (A100, A30, CMP 170HX)** as an opt-in with `KV_DTYPE=fp8`. BF16
+  stays its default there (the 27B already uses FP8). Untested.
+- **Host RAM for Flash-Next on four cards:** 72 GiB is the tested minimum (64 GiB ran out of memory). Startup is
+  refused below about 69 GiB, plus the KV RAM cache size when it's on; with `--ple int6` the floor is about 60 GiB
+  (estimated, not boot-tested). 96 GB is the reference configuration; a host with at least 92 GiB MemTotal counts as
+  that class. `MERLIN_SKIP_RAM_CHECK=1` keeps a RAM refusal as a warning only (see SETUP).
+- **Qwen3.8-27B on WSL2 and on cards without P2P.** On WSL2, Merlin turns on pinned memory, which the 27B,
+  Nemotron 3.5 Super VL and Ornith 1.5 need for their host embedding tables, and checks for WSL before starting;
+  on Flash-Next it prints how to turn it on instead. `P2P=off` selects the no-P2P layouts.
+
+### Before you upgrade
+
+- **The engine wheel is unchanged from 3.0.0** (no native changes in 3.0.1), so `vllm --version` still prints
+  `0.32.0+merlin.7002f56537`; the 3.0.1 Python comes from the checkout.
+
+- **Request limits.** `allowed_token_ids` or `logit_bias` over 1,024 entries, `bad_words` over 128 sequences or 1,024
+  tokens in total, or `stop_token_ids` over 128 with `min_tokens` set now return HTTP 400 instead of crashing the
+  engine. With speculative decoding, `logit_bias` is refused. Generative
+  scoring takes up to 32 items and 32,768 tokens (`MERLIN_GENERATIVE_SCORING_MAX_ITEMS`, `..._MAX_TOKENS`).
+- **The API key now also covers** `/tokenize`, `/detokenize` and `/generative_scoring`. `/tokenize` refuses media
+  parts.
+- **An explicit `VLLM_HOST_EMBED_TABLE=1` is refused at boot** on a model whose embeddings are tied or quantized
+  (it used to be skipped silently): unset it or set it to `0`. Unset, the default, is unchanged, and Flash-Next is
+  unaffected.
+- **The first Qwen3.8-27B start recompiles**, because its compile cache moved into the install (`.vllm-cache`);
+  `VLLM_CACHE_ROOT` overrides it.
+- **`REDUCED_DRAFT_VOCAB` and `DRAFT_VOCAB` now stop the launch** when set (an empty value, or `REDUCED_DRAFT_VOCAB=0`,
+  is accepted). Reduced draft vocabulary is gone (see Removed); unset them.
+- **Thinking-off decode at 262K measured lower on two layouts:** Swift1.5 −11.4 % and Qwen3.8-27B on four cards
+  −5.7 % against 3.0.0. Step time is the same or better; the gap is MTP draft acceptance over a 128-token sample, and
+  the 259K thinking-off cells read +0.8 % and +5.4 % (see the bench cards).
+
+### Fixes
+
+- **`/health` watches for stalls**, on by default with stats logging, one API server and one engine: it returns 503
+  when the engine completes no step for 120 s with requests in flight (`VLLM_MERLIN_HEALTH_STALL_S`; `0` turns it off). A failed request logs its cause at ERROR
+  and returns a clear error message.
+- A single request too large for the KV cache now fails with "KV cache capacity exhausted" instead of hanging.
+- The RAM check now respects memory limits set on a container or a systemd service, so a server that can't fit is
+  refused before the weights load instead of being killed partway through.
+- A worker that dies during startup now fails the boot instead of hanging it.
+- Structured output (JSON mode, strict tools, grammars) with speculative decoding is now exact. Draft acceptance
+  for these requests reads lower as a result; this is expected.
+- Flash-Next refuses to run FP8 KV with a recipe's automatic scales when the checkpoint's config doesn't match them; scales you set yourself with `SCALES` aren't checked. Calibrate a new checkpoint with
+  `tools/qsa_calibrate.py` and pass `SCALES=`; the calibration now records which checkpoint it was made on, and the
+  launcher warns when the scales name another checkpoint or were not calibrated under the YaRN length being served.
+- A Flash-Next checkpoint whose config doesn't set `mamba_ssm_dtype` now keeps its GDN state in float32, as every shipped
+  checkpoint does, instead of falling back to bf16.
+- Bad sampler settings are rejected with an error before the request is admitted.
+- An FP8 embedding table with broken scales (NaN, infinite or zero) and incompletely packed shards are refused at
+  load.
+- `--skip-tokenizer-init` is refused, and Merlin notes when extra arguments override a recipe value.
+- `include_reasoning=false` no longer marks reasoning finished before generation starts; structured output now waits
+  for the reasoning to end.
+- With thinking off, a non-streaming response now puts the whole output in `content` and reports zero reasoning
+  tokens, as streaming does.
+- `/v1/messages`: a `tool_result` that carries a `tool_reference` part (deferred tool search) is now rendered as
+  `Tool reference: <name>` text instead of failing with HTTP 400, so a history that contains one replays.
+- **A boot hang on the Flash-Next family is fixed.** A Triton kernel loading while the host n-gram table was being
+  pulled could stall both first-stage ranks. Every model now preloads its boot kernels and synchronises before a
+  later kernel load. Two new warnings: `Triton kernel first compiled while serving` (a kernel compiled after startup,
+  which costs that request time) and `Triton preload short for ...` (fewer kernels preloaded than expected).
+- A dangling link in the vLLM cache directory is caught at startup and by `merlin doctor`, and the 27B keeps its compile
+  cache inside the install.
+- Sessions that stop while preempted, or on a hybrid model, resume correctly from the prefix cache.
+- `n > 1` requests with a large seed no longer overflow.
+- `merlin serve --instances N` starts all N servers or none. With `--wait-ready SECONDS` it waits until every
+  instance answers `/health` and is still running; if one dies, even after answering while others load, or misses the
+  deadline, all are stopped and the command exits 1. If it cannot confirm the stopped servers are gone, it names them
+  so you can stop them by hand.
+- **YaRN past 262K no longer overruns the drafter.** With a YaRN override, the MTP and DFlash2 drafters kept the
+  checkpoint's 262,144-position table, so a longer prompt could stop the engine. The drafter now follows
+  `--max-model-len`, and the draft `max_position_embeddings` override covers every eagle-family drafter (MTP,
+  DFlash, DSpark) and the text config, so drafts follow the target's YaRN table past 262K (a port of the open upstream
+  PR vllm#63432).
+- A failed `generate()` request is always logged at ERROR, and `EngineGenerateError` carries a default message.
+- The "Unknown Merlin environment variable" warning no longer fires for setup and launcher `MERLIN_*` names, and the
+  per-admission `SimpleCPU tier miss` log is DEBUG unless `MERLIN_KV_HOST_TIER_CENSUS=1`.
+- A clean shutdown no longer prints an `EngineDeadError` traceback.
+- An always-fatal bounds-guard hit (QSA rope position, uncommitted ring) found at shutdown now fails the rank with
+  exit code 1 in every guard mode, including the default `warn`.
+- The host n-gram table no longer times out on a cold kernel compile and leaves no orphaned process when killed.
+- `install-env.sh --verify` and `--check` work without `uv` on the PATH. With an inherited `CUDA_HOME` that has no
+  `nvcc`, it now prints the refusal and exits 1 instead of failing silently, and the FlashInfer patcher checks for GNU
+  `patch` before downloading anything.
+- The benchmark tool counts speculative-decoding output correctly, so its reported output rate changes.
+- **Fixes from upstream vLLM:**
+  - top-p no longer emits token 0 when a logit is forced very high, as at the end of a thinking budget;
+  - split top-p sampling fixes;
+  - hybrid models no longer write state through stale block-table rows left by an earlier, larger batch;
+  - hybrid prefix hits: requests sharing an already-cached prompt boundary are no longer admitted one per step;
+  - resumable and streaming sessions resume correctly;
+  - cuBLAS initialises before memory profiling;
+  - pipeline-parallel draft tokens are gathered in order;
+  - adaptive verification no longer shrinks the KV cache by its profiling activations;
+  - third-party Flash-Next quantizations with quantized q/k/v and a BF16 QSA indexer (such as AWQ builds) load.
+
+### Engine
+
+- The MTP drafter's attention layers now apply the FP8 KV scales. Output is unchanged.
+- Qwen 4 readiness: Flash-Next family model types load from HF config, and the config check names a pipeline split
+  that keeps the n-gram layers on the first card.
+- YaRN M-RoPE with video pruning keeps the checkpoint's original correction window; the cos/sin cache still covers
+  the longer positions. No shipped profile reaches this path.
+- When freeing KV blocks by yielding one session, the scheduler now picks the smallest session that covers the
+  shortfall instead of the first. Output is unchanged.
+- With `VLLM_HOST_EMBED_TABLE=1`, the DFlash2 drafter's codebooks also move to host memory.
+
+### Setup and defaults
+
+- **`merlin setup` recommends the 27B over ThinkingCap on 4× RTX 3090** when Flash-Next doesn't fit. At the served default (reasoning
+  effort medium) ThinkingCap is not faster; its earlier lead was measured at xhigh. ThinkingCap stays available with `--model 27b-thinkingcap`.
+- **SSE keep-alive every 15 s** on `/v1/chat/completions` and `/v1/completions`, so idle streams survive common proxy timeouts. `-- --sse-keep-alive-interval 0`
+  turns it off.
+- **Cleaner `./setup.sh` output**: titled sections, aligned options and a downloads table with a total. `NO_COLOR` is
+  honoured. The existing questions, their defaults and saved answers are unchanged. Two questions are new and are
+  asked only where they apply: **Drafter** on Flash-Next family rows with DFlash2 (default MTP) and **Swarm mode** on
+  rows with a swarm cap (default no).
+- **`merlin doctor` shows each GPU's PCIe link** and the IOMMU groups.
+- **`merlin doctor` reports the GPU unlock state** per card (`on`, `off`, or `unknown` with the reason) and whether the `gpu_unlock` module is loaded,
+  on the GeForce Ampere and Ada cards the module supports (tested on RTX 3090; the others untested ⚫). It reads the card's registers in a short-lived child process
+  with a 5 s timeout and never writes them; it needs root on the host itself, and in a container, VM or WSL2 it says to check on the host. It runs on a live
+  `merlin doctor` only, not with `--dry-run`, `--simulate` or `--inventory`.
+- **DFlash2 with a KV RAM cache is refused** before anything downloads. The `--spec dflash2` hint now appears only on
+  layouts that can run it.
+- **First serve honours `CC` and `CXX`** (setup passes the compiler it found) and uses the venv's Ninja, so a host with
+  only `gcc-14`, or with no system Ninja, no longer stops at `first serve needs ...`.
+- **A complete checkpoint on a read-only mount** verifies instead of crashing while writing its verified marker.
+- The suggested second-server command is quoted, so it works from a checkout path with spaces.
+- **`merlin verify <dir>`** re-hashes every file of a checkpoint against its published checksums. `merlin serve`
+  only checks file sizes at startup, and suggests `verify` when a checkpoint hasn't been verified.
+- **The Flash-Next systemd unit restarts after the engine dies** (`Restart=always`), and stops retrying after five
+  failed starts within an hour.
+- **Containers:** the image tag matches the source release, and the Docker example binds to `127.0.0.1` instead of
+  every interface.
+- **CUDA 13.x other than 13.0** is accepted for an inherited `CUDA_HOME`; 13.0 is the tested toolkit.
+- **Ornith 1.5 `SEQS=`** now sizes its CUDA-graph capture to match.
+- **Launcher defaults:** `VLLM_NO_USAGE_STATS=1` on the Flash-Next family and `HF_HUB_OFFLINE=1` on the 27B and
+  Ornith 1.5.
+- **Launcher knobs:** `SEQS` and `MAXLEN` now also apply on Flash-Next and the 27B (the CUDA-graph capture follows
+  `SEQS`, and a value off the tested row prints a note), and Flash-Next takes `PP_PARTITION` and passes
+  `MERLIN_MARLIN_MOE_CFG` through. An extra `--speculative-config` after `--` (any spelling vLLM accepts: `--speculative_config`, `-sc` or `--speculative-config.KEY`) merges with the
+  recipe's; changing its method or K is refused. `SPEC=none` turns speculation off for diagnosis only; it is not a serving lane.
+- **Launcher checks:** `/dev/shm` is checked for free space rather than its total size; a `MODEL` and a
+  `MERLIN_CHECKPOINT_DIR` that name different folders are refused; the 27B with P2P on drops an inherited
+  `NCCL_P2P_DISABLE=1`; and a server on a non-loopback `HOST` warns that the API key does not guard `/invocations`
+  or the ops routes.
+- **Opt-in FlashInfer workload tile for the 27B** (default off): `MERLIN_FLASHINFER_WORKLOAD_TILE=1
+  release/install-env.sh` applies FlashInfer patch 0002 after 0001; see the
+  [patch notes](../release/patches/flashinfer-0.7.0.post1/README.md). The Flash-Next family ignores the knob and prints a note saying so.
+- **`./setup.sh` takes an install lock** (`.merlin/setup.lock`): a second run in the same checkout stops with a
+  message. A successful install removes only its own rollback environment and keeps older `venv-old-*` ones. A failed
+  uv size probe reports the URL and an offline/proxy hint.
+- **The old `scripts/serve*.sh` shims are kept through Merlin 3.0.x** (the 3.0.0 notes said the next release would
+  remove them).
+- **ThinkingCap containers serve as `qwen38-27b`**, as bare metal does; `SERVED=thinkingcap` gives the old name.
+- The LXC `provision.sh` no longer needs `TILE_PROOF_LOG` to reuse an environment; `install-env.sh --verify` is the
+  check.
+- PLE offload warns when either pull-speed control is off, including a direct `vllm serve` without the launcher's
+  `VLLM_E2_PLE_FAST_IDS=1` and `VLLM_E2_PLE_EARLY_REQUEST=1`.
+
+### Removed
+
+- `VLLM_SPEC_DRAFT_UNDER_TARGET_TOPK`, which was off by default and measured 2–2.5 % slower. Setting it prints a note
+  that it is ignored.
+- The reduced MTP draft vocabulary: the `REDUCED_DRAFT_VOCAB` / `DRAFT_VOCAB` switches, the bundled table and its
+  builder. It was off by default in 3.0.0. Setting either switch (other than an empty value or `REDUCED_DRAFT_VOCAB=0`) now stops the launch with a
+  message; `DRAFT_HEAD` still sets the draft head's precision. A direct `vllm serve` still honours
+  `VLLM_DRAFT_VOCAB_FILE`; that engine path is dormant and goes in a later release.
+
+### Docs
+
+- The 3.0.0 Flash-Next prefill gain (+12–13 %) is now stated against v2.5.2, which it was measured against.
+- The Nemotron 3.5 Super VL host-RAM embedding table is documented. `VLLM_HOST_EMBED_TABLE=0` keeps it on the GPU.
+- The 3.0.0 bench cards gained 262K rows on 2026-10-22, from the same runs; each such table says so.
+- In the 3.0.0 notes below, one dead link now points at How to serve.
 
 ## Merlin 3.0.0
 
@@ -32,9 +280,9 @@ releases were measured on vLLM 0.28-0.30 when they shipped and are kept as publi
   (`--tp`, `--profile`, `--instances N` for several servers on one host); `merlin doctor` checks the host first.
 - **Prebuilt engine for Ampere and Ada.** One wheel for sm_80, sm_86 and sm_89, checked against its published sha256.
 - **More hardware support.** Profiles for RTX 3090 without P2P, eight RTX 3090s, RTX 4090 (24 and 48 GB), RTX A6000 / A40,
-  A100, A30 and CMP 170HX; see [Which checkpoint runs where](../README.md#which-checkpoint-runs-where).
+  A100, A30 and CMP 170HX; see [Which checkpoint runs where](how-to-serve.md#which-checkpoint-runs-where).
 - **Faster prefill.** Flash-Next cold prefill 5,020 → 5,660 tok/s at 10K and 5,417 → 6,051 tok/s at 100K against
-  v2.5.3 (+12–13 %); Qwen3.8-27B on four cards 2,483 → 3,009 tok/s at 10K (+21 %) against v1.3.0.
+  v2.5.2 (+12–13 %); Qwen3.8-27B on four cards 2,483 → 3,009 tok/s at 10K (+21 %) against v1.3.0.
 - **RecoverSSM on every checkpoint**, including 27B on four cards (pool 1,974,072 → 2,012,105 tokens) and both new
   ones, and **27B on one RTX 3090**: a 271,506-token pool, one 262K or two 131K sessions, images up to 4 MP.
 
@@ -155,7 +403,7 @@ its bench card is [models/ornith1.5/benchmarks/2026-10-21](../models/ornith1.5/b
 
 - **Flash-Next, Swift1.5 and Swift1.5-Huihui.** Every MTP drafter scores the full vocabulary with a BF16 draft head;
   `DRAFT_HEAD=int8` is available (6.5–7.2 % lower ms per output token at the same MTP acceptance) and planned as the
-  default in the next release, and no reduced draft-vocabulary table ships (`REDUCED_DRAFT_VOCAB=1` is unavailable). The Swift1.5 and Huihui launchers are
+  default in a later release (3.0.1 keeps `bf16`), and no reduced draft-vocabulary table ships (`REDUCED_DRAFT_VOCAB=1` is unavailable). The Swift1.5 and Huihui launchers are
   generated from the checkpoint profile with their own KV scales, both tested on the reference host. The pool holds
   3 × 262K and 6 × 131K sessions at once, 0 preemptions, and an 8 MP image fits at the full pin. Flash-Next decode
   with thinking on is 1.4–5.8 % faster than v2.5.2 at every depth (187.4 against 177.2 tok/s at 259,587 tokens).
@@ -217,7 +465,7 @@ its bench card is [models/ornith1.5/benchmarks/2026-10-21](../models/ornith1.5/b
 Make a fresh checkout and run `./setup.sh`: a models folder that already holds a checkpoint is checked against the
 release checksums and reused rather than downloaded again. The old serve scripts (`scripts/serve-v2.5.sh` and
 others) forward to the new launcher with a notice and are removed in the next release. Merlin 3.0.0 does not carry the
-reduced-vocabulary INT4 draft head of the Flash-Next v3.0.0 build (2026-10-10, never published).
+reduced-vocabulary INT4 draft head of an earlier, unpublished Flash-Next build.
 Upgrading is recommended for anyone serving with prefix caching, for the RecoverSSM fix above. A clone of
 qwen38-flash-next-3090s can point at the new name with
 `git remote set-url origin https://github.com/halt95/merlin-engine.git`.

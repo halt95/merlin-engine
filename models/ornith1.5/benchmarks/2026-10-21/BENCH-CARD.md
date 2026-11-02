@@ -61,8 +61,11 @@ before any answer, so they measure decode speed only.
 |---|---|---|
 | 10,157 | 5,148 tok/s | 1.97 |
 | 101,845 | 3,049 tok/s | 33.40 |
+| 261,888 | 1,704 tok/s | 153.7 |
 
-Prefill is one cold send per depth (thinking on, 8 tokens out).
+<sub>262K row added on 2026-10-22, after first publication, from the same runs.</sub>
+
+Prefill is one cold send per depth (thinking on, 8 tokens out); the 262K row is the exact-262K run's cold send 1.
 
 Prefill over context depth: prompt tokens / median cold TTFT of the thinking-on ladder cells (3 sends each), and the
 exact-262K row's cold send.

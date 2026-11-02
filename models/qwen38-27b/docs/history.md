@@ -36,7 +36,7 @@ Decode rate = completion tokens ÷ decode time for the one stream, median over 9
 (card: [`benchmarks/2026-09-26/BENCH-CARD.md`](https://github.com/halt95/qwen38-27b-3090s/blob/v1.3.1/benchmarks/2026-09-26/BENCH-CARD.md)). Decode throughput at 32 concurrent
 streams was 771.7 tok/s (K=3) and 946.4 (K=1) on dual card, 1,120.9 (K=3) and 948.1 (K=1) on quad card; with a cold 250K
 prompt prefilling, a chat request started in 3.4 s on dual card (276 s without the long-prefill threshold) and 2.0 s on
-quad card (149 s). These concurrency and long-prefill figures are v1.0.0 history: the v1.3.0 gate did not re-run the
+quad card (149 s). These concurrency and long-prefill figures are v1.0.0 history: the v1.3.0 check did not re-run the
 c1-c32 decode ladder or the long-prefill probe. K=1 was measured on v1.0.0 only; it is not re-measured on the v1.3.0
 engine. The earlier three-patch build that v1.0.0 was compared against has its own card:
 [`benchmarks/2026-09-25/BENCH-CARD.md`](https://github.com/halt95/qwen38-27b-3090s/blob/v1.3.1/benchmarks/2026-09-25/BENCH-CARD.md).

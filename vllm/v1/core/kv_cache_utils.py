@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, Any, NamedTuple, NewType, TypeAlias, cast, ove
 from vllm import envs
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
+from vllm.merlin import kv_host_tier
 from vllm.multimodal.utils import get_mm_features_in_window
 from vllm.utils.hashing import xxhash, xxhash_cbor
 from vllm.utils.math_utils import cdiv, round_up
@@ -52,6 +53,7 @@ from vllm.v1.request import Request
 from vllm.v1.utils import tensor_data
 
 if TYPE_CHECKING:
+    from vllm.config import SpeculativeConfig
     from vllm.v1.core.block_pool import BlockPool
     from vllm.v1.core.single_type_kv_cache_manager import SingleTypeKVCacheManager
 
@@ -748,16 +750,43 @@ def resolve_dcp_kv_cache_spec(spec: KVCacheSpec, dcp_world_size: int) -> KVCache
     return replace(spec, block_size=block_size)
 
 
+def sliding_window_context_kv_is_causal(
+    speculative_config: "SpeculativeConfig | None",
+) -> bool:
+    """Whether every sliding-window group's context KV at slot ``i`` depends
+    only on tokens ``<= i``.
+
+    True without speculative decoding (target-model layers) and for DFlash
+    drafters (``method == "dflash"``, DFlash2 included), whose context KV comes
+    from the target hidden state. A shifted-input drafter (EAGLE-style, MTP)
+    writes token ``i + 1`` into slot ``i``, which a fine-grained sliding-window
+    hit does not prove for each returned block. Other methods are treated as
+    shifted (conservative).
+    """
+    return speculative_config is None or speculative_config.method == "dflash"
+
+
 def partial_hash_hits_enabled(
     kv_cache_groups: Sequence[KVCacheGroupSpec],
     hash_block_size: int,
     dcp_world_size: int = 1,
     manager_classes: Sequence[type["SingleTypeKVCacheManager"]] | None = None,
+    num_prefill_lookahead: int = 0,
+    causal_sliding_window_kv: bool = True,
 ) -> bool:
     """Whether aligned Mamba states support sub-block prefix-cache hits.
 
     If ``manager_classes`` (one per group) is given, also require every other
     prefix-cacheable group to support fine-grained lookups.
+    A sliding window group with a block above
+    the hash unit must also have that unit cover ``num_prefill_lookahead``:
+    its fine-grained EAGLE hit excludes one hash unit below a keyed boundary,
+    while a multi-module drafter's KV at those positions depends on that many
+    tokens past them, which the key does not fingerprint. Such a group also
+    needs ``causal_sliding_window_kv`` (see
+    ``sliding_window_context_kv_is_causal``): fine-grained sliding-window reuse
+    is only proven for causal context KV. Such configs keep block-aligned hits,
+    as before the sliding window capability.
     """
     if not any(
         isinstance(spec, MambaSpec)
@@ -785,6 +814,29 @@ def partial_hash_hits_enabled(
             "Disabling fine-grained prefix-cache hits because these KV "
             "cache managers require block-aligned lookups: %s.",
             ", ".join(sorted(unsupported_managers)),
+        )
+        return False
+    has_fine_grained_sliding_window = any(
+        isinstance(spec, SlidingWindowSpec)
+        and resolve_dcp_kv_block_size(spec, dcp_world_size) > hash_block_size
+        for group in kv_cache_groups
+        if group.kv_cache_spec.prefix_cacheable
+        for spec in iter_layer_specs(group.kv_cache_spec)
+    )
+    if num_prefill_lookahead > hash_block_size and has_fine_grained_sliding_window:
+        logger.warning_once(
+            "Disabling fine-grained prefix-cache hits: a sliding-window group's "
+            "EAGLE hit excludes one hash unit (%d), which does not cover the "
+            "prefill lookahead (%d).",
+            hash_block_size,
+            num_prefill_lookahead,
+        )
+        return False
+    if not causal_sliding_window_kv and has_fine_grained_sliding_window:
+        logger.warning_once(
+            "Disabling fine-grained prefix-cache hits: a sliding-window group "
+            "may hold shifted-input draft KV (speculative method other than "
+            "dflash), whose sub-block reuse is not proven."
         )
         return False
     return True
@@ -934,6 +986,10 @@ def resolve_cache_hit_alignment_tokens(
         hash_block_size,
         vllm_config.parallel_config.decode_context_parallel_size,
         manager_classes,
+        num_prefill_lookahead=vllm_config.num_prefill_lookahead_tokens,
+        causal_sliding_window_kv=sliding_window_context_kv_is_causal(
+            getattr(vllm_config, "speculative_config", None)
+        ),
     ):
         return hash_block_size
     return scheduler_block_size
@@ -2107,6 +2163,14 @@ def _annotate_eagle_groups(
         ):
             group.is_eagle_group = True
 
+    # DFlash draft layers trail the
+    # target and are named layers.{i + N}: flag exactly their groups, not
+    # every group through the coordinator's flag-all fallback.
+    from vllm.merlin.draft_kv_groups import flag_dflash_draft_groups
+
+    if flag_dflash_draft_groups(vllm_config, kv_cache_spec, kv_cache_groups):
+        return
+
     if not use_trailing_layer_fallback:
         return
     if not _groups_partition_layers_exactly(kv_cache_spec, kv_cache_groups):
@@ -2309,6 +2373,7 @@ def kv_cache_groups_tp_replicas(
 
 def generate_scheduler_kv_cache_config(
     kv_cache_configs: list[KVCacheConfig],
+    widest_stage_tensors: bool = False,
 ) -> KVCacheConfig:
     """Generate the KV cache configuration for the scheduler."""
     assert all(
@@ -2321,6 +2386,14 @@ def generate_scheduler_kv_cache_config(
     # All workers have the same kv_cache_config except layer names, so use
     # an arbitrary one to initialize the scheduler.
     cfg = copy.deepcopy(kv_cache_configs[0])
+    # a group is a draft group if it
+    # is one on any stage: a PP worker without the drafter's layers projects it
+    # unflagged, and worker 0 must not hand the scheduler the flag-all fallback.
+    for gid, group in enumerate(cfg.kv_cache_groups):
+        group.is_eagle_group = any(
+            gid < len(c.kv_cache_groups) and c.kv_cache_groups[gid].is_eagle_group
+            for c in kv_cache_configs
+        )
     for group in cfg.kv_cache_groups:
         if isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs):
             # All layers in the UniformTypeKVCacheSpecs have the same type,
@@ -2328,6 +2401,8 @@ def generate_scheduler_kv_cache_config(
             group.kv_cache_spec = next(
                 iter(group.kv_cache_spec.kv_cache_specs.values())
             )
+    if widest_stage_tensors:
+        kv_host_tier.take_widest_stage_tensors(cfg, kv_cache_configs)
     return cfg
 
 
@@ -2578,7 +2653,11 @@ def _side_cache_layout_enabled(vllm_config: VllmConfig) -> bool:
     """
     if not _SIDE_CACHE_LAYOUT:
         return False
-    if getattr(vllm_config, "kv_transfer_config", None) is not None:
+    if getattr(
+        vllm_config, "kv_transfer_config", None
+    ) is not None and not kv_host_tier.keeps_side_cache_layout(
+        vllm_config
+    ):  # the tier keeps the layout
         return False
     attention_config = getattr(vllm_config, "attention_config", None)
     if getattr(attention_config, "hisparse_config", None) is not None:
