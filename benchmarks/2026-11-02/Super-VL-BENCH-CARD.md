@@ -22,15 +22,18 @@ to the last event. With MTP, read the median event interval (ITL) together with 
 | 34,147 | on | 98.5 | 101.2 | −2.7 % | 36.06 | 3.51 | 6.81 | 3/3 |
 | 136,625 | on | 101.5 | 101.3 | +0.2 % | 35.53 | 3.51 | 30.17 | 3/3 |
 | 262,839 | on | 104.5 | — | — | 36.11 | 3.66 | 67.38 | 3/3 |
-| 4,328 | off | — | — | — | n/a | n/a | n/a | 0/3 |
-| 34,206 | off | — | — | — | n/a | n/a | n/a | 0/3 |
-| 136,684 | off | 81.6 | — | — | 35.78 | 2.85 | 30.17 | 1/3 |
+| 4,328 | off | 85.8 | — | — | 36.09 | 3.08 | 1.14 | 3/3 |
+| 34,206 | off | 87.3 | — | — | 35.60 | 3.09 | 6.83 | 3/3 |
+| 136,684 | off | 80.8 | — | — | 35.80 | 2.82 | 30.18 | 2/3 |
 | 262,898 | off | 80.5 | — | — | 36.32 | 2.87 | 67.36 | 2/3 |
 
-A cell with 1/3 or 2/3 valid sends is the median of its valid sends only; a 0/3 cell has no figure.
+A cell with 2/3 valid sends is the median of its valid sends only.
 
-Thinking-off cells below 131K are not valid: the model's answers missed the probe's two answer lines, so they
-measure the probe, not decode speed. The 3.0.0 card measured thinking on only.
+Super VL only: with thinking off, a send counts if it returned HTTP 200, generated at least 200 tokens and had no
+streaming problems. The answer-format, word-count and natural-stop checks are not applied, because at short context
+the model writes its deliberation as visible text and runs to the 1,024-token limit (all sends at 4K and 32K). Those
+rows time that text, not a finished answer. Two sends with under 200 tokens are excluded. The 3.0.0 card measured
+thinking on only.
 
 ## 2. Exact 262K
 
