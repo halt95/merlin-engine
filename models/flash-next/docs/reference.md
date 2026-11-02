@@ -1,7 +1,7 @@
 # Reference
 
 The detail behind the [README](../README.md) for Merlin 3.0.1, Merlin engine **built on vLLM 0.32.0**.
-The current measured claims are in [Benchmarks](#benchmarks). Historical measurements are explicitly marked
+The current measured claims are in the [3.0.1 bench card](../benchmarks/2026-11-02/BENCH-CARD.md); see also [Benchmarks](#benchmarks). Historical measurements are explicitly marked
 **v3.0.0 (0.30) figure**; their original release labels are retained, and they are not re-measured 0.32 results.
 
 - [Overview](#overview)
@@ -103,7 +103,7 @@ requests are prefilling heavily may recompute instead of restoring from the cach
 a fix is planned. It runs with the MTP drafter only: `--kv-ram-cache` with `--spec dflash2`
 is refused in 3.0.1 (with DFlash2 the cache restored nothing on the reference host).
 
-On the reference 4 x RTX 3090 host a 262K restore took 1.2–1.4 s, against about 56 s to recompute. Host
+On the reference 4 x RTX 3090 host a 262K restore took 1.2–1.4 s, against about 45 s to recompute. Host
 memory grows in steps over the first 262K requests while the request history fills (bounded: about 70 MiB).
 These are measured results for the reference layout, not an increase in the GPU pool or a promise for every
 session length and layout.
@@ -340,9 +340,9 @@ multi-conversation follow-up reuse percentages under MTP.
 
 ## Benchmarks
 
-The [2026-10-15 0.32 summary](../benchmarks/2026-10-15/BENCH-CARD.md) records the maintainer-supplied
-Concurrent decode, cache-hit, image-cap and pool results. Raw streams, boot logs and a full release-check card
-are not included. No new GPU measurement was performed for this docs refresh.
+The [2026-11-02 bench card](../benchmarks/2026-11-02/BENCH-CARD.md) has the Merlin 3.0.1 results. The
+[2026-10-15 0.32 summary](../benchmarks/2026-10-15/BENCH-CARD.md) records maintainer-supplied rc-build concurrent decode, cache-hit,
+image-cap and pool results; its raw streams, boot logs and a full release-check card are not included.
 
 The [2026-10-09 v3.0.0 card](../benchmarks/2026-10-09/BENCH-CARD.md) is historical:
 **v3.0.0 (0.30) figure** throughout, including its v2.5.1 comparator and optional YaRN entry.
@@ -394,7 +394,7 @@ own qualification. Local-argmax remains opt-in; no new performance result is cla
   Prudctual, Karl0007, semerandre and wzhao18. v2.5.1 adds ten more upstream ports, including
   [RecoverSSM](https://github.com/vllm-project/vllm/pull/58863), the GDN state recovery for speculative
   decoding behind the larger pool. Original authorship remains in upstream history and `NOTICE`.
-- Reports and contributions: a community idle-power report and contribution, brandon-nuttall (local-argmax mixin), mgabor3141 (club-3090 [discussion](https://github.com/noonghunna/club-3090/discussions/1572))
+- Reports and contributions: a community idle-power report and contribution, brandon-nuttall (YaRN past 262K report, `SEQS`/`MAXLEN` launcher fix, local-argmax mixin), R-omk (YaRN past 262K crash report and recipes), mgabor3141 (club-3090 [discussion](https://github.com/noonghunna/club-3090/discussions/1572))
 - Quantised experts: [Intel/Qwen3.8-Flash-Next-W4A16-AutoRound](https://huggingface.co/Intel/Qwen3.8-Flash-Next-W4A16-AutoRound);
   FP8 PLE table: [RadixArk/Qwen3.8-Flash-Next-NVFP4](https://huggingface.co/RadixArk/Qwen3.8-Flash-Next-NVFP4);
   MTP INT4 packing recipe adapted from [DominikBucko/qwen38-flash-next-2x3090](https://github.com/DominikBucko/qwen38-flash-next-2x3090);

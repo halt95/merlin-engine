@@ -10,7 +10,7 @@ parallelism, Mamba-2 RecoverSSM, MTP speculative decoding and prefix caching, be
 
 > **Status: tested on the reference host (registry profile `svl-quad-3090`).** The 3.0.0 release bench card passed this
 > recipe on the reference host (2026-10-20; its agents, GSM8K and needle results are from a 2026-10-17 pre-release build), and the 3.0.1 card re-measured decode,
-> prefill, agents and GSM8K at medium (2026-11-02). The KV pin below has not had a sustained-load test yet.
+> prefill, agents and GSM8K (2026-11-02). The KV pin below has not had a sustained-load test yet.
 
 ```bash
 MODEL=~/models/nemotron-super-vl PORT=8100 bash models/nemotron-super-vl/serve.sh
@@ -33,10 +33,10 @@ Maintainer measurements on 4× RTX 3090 (220 W, PCIe Gen4) with P2P (the aikitor
 | Decode, 4K / 131K / 262K prompt | 103 / 102 / 93 tok/s |
 | Cold prefill, 10K / 100K / 262K prompt | 4,545 / 4,689 / 3,916 tok/s |
 | Agents at once (8 × 16K conversations), total, thinking on / off | 432 / 432 tok/s |
-| GSM8K-200 (5-shot), correct of 200, thinking on at medium / thinking off | 197 / 195 |
+| GSM8K-200 (5-shot), correct of 200, thinking on / thinking off | 197 / 195 |
 | Sessions held at once (3.0.0 run) | 5 × 262K and 9 × 131K (the engine's sequence limit), every session resident (re-sent prompts ≥ 99.91 % cached), peak KV 95.0 %, 0 preemptions |
 | 8 MP image (3.0.0 run) | correct; the processor downscales it to its native ~3.4 MP cap; lowest free memory 686 MiB on any card |
-| KV pool | 1,392,275 tokens (at a 262K context length; the shipped 1M default allocates 1,856,367) |
+| KV pool | 1,856,367 tokens (the shipped 1M context; 3.0.0 measured 1,392,275 at a 262K context length) |
 
 ## The recipe
 

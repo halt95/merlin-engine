@@ -67,7 +67,7 @@ before the needle). Decode is the median of the 3 sends; TTFT is send 1's.
 | prompt tokens | thinking | 3.0.1 tok/s | 3.0.0 tok/s | change | ITL ms | tokens/event | cold TTFT s (3.0.1 / 3.0.0) |
 |---|---|---|---|---|---|---|---|
 | 261,888 | on | 238.4 | 214.8 | +11.0 % | 19.93 | 4.41 | 124.7 / 164.1 |
-| 261,888 | off | 149.1 | 158.1 | −5.7 % | 20.00 | 2.84 | 124.6 / 164.1 |
+| 261,888 | off | 149.1 | 158.1 | −5.7 % | 20.00 | 2.84 | 124.6 / 164.0 |
 
 Thinking off at exact 262K reads −5.7 % against the 3.0.0 card. The time per decode step is
 20.00 ms against 20.78 ms; the difference is MTP acceptance (2.84 against 3.12 tokens per
@@ -78,14 +78,14 @@ step), which varies over a 128-token sample. The 259K thinking-off ladder cell r
 | prompt tokens | thinking | 3.0.1 tok/s | 3.0.0 tok/s | change | ITL ms | tokens/event | cold TTFT s (3.0.1 / 3.0.0) |
 |---|---|---|---|---|---|---|---|
 | 261,888 | on | 143.5 | 142.5 | +0.7 % | 29.89 | 4.00 | 234.9 / 305.3 |
-| 261,888 | off | 108.7 | 111.1 | −2.1 % | 29.17 | 3.05 | 235.6 / 305.3 |
+| 261,888 | off | 108.7 | 111.1 | −2.1 % | 29.17 | 3.05 | 235.6 / 305.1 |
 
 ### One card (TP1)
 
 | prompt tokens | thinking | 3.0.1 tok/s | 3.0.0 tok/s | change | ITL ms | tokens/event | cold TTFT s (3.0.1 / 3.0.0) |
 |---|---|---|---|---|---|---|---|
 | 261,888 | on | 71.4 | 72.9 | −2.1 % | 56.00 | 3.76 | 452.4 / 574.1 |
-| 261,888 | off | 50.5 | 49.3 | +2.4 % | 55.84 | 2.67 | 452.2 / 574.1 |
+| 261,888 | off | 50.5 | 49.3 | +2.4 % | 55.84 | 2.67 | 452.2 / 574.2 |
 
 ## 3. Cold prefill
 
@@ -113,7 +113,7 @@ step), which varies over a 128-token sample. The 259K thinking-off ladder cell r
 | 101,845 | 871 tok/s | 708 tok/s | +23.0 % | 116.87 |
 | 261,888 | 579 tok/s | 456 tok/s | +27.0 % | 452.4 |
 
-One cold send per depth (8 tokens out at 10K and 100K; the exact-262K row's cold thinking-on send at 262K).
+One cold send per depth (8 tokens out at 10K and 100K; the 2026-11-01 run's cold thinking-on send at 262K, so it can differ slightly from the table above).
 
 ## 4. Agents at once
 
@@ -123,7 +123,7 @@ off, temperature 0. Total tok/s = tokens decoded while all eight stream / that o
 | layout | 3.0.1 total tok/s | 3.0.0 total tok/s | change | overlap window s |
 |---|---|---|---|---|
 | Four cards | 854 | 752 | +13.6 % | 4.30 (short) |
-| Two cards | 615 | 517 | +19.0 % | 6.08 |
+| Two cards | 615 | 517 | +18.9 % | 6.08 |
 
 A window under 5 s is short: read that total loosely, as on the 3.0.0 card.
 

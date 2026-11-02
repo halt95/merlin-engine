@@ -26,7 +26,7 @@ git clone https://github.com/halt95/merlin-engine.git && cd merlin-engine && ./s
 ```
 
 The setup script checks your GPUs, suggests a model, shows each download and its size before it starts, then
-launches the server on `127.0.0.1:8000`. Nothing is installed system-wide. Run it again to restart the server.
+launches the server on `127.0.0.1` (port 8000; 8100 for the 27B and ThinkingCap). Nothing is installed system-wide. Run it again to restart the server.
 
 The [How to serve](docs/how-to-serve.md) guide covers the rest: [Merlin's commands and flags](docs/how-to-serve.md#2-merlin-commands),
 talking to the server, serving on your network, picking GPUs and switching models.
@@ -62,7 +62,7 @@ prints `Application startup complete`.
 | [Nemotron 3.5 Super VL](https://huggingface.co/halt95/Nemotron-3.5-Super-VL-120B-A12B-W4A16-Merlin) | 120B MoE, 1M context | 4 | 1,856,367 | 93 tok/s | 432 tok/s | 432 tok/s | 197 | 195 |
 | [Ornith 1.5](https://huggingface.co/halt95/Ornith-1.5-122B-A10B-W4A16-Merlin) | 122B MoE | 4 | 894,618 | 105 tok/s | 528 tok/s | 486 tok/s | 196 | 190 |
 
-<sub>Merlin 3.0.1. Measured on 4 x RTX 3090 at 220 W with P2P enabled (aikitoria's open-gpu-kernel-modules P2P driver) and Zagitta's gpu-unlock. Decode is one stream with thinking on (reasoning effort medium, each checkpoint's default), at the full
+<sub>Merlin 3.0.1. Measured on 4 x RTX 3090 at 220 W with P2P enabled (aikitoria's open-gpu-kernel-modules P2P driver) and Zagitta's gpu-unlock. Decode is one stream with thinking on (reasoning effort medium where the checkpoint has one; the Nemotron 3.5 Super VL and Ornith 1.5 templates have no effort levels), at the full
 262,144-token context. 8 agents is total throughput for eight simultaneous follow-ups on 16K conversations; with thinking on (effort medium) a 512-token follow-up may end inside the reasoning, and reasoning tokens count. GSM8K-200 is correct answers out
 of 200: thinking on at effort medium on this release, thinking off from the Merlin 3.0.0 runs (the model weights are unchanged). All models use an FP8 KV cache and MTP speculative decoding. The bench cards
 have the full figures and method.</sub>
@@ -76,7 +76,7 @@ have the full figures and method.</sub>
 - **Built for agents.** Follow-up turns resume from cache, even when more conversations are open than the cache can
   hold.
 - **KV RAM cache (experimental).** `--kv-ram-cache 24g` keeps conversation prefixes the GPU evicts in host RAM and
-  restores them with identical output: on Flash-Next a 262K restore takes 1.2–1.4 s instead of about 56 s to recompute.
+  restores them with identical output: on Flash-Next a 262K restore takes 1.2–1.4 s instead of about 45 s to recompute.
 - **Swarm mode (experimental).** `--swarm` raises the session cap on four RTX 3090s, from 8 to 24 on the Flash-Next
   family and from 24 to 32 on the 27B family, with a 48 GB KV RAM cache. Tested on Flash-Next and the 27B with P2P.
 - **DFlash2 for the Flash-Next family.** `--spec dflash2` on four RTX 3090s with P2P decodes 5–18 % faster than MTP,
@@ -107,7 +107,7 @@ have the full figures and method.</sub>
   Ornith 1.5. The Flash-Next family drafts over the full vocabulary with a BF16 draft head.
 - **Faster prefill in 3.0.1, with the optional gpu-unlock host upgrade.** Cold prefill of a full 262K prompt on four
   RTX 3090s against Merlin 3.0.0: +17 % on Flash-Next, +32 % on Qwen3.8-27B and ThinkingCap, +33 % on Nemotron 3.5
-  Super VL and Ornith 1.5. The engine wheel is unchanged; the gain comes from the unlocked host.
+  Super VL and Ornith 1.5. The engine wheel is unchanged. A stock-versus-unlocked A/B ties the gain to the unlocked host on Flash-Next and the 27B; Super VL and Ornith 1.5 had no A/B.
 - **DFlash2 drafter for the Flash-Next family.** `--spec dflash2` runs incoai's block-diffusion drafter on four RTX 3090s
   with P2P: decode 5–18 % faster than MTP, and the server holds three 262K sessions instead of six 131K ones. MTP stays
   the default.
@@ -224,7 +224,7 @@ PLE-offload work · [Sumandora](https://github.com/Sumandora/remove-refusals-wit
 [froggeric](https://huggingface.co/froggeric/Qwen-Fixed-Chat-Templates) (chat template) · [aikitoria](https://github.com/aikitoria/open-gpu-kernel-modules)
 (P2P on consumer Ampere) · [Zagitta](https://github.com/Zagitta/gpu-unlock) (GPU unlock) · [incoai](https://huggingface.co/incoai/Qwen3.8-Flash-Next-DFlash2) (DFlash2 drafter) ·
 [club-3090](https://github.com/noonghunna/club-3090/discussions/1735) (sm_80 FP8 KV decoder port) · [Sudzpel](https://github.com/Sudzpel) (GPU unlock proposal and measurements) ·
-[brandon-nuttall](https://github.com/brandon-nuttall) (`use_local_argmax_reduction`, TP2×PP4 community rig) · [CoolShades](https://github.com/CoolShades) (idle-power report and first fix behind the v2.5.2 engine fix) ·
+[brandon-nuttall](https://github.com/brandon-nuttall) (YaRN past 262K report, `SEQS`/`MAXLEN` launcher fix, `use_local_argmax_reduction`, TP2×PP4 community rig) · [R-omk](https://github.com/R-omk) (YaRN past 262K crash report and recipes) · [CoolShades](https://github.com/CoolShades) (idle-power report and first fix behind the v2.5.2 engine fix) ·
 [Neiko2002](https://huggingface.co/Neiko2002) · [Yarikdevcom](https://github.com/yarikdevcom) (independent work on the same hardware class)
 
 Upstream fixes are credited in the engine repository.

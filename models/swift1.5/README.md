@@ -48,7 +48,7 @@ The shared 0.32 installer is integrated. The dependency lock is complete: 222 ex
 
 ```bash
 venv/bin/hf download halt95/Swift1.5-Qwen3.8-Flash-Next-W4A16-Merlin \
-  --revision 3c9a1159eac1282463b06313de7dd9262edf8b58 --local-dir ./ckpt-swift
+  --revision 4d4c7d3b0bb86c76838457e48c823061a3d2f8f6 --local-dir ./ckpt-swift
 (cd ckpt-swift && sha256sum -c ../models/swift1.5/checkpoint.sha256)
 
 # The generated launcher inherits CUDA_HOME; select the locked venv toolkit.

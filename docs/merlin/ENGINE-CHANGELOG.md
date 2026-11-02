@@ -16,7 +16,7 @@ The engine-side subset; the full 3.0.1 list is in the [main changelog](../CHANGE
   SIZE is GiB per server, split into whole GiB per TP x PP rank, in addition to the server's host-RAM
   budget; locked memory must be allowed. The tier is off by default and experimental in 3.0.1 on the Flash-Next
   family (MTP drafter only) and on the 27B and ThinkingCap (RecoverSSM path only). Ornith 1.5 accepts it, untested ⚫;
-  Super VL refuses it. On the reference 4 x RTX 3090 host a 262K restore took 1.2–1.4 s, against about 56 s to recompute. Known limits: a 262K session evicted during heavy
+  Super VL refuses it. On the reference 4 x RTX 3090 host a 262K restore took 1.2–1.4 s, against about 45 s to recompute. Known limits: a 262K session evicted during heavy
   prefill may be recomputed instead of restored (output identical), and host memory grows in steps over the first
   262K requests while the request history fills (bounded: about 70 MiB on Flash-Next, 280 MiB on the 27B).
 

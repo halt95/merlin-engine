@@ -12,4 +12,4 @@ Each card has the single-stream decode ladder from 4K to 261K with thinking on a
 | [Qwen3.8-27B](Qwen3.8-27B-BENCH-CARD.md) | Qwen3.8-27B | 1, 2, 4 | 3.0.0 (2026-10-20) |
 | [ThinkingCap](ThinkingCap-BENCH-CARD.md) | ThinkingCap | 2, 4 | 3.0.0 (2026-10-20) |
 | [Nemotron 3.5 Super VL](Super-VL-BENCH-CARD.md) | Nemotron 3.5 Super VL | 4 | 3.0.0 (2026-10-20) |
-| [Ornith 1.5](Ornith-1.5-BENCH-CARD.md) | Ornith 1.5 | 4 | 3.0.0 (2026-10-21) |
+| [Ornith 1.5](Ornith-1.5-BENCH-CARD.md) | Ornith 1.5 | 4 | 3.0.0 (2026-10-20; run 2026-10-21) |

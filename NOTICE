@@ -97,7 +97,8 @@ Jurgen Schmied and Zihua Wu. Several previous ports are now part
 of the upstream base. See upstream history for their original attribution.
 
 Additional credits: pondzikk (vLLM contributions); lucifer1004 (uniform multi-token FlashInfer decode on Ampere); brandon-nuttall
-(LocalArgmaxMixin and the TP2 x PP4 community rig); peakcrosser7 (Flash-Next
+(the YaRN past 262K report, the SEQS and MAXLEN launcher fix, LocalArgmaxMixin and the TP2 x PP4
+community rig); R-omk (the YaRN past 262K crash report and recipes); peakcrosser7 (Flash-Next
 model support and original PLE offload); a community idle-power report and
 community PR; Jon-Nielsen (TP4 x PP2 serving kit); mgabor3141 (Swift reports);
 aikitoria (consumer Ampere P2P driver work); Zagitta (gpu-unlock kernel module; its NVIDIA firmware is personal-use and not shipped); Sudzpel (the GPU unlock

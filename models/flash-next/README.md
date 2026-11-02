@@ -88,7 +88,7 @@ The checkpoint includes a host-resident n-gram embedding table, so host RAM matt
 ## Quick start
 
 **The shared 0.32 installer is integrated.** The dependency lock is complete: 222 exact pins with artifact SHA-256 hashes, resolved with uv; a dry-run `--require-hashes` install resolves.
-Follow [release/README.md](../../release/README.md); the engine is built from this checkout. The old v3.0.0 bundle and compiled-ops commands are historical and are not the Merlin 3.0.0 install route.
+Follow [release/README.md](../../release/README.md); the engine is built from this checkout. The old v3.0.0 bundle and compiled-ops commands are historical and are not the current install route.
 
 After a verified 0.32 build and environment are available, run from the repository root:
 
@@ -120,7 +120,7 @@ The tier needs at least one 262K restore unit per rank: the smallest size on 4 x
 [SETUP](../../docs/SETUP.md) lists the other layouts. Capacity is counted in whole restore units: by the layout math, 16g on 4 x 3090
 is about 260 host rows per rank, room for 3 whole 262K units (68 rows each, about 4.2 GiB per session over the four ranks).
 That is a row count, not a measured restore count: how many long sessions restore reliably at a given size is not
-yet measured. A 262K restore took 1.2–1.4 s on 4 x RTX 3090, against about 56 s to recompute. Budget the cache in addition to the server's
+yet measured. A 262K restore took 1.2–1.4 s on 4 x RTX 3090, against about 45 s to recompute. Budget the cache in addition to the server's
 host RAM and allow locked memory. **The cache is experimental on Flash-Next in 3.0.1:** under heavy concurrent
 prefill a session may recompute rather than restore (output remains identical). It runs with MTP only;
 `--spec dflash2` with `--kv-ram-cache` is refused. The cache does not change the session cap. `merlin serve --swarm`
@@ -143,7 +143,7 @@ with FP8); no capped-host boot has measured it yet. Details: [docs/SETUP.md](../
 ### Container
 
 The shared [container recipe](../../container/README.md) builds this checkout through the 0.32
-installer. Complete the dependency lock first; the image still needs hardware qualification.
+installer. The image still needs hardware qualification.
 
 ### Proxmox LXC
 
@@ -173,7 +173,7 @@ print(reply.choices[0].message.content)
 - Tools use the standard `tools` field; images go in `image_url` content parts, up to 42 per request.
 - If a reply comes back empty with `finish_reason: "stop"` and zero tokens, retry once.
 
-## What's new in v3.0.0
+## The unpublished v3.0.0 bundle (history)
 
 v3.0.0 (built 2026-10-10, never published) used vLLM 0.30. Its decode ladder, GSM8K, needle, follow-up reuse, idle-power,
 warmup, boot-time and optional YaRN-entry results are historical: **v3.0.0 (0.30) figure**, not re-measured
@@ -182,9 +182,9 @@ on 0.32. The [v3.0.0 notes](CHANGELOG.md#v300) and
 
 ## Documentation
 
-- [CHANGELOG.md](CHANGELOG.md): Merlin 3.0.0 and historical recipe release notes.
+- [CHANGELOG.md](CHANGELOG.md): Merlin 3.0.1, 3.0.0 and historical recipe release notes.
 - [docs/reference.md](docs/reference.md): launcher controls, capacity, deployment status and known behaviours.
-- [2026-10-20 bench card](benchmarks/2026-10-20/BENCH-CARD.md): the measured Merlin 3.0.0 claims; [2026-10-15 0.32 summary](benchmarks/2026-10-15/BENCH-CARD.md): rc-build concurrency, cache-hit and identity runs.
+- [2026-11-02 bench card](benchmarks/2026-11-02/BENCH-CARD.md): the measured Merlin 3.0.1 claims; [2026-10-20 bench card](benchmarks/2026-10-20/BENCH-CARD.md): Merlin 3.0.0; [2026-10-15 0.32 summary](benchmarks/2026-10-15/BENCH-CARD.md): rc-build concurrency, cache-hit and identity runs.
 - [v3.0.0 bench card](benchmarks/2026-10-09/BENCH-CARD.md): **v3.0.0 (0.30) figure** throughout.
 - [docs/topology-selector.md](docs/topology-selector.md): opt-in topology selection.
 - [docs/history.md](docs/history.md): earlier releases with their original measurement scope.

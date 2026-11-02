@@ -18,15 +18,16 @@ releases were measured on vLLM 0.28-0.30 when they shipped and are kept as publi
 
 ## Merlin 3.0.1
 
-2026-11-02. Built on vLLM 0.32.0, with the same seven models as 3.0.0. Every speed figure was re-measured for this release with
-the GPU unlock and P2P (see below).
+2026-11-02. Built on vLLM 0.32.0, with the same seven models as 3.0.0. Every figure in the 3.0.1 bench tables was re-measured for this release
+with the GPU unlock and P2P on release candidates just before the final commit (see below), except rows marked
+(3.0.0 run). The DFlash2 and KV RAM cache figures were measured separately on earlier builds.
 
 ### Highlights
 
 - **KV RAM cache (experimental).** `--kv-ram-cache 24g` keeps conversation prefixes that the GPU evicts in host RAM,
   and restores them instead of recomputing them. A restore gives exactly the same output as a GPU cache hit. It works on
   the Flash-Next family (MTP drafter only) and Qwen3.8-27B. It's off by default; Ornith 1.5 accepts it but is untested.
-  On Flash-Next a 262K restore takes 1.2–1.4 s instead of about 56 s to recompute. Known limits: a 262K session
+  On Flash-Next a 262K restore takes 1.2–1.4 s instead of about 45 s to recompute. Known limits: a 262K session
   evicted during heavy prefill may be recomputed instead of restored, and host memory grows in steps over the first
   262K requests while the request history fills (bounded: about 70 MiB on Flash-Next, 280 MiB on the 27B; in our soaks
   0.18–0.38 % per hour of resident-memory growth while it fills, above the 0.1 % per hour soak limit).
@@ -54,7 +55,7 @@ the GPU unlock and P2P (see below).
 
 ### Measured on Merlin 3.0.1
 
-4x RTX 3090 without NVLink, P2P on, Zagitta's gpu-unlock, 220 W, 2026-11-02 bench cards (runs measured 2026-11-01 to 2026-11-02 UTC). Decode: one stream, thinking on (reasoning effort medium, each checkpoint's default), median of 3, at a 4K / 131K prompt and the full 262,144-token context (261,888 prompt + 128 out). 8 agents: total throughput of eight simultaneous follow-ups on 16K conversations; with thinking on a 512-token follow-up may end inside the reasoning, and reasoning tokens count. GSM8K-200 is correct answers out of 200: thinking on at effort medium on this release (on four cards), thinking off from the 3.0.0 runs, as the weights are unchanged.
+4x RTX 3090 without NVLink, P2P on, Zagitta's gpu-unlock, 220 W, 2026-11-02 bench cards (runs measured 2026-11-01 to 2026-11-02 UTC). Decode: one stream, thinking on (reasoning effort medium where the checkpoint has one; the Nemotron 3.5 Super VL and Ornith 1.5 templates have no effort levels), median of 3, at a 4K / 131K prompt and the full 262,144-token context (261,888 prompt + 128 out). 8 agents: total throughput of eight simultaneous follow-ups on 16K conversations; with thinking on a 512-token follow-up may end inside the reasoning, and reasoning tokens count. GSM8K-200 is correct answers out of 200: thinking on at effort medium on this release (on four cards), thinking off from the 3.0.0 runs, as the weights are unchanged.
 
 | Checkpoint | GPUs | KV pool, tokens | Decode, tok/s, 4K / 131K / 262K | 262K prefill | 8 agents, tok/s, thinking on / off | GSM8K-200, thinking on / off |
 |---|---|---|---|---|---|---|
@@ -84,7 +85,7 @@ Against 3.0.0, 262K prefill is 16-17 % faster on the Flash-Next family and 27-33
   906,581-token pool that holds three 262K sessions (one before), tested on the reference host on 2026-10-19.
   `--profile fn-quad-24g-sm89-pp4` is the same layout on 4× RTX 4090 without P2P, by name only and untested ⚫.
 - **4× RTX 4090 prefills in 2,048-token chunks** (`fn-quad-24g-sm89`; 1,024 before). On cloud-hosted 4090s this cut the
-  131K time to first token from 24.4–27.0 s to 22.5 s (about 15–20 % faster prefill), with decode unchanged. The 8 MP
+  131K time to first token from 24.4–27.0 s to 22.5 s (about 8–20 % faster prefill), with decode unchanged. The 8 MP
   image and 262K checks ran at 1,024 and have not run at 2,048 yet; `CHUNK=1024` goes back to the checked chunk.
 - **FP8 KV cache for the Flash-Next family on sm_80 (A100, A30, CMP 170HX)** as an opt-in with `KV_DTYPE=fp8`. BF16
   stays its default there (the 27B already uses FP8). Untested.
@@ -98,7 +99,7 @@ Against 3.0.0, 262K prefill is 16-17 % faster on the Flash-Next family and 27-33
 
 ### Before you upgrade
 
-- **The engine wheel is unchanged from 3.0.0** (no native changes in 3.0.1), so `vllm --version` still prints
+- **The engine wheel is unchanged from 3.0.0** (no compiled-code changes in 3.0.1; the native sources changed only in comments and message text), so `vllm --version` still prints
   `0.32.0+merlin.7002f56537`; the 3.0.1 Python comes from the checkout.
 
 - **Request limits.** `allowed_token_ids` or `logit_bias` over 1,024 entries, `bad_words` over 128 sequences or 1,024
@@ -114,8 +115,8 @@ Against 3.0.0, 262K prefill is 16-17 % faster on the Flash-Next family and 27-33
   `VLLM_CACHE_ROOT` overrides it.
 - **`REDUCED_DRAFT_VOCAB` and `DRAFT_VOCAB` now stop the launch** when set (an empty value, or `REDUCED_DRAFT_VOCAB=0`,
   is accepted). Reduced draft vocabulary is gone (see Removed); unset them.
-- **Thinking-off decode at 262K measured lower on two layouts:** Swift1.5 −11.4 % and Qwen3.8-27B on four cards
-  −5.7 % against 3.0.0. Step time is the same or better; the gap is MTP draft acceptance over a 128-token sample, and
+- **Thinking-off decode at 262K measured lower on five layouts:** Swift1.5 −11.4 %, Qwen3.8-27B on four cards −5.7 %
+  and on two cards −2.1 %, Nemotron 3.5 Super VL −1.2 % and Flash-Next −0.4 % against 3.0.0. Step time is the same or better; the gap is MTP draft acceptance over a 128-token sample, and
   the 259K thinking-off cells read +0.8 % and +5.4 % (see the bench cards).
 
 ### Fixes
@@ -160,7 +161,7 @@ Against 3.0.0, 262K prefill is 16-17 % faster on the Flash-Next family and 27-33
   checkpoint's 262,144-position table, so a longer prompt could stop the engine. The drafter now follows
   `--max-model-len`, and the draft `max_position_embeddings` override covers every eagle-family drafter (MTP,
   DFlash, DSpark) and the text config, so drafts follow the target's YaRN table past 262K (a port of the open upstream
-  PR vllm#63432).
+  PR vllm#63432). Reported by brandon-nuttall and R-omk, whose 524K recipes we then tested.
 - A failed `generate()` request is always logged at ERROR, and `EngineGenerateError` carries a default message.
 - The "Unknown Merlin environment variable" warning no longer fires for setup and launcher `MERLIN_*` names, and the
   per-admission `SimpleCPU tier miss` log is DEBUG unless `MERLIN_KV_HOST_TIER_CENSUS=1`.
@@ -196,7 +197,7 @@ Against 3.0.0, 262K prefill is 16-17 % faster on the Flash-Next family and 27-33
 
 ### Setup and defaults
 
-- **`merlin setup` recommends the 27B over ThinkingCap on 4× RTX 3090** when Flash-Next doesn't fit. At the served default (reasoning
+- **`./setup.sh` recommends the 27B over ThinkingCap on 4× RTX 3090** when Flash-Next doesn't fit. At the served default (reasoning
   effort medium) ThinkingCap is not faster; its earlier lead was measured at xhigh. ThinkingCap stays available with `--model 27b-thinkingcap`.
 - **SSE keep-alive every 15 s** on `/v1/chat/completions` and `/v1/completions`, so idle streams survive common proxy timeouts. `-- --sse-keep-alive-interval 0`
   turns it off.
@@ -225,7 +226,7 @@ Against 3.0.0, 262K prefill is 16-17 % faster on the Flash-Next family and 27-33
 - **Ornith 1.5 `SEQS=`** now sizes its CUDA-graph capture to match.
 - **Launcher defaults:** `VLLM_NO_USAGE_STATS=1` on the Flash-Next family and `HF_HUB_OFFLINE=1` on the 27B and
   Ornith 1.5.
-- **Launcher knobs:** `SEQS` and `MAXLEN` now also apply on Flash-Next and the 27B (the CUDA-graph capture follows
+- **Launcher knobs (thanks to brandon-nuttall):** `SEQS` and `MAXLEN` now also apply on Flash-Next and the 27B (the CUDA-graph capture follows
   `SEQS`, and a value off the tested row prints a note), and Flash-Next takes `PP_PARTITION` and passes
   `MERLIN_MARLIN_MOE_CFG` through. An extra `--speculative-config` after `--` (any spelling vLLM accepts: `--speculative_config`, `-sc` or `--speculative-config.KEY`) merges with the
   recipe's; changing its method or K is refused. `SPEC=none` turns speculation off for diagnosis only; it is not a serving lane.

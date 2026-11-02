@@ -6,8 +6,8 @@
 > Streams are client-timed; drivers, raw streams and boot logs are not published.
 >
 > Checkpoint: [halt95/ThinkingCap-Qwen3.8-27B-W4A16-Merlin](https://huggingface.co/halt95/ThinkingCap-Qwen3.8-27B-W4A16-Merlin). The 3.0.0 column is the [2026-10-20 card](../2026-10-20/ThinkingCap-BENCH-CARD.md).
-> Four cards: TP4, `27b-tp4-3090`; thinking-on effort `medium` (the server default; thinking-on rows re-measured at medium on a fresh boot, 2026-11-02); boot 171 s; KV pool 2,012,105 tokens.
-> Two cards: TP2, `27b-tp2-3090`; thinking-on effort `medium` (the server default; thinking-on rows re-measured at medium on a fresh boot, 2026-11-02); boot 171 s; KV pool 826,689 tokens.
+> Four cards: TP4, `27b-tp4-3090`; thinking-on effort `medium` (the server default; thinking-on rows re-measured at medium on a fresh boot, 2026-11-02); boot 171 s on 2026-11-01, 121 s on 2026-11-02; KV pool 2,012,105 tokens.
+> Two cards: TP2, `27b-tp2-3090`; thinking-on effort `medium` (the server default; thinking-on rows re-measured at medium on a fresh boot, 2026-11-02); boot 171 s on 2026-11-01, 86 s on 2026-11-02; KV pool 826,689 tokens.
 > MTP K=4, FP8 KV, RecoverSSM on.
 
 ## 1. Single-stream decode ladder
@@ -43,7 +43,7 @@ to the last event. With MTP, read the median event interval (ITL) together with 
 | 130,445 | off | 120.4 | 115.9 | +3.9 % | 24.21 | 2.87 | 85.11 | 3/3 |
 | 259,616 | off | 99.9 | 94.6 | +5.6 % | 28.84 | 2.87 | 232.16 | 3/3 |
 
-Thinking-on rows: reasoning effort medium (the server default), re-measured on 2026-11-02 on a fresh boot of the same release tree; the 3.0.0 column was measured at effort `xhigh`, so the thinking-on changes compare different efforts. Thinking-off rows, prefill and the thinking-off agents rows are unchanged from the earlier runs.
+Thinking-on rows: reasoning effort medium (the server default), re-measured on 2026-11-02 on a fresh boot of a later release candidate; the 3.0.0 column was measured at effort `xhigh`, so the thinking-on changes compare different efforts. Thinking-off rows, prefill and the thinking-off agents rows are from the 2026-11-01 runs, some on an earlier release candidate. None of these runs used the final 3.0.1 commit.
 
 ## 2. Exact 262K
 
@@ -55,14 +55,14 @@ before the needle). Decode is the median of the 3 sends; TTFT is send 1's.
 | prompt tokens | thinking | 3.0.1 tok/s | 3.0.0 tok/s | change | ITL ms | tokens/event | cold TTFT s (3.0.1 / 3.0.0) |
 |---|---|---|---|---|---|---|---|
 | 261,888 | on | 238.0 | 248.2 | −4.1 % | 19.56 | 4.27 | 124.1 / 164.3 |
-| 261,888 | off | 147.2 | 146.0 | +0.8 % | 19.90 | 2.78 | 124.6 / 164.3 |
+| 261,888 | off | 147.2 | 146.0 | +0.8 % | 19.90 | 2.78 | 124.6 / 164.2 |
 
 ### Two cards (TP2)
 
 | prompt tokens | thinking | 3.0.1 tok/s | 3.0.0 tok/s | change | ITL ms | tokens/event | cold TTFT s (3.0.1 / 3.0.0) |
 |---|---|---|---|---|---|---|---|
 | 261,888 | on | 159.7 | 164.8 | −3.1 % | 29.67 | 4.36 | 235.4 / 304.6 |
-| 261,888 | off | 97.4 | 88.1 | +10.5 % | 28.95 | 2.72 | 235.5 / 304.6 |
+| 261,888 | off | 97.4 | 88.1 | +10.5 % | 28.95 | 2.72 | 235.5 / 304.4 |
 
 ## 3. Cold prefill
 
@@ -82,7 +82,7 @@ before the needle). Decode is the median of the 3 sends; TTFT is send 1's.
 | 101,887 | 1,679 tok/s | 1,297 tok/s | +29.5 % | 60.70 |
 | 261,888 | 1,114 tok/s | 860 tok/s | +29.5 % | 235.2 |
 
-One cold send per depth (8 tokens out at 10K and 100K; the exact-262K row's cold thinking-on send at 262K).
+One cold send per depth (8 tokens out at 10K and 100K; the 2026-11-01 run's cold thinking-on send at 262K, so it can differ slightly from the table above).
 
 ## 4. Agents at once
 
@@ -91,7 +91,7 @@ off, temperature 0. Total tok/s = tokens decoded while all eight stream / that o
 
 | layout | 3.0.1 total tok/s | 3.0.0 total tok/s | change | overlap window s |
 |---|---|---|---|---|
-| Four cards | 832 | 733 | +13.5 % | 4.48 (short) |
+| Four cards | 832 | 733 | +13.6 % | 4.48 (short) |
 | Two cards | 633 | 502 | +26.1 % | 5.71 |
 
 A window under 5 s is short: read that total loosely, as on the 3.0.0 card.

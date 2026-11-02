@@ -11,7 +11,7 @@ The model's own chat template and sampling are served as shipped: T 0.6, top_p 0
 is `qwen3` and the tool-call parser `qwen3_coder`.
 
 > **Status: tested on the reference host** (registry profile `ornith-quad-3090`, 4 × RTX 3090 with P2P), and on a
-> 4 × RTX 3090 host without P2P (`ornith-quad-3090-nop2p`). The full 3.0.0 bench card ran on the reference host on 2026-10-21; the 3.0.1 card re-measured decode, prefill, agents and GSM8K at medium (2026-11-02).
+> 4 × RTX 3090 host without P2P (`ornith-quad-3090-nop2p`). The full 3.0.0 bench card ran on the reference host on 2026-10-21; the 3.0.1 card re-measured decode, prefill, agents and GSM8K (2026-11-02).
 
 ```bash
 MODEL=/path/to/Ornith-1.5-122B-A10B-W4A16-Merlin PORT=8000 bash models/ornith1.5/serve.sh
@@ -50,7 +50,7 @@ Maintainer measurements on 4× RTX 3090 (220 W, PCIe Gen4) with P2P (the aikitor
 | Decode, 4K / 131K / 262K prompt (262K = exactly 261,888 prompt tokens + 128 out) | 146 / 115 / 105 tok/s |
 | Cold prefill, 10K / 100K / 262K prompt | 6,218 / 3,994 / 2,261 tok/s |
 | Agents at once (8 × 16K conversations), total, thinking on / off | 528 / 486 tok/s |
-| GSM8K-200 (5-shot), correct of 200, thinking on at medium / thinking off | 196 / 190 |
+| GSM8K-200 (5-shot), correct of 200, thinking on / thinking off | 196 / 190 |
 | Prompts sent at once (not a residency test) (3.0.0 run) | 3 × ~262K needle prompts (259,261-261,565 tokens) sent at once, every needle found |
 | Needles (3.0.0 run) | 10/10 at 131K and 23/23 at 262K, exact |
 | Agent-trace replay (recorded tool-use sessions) (3.0.0 run) | 52/52 tool calls valid, decode p50 149 tok/s |

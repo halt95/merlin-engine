@@ -13,7 +13,7 @@ and [reference](docs/reference.md) for configuration and evidence boundaries.
 - **Host-RAM KV tier, opt-in:** `--kv-ram-cache SIZE` caches evicted prefix KV blocks for restore
   instead of recompute; it adds no GPU context or simultaneous-session capacity. SIZE is GiB per server,
   split into whole GiB per TP x PP rank, and needs additional host RAM with locked memory allowed.
-  On the reference 4 x RTX 3090 host a 262K restore took 1.2–1.4 s, against about 56 s to recompute. The cache is off by default and experimental in 3.0.1. See the
+  On the reference 4 x RTX 3090 host a 262K restore took 1.2–1.4 s, against about 45 s to recompute. The cache is off by default and experimental in 3.0.1. See the
   [3.0.1 options](docs/reference.md#merlin-301-options) for controls and limits.
 - **Reduced draft vocabulary removed.** The `REDUCED_DRAFT_VOCAB` / `DRAFT_VOCAB` switches, the bundled table and its
   builder are gone; setting either switch stops the launch (an empty value, or `REDUCED_DRAFT_VOCAB=0`, is accepted). `DRAFT_HEAD` still sets the draft head's precision.

@@ -3,7 +3,7 @@
 > **Recipe 3.0.0 / Merlin 3.0.1:** vLLM **0.32.0**, FlashInfer **0.7.0.post1** with the ported tile,
 > **FGPC ON**, RecoverSSM on every layout, pools **826,689 / 2,012,105 tokens** (TP2 / TP4),
 > and an **8 MP** release cap.
-> The [2026-10-20 card](../benchmarks/2026-10-20/BENCH-CARD.md) contains the current recorded 3.0.0 results; the [2026-10-15 card](../benchmarks/2026-10-15/BENCH-CARD.md) records the 0.32 tile reclaim.
+> The [2026-11-02 card](../benchmarks/2026-11-02/BENCH-CARD.md) has the current 3.0.1 results; the [2026-10-20 card](../benchmarks/2026-10-20/BENCH-CARD.md) has the 3.0.0 results; the [2026-10-15 card](../benchmarks/2026-10-15/BENCH-CARD.md) records the 0.32 tile reclaim.
 > Unless explicitly marked 0.32 or 3.0.0, numerical results, boot logs and patch-series descriptions below are
 > historical v1.3.x **vLLM 0.30** evidence. They have not been revalidated for the assembled release.
 > The old bundle route is archived at tag `v1.3.1` of halt95/qwen38-27b-3090s; use the shared [release tooling](../../../release/README.md).
@@ -32,7 +32,7 @@ MTP head) served with vLLM at its **full 262,144-token context** on consumer Amp
 and drafter, FP8 E4M3 KV, MTP with **K=4** draft tokens per step, fp16 SSM state.
 
 - **TP2:** **826,689-token** FP8 KV pool, RecoverSSM on.
-- **TP4:** **2,012,105-token** FP8 KV pool, RecoverSSM on: block 1024, chunk 4096).
+- **TP4:** **2,012,105-token** FP8 KV pool, RecoverSSM on: block 1024, chunk 4096.
 - **FGPC ON** on both profiles through `--enable-mamba-shared-prefix-checkpoint`.
 - **0.32 tile reclaim:** TP2 ITL at 4K / 32K / 131K **19.99 / 21.41 / 25.27 ms**;
   TP4 **15.83 / 16.62 / 18.37 ms** (RecoverSSM-off line). These are decode-step intervals, not output-token throughput.
@@ -72,7 +72,7 @@ through that installer; historical 0.30 bundles do not install this release.
 | `models/qwen38-27b/serve.sh`, `models/qwen38-27b/serve-tp4.sh` | TP2 and TP4 launchers |
 | `models/thinkingcap/serve.sh`, `models/thinkingcap/serve-tp4.sh` | wrappers that select the ThinkingCap checkpoint (default effort `medium`) |
 | `quant/` | checkpoint calibration and quantisation tools |
-| [Current bench card](../benchmarks/2026-10-20/BENCH-CARD.md) | 3.0.0 release-wheel results (tile reclaim and image-cap results: [2026-10-15 card](../benchmarks/2026-10-15/BENCH-CARD.md)) |
+| [Current bench card](../benchmarks/2026-11-02/BENCH-CARD.md) | 3.0.1 results; [2026-10-20 card](../benchmarks/2026-10-20/BENCH-CARD.md): 3.0.0 release-wheel results (tile reclaim and image-cap results: [2026-10-15 card](../benchmarks/2026-10-15/BENCH-CARD.md)) |
 | [Historical base card](../benchmarks/2026-10-12/BENCH-CARD.md), [ThinkingCap card](../../thinkingcap/benchmarks/2026-10-12/ThinkingCap-BENCH-CARD.md) | vLLM 0.30 measurement records |
 
 **Serve-script variables:** `MODEL` is required; the rest are optional: `PORT` (8100), `HOST` (127.0.0.1), `SERVED`
@@ -95,7 +95,7 @@ directory; export `HF_HUB_OFFLINE=0` to allow Hub lookups). The download step se
 
 | Profile | Cards | Context | Status |
 |---|---:|---:|---|
-| `models/qwen38-27b/serve.sh` | dual card (2, TP=2) | 262K | Headline profile; gated on v1.3.0; RecoverSSM on, `--max-num-seqs 16 --max-num-batched-tokens 2048`, 3 × 262K or 6 × 131K resident; P2P on by default, `P2P=off` without it (untested on 3090s) |
+| `models/qwen38-27b/serve.sh` | dual card (2, TP=2) | 262K | Headline profile; RecoverSSM on, `--max-num-seqs 16 --max-num-batched-tokens 2048`, 3 × 262K or 6 × 131K resident; P2P on by default, `P2P=off` without it (untested on 3090s) |
 | `models/qwen38-27b/serve-tp4.sh` | quad card (4, TP=4) | 262K | RecoverSSM on with the shipped geometry (`--block-size 1024 --max-num-batched-tokens 4096`, LPT 832), `--max-num-seqs 24` (32 with `merlin serve --swarm` and the 48g KV RAM cache, 3.0.1), 7 × 262K or 14 × 131K resident; P2P on by default, `P2P=off` without it (untested on 3090s) |
 | single card | 1 | 262K | Ships as `serve-1card.sh` (TP1): 4 MP images with the single-card memory settings (96 MiB FlashInfer workspace shared with the MTP drafter, in-place vision rotary); tested 2026-10-21 (pool 271,506) |
 
@@ -145,7 +145,7 @@ See the [CUDA driver requirements](../../../release/install-0.32.md). A fresh in
 | | Required | Reference host |
 |---|---|---|
 | GPUs | 2× (dual card) or 4× (quad card) 24 GB sm_86 cards, with no other process on them | RTX 3090 |
-| OS | Linux x86_64 with glibc ≥ 2.34 (the compiled engine libraries need it) | Debian 13, glibc 2.41 |
+| OS | Linux x86_64 with glibc 2.38 or newer (the compiled engine libraries need it) | Debian 13, glibc 2.41 |
 | NVIDIA driver | one that supports CUDA 13.0 | 610.43.02, P2P-enabled |
 | CUDA toolkit | none on 3.0.x: the 0.32 environment carries CUDA 13.0 (nvcc 13.0.88) for FlashInfer's JIT; an inherited `CUDA_HOME` must pass the release's toolkit check ([install-0.32.md](../../../release/install-0.32.md)). The 0.30 install needed a system `nvcc` | 13.3 (0.30 install) |
 | Python | 3.13, with `venv` | 3.13 |
@@ -473,7 +473,7 @@ calibration data is distributed. The 11 files are checksummed in `models/qwen38-
 ### Serving an agent
 
 The operational settings below include historical 0.30 check results; those counts and timings are not 0.32 remeasurements.
-For current 3.0.0 evidence, use the [2026-10-20 card](../benchmarks/2026-10-20/BENCH-CARD.md); the [2026-10-15 card](../benchmarks/2026-10-15/BENCH-CARD.md) is the tile-reclaim card.
+For current evidence, use the [2026-11-02 card](../benchmarks/2026-11-02/BENCH-CARD.md) (3.0.1) and the [2026-10-20 card](../benchmarks/2026-10-20/BENCH-CARD.md) (3.0.0); the [2026-10-15 card](../benchmarks/2026-10-15/BENCH-CARD.md) is the tile-reclaim card.
 
 
 | agent need | as served |
@@ -486,7 +486,7 @@ For current 3.0.0 evidence, use the [2026-10-20 card](../benchmarks/2026-10-20/B
 
 ## Benchmarks
 
-**Current 3.0.0 evidence:** [2026-10-20 bench card](../benchmarks/2026-10-20/BENCH-CARD.md); [tile reclaim and 8 MP stress results, 2026-10-15](../benchmarks/2026-10-15/BENCH-CARD.md).
+**Current evidence:** [2026-11-02 bench card](../benchmarks/2026-11-02/BENCH-CARD.md) (3.0.1); [2026-10-20 bench card](../benchmarks/2026-10-20/BENCH-CARD.md) (3.0.0); [tile reclaim and 8 MP stress results, 2026-10-15](../benchmarks/2026-10-15/BENCH-CARD.md).
 All tables and plots below this point are **historical v1.3.x vLLM 0.30 results**, unless explicitly stated otherwise.
 
 

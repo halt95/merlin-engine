@@ -2,7 +2,7 @@
 
 Historical **vLLM 0.30** release material, moved here from the [README](../README.md). The last public package release
 was v1.3.1 (documentation fixes on v1.3.0). Its notes are in [CHANGELOG.md](../CHANGELOG.md#v130).
-The current recipe is **3.0.0 on vLLM 0.32.0**; use its [2026-10-20 bench card](../benchmarks/2026-10-20/BENCH-CARD.md)
+The current recipe is **3.0.1 on vLLM 0.32.0**; use its [2026-11-02 bench card](../benchmarks/2026-11-02/BENCH-CARD.md) and the 3.0.0 [2026-10-20 card](../benchmarks/2026-10-20/BENCH-CARD.md)
 for current evidence. None of the numbers below are new 0.32 measurements.
 
 ## The releases in brief (v1.3.0, v1.1.0, v1.0.0)

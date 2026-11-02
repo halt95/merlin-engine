@@ -7,6 +7,11 @@ Release notes, newest first. To install and run the current release, see the [RE
 (scripts, serve-script variables and knobs, capacity, known behaviours, measurement method) is in
 [docs/reference.md](docs/reference.md); v1.0.0 and its numbers are in [docs/history.md](docs/history.md).
 
+## Merlin 3.0.1
+
+See the [engine changelog](../../docs/CHANGELOG.md) for the full release. This recipe's results, measured with P2P and the
+GPU unlock, are in the [2026-11-02 bench card](benchmarks/2026-11-02/BENCH-CARD.md); the 2026-10-20 card stays as the 3.0.0 comparator.
+
 ## Merlin 3.0.0
 
 Recipe for Merlin 3.0.0 on **vLLM 0.32.0**, with the shared installer and tile tooling integrated. The dependency lock is complete with 222 exact pins and SHA-256 hashes; a fresh install (2026-10-21) and a from-source build (2026-10-22) passed on the reference host.

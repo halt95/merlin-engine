@@ -237,7 +237,7 @@ serve profiles at 262K with MTP K=3, and a container recipe. Its numbers: [docs/
 - [docs/reference.md](docs/reference.md): what the build and serve scripts do, serve-script variables and knobs,
   requirements, health checks, troubleshooting, the ThinkingCap profile, what is in v1.3.0, how the model sits on the
   cards, capacity, benchmarks, known behaviours and a glossary.
-- Bench cards: [3.0.0 results, 2026-10-20](benchmarks/2026-10-20/BENCH-CARD.md) and [0.32 tile reclaim, 2026-10-15](benchmarks/2026-10-15/BENCH-CARD.md); historical 0.30 cards: [v1.3.0](benchmarks/2026-10-12/BENCH-CARD.md) and
+- Bench cards: [3.0.1 results, 2026-11-02](benchmarks/2026-11-02/BENCH-CARD.md), [3.0.0 results, 2026-10-20](benchmarks/2026-10-20/BENCH-CARD.md) and [0.32 tile reclaim, 2026-10-15](benchmarks/2026-10-15/BENCH-CARD.md); historical 0.30 cards: [v1.3.0](benchmarks/2026-10-12/BENCH-CARD.md) and
   [ThinkingCap](../thinkingcap/benchmarks/2026-10-12/ThinkingCap-BENCH-CARD.md) (2026-10-12), [v1.0.0](https://github.com/halt95/qwen38-27b-3090s/blob/v1.3.1/benchmarks/2026-09-26/BENCH-CARD.md)
   (2026-09-26), [the earlier three-patch build](https://github.com/halt95/qwen38-27b-3090s/blob/v1.3.1/benchmarks/2026-09-25/BENCH-CARD.md) (2026-09-25).
 - [docs/loop-check.md](docs/loop-check.md): the repetition-loop check.

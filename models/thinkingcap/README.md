@@ -42,8 +42,8 @@ it is **not** published, reviewed or endorsed by BottleCap AI or Qwen.
 | Weights licence | Apache-2.0 | PolyForm Small Business 1.0.0 plus BottleCap AI's personal-use permission ([License](#license)) |
 | Historical 0.30 numbers | single-stream thinking decode at 32K: 198 tok/s dual card, 249 quad card | x0.860 of the base's median thinking tokens at medium effort at the same GSM8K accuracy (97.27 %, 1,319 items); 172.8 tok/s at 32K on dual card (2026-10-08 check) and 223.4 on quad card (2026-10-12) |
 
-Both checkpoints run on the same engine, pins, port (8100) and served name (`qwen38-27b`). The measurements, each dated per row, are in the
-[ThinkingCap bench card](benchmarks/2026-10-12/ThinkingCap-BENCH-CARD.md); the profile's detail (what differs, token cost by effort,
+Both checkpoints run on the same engine, pins, port (8100) and served name (`qwen38-27b`). The 3.0.1 measurements are in the
+[2026-11-02 card](benchmarks/2026-11-02/BENCH-CARD.md), and the older ones, dated per row, in the [2026-10-12 card](benchmarks/2026-10-12/ThinkingCap-BENCH-CARD.md); the profile's detail (what differs, token cost by effort,
 capacity rows) is in [ThinkingCap checkpoint profile](../qwen38-27b/docs/reference.md#thinkingcap-checkpoint-profile).
 
 ## Merlin 3.0.1 bench card (2026-11-02)

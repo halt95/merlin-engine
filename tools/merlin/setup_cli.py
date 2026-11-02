@@ -274,7 +274,7 @@ def fp8_ple_sums(model: str, repo: Path = REPO) -> dict[str, str]:
 
 
 def int6_engine_reason(repo: Path = REPO) -> str | None:
-    """Why this checkout cannot serve an INT6 g32 table (None when it can): the loader is not in this release, and its
+    """Why this checkout cannot serve an INT6 g32 table (None when it can): the engine must carry the INT6 g32 loader, and its
     launcher boots the format only as an opt-in test table until it is promoted."""
     try:
         loader = (repo / "vllm" / "models" / "qwen4_exp" / "nvidia" / "ple_formats.py").read_text(encoding="utf-8")

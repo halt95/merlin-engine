@@ -1,7 +1,7 @@
 <!-- Modified by the Merlin project from the upstream vLLM README; see NOTICE. -->
 # Merlin engine
 
-Merlin is a vLLM fork tuned for NVIDIA Ampere and Ada (**sm_80, sm_86 and sm_89**) GPUs, with model recipes for Qwen3.8-Flash-Next and Qwen3.8-27B. **Merlin 3.0.1 is built on vLLM 0.32.0.** It combines the engine, launchers, checkpoint checksums and installation tooling in one repository. Model weights stay on Hugging Face.
+Merlin is a vLLM fork tuned for NVIDIA Ampere and Ada (**sm_80, sm_86 and sm_89**) GPUs, with model recipes for the seven checkpoints below. **Merlin 3.0.1 is built on vLLM 0.32.0.** It combines the engine, launchers, checkpoint checksums and installation tooling in one repository. Model weights stay on Hugging Face.
 
 The fork carries the sm_86 FP8 QSA attention reader, host-memory PLE embedding offload, RecoverSSM, prefix-cache retention, persistent top-k and guard telemetry. It serves an OpenAI-compatible API with vision, reasoning and tool calling. See the [upstream vLLM README](https://github.com/vllm-project/vllm/blob/v0.32.0/README.md) and [vLLM documentation](https://docs.vllm.ai/); Merlin changes are described in [CHANGELOG.md](../CHANGELOG.md) and [NOTICE](../../NOTICE).
 
@@ -16,6 +16,8 @@ The [models/ index](../../models/README.md) leads to each recipe's launchers, re
 | [Swift1.5-Huihui](../../models/swift1.5-huihui/README.md) | 3.0.0 | [Swift1.5-Huihui-Qwen3.8-Flash-Next-W4A16-Merlin](https://huggingface.co/halt95/Swift1.5-Huihui-Qwen3.8-Flash-Next-W4A16-Merlin) | Same quad layout; tested on the reference host (Merlin 3.0.0 release bench card) |
 | [Qwen3.8-27B](../../models/qwen38-27b/README.md) | 3.0.0 | [Qwen3.8-27B-W4A16-Merlin](https://huggingface.co/halt95/Qwen3.8-27B-W4A16-Merlin) | 2× RTX 3090 TP2 or 4× RTX 3090 TP4 |
 | [ThinkingCap](../../models/thinkingcap/README.md) | 3.0.0 | [ThinkingCap-Qwen3.8-27B-W4A16-Merlin](https://huggingface.co/halt95/ThinkingCap-Qwen3.8-27B-W4A16-Merlin) | Profile of the 27B recipe; separate weight licence |
+| [Nemotron 3.5 Super VL](../../models/nemotron-super-vl/README.md) | 3.0.0 | [Nemotron-3.5-Super-VL-120B-A12B-W4A16-Merlin](https://huggingface.co/halt95/Nemotron-3.5-Super-VL-120B-A12B-W4A16-Merlin) | 4× RTX 3090 |
+| [Ornith 1.5](../../models/ornith1.5/README.md) | 3.0.0 | [Ornith-1.5-122B-A10B-W4A16-Merlin](https://huggingface.co/halt95/Ornith-1.5-122B-A10B-W4A16-Merlin) | 4× RTX 3090, with or without P2P |
 
 Recipe versions stay at 3.0.0 in Merlin 3.0.1 (the VERSION files are unchanged); the recipe changes are in the
 [changelog](../CHANGELOG.md). The previous public release is Merlin 3.0.0.
@@ -98,7 +100,7 @@ The engine now lives at the repository root, and recipes live under `models/<mod
 git remote set-url origin https://github.com/halt95/merlin-engine.git
 ```
 
-Flash-Next FGPC stays off. The 27B keeps FGPC on under its 0.32 name, `--enable-mamba-shared-prefix-checkpoint`. The native context remains 262,144 tokens and no shipped profile enables YaRN. A YaRN extension is opt-in through `--hf-overrides` (recipe in [How to serve](../how-to-serve.md#longer-context-with-yarn-flash-next)), is tested at 393,216 tokens on Flash-Next only, and changes numerics from the 0.30 releases. Sequence parallelism is off by default and can change output rounding. Oversubscribing the KV pool can still thrash prefix caching, and the upstream `qwen3_coder` parser can drop JSON-form `<tool_call>` blocks.
+Flash-Next FGPC stays off. The 27B keeps FGPC on under its 0.32 name, `--enable-mamba-shared-prefix-checkpoint`. The native context remains 262,144 tokens and no shipped profile enables YaRN. A YaRN extension is opt-in through `--hf-overrides` (recipe in [How to serve](../how-to-serve.md#longer-context-with-yarn-flash-next)), is tested on Flash-Next at 393K and 524K (MTP and DFlash2) and 917K (MTP), and changes numerics from the 0.30 releases. Sequence parallelism is off by default and can change output rounding. Oversubscribing the KV pool can still thrash prefix caching, and the upstream `qwen3_coder` parser can drop JSON-form `<tool_call>` blocks.
 
 ## Licence and security
 

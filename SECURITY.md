@@ -17,7 +17,7 @@ Merlin 3.0.1 is the current release. Security fixes target the latest public Mer
 
 ## Deployment assumptions
 
-Merlin inherits vLLM's trust assumptions. Read the bundled [upstream security guide](https://docs.vllm.ai/en/v0.32.0/usage/security.html), especially its guidance on distributed communication and media downloads.
+Merlin inherits vLLM's trust assumptions. Read the [upstream security guide](https://docs.vllm.ai/en/v0.32.0/usage/security.html), especially its guidance on distributed communication and media downloads.
 
 - Keep distributed, worker and PLE communication on trusted, isolated networks. Do not expose those ports to the internet.
 - Restrict access to the serving API and put authentication, TLS and resource controls at the deployment boundary.

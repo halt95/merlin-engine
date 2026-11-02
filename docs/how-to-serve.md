@@ -3,7 +3,7 @@
 From GPUs to a running, OpenAI-compatible endpoint in one command, then everything you can change afterwards.
 Merlin runs on Linux x86-64 with glibc 2.38 or newer (Ubuntu 24.04, Debian 13, RHEL 10 or newer) and NVIDIA Ampere or Ada cards (sm_80, sm_86, sm_89). Which GPUs run which checkpoint,
 and every profile the engine ships, is in [Which GPUs run what](#6-which-gpus-run-what); what each checkpoint needs in
-RAM and disk is in the README's Requirements section.
+RAM and disk is in [SETUP.md](SETUP.md), and setup prints it for your choice.
 
 ## 1. Install and start
 
@@ -31,7 +31,7 @@ git clone https://github.com/halt95/merlin-engine.git && cd merlin-engine && ./s
 4. **Shows every download with its size** (the prebuilt engine, the Python packages, the checkpoint) and asks once.
    `n` stops with nothing downloaded and nothing saved.
 5. **Installs and starts**: the prebuilt engine into `venv/`, the checkpoint checked file by file against its
-   checksums, then the server on `127.0.0.1:8000`. It is ready when the log says `Application startup complete`; the
+   checksums, then the server on `127.0.0.1` (port 8000; 8100 for the 27B and ThinkingCap). It is ready when the log says `Application startup complete`; the
    first start compiles kernels and takes longer than later ones.
 
 Nothing is installed system-wide and nothing needs sudo: uv and Python 3.13 live in `.merlin/`, the engine in `venv/`.
@@ -313,8 +313,8 @@ On 4× RTX 4090 and 2× CMP 170HX 64 GB the Flash-Next column's 🟡 is Flash-Ne
 "N sessions (M at once)" means the KV cache holds N full 262K conversations but the server
 admits M requests at a time; the rest queue. Without P2P every model runs the same layouts with P2P off; on four
 RTX 3090s Ornith 1.5 and Flash-Next's PP4 layout are tested that way (Flash-Next's default layout and the 27B were
-boot-checked with `--swarm`, 2026-11-01), while Nemotron and the two- and eight-card setups
-are not yet (⚫). The 3090 Ti and
+boot-checked with `--swarm`, 2026-11-01), while Nemotron and the two-card and single-server eight-card setups
+are not yet (⚫). The 🟢 8× cells are two separate 4-card servers of a profile tested on four cards, not an 8-card qualification. The 3090 Ti and
 RTX A5000 run the RTX 3090 profiles, untested on those cards (⚫). KV cache: FP8 everywhere, except Flash-Next and its fine-tunes on sm_80 cards (A30, A100, CMP 170HX),
 which default to BF16, so fewer sessions fit; `KV_DTYPE=fp8` opts them into FP8 KV (untested ⚫). On 4× CMP 170HX 64 GB the 27B (one, two and four cards) and Nemotron ran with
 FP8 KV, 262K needles exact. Source: the engine's profile registry (`tools/merlin/profiles/`).</sub>
