@@ -1,6 +1,6 @@
 # container/ — Merlin 3.0.1
 
-> **unqualified until qualified on hardware**
+> **community-qualified on 8 × RTX 3090 (2026-11-03, with this branch's build fixes) — see [Hardware qualification](#hardware-qualification)**
 
 The image installs **this repository checkout**, built on vLLM **0.32.0**, through
 [release/install-env.sh](../release/install-env.sh). That shared installer owns the 0.32
@@ -23,6 +23,10 @@ Build from the matching clean ref. Use a Docker-tag-safe published tag or full c
 or a Compose `.env` file; Compose passes the same value to the build. For direct builds, pass
 `--build-arg SOURCE_REF="$SOURCE_REF"` and tag the image `merlin-engine:$SOURCE_REF`, as shown below.
 For a custom source repository, also pass `--build-arg SOURCE_URL=<url>` to `docker build`.
+For the wheel fast path, pass the release wheel URL as `--build-arg MERLIN_WHEEL_URL=<url>`
+(Compose forwards `MERLIN_WHEEL_URL`), matching the manual install's wheel option. The
+installer verifies the wheel against `release/merlin-wheel.sha256`; an empty value builds
+the engine from source.
 The image bootstraps
 [uv 0.12.13](https://github.com/astral-sh/uv/releases/tag/0.12.13) and installs the Rust
 version selected by the checkout's `rust-toolchain.toml`.
@@ -67,6 +71,11 @@ Choose the checkpoint and canonical [recipe](../models/README.md) with environme
 | `qwen38-27b` | `models/qwen38-27b/serve.sh` | 2 GPUs |
 | `thinkingcap` | `models/thinkingcap/serve.sh` | 2 GPUs |
 
+`MERLIN_PROFILE` (Flash-Next family only) pins the layout when the family's default recipe —
+fixed to the reference quad, `fn-quad-3090` — is not what this host should serve. The pin goes
+through `merlin serve --profile`, so any qualified row of the model can be served. Example:
+eight RTX 3090s serve the octo latency layout with `MERLIN_PROFILE=fn-octo-3090-tp4pp2`.
+
 ```bash
 MERLIN_MODEL=qwen38-27b MODEL_DIR=/absolute/path/to/Qwen3.8-27B-W4A16-Merlin \
   docker compose -f container/docker-compose.yml up --build -d
@@ -92,7 +101,7 @@ it. Extra positional flags pass through to the Flash-Next family launchers. The 
 family takes environment settings (`GPUS`, `KV_BYTES`, `SERVED`, etc.); extra flags are
 rejected because those launchers do not forward them.
 
-Compose forwards `MODEL_NAME`, `SERVED`, `GPUS`, `KV_BYTES` and `WARM` from the host shell
+Compose forwards `MODEL_NAME`, `SERVED`, `GPUS`, `KV_BYTES`, `WARM` and `MERLIN_PROFILE` from the host shell
 or a compose `.env` file (unset or empty keeps the launcher default). `KV_BYTES` applies to
 Swift, Swift1.5-Huihui and the 27B recipes; Flash-Next sizes its own pool. `WARM=0` skips the
 Flash-family warm-up and is the setting for exploratory non-sm_86 runs, for example
@@ -127,6 +136,32 @@ The CPU readiness regression suite can be run with:
 venv/bin/python -m unittest discover -s container -p test_healthcheck.py -v
 ```
 
-No container build, regression suite or GPU boot has been run for this recipe. Hardware qualification must
-record a successful build, model load, `/v1/models`, one-token completion, needle probes
-and image size on a supported GPU configuration before this label can be removed.
+## Hardware qualification
+
+The stock recipe does not build on a GPU-less build host: a `docker build` has no NVIDIA
+driver and the pip CUDA distribution ships no `libcuda`, so CMake's CUDAToolkit module
+cannot create the `CUDA::cuda_driver` imported target and the native configure fails on
+every target that links it (`cumem_allocator`, `_C_stable_libtorch`,
+`_moe_C_stable_libtorch`, `_vllm_fa2_C`, `_vllm_fa3_C`; "CMake Generate step failed"). This
+branch adds a link-time-only driver stub — Debian's `libcuda1`, extracted to
+`/opt/cuda-stubs` and exposed through `CMAKE_LIBRARY_PATH`, never on the default loader
+path, where it would shadow the driver the container toolkit mounts at runtime — plus a
+`MERLIN_WHEEL_URL` build argument for the installer's wheel fast path and `MERLIN_PROFILE`
+for serving a non-default layout.
+
+Qualification record (8 × RTX 3090 — 7 × RTX 3090 + 1 × RTX 3090 Ti, sm_86, driver
+595.91.07, 2026-11-03):
+
+| Check | Result |
+|---|---|
+| Build (wheel path, `MERLIN_WHEEL_URL`, `MAX_JOBS=16`) | 9.67 GB image; the source-ref verification passed (`SOURCE OK: commit=3ff5252…`) |
+| Model load | `MERLIN_PROFILE=fn-octo-3090-tp4pp2` on eight cards; startup ~4 min with warm caches |
+| `/v1/models` | HTTP 200 with the bearer key; all four served names listed |
+| One-token completion | the image HEALTHCHECK's generation (nonempty `choices`, `completion_tokens >= 1`) passes; `docker inspect` reports `healthy` |
+| Needle probes | a 155,572-token prompt with a single-occurrence needle answered correctly (56.2 s wall, greedy) |
+| Image size | 9.67 GB |
+
+The GPU run then served production traffic on the qualifying host at the octo TP4 × PP2
+shape (`GPUS` pinned past the idle check — the host has a desktop GL context on its first
+card and a ninth non-matching card; `P2P=off`, `KV_BYTES=9e9`, `DRAFT_HEAD=int8`). The
+from-source default build with the stub fix is verified in the pull-request thread.
