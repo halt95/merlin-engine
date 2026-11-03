@@ -8,6 +8,7 @@
 [![Context](https://img.shields.io/badge/context-262K-ffb000)](#models)
 [![Licence](https://img.shields.io/badge/licence-Apache--2.0-lightgrey)](LICENSE)
 [![Support](https://img.shields.io/badge/support-Ko--fi-FF5E5B?logo=kofi&logoColor=white)](https://ko-fi.com/halt95)
+[![Discord](https://img.shields.io/badge/discord-join_the_community-5865F2?logo=discord&logoColor=white)](https://discord.gg/jVDYAwdGzt)
 
 **[Quick start](#quick-start) · [Models](#models) · [Features](#features) · [Performance](#performance) · [Hardware](#hardware) · [How to serve](docs/how-to-serve.md) · [Changelog](docs/CHANGELOG.md)**
 
