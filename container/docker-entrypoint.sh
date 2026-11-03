@@ -43,6 +43,12 @@ if ! command -v nvidia-smi >/dev/null 2>&1 || ! nvidia-smi -L >/dev/null 2>&1; t
 fi
 cd "$REPO"
 if [ "$family" = flash ]; then
+  # MERLIN_PROFILE pins a layout when the family's default recipe (the reference
+  # quad) is not what this host should serve; the family serve.sh is fixed to
+  # that layout, so the pin goes through the merlin CLI, which takes --profile.
+  if [ -n "${MERLIN_PROFILE:-}" ]; then
+    exec "$VENV/bin/merlin" serve "$recipe" "$CKPT" --profile "$MERLIN_PROFILE" -- "$@"
+  fi
   exec bash "$REPO/models/$recipe/serve.sh" "$CKPT" "$@"
 fi
 exec bash "$REPO/models/$recipe/serve.sh"

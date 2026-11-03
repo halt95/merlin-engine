@@ -12,6 +12,7 @@ services:
       args:
         SOURCE_REF: "${SOURCE_REF:-merlin-v3.0.1}"
         MAX_JOBS: "${MAX_JOBS:-4}"
+        MERLIN_WHEEL_URL: "${MERLIN_WHEEL_URL:-}"
         TORCH_CUDA_ARCH_LIST: "8.0;8.6;8.9"
     deploy:
       resources:
@@ -40,6 +41,7 @@ services:
       GPUS: "${GPUS:-}"               # 27B / ThinkingCap devices, e.g. 0,1 (TP2) or 0,1,2,3 (TP4)
       KV_BYTES: "${KV_BYTES:-}"       # per-GPU KV pin (Swift, Huihui, 27B; Flash-Next sizes its own pool)
       WARM: "${WARM:-}"               # Flash-Next family warm-up: 1 (default) or 0; use 0 on non-sm_86 exploratory runs
+      MERLIN_PROFILE: "${MERLIN_PROFILE:-}"  # Flash-Next family layout pin (e.g. fn-octo-3090-tp4pp2 on eight cards); empty serves the family's default
       # VLLM_API_KEY: "<key>"
     volumes:
       - "${MODEL_DIR:?set MODEL_DIR to an absolute checkpoint directory}:/models/checkpoint"
