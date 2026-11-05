@@ -8,7 +8,7 @@
 > Checkpoint: [halt95/Qwen3.8-Flash-Next-W4A16-Merlin](https://huggingface.co/halt95/Qwen3.8-Flash-Next-W4A16-Merlin). Layout: TP2 × PP2 + EP on four cards, MTP K=3 probabilistic, FP8 KV; thinking-on effort `low` (the default at measurement time); boot 231 s (compile cache carried over from an earlier boot); KV pool 924,993 tokens.
 >
 > **Draft head.** Measured with the BF16 draft lm_head that 3.0.0 ships, as every earlier Flash-Next release did. The INT8
-> copy (`DRAFT_HEAD=int8`, 6.5–7.2 % lower ms per token at the same MTP acceptance) is a candidate default for a later release; 3.0.1 keeps `bf16`.
+> copy (`DRAFT_HEAD=int8`, 6.5–7.2 % lower ms per token at the same MTP acceptance) is a candidate default for a later release; later releases keep `bf16` as the default.
 
 ## 1. Single-stream decode ladder
 
@@ -51,8 +51,6 @@ speed only.
 | 10,187 | 5,660 tok/s | 5,020 tok/s | +12.7 % | 1.80 |
 | 101,875 | 6,051 tok/s | 5,417 tok/s | +11.7 % | 16.84 |
 | 261,888 | 5,838 tok/s | 5,236 tok/s<sup>1</sup> | +11.5 % | 44.9 |
-
-<sub>262K row added on 2026-10-22, after first publication, from the same runs.</sub>
 
 Prefill is one cold send per depth (8 tokens out); the 262K row is the exact-262K run's cold send 1 (section 2).
 <sup>1</sup> v2.5.2 re-ran prefill at 10K and 100K only (within 0.1 % of v2.5.1 there); its 262K figure is the v2.5.1 card's

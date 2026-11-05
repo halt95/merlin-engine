@@ -47,7 +47,7 @@ REQUIRED_CUDAGRAPH_MODE_NAME = "FULL_AND_PIECEWISE"
 PRODUCTION_BREAKABLE_PIN = "0"
 
 REQUIRED_SPLITTING_OPS = (
-    "vllm::qwen4_exp_qsa_with_output",
+    "vllm::qwen4_exp_nv_qsa_with_output",
     "vllm::qwen4_exp_nv_ple_short_conv",
     "vllm::qwen4_exp_compute_ple_ngram_ids",
     "vllm::qwen_gdn_attention_core",
@@ -56,7 +56,7 @@ REQUIRED_SPLITTING_OPS = (
 )
 
 #: Upstream auto-enables breakable cudagraphs for these; this tree
-#: does not (vllm/config/vllm.py). Kept to name the mechanism in messages.
+#: does not (vllm/config/vllm.py).
 OUR_AUTO_BREAKABLE_ARCHITECTURES = frozenset(flashnext_family.archs())
 
 
@@ -219,7 +219,6 @@ def assert_compiled_submodule(module, vllm_config, *, role: str = "target") -> N
     )
 
 
-
 #: Target architectures whose V2 capture is checked. The construction guard
 #: above lives in the NVIDIA Qwen4Exp model; this tree targets sm_86 only.
 QWEN4EXP_TARGET_ARCHITECTURES = frozenset(flashnext_family.target_archs())
@@ -296,7 +295,6 @@ def assert_resolved_cudagraph_modes(
     )
 
 
-
 UPSTREAM_UVA_ENV = "VLLM_PLE_CPU_OFFLOAD"
 
 
@@ -304,10 +302,9 @@ def check_upstream_uva_env_against_pull() -> None:
     """Fail loud if the old name would turn upstream's UVA path on.
 
     ``VLLM_PLE_CPU_OFFLOAD`` may be unset (the fork then supplies
-    ``cpu_offload=False`` as the Engram default) or exactly ``"0"``. ``"1"`` --
-    the earlier spelling of "enable our offload" -- would enable upstream's
-    pinned-host UVA backend beside ours: a double offload. Any other value is
-    rejected rather than interpreted.
+    ``cpu_offload=False`` as the Engram default) or exactly ``"0"``. ``"1"``
+    would enable upstream's pinned-host UVA backend beside ours: a double
+    offload. Any other value is rejected rather than interpreted.
     """
     raw = os.environ.get(UPSTREAM_UVA_ENV)
     if raw is None or raw == "0":

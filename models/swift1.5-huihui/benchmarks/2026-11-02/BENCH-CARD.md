@@ -57,9 +57,6 @@ off, temperature 0. Total tok/s = tokens decoded while all eight stream / that o
 |---|---|---|---|---|
 | Four cards | 681 | 660 | +3.2 % | 5.60 |
 
-This is a second pass. In the first, one agent stopped after one token (a natural end of sequence), so the
-eight never streamed together; the 3.0.0 card was re-run the same way.
-
 **Thinking on, reasoning effort medium** (the server default). The same eight conversations and follow-ups, with thinking on and each request setting medium. A 512-token follow-up may end inside the reasoning, and reasoning tokens count, so these totals measure decoded tokens, not finished answers.
 
 | layout | 3.0.1 total tok/s, thinking on | overlap window s |

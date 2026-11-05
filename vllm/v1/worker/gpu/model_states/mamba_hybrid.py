@@ -84,6 +84,8 @@ class MambaHybridAttnMetadata(ModelSpecificAttnMetadata):
 class MambaHybridModelState(DefaultModelState):
     """Model state for hybrid attention + Mamba / linear-attention models."""
 
+    _workload_tile = False  # set in __init__
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -93,6 +95,9 @@ class MambaHybridModelState(DefaultModelState):
     ) -> None:
         super().__init__(vllm_config, model, encoder_cache, device)
         self.cache_config = vllm_config.cache_config
+        # The default-off knob is read once
+        # here, not on every prepare_attn step.
+        self._workload_tile = bool(envs.MERLIN_FLASHINFER_WORKLOAD_TILE)
         self.num_accepted_tokens_gpu = torch.ones(
             self.max_num_reqs, dtype=torch.int32, device=self.device
         )
@@ -108,8 +113,21 @@ class MambaHybridModelState(DefaultModelState):
         # the persistent per-req-slot tables, not the per-step gather.
         self._runner_block_tables: Any = None
         self.recoverssm = (
-            RecoverSSMState() if self.cache_config.use_recoverssm else None
+            # RecoverSSM state sized with the
+            # pp_size + 1 snapshot ring
+            RecoverSSMState(
+                # The PP queue depth + 1.
+                snapshot_ring_depth=(
+                    self.vllm_config.parallel_config.pipeline_parallel_size + 1
+                )
+            )
+            if self.cache_config.use_recoverssm
+            else None
         )
+        # (idx_mapping, num_sampled) whose
+        # scatter + deferred RecoverSSM commit `commit_deferred_early` already
+        # enqueued; the matching postprocess_state skips both.
+        self._early_committed: tuple[Any, Any] | None = None
         # (idx_mapping, num_sampled, num_computed_tokens, recorded step) of a
         # postprocess tail held until flush_deferred_postprocess().
         self._deferred_tail: tuple[Any, ...] | None = None
@@ -384,7 +402,7 @@ class MambaHybridModelState(DefaultModelState):
             num_accepted_tokens=num_accepted_tokens,
             num_decode_draft_tokens_cpu=num_decode_draft_tokens_cpu,
         )
-        if envs.MERLIN_FLASHINFER_WORKLOAD_TILE:
+        if self._workload_tile:
             mamba_attn_metadata.workload_prefill_flags = scheduled_prefill_flags(
                 input_batch, num_reqs
             )
@@ -421,6 +439,8 @@ class MambaHybridModelState(DefaultModelState):
             )
         return attn_metadata
 
+    # non-last PP rank detaches and restores the step's
+    # deferred RecoverSSM commit
     def detach_deferred_state(self) -> Any:
         # Non-last PP rank: the RecoverSSM commit of this step has to wait for
         # the accepted counts of the PP broadcast; snapshot its inputs now.
@@ -439,6 +459,44 @@ class MambaHybridModelState(DefaultModelState):
 
     supports_deferred_postprocess = True
 
+    def commit_deferred_early(
+        self, idx_mapping: torch.Tensor, num_sampled: torch.Tensor
+    ) -> bool:
+        """
+        Non-last PP rank: enqueue the restored deferred step's num_accepted
+        scatter and RecoverSSM commit before the drafts arrive. Returns False
+        (nothing enqueued) unless a deferred step is restored.
+
+        Bit-identical by construction: the same kernels with the same
+        arguments, in the same order relative to each other, moved ahead of
+        post_update only. post_update writes num_computed_tokens,
+        last_sampled_tokens, all_token_ids, total_len and draft_tokens; the
+        scatter and commit read none of them (a deferred commit reads its own
+        snapshot of the step's commit inputs, plus num_sampled and
+        idx_mapping) and write only num_accepted_tokens, the align state
+        indices, the commit context's scratch and the GDN/conv/PLE state,
+        none of which post_update reads. The fused align postprocess, which
+        reads post_update's num_computed_tokens, stays after it
+        (postprocess_state)."""
+        rssm = self.recoverssm
+        if rssm is None or not rssm._step_is_deferred or rssm._step is None:
+            return False
+        self.check_deferred_postprocess()
+        if idx_mapping.shape[0]:
+            _scatter_num_accepted_kernel[(idx_mapping.shape[0],)](
+                idx_mapping,
+                num_sampled,
+                self.num_accepted_tokens_gpu,
+            )
+        rssm.commit_step(
+            num_sampled,
+            idx_mapping,
+            state_indices=(self._mamba_state_idx_gpu if self._align_mode else None),
+            num_accepted_tokens=self.num_accepted_tokens_gpu,
+        )
+        self._early_committed = (idx_mapping, num_sampled)
+        return True
+
     def postprocess_state(
         self,
         idx_mapping: torch.Tensor,
@@ -447,7 +505,28 @@ class MambaHybridModelState(DefaultModelState):
         *,
         defer_tail: bool = False,
     ) -> None:
+        # Postprocess after an early deferred commit
+        # runs only the align tail
         self.check_deferred_postprocess()
+        # The scatter and commit already ran
+        # (commit_deferred_early, same idx_mapping/num_sampled): only the fused
+        # align postprocess remains.
+        early = getattr(self, "_early_committed", None)
+        self._early_committed = None
+        if early is not None:
+            if early[0] is not idx_mapping or early[1] is not num_sampled:
+                raise RuntimeError(
+                    "RecoverSSM: an early deferred commit was followed by the "
+                    "postprocess of a different step"
+                )
+            if defer_tail:
+                raise RuntimeError(
+                    "RecoverSSM: an early deferred commit cannot defer its tail"
+                )
+            self._postprocess_tail(
+                idx_mapping, num_sampled, num_computed_tokens, commit=False
+            )
+            return
         # Chunked prefill does not sample a token, so num_sampled can be 0.
         # Mamba treats num_accepted_tokens=1 as the neutral non-spec value.
         num_reqs = idx_mapping.shape[0]
@@ -468,6 +547,8 @@ class MambaHybridModelState(DefaultModelState):
                     max(num_sampled, 1),
                 )
 
+        # Postprocess tail deferred until after the
+        # proposal (commit-after-propose)
         if defer_tail:
             self._deferred_tail = (
                 idx_mapping,
@@ -519,9 +600,11 @@ class MambaHybridModelState(DefaultModelState):
         idx_mapping: torch.Tensor,
         num_sampled: torch.Tensor | int,
         num_computed_tokens: torch.Tensor | None,
+        *,
+        commit: bool = True,
     ) -> None:
         num_reqs = idx_mapping.shape[0]
-        if self.recoverssm is not None:
+        if self.recoverssm is not None and commit:
             self.recoverssm.commit_step(
                 num_sampled,
                 idx_mapping,

@@ -3,10 +3,11 @@
 """``merlin``: one front end over the profile registry, preflight and the one launcher.
 
     merlin serve [checkpoint] [path] [--profile ID | --tp N] [--instances N] [--kv-ram-cache SIZE] [--swarm]
-                 [--ple fp8|int6] [--spec mtp|dflash2] [--dry-run] [-- extra vllm args]
+                 [--ple fp8|int6] [--ple-store ram|disk] [--spec mtp|dflash2] [--dry-run] [-- extra vllm args]
     merlin verify <dir> [--checkpoint NAME] [--ple fp8|int6]
     merlin list
     merlin doctor [preflight.py args]
+    merlin doctor --report [FILE] [--log FILE] [--lines N] [preflight.py args]
 
 The checkpoint name is optional when the directory can be identified (config.json + the recipes' checkpoint.sha256
 lists). Identification does not verify shard bytes: ``merlin verify`` streams all listed files through SHA-256.
@@ -640,7 +641,7 @@ def resolve(
         raise CliError(str(e)) from None
     ckpt = path or env_in.get("MERLIN_CHECKPOINT_DIR") or PLACEHOLDER
     # the RAM gates count the KV host tier this launch asks for and the PLE table this checkpoint carries (INT6 g32)
-    inv = replace(inv, kv_tier_gib=pf.kv_host_tier_gib(env_in), ple_table_gib=pf.ple_table_gib_of(ckpt, inv.ple_table_gib))
+    inv = replace(inv, kv_tier_gib=pf.kv_host_tier_gib(env_in), ple_table_gib=pf.ple_table_gib_of(ckpt, inv.ple_table_gib, env_in.get("PLE_STORE")))
     if not (repo / LAUNCHER).is_file():
         raise CliError(f"{LAUNCHER} is not in this tree ({repo}); nothing started.")
     sel = _gpu_selection(env_in)
@@ -739,7 +740,7 @@ def resolve(
         if p["match"]["cards"] > 1:
             env["P2P"] = p["match"]["p2p"]  # the row was qualified on exactly this interconnect
     else:
-        if rep.p2p_mode and len(p["interconnect"]["modes"]) > 1:
+        if rep.p2p_mode and (R.auto_p2p_switch(p) or rep.p2p_mode == "ipc"):
             env["P2P"] = rep.p2p_mode
     if rep.adjusted is not None:  # the pin preflight derived for these cards (whole blocks where the row records them)
         pin = rep.adjusted["pin_bytes"]
@@ -932,7 +933,7 @@ def plan_instances(
     except R.ProfileError as e:
         raise CliError(str(e)) from None
     # every instance gets the same KV host tier and PLE table (the checkpoint's: INT6 g32 with --ple int6)
-    inv = replace(inv, kv_tier_gib=pf.kv_host_tier_gib(env_in), ple_table_gib=pf.ple_table_gib_of(path or env_in.get("MERLIN_CHECKPOINT_DIR"), inv.ple_table_gib))
+    inv = replace(inv, kv_tier_gib=pf.kv_host_tier_gib(env_in), ple_table_gib=pf.ple_table_gib_of(path or env_in.get("MERLIN_CHECKPOINT_DIR"), inv.ple_table_gib, env_in.get("PLE_STORE")))
     if _gpu_selection(env_in) is not None:
         raise CliError("--instances partitions the host itself; unset GPUS / CUDA_VISIBLE_DEVICES (or start the instances by hand)")
     if n < 1:
@@ -1021,12 +1022,17 @@ def plan_instances(
             if have < need_gib:
                 per = " / ".join(f"~{f:.0f}" for f in sorted(set(floors)))
                 raise CliError(
-                    f"{what} {have:.0f} GiB cannot hold {n} Flash-Next instance(s){beside}: each pins a ~{inv.ple_table_gib:.1f} GiB "
-                    f"PLE table and needs {per} GiB resident ({FN_RAM_FLOOR_GIB:.0f} GiB at four workers plus "
+                    f"{what} {have:.0f} GiB cannot hold {n} Flash-Next instance(s){beside}: each {pf.ple_pin_text(inv.ple_table_gib)} "
+                    f"and needs {per} GiB resident ({FN_RAM_FLOOR_GIB:.0f} GiB at four workers plus "
                     f"{pf.RAM_PER_EXTRA_WORKER_GIB:.0f} GiB per worker above four{tier_s}; ~{need_gib:.0f} GiB for {count}; "
                     f"{FN_RAM_WARN_GIB:.0f} GiB per instance is the qualified allocation). Start fewer instances."
                 )
-            if have < count * FN_RAM_WARN_GIB + tier_gib:
+            if not inv.ple_table_gib and have < need_gib + pf.PS.CACHE_WARN_GIB:  # the instances share one page-cache copy
+                plans[0].warnings.append(
+                    f"ram: {what} {have:.0f} GiB leaves under {pf.PS.CACHE_WARN_GIB} GiB of page cache for the PLE table above "
+                    f"the computed ~{need_gib:.0f} GiB{tier_s}; decode and prefill slow down"
+                )
+            if inv.ple_table_gib and have < count * FN_RAM_WARN_GIB + tier_gib:
                 plans[0].warnings.append(
                     f"ram: {what} {have:.0f} GiB is below {count} x {FN_RAM_WARN_GIB:.0f} GiB qualified{tier_s} "
                     f"(floor {need_gib:.0f} GiB; the boot peak is unmeasured)"
@@ -1102,13 +1108,13 @@ KV_TIER_FAMILIES = ("flash-next", "27b", "ornith")
 SWARM_FAMILIES = ("flash-next", "27b")
 # The plan note per family besides Flash-Next (whose experimental note the launcher adds): 27B experimental, Ornith
 # untested.
-KV_TIER_UNTESTED = {"27b": "KV RAM cache on the 27B: experimental in 3.0.1 (RecoverSSM path only; a "
+KV_TIER_UNTESTED = {"27b": "KV RAM cache on the 27B: experimental (RecoverSSM path only; a "
                            "session evicted under heavy concurrent prefill may recompute, output identical)",
                     "ornith": "KV RAM cache on Ornith 1.5: untested ⚫ (the engine accepts it on the RecoverSSM path; "
                               "its hardware qualification has not run yet)"}
-# Above this --kv-ram-cache total (GiB per server) the plan adds an untested note. It is a conservative bound, not a size
-# a run validated; raise it only when a larger size has been run.
-KV_RAM_CACHE_TESTED_GIB = 160
+# Above this --kv-ram-cache total (GiB per server) the plan adds an untested note. 48 GiB is the largest size with a
+# recorded run; raise it only when a larger size has been run.
+KV_RAM_CACHE_TESTED_GIB = 48
 _KV_RAM_CACHE = re.compile(r"(\d+)(?:g|gib)?", re.IGNORECASE)
 
 
@@ -1205,7 +1211,7 @@ def _print_plan(plan: Plan, out: Any, label: str) -> None:
     for n in plan.notes:
         out.write(f"# NOTE {n}\n")
     for n in (plan.vllm.notes if plan.vllm is not None else []):
-        if L.is_cap_note(n):  # the launcher prints these at boot: default / --swarm / exported SEQS
+        if L.is_cap_note(n) or n.startswith("context:"):  # cap and context notes also print at boot
             out.write(f"# WARN {n.removeprefix('WARNING: ')}\n" if n.startswith("WARNING: ") else f"# NOTE {n.removeprefix('note: ')}\n")
     for w in plan.warnings:
         out.write(f"# WARN {w}\n")
@@ -1286,6 +1292,8 @@ def _spec_env(args: argparse.Namespace, name: str) -> dict[str, str]:
 def _serve_flags(args: argparse.Namespace, name: str, path: str | None) -> int | None:
     """``--ple int6`` and ``--kv-ram-cache``: refused before anything resolves when this build or this checkpoint
     cannot take them. Returns the tier's GiB per server (0 = off), or None without ``--kv-ram-cache``."""
+    if getattr(args, "ple_store", None) == "disk" and CHECKPOINTS.get(name) != KV_TIER_FAMILY:
+        raise CliError(f"--ple-store disk: {name} has no PLE table; it applies to the Flash-Next family only. Nothing started.")
     if getattr(args, "ple", "fp8") == "int6":
         import setup_cli
 
@@ -1495,6 +1503,7 @@ def cmd_serve(args: argparse.Namespace, extra: list[str], out: Any) -> int:
         print("merlin: give --profile or --tp, not both", file=sys.stderr)
         return 2
     try:
+        extra = L.C.context_args(getattr(args, "context", None), extra, L._flag_values(extra))
         name, path, id_notes = _identify(args)
         if path is not None and not Path(path).is_dir():
             raise CliError(f"checkpoint directory {path!r} is not a directory")
@@ -1508,6 +1517,8 @@ def cmd_serve(args: argparse.Namespace, extra: list[str], out: Any) -> int:
             id_notes.append(hint)
         spec_env = _spec_env(args, name)
         launch_env = {**spec_env, **swarm_env}  # what the launcher is told (SPEC, SWARM); the plan env gets it at exec
+        if args.ple_store:
+            launch_env["PLE_STORE"] = args.ple_store
         if not swarm_env and L.SWARM_ENV in os.environ:
             launch_env[L.SWARM_ENV] = "0"  # decided off: the plan and the launcher read the same 0 whatever the export spelt
         inv = pf.simulate(args.simulate) if args.simulate else pf.probe(pf.default_runner)
@@ -1656,16 +1667,19 @@ def _health_ok(host: str, port: int) -> bool:
     h = "127.0.0.1" if h in ("", "0.0.0.0") else h
     h = f"[{h}]" if ":" in h else h
     try:
-        with urllib.request.urlopen(f"http://{h}:{port}/health", timeout=2) as r:
+        # never through an http_proxy from the environment: a missed answer here stops every instance at the deadline
+        with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(f"http://{h}:{port}/health", timeout=2) as r:
             return r.status == 200
     except Exception:  # noqa: BLE001 - not up yet
         return False
 
 
 def launch_instances(plans: list[Plan], log_dir: Path, wait_ready: float = 0.0) -> int:
-    """Start every plan or none of them. All ports of all instances are checked before the first spawn; if a later spawn
-    fails (or, with ``wait_ready``, an instance dies or misses the /health deadline) the instances THIS invocation
-    spawned are stopped and the exit is non-zero. "spawned" (a process exists) is reported apart from "ready"."""
+    """Own the instances in the foreground, from spawn through shutdown.
+    All ports are checked before spawning. Startup/readiness failure, an instance
+    exit, Ctrl+C or SIGTERM stops and reaps this invocation's process groups.
+    """
+    import signal
     import time
 
     hosts = [L.effective_host_port(p.vllm.args, p.vllm.extra)[0] for p in plans]  # type: ignore[union-attr]
@@ -1680,69 +1694,237 @@ def launch_instances(plans: list[Plan], log_dir: Path, wait_ready: float = 0.0) 
         print(f"merlin: {e}; nothing started", file=sys.stderr)
         return e.code
     spawned: list[tuple[int, Plan, int, subprocess.Popen, Path]] = []
+    interrupted = 0
+    previous_handlers = {}
+
+    def request_stop(signum, _frame):
+        # Defer interruption until Popen has returned and its child is recorded.
+        # Repeated signals during cleanup must not interrupt group termination.
+        nonlocal interrupted
+        interrupted = interrupted or signum
+
+    def check_interrupted():
+        if interrupted:
+            raise KeyboardInterrupt
+
     try:
-        for i, plan in enumerate(plans):
-            env = {**os.environ, **plan.env}
-            port = _plan_ports(plan)[0][1]
-            log = log_dir / f"merlin-{plan.profile_id}-{port}.log"
-            with open(log, "ab") as fh:
-                proc = subprocess.Popen(plan.argv, env=env, stdout=fh, stderr=subprocess.STDOUT, start_new_session=True)
-            spawned.append((i, plan, port, proc, log))
-            print(f"merlin: instance {i}: {plan.profile_id} [{plan.status}] GPUs {','.join(map(str, plan.cards))} -> http://{hosts[i]}:{port} pid {proc.pid} (own process group) log {log}", file=sys.stderr)
-            for n in plan.notes:
-                print(f"merlin: NOTE {n}", file=sys.stderr)
-    except (OSError, ValueError, subprocess.SubprocessError) as e:
-        n_done = len(spawned)
-        survivors = _stop_instances([s[3] for s in spawned])
-        print(f"merlin: instance {n_done} failed to start ({e}); stopped the {n_done} instance(s) this command had spawned"
-              + (f"; could NOT confirm process group(s) {survivors} gone, stop them by hand" if survivors
-                 else ". Nothing is left running by this command."),
-              file=sys.stderr)
-        return 1
-    if wait_ready > 0:
-        deadline = time.monotonic() + wait_ready
-        pending = list(spawned)
-        answered: set[int] = set()
-        failure = ""
-        while not failure:
-            for i, _plan, port, proc, log in spawned:  # every instance, also the ones that already answered
-                if proc.poll() is not None:
-                    when = ("after it answered /health, while others were still loading" if i in answered
-                            else "before it was ready")
-                    failure = f"instance {i} (pid {proc.pid}) exited with code {proc.returncode} {when}; see {log}"
-                    break
-            if failure:
-                break
-            for item in list(pending):
-                if _health_ok(hosts[item[0]], item[2]):
-                    pending.remove(item)
-                    answered.add(item[0])
-            if not pending:
-                # ready only when every instance answers in one pass and every process is still running after it
-                pending = [s for s in spawned if not _health_ok(hosts[s[0]], s[2])]
-                if any(s[3].poll() is not None for s in spawned):
-                    continue  # the exit is reported at the top of the loop
-                if not pending:
-                    break
-            if time.monotonic() >= deadline:
-                failure = f"instance(s) {', '.join(str(x[0]) for x in pending)} not ready after {wait_ready:g}s"
-            else:
-                time.sleep(1.0)
-        if failure:
-            survivors = _stop_instances([s[3] for s in spawned])
-            print(f"merlin: {failure}; stopped all {len(spawned)} instance(s) this command had spawned"
-                  + (f"; could NOT confirm process group(s) {survivors} gone, stop them by hand" if survivors else ""),
+        for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):  # SIGHUP: an ssh drop; each instance has its own session and never gets it
+            previous_handlers[sig] = signal.signal(sig, request_stop)
+        try:
+            for i, plan in enumerate(plans):
+                check_interrupted()
+                env = {**os.environ, **plan.env}
+                port = _plan_ports(plan)[0][1]
+                log = log_dir / f"merlin-{plan.profile_id}-{port}.log"
+                with open(log, "ab") as fh:
+                    proc = subprocess.Popen(plan.argv, env=env, stdout=fh, stderr=subprocess.STDOUT, start_new_session=True)
+                    spawned.append((i, plan, port, proc, log))
+                check_interrupted()
+                print(f"merlin: instance {i}: {plan.profile_id} [{plan.status}] GPUs {','.join(map(str, plan.cards))} -> http://{hosts[i]}:{port} pid {proc.pid} (own process group) log {log}", file=sys.stderr)
+                for n in plan.notes:
+                    print(f"merlin: NOTE {n}", file=sys.stderr)
+        except (OSError, ValueError, subprocess.SubprocessError) as e:
+            print(f"merlin: instance {len(spawned)} failed to start ({e}); stopping this command's instances",
                   file=sys.stderr)
             return 1
-        print("merlin: ready: " + " ".join(f"http://{hosts[i]}:{port}" for i, _, port, _, _ in spawned), file=sys.stderr)
+        if wait_ready > 0:
+            deadline = time.monotonic() + wait_ready
+            pending = list(spawned)
+            answered: set[int] = set()
+            failure = ""
+            while not failure:
+                check_interrupted()
+                for i, _plan, port, proc, log in spawned:  # every instance, also the ones that already answered
+                    if proc.poll() is not None:
+                        when = ("after it answered /health, while others were still loading" if i in answered
+                                else "before it was ready")
+                        failure = f"instance {i} (pid {proc.pid}) exited with code {proc.returncode} {when}; see {log}"
+                        break
+                if failure:
+                    break
+                for item in list(pending):
+                    check_interrupted()
+                    if _health_ok(hosts[item[0]], item[2]):
+                        pending.remove(item)
+                        answered.add(item[0])
+                if not pending:
+                    # ready only when every instance answers in one pass and every process is still running after it
+                    pending = [s for s in spawned if not _health_ok(hosts[s[0]], s[2])]
+                    if any(s[3].poll() is not None for s in spawned):
+                        continue  # the exit is reported at the top of the loop
+                    if not pending:
+                        break
+                if time.monotonic() >= deadline:
+                    failure = f"instance(s) {', '.join(str(x[0]) for x in pending)} not ready after {wait_ready:g}s"
+                else:
+                    time.sleep(1.0)
+            if failure:
+                print(f"merlin: {failure}; stopping this command's instances", file=sys.stderr)
+                return 1
+            check_interrupted()
+            print("merlin: ready: " + " ".join(f"http://{hosts[i]}:{port}" for i, _, port, _, _ in spawned), file=sys.stderr)
+        else:
+            print("merlin: spawned (not yet ready; poll /health, load takes minutes): " + " ".join(f"http://{hosts[i]}:{port}" for i, _, port, _, _ in spawned), file=sys.stderr)
+        print("merlin: running in foreground; Ctrl+C stops all instances", file=sys.stderr)
+        while spawned:
+            check_interrupted()
+            for i, _plan, port, proc, log in spawned:
+                if proc.poll() is not None:
+                    print(f"merlin: instance {i} (pid {proc.pid}) exited with code {proc.returncode}; "
+                          f"stopping this command's instances; see {log}", file=sys.stderr)
+                    return 1
+            time.sleep(0.2)
         return 0
-    print("merlin: spawned (not yet ready; poll /health, load takes minutes): " + " ".join(f"http://{hosts[i]}:{port}" for i, _, port, _, _ in spawned), file=sys.stderr)
+    except KeyboardInterrupt:
+        signum = interrupted or signal.SIGINT
+        print(f"merlin: received {signal.Signals(signum).name}; stopping this command's instances", file=sys.stderr)
+        return 128 + signum
+    finally:
+        try:
+            survivors = _stop_instances([s[3] for s in spawned])
+            if survivors:
+                print(f"merlin: could NOT confirm process group(s) {survivors} gone, stop them by hand",
+                      file=sys.stderr)
+            else:
+                print(f"merlin: stopped the {len(spawned)} instance(s) this command had spawned. "
+                      "Nothing is left running by this command.", file=sys.stderr)
+        finally:
+            for sig, handler in previous_handlers.items():
+                signal.signal(sig, handler)
+
+
+# merlin doctor --report: one redacted file for bug reports. Secrets never leave the host: the API key, Hugging
+# Face tokens and auth headers are replaced before anything is written.
+REPORT_LINES = 200  # server-log lines in the report
+# A name that ends in a secret word (so "max_num_batched_tokens=8192" survives), then = or : (the name may be quoted, as in
+# JSON and Python-dict logs), then the whole value: shell words, quoted strings (shlex.quote splits a value that holds a
+# quote into several) and bracketed lists.
+_NAME = (r"[A-Za-z0-9_.-]*(?:API[_-]?KEY|ACCESS[_-]?KEY|PRIVATE[_-]?KEY|SECRET[_-]?KEY|SECRET|TOKEN|PASSWORD|PASSWD|CREDENTIALS?"
+         r"|SIGNATURE|WATERMARK[_-]?CONFIG)")
+_QUOTED = r"""(?:'[^']*'|"(?:[^"\\]|\\.)*"|\[[^\]]*\])"""
+_WORD = rf"""(?:{_QUOTED}+|[^\s'"\[]\S*)"""
+_SECRETS = [
+    (re.compile(rf"""(?i)(authorization["']?\s*[=:]\s*)(?:(?:bearer|basic)\s+)?{_WORD}"""), r"\1<redacted>"),
+    (re.compile(rf"""(?i)\b({_NAME})(["']?\s*[=:]\s*){_WORD}"""), r"\1\2<redacted>"),
+    # --api-key takes several values on one line, in shell and in a printed argv list (quote-comma separators)
+    (re.compile(rf"""(?i)(--api[-_]key(?:=|["']?,?\s+)){_WORD}(?:,?[ \t]+(?!["']?-|\S*://){_WORD})*"""), r"\1<redacted>"),
+    (re.compile(rf"(?i)(--(?:hf[-_]token|watermark[-_]config|[a-z_-]*(?:token|secret|password|passwd))(?:=|\s+)){_WORD}"), r"\1<redacted>"),
+    (re.compile(r"(?i)\b(bearer|basic)\s+[A-Za-z0-9._~+/=-]{6,}"), r"\1 <redacted>"),
+    (re.compile(r"(://[^/\s:@]+:)[^@\s/]+@"), r"\1<redacted>@"),  # user:password@host in a URL
+    (re.compile(r"\b(?:hf|sk|ghp|gho|ghs|github_pat)[_-][A-Za-z0-9_-]{16,}\b"), "<redacted>"),
+    (re.compile(r"\bAKIA[0-9A-Z]{16}\b"), "<redacted>"),
+]
+
+
+# Values of settings named like secrets (HF_HUB_DISABLE_TOKEN=1) that are not secrets, and would blank out the report.
+_NOT_SECRETS = frozenset(("", "0", "1", "true", "false", "yes", "no", "on", "off", "none", "null", "auto"))
+
+
+def redact(text: str, literals: list[str] | tuple[str, ...] = ()) -> str:
+    """``text`` with every known secret replaced: the literal values given (the live key and tokens) and anything shaped
+    like a key, token or auth header."""
+    for v in sorted({v.strip() for v in literals if v and v.strip().lower() not in _NOT_SECRETS}, key=len, reverse=True):
+        # a short value only as a whole word: "abc" must not eat "abcdef", but a key that short still goes
+        text = text.replace(v, "<redacted>") if len(v) >= 6 else re.sub(rf"(?<![\w-]){re.escape(v)}(?![\w-])", "<redacted>", text)
+    for pat, sub in _SECRETS:
+        text = pat.sub(sub, text)
+    return text
+
+
+def _secret_literals() -> list[str]:
+    """The live secrets: env values whose names say key, token, secret, password or credential, the saved API key and the
+    Hugging Face token file."""
+    vals = [v for k, v in os.environ.items() if re.fullmatch(_NAME, k, re.I)]  # the same names the patterns redact
+    hf = Path(os.environ.get("HF_HOME") or Path.home() / ".cache" / "huggingface")
+    for f in (REPO / ".merlin" / "api-key", hf / "token"):
+        try:
+            vals.append(f.read_text())
+        except OSError:
+            pass
+    return vals
+
+
+def _newest_log() -> Path | None:
+    d = Path(os.environ.get("MERLIN_LOG_DIR") or os.getcwd())
+    logs = sorted(d.glob("merlin-*.log"), key=lambda p: p.stat().st_mtime)
+    return logs[-1] if logs else None
+
+
+def _tail(path: Path, n: int) -> str:
+    from collections import deque
+
+    with open(path, encoding="utf-8", errors="replace") as fh:
+        return "".join(deque(fh, maxlen=n))
+
+
+def doctor_report(rest: list[str], out: Any) -> int:
+    """``merlin doctor --report [FILE] [--log FILE] [--lines N] [preflight args]``: preflight (host, GPUs, driver,
+    topology, RAM), the resolved serve plan (profile and command, a dry run), and the server log's last lines, redacted,
+    in one file (mode 0600)."""
+    import contextlib
+    import io
+    import platform
+    import time
+
+    path, log, lines, fwd = None, None, REPORT_LINES, []
+    i = 0
+    while i < len(rest):
+        a = rest[i]
+        if a == "--report":
+            if i + 1 < len(rest) and not rest[i + 1].startswith("-"):
+                path, i = Path(rest[i + 1]), i + 1
+        elif a == "--log" and i + 1 < len(rest):
+            log, i = Path(rest[i + 1]), i + 1
+        elif a == "--lines" and i + 1 < len(rest) and rest[i + 1].isdigit():
+            lines, i = int(rest[i + 1]), i + 1
+        else:
+            fwd.append(a)
+        i += 1
+    model = next((fwd[j + 1] for j, a in enumerate(fwd[:-1]) if a == "--model"), "flash-next")
+    stamp = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
+    path = path or Path(os.getcwd()) / f"merlin-report-{stamp}.txt"
+    parts = [f"# merlin doctor --report ({stamp} UTC)",
+             f"python {platform.python_version()} \u00b7 {platform.platform()} \u00b7 engine tree {REPO}"]
+    for name in sorted(CHECKPOINTS):
+        v = REPO / L.CHECKPOINTS[name][1] / "VERSION" if len(L.CHECKPOINTS[name]) > 1 else None
+        if v is not None and v.is_file():
+            parts.append(f"{name} recipe version {v.read_text().strip()}")
+    buf, err = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stderr(err):
+        try:
+            rc = pf.main(fwd, stdout=buf)
+        except SystemExit as e:  # argparse, on an argument preflight does not know: the report still gets written
+            rc = e.code if isinstance(e.code, int) else 2
+    parts += ["", f"## preflight (exit {rc})", buf.getvalue().rstrip(), err.getvalue().rstrip()]
+    buf, err = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stderr(err):
+        try:
+            sim = next((fwd[j + 1] for j, a in enumerate(fwd[:-1]) if a == "--simulate"), None)
+            rc = main(["serve", pf.CHECKPOINT_NAMES.get(model, model), "--dry-run", *(["--simulate", sim] if sim else [])], buf)
+        except SystemExit as e:  # argparse
+            rc = e.code if isinstance(e.code, int) else 2
+    parts += ["", f"## serve plan, dry run (exit {rc})", err.getvalue().rstrip(), buf.getvalue().rstrip()]
+    log = log or _newest_log()
+    if log is not None and log.is_file():
+        parts += ["", f"## server log: last {lines} lines of {log}", _tail(log, lines).rstrip()]
+    else:
+        parts += ["", "## server log", "none found (merlin-*.log in MERLIN_LOG_DIR or here); give --log FILE"]
+    text = redact("\n".join(p for p in parts if p is not None) + "\n", _secret_literals())
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT, 0o600)  # mode applies only on create: force it before any secret lands
+    if hasattr(os, "fchmod"):
+        os.fchmod(fd, 0o600)
+    os.ftruncate(fd, 0)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write(text)
+    print(f"merlin: report written to {path} (secrets redacted; read it before you share it)", file=out)
     return 0
 
 
 def main(argv: list[str] | None = None, out: Any = None) -> int:
     out = out or sys.stdout
     argv = list(sys.argv[1:] if argv is None else argv)
+    if argv[:1] == ["doctor"] and "--report" in argv[1:]:
+        return doctor_report(argv[1:], out)
     if argv[:1] == ["doctor"]:  # transparent forwarding to preflight (options included)
         rest = argv[1:]
         return pf.main(rest[1:] if rest[:1] == ["--"] else rest, stdout=out)
@@ -1763,17 +1945,23 @@ def main(argv: list[str] | None = None, out: Any = None) -> int:
     s.add_argument("target", nargs="*", help="[checkpoint name] [checkpoint directory]; a directory alone is identified")
     s.add_argument("--profile", help="force a profile id of this checkpoint (checked against the hardware)")
     s.add_argument("--tp", type=int, help="pick the profile with this tensor-parallel size (a subset of a larger host)")
-    s.add_argument("--instances", type=int, help="start N servers on N disjoint card sets (consecutive ports from PORT)")
+    s.add_argument("--instances", type=int, help="run N servers in the foreground on N disjoint card sets "
+                   "(consecutive ports from PORT); Ctrl+C stops all instances")
     s.add_argument("--wait-ready", type=float, default=0.0, metavar="SECONDS",
                    help="with --instances: wait up to SECONDS for every /health; on a dead or late instance stop all of them and exit 1")
     s.add_argument("--served-suffix", action="store_true", help="with --instances: append -<i> to the served model name(s)")
     s.add_argument("--ple", choices=("fp8", "int6"), default="fp8", help="Flash-Next: the PLE table, fp8 (default) or int6 (INT6 "
                    "g32, 38.74 GiB: give the INT6 overlay folder that setup or merlin pull --ple int6 built, <checkpoint>-int6)")
+    s.add_argument("--ple-store", choices=("ram", "disk"), default=None, help="Flash-Next: where the PLE table lives, ram (the default) or "
+                   "disk (experimental: read from the checkpoint's own files, on NVMe; frees the table's host RAM, but first reads are much "
+                   "slower; see docs/how-to-serve.md). Other storage warns and runs")
     s.add_argument("--spec", choices=SPEC_CHOICES, help="the drafter: mtp (default) or dflash2 (Flash-Next family, rows "
                    f"with a DFlash2 geometry; {DFLASH2_WHY.replace(chr(37), chr(37) * 2)}; the drafter from DFLASH2_MODEL or {DFLASH2_DEFAULT_DIR})")
-    s.add_argument("--kv-ram-cache", metavar="SIZE", help="Flash-Next (experimental in 3.0.1, MTP only), 27B (experimental in 3.0.1) and Ornith 1.5: a host-RAM cache for prefix KV blocks the GPU pool evicts "
+    s.add_argument("--kv-ram-cache", metavar="SIZE", help="Flash-Next (experimental, MTP only), 27B (experimental) and Ornith 1.5: a host-RAM cache for prefix KV blocks the GPU pool evicts "
                    "(restored instead of recomputed; adds no context and does not change the session cap (--swarm does); RAM only, never disk; ~66K tokens/GiB on Flash-Next TP2xPP2; needs memlock: LimitMEMLOCK=infinity or ulimit -l unlimited). SIZE = host RAM per "
                    f"server (24g, 24gib or 24 = GiB; 0 = off), split over its TP x PP ranks into {KV_HOST_TIER_ENV} (rounded down to whole GiB per rank)")
+    s.add_argument("--context", metavar="SIZE", help="context in tokens or binary k/m (512k = 524288); "
+                   "auto-YaRN past native, checked against the resolved KV pool; explicit --hf-overrides wins")
     s.add_argument("--swarm", action="store_true", help="the row's tested high-concurrency cap instead of its default (experimental): "
                    "the Flash-Next 4 x 3090 profiles 24 sessions (default 8), the 27B 4 x 3090 (TP4) profiles 32 (default 24). Needs the KV RAM cache "
                    "at the size that cap was qualified at (48g per server): without --kv-ram-cache the cache is set to that size, a smaller "
@@ -1786,7 +1974,8 @@ def main(argv: list[str] | None = None, out: Any = None) -> int:
     ls.add_argument("--arch", help="only rows for this arch (sm_80, sm_86, sm_89)")
     ls.add_argument("--cards", type=int, help="only rows of this card count")
     ls.add_argument("--vram", type=int, help="only rows of this VRAM class (GB)")
-    sub.add_parser("doctor", help="run tools/merlin/preflight.py (all following args pass through)")
+    sub.add_parser("doctor", help="run tools/merlin/preflight.py (all following args pass through); --report [FILE] writes a "
+                   "redacted bug-report file (preflight, the serve plan, the server log's last lines)")
     sub.add_parser("pull", help="download and verify a checkpoint: merlin pull <checkpoint> [--models-dir DIR] [--ple int6] "
                    "(int6: also the family's PLE pack and the overlay DIR-int6)")
     v = sub.add_parser("verify", help="stream SHA-256 over every listed checkpoint file, including shards")

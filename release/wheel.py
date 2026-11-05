@@ -25,7 +25,7 @@ import zipfile
 from pathlib import Path
 
 NAME_RE = re.compile(
-    r"vllm-0\.32\.0\+merlin\.(?P<commit>[0-9a-f]{10})-cp313-cp313-linux_x86_64\.whl"
+    r"vllm-0\.33\.0\+merlin\.(?P<commit>[0-9a-f]{10})-cp313-cp313-linux_x86_64\.whl"
 )
 REQUIRED = (
     "vllm/_C_stable_libtorch.abi3.so",
@@ -75,7 +75,7 @@ def parse_name(wheel: Path) -> str:
     if not m:
         raise WheelError(
             f"{wheel.name} is not a Merlin engine wheel name "
-            "(vllm-0.32.0+merlin.<commit>-cp313-cp313-linux_x86_64.whl)"
+            "(vllm-0.33.0+merlin.<commit>-cp313-cp313-linux_x86_64.whl)"
         )
     return m["commit"]
 

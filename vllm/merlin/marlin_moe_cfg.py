@@ -46,13 +46,14 @@ the engine's choice is certifiable from here. The classes are:
   identity is an empirical property of the shape, not of the code.
 * ``non-exact``  switching to or from ``bm=8`` (different M layout).
 
-Every rule must carry an ``ack``: ``bitwise`` states that a
-microbench (the default and the rule's kernel tuple run on the same inputs
-for each shape) showed ``torch.equal`` for this shape set; ``nonexact`` accepts differing bits. A
-rule with no ack, or a ``bm=8`` rule without ``ack=nonexact``, is a boot error.
-A ``non-exact`` outcome at run time under a bare ``bitwise`` ack (baseline was
-8, or the rule moves to 8) skips the rule with a warning. Active rules log a
-warning once per (rule, class) naming what the bit-identity rests on.
+Every rule must carry an ``ack``: ``bitwise`` states that a microbench (the
+default and the rule's kernel tuple run on the same inputs for each shape)
+showed ``torch.equal`` for this shape set; ``nonexact`` accepts differing bits.
+A rule with no ack, or a ``bm=8`` rule without ``ack=nonexact``, is a boot
+error. A ``non-exact`` outcome at run time under a bare ``bitwise`` ack
+(baseline was 8, or the rule moves to 8) skips the rule with a warning. Active
+rules log a warning once per (rule, class) naming what the bit-identity rests
+on.
 
 Pinned configs are checked here against the compiled set
 (``csrc/quantization/marlin/generate_kernels.py``) and shape divisibility; a
@@ -63,8 +64,8 @@ which raises on the first call.
 Out of scope: ``batched_fused_marlin_moe`` (its block size is chosen
 differently) and the ``MarlinExperts`` LoRA path are untouched.
 
-Imports only the standard library and ``vllm.envs`` / ``vllm.logger`` so the
-parsing and selection logic runs and is tested without a GPU.
+Imports only the standard library and ``vllm.envs`` / ``vllm.logger``, so the
+parsing and selection logic runs without a GPU.
 """
 
 from __future__ import annotations

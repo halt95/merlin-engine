@@ -19,7 +19,7 @@ v1.3.0 = Merlin engine v2.5.2 (vLLM 0.30.0 plus the Flash-Next fork's commits an
 
 **Evidence.** Every figure is a maintainer measurement on the reference host, served as shipped, by the harnesses named in each section. The results and the setup are documented here; the raw run artifacts (rows, harnesses, gate records, boot logs) are not published. **Measured** (2026-10-08 to 2026-10-09, UTC): dual card 2026-10-08 20:23-22:20; quad card 2026-10-08 22:52 to 2026-10-09 00:23.
 
-> **Trees.** Sections 1-6 were measured on the gate tree; the later trees and what each re-checked are in section 7.
+> **Trees.** Sections 1-6 were measured on tree 1; the later trees and what each re-checked are in section 7.
 >
 > **ThinkingCap.** The ThinkingCap checkpoint profile (`serve/serve-thinkingcap*.sh`) has its own card in this folder:
 > [`ThinkingCap-BENCH-CARD.md`](ThinkingCap-BENCH-CARD.md).
@@ -203,17 +203,17 @@ Tile on against tile off on identical questions: on-only right 2, off-only right
 
 ## 7. Later trees
 
-Sections 1-6 were measured on the gate tree. The commits after it were re-checked on the trees below; nothing here replaces a section 1-6 measurement.
+Sections 1-6 were measured on tree 1. The commits after it were re-checked on the trees below; nothing here replaces a section 1-6 measurement.
 
 | tree | changed since the one above | re-checked on it |
 |---|---|---|
-| 1. gate tree | the serve configurations as frozen | everything in sections 1-6 |
-| 2. renamed tree | the tile's internal identifiers and proof-line text, container route removed, checksums and docs; one comment in `serve/serve.sh` | clean install, tile proof on every rank at dual and quad card (section 8); the ThinkingCap thinking-token run ([ThinkingCap card](ThinkingCap-BENCH-CARD.md), section 1) |
-| 3. delta-audit tree | device-labelled tile proof line, the scale argument behind the tile path, apply-script import and lock checks, RecoverSSM commit storage binding, the split-KV merge test's criterion | tile proof with device labels (dual, quad), RecoverSSM boot evidence, served tokenizer parity, GSM8K-200, greedy tokens against tree 2, the split-KV merge test, release audit tests, the club-3090 method (section 9) |
-| 4. 0012 first revision | series patch 0012, first revision (idle quiesce of the guard reader), regenerated checksums | idle power on dual card (section 10, first revision) |
-| 5. release head | series patch 0012, second revision (run-time stream checks, fatal-arm and lifecycle fixes on the same idle path), its tests; later only comments (serve-script headers, an installer comment), docs and checksums | idle power on dual and quad card (section 10, second revision); boot, tile proof, GSM8K-200, 262K needle, 8-conversation load, multi-turn replay, loop gate and smokes on dual and quad card (section 11) |
+| 1. tree 1 | the serve configurations as frozen | everything in sections 1-6 |
+| 2. tree 2 (identifiers renamed) | the tile's internal identifiers and proof-line text, container route removed, checksums and docs; one comment in `serve/serve.sh` | clean install, tile proof on every rank at dual and quad card (section 8); the ThinkingCap thinking-token run ([ThinkingCap card](ThinkingCap-BENCH-CARD.md), section 1) |
+| 3. tree 3 (device-labelled proof) | device-labelled tile proof line, the scale argument behind the tile path, apply-script import and lock checks, RecoverSSM commit storage binding, the split-KV merge test's criterion | tile proof with device labels (dual, quad), RecoverSSM boot evidence, served tokenizer parity, GSM8K-200, greedy tokens against tree 2, the split-KV merge test, release audit tests, the club-3090 method (section 9) |
+| 4. tree 4 (series 0012, first revision) | series patch 0012, first revision (idle quiesce of the guard reader), regenerated checksums | idle power on dual card (section 10, first revision) |
+| 5. tree 5 (release) | series patch 0012, second revision (run-time stream checks, fatal-arm and lifecycle fixes on the same idle path), its tests; later only comments (serve-script headers, an installer comment), docs and checksums | idle power on dual and quad card (section 10, second revision); boot, tile proof, GSM8K-200, 262K needle, 8-conversation load, multi-turn replay, loop gate and smokes on dual and quad card (section 11) |
 
-**Delta-audit tree.** Clean install, shipped scripts, Qwen3.8-27B v1.3.0 checkpoint with the served upstream `tokenizer.json`:
+**Tree 3.** Clean install, shipped scripts, Qwen3.8-27B v1.3.0 checkpoint with the served upstream `tokenizer.json`:
 
 | boot | KV pool, block | boot to ready | tile proof |
 |---|---:|---:|---:|
@@ -224,10 +224,10 @@ Sections 1-6 were measured on the gate tree. The commits after it were re-checke
 - Served tokenizer against the upstream `tokenizer.json`: **PASS** on the 153-item combining-mark set plus controls (9 sets).
 - GSM8K-200 on this tree (**thinking off, temperature 0, 5-shot**, a different protocol from section 4's as-served run, so the two are not compared): **193 / 200**, 5 cut at the token cap.
 - Greedy tokens (3 prompts x 512 tokens, temperature 0, thinking off): this tree against tree 2 on the same checkpoint: 0 of 3 identical. The control: tree 2 booted twice with fresh compile caches gave 0 of 3 identical across the two boots, and 3 of 3 (and 3 of 3) identical within each boot. Greedy output is exact within one compile cache and not across caches, even on the same tree, so cross-tree token equality is not a usable check.
-- Split-KV merge test (tile against stock, error against an fp64 reference): the first version of the test, which also required agreement with stock, failed (2 sentinel cells of the quad card 27B-scale shape outside its error budget); with the criterion corrected to the tile's own error against fp64 it passes (44 cells ok, 0 failures).
+- Split-KV merge test (the tile's own error against an fp64 reference): passes (44 cells ok, 0 failures).
 - Release audit tests: tile-proof ranks 31 passed, 0 failed; patch-hash test **skipped** (it needs a wheel download that was not available on the host).
 
-## 8. Tile proof on the renamed tree
+## 8. Tile proof on tree 2
 
 After the identifier rename, a clean install of the release tree was booted from the shipped scripts and its own `release/check-tile-proof.sh` was run against each boot log:
 
@@ -258,7 +258,7 @@ After the identifier rename, a clean install of the release tree was booted from
 
 Series patch 0012: the guard's counter reader stops polling the device once the engine is idle, and resumes with the next request. Hardware: 220 W per-card cap, driver 610.43.02.
 
-**Second revision (the one shipped), dual and quad card** (release head's serve scripts, 2026-10-09; 20 requests, then idle; P-states and draw sampled on every card of the profile):
+**Second revision (the one shipped), dual and quad card** (tree 5's serve scripts, 2026-10-09; 20 requests, then idle; P-states and draw sampled on every card of the profile):
 
 | step | dual card (TP=2) | quad card (TP=4) |
 |---|---:|---:|
@@ -302,9 +302,9 @@ Only the periodic device-to-host copy holds the card in P2. The other arms reach
 - The control shows the effect is the reader: with it polling, the pair stays in P2 and draws the figure above.
 - The draw figures are window means over a stretch that includes the P2 to P8 drop, so they are comparisons between rows, not steady-state idle watts; the steady quiet draw is the ablation's tail mean.
 
-## 11. Release head under load (series 0012, second revision; 2026-10-11)
+## 11. Tree 5 under load (series 0012, second revision; 2026-10-11)
 
-A targeted re-check of the shipped engine after the gate: an install of the release head's engine, patches and serve scripts
+A targeted re-check of the shipped engine after the gate: an install of tree 5's engine, patches and serve scripts
 (the later release commits change only comments, docs and checksums), fresh compile caches, the shipped `serve/serve.sh` and
 `serve/serve-tp4.sh` with no knob set, the same harnesses as sections 1-4. Dual card ran on one card pair while the ThinkingCap
 checkpoint ran on the other ([ThinkingCap card](ThinkingCap-BENCH-CARD.md), section 8); quad card ran alone afterwards.

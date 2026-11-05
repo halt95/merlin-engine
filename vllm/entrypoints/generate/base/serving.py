@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by the Merlin project; see NOTICE.
 import json
 import time
 from collections.abc import Awaitable
@@ -10,7 +11,7 @@ from typing import ClassVar, Generic, TypeVar
 from fastapi import Request
 from pydantic import ConfigDict
 
-from vllm import RequestOutput
+from vllm import RequestOutput, envs
 from vllm.engine.protocol import EngineClient
 from vllm.entrypoints.generate.base.protocol import (
     PerRequestMetrics,
@@ -180,6 +181,34 @@ class GenerateBaseServing(BaseServing, BeamSearchOnlineMixin):
             raise self.engine_client.dead_error
         self.engine_client.check_admission(n)
 
+    # vllm#65355
+    def _check_max_num_seqs(self, n: int | None) -> ErrorResponse | None:
+        """Reject request-level ``n`` above the server's ``max_num_seqs``.
+
+        vllm#65355: one request must not
+        fan out into more sequences than the engine can schedule. The global
+        ``VLLM_MAX_N_SEQUENCES`` cap (sampling_params) still applies on top.
+        Runs before the request is rendered or expanded; accepted requests
+        are unchanged.
+        """
+        if n is None or n <= 1:
+            return None
+        scheduler_config = getattr(
+            getattr(self.engine_client, "vllm_config", None), "scheduler_config", None
+        )
+        max_num_seqs = getattr(scheduler_config, "max_num_seqs", None)
+        if not isinstance(max_num_seqs, int) or max_num_seqs < 1:
+            return None
+        limit = min(envs.VLLM_MAX_N_SEQUENCES, max_num_seqs)
+        if n <= limit:
+            return None
+        return self.create_error_response(
+            f"n must be at most {limit} (the lower of VLLM_MAX_N_SEQUENCES="
+            f"{envs.VLLM_MAX_N_SEQUENCES} and the server's max_num_seqs="
+            f"{max_num_seqs}), got {n}.",
+            param="n",
+        )
+
     def create_streaming_error_response(
         self,
         message: str | Exception,
@@ -210,11 +239,7 @@ class GenerateBaseServing(BaseServing, BeamSearchOnlineMixin):
         self, e: GenerationError
     ) -> str:
         """Convert GenerationError to streaming error response."""
-        return self.create_streaming_error_response(
-            str(e),
-            err_type="InternalServerError",
-            status_code=e.status_code,
-        )
+        return self.create_streaming_error_response(e)
 
     @staticmethod
     def _get_data_parallel_rank(raw_request: Request | None) -> int | None:
@@ -354,6 +379,32 @@ def decode_token_ids(
         token_str = next(decoded)
         out.append((token_str, list(token_str.encode("utf-8", errors="replace"))))
     return out
+
+
+def chat_top_logprobs_limit(
+    top_logprobs: int | None, return_all: bool = False
+) -> int | None:
+    """How many of a position's logprob candidates `/v1/chat/completions`
+    returns, in the engine's order (sampled token first): the first
+    ``top_logprobs``, none when it is unset, and all of them (``None``) for
+    ``top_logprobs=-1`` or ``logprob_token_ids`` (``return_all``). Shared with
+    chat derender so the two cannot drift."""
+    if return_all or top_logprobs == -1:
+        return None
+    return top_logprobs or 0
+
+
+def completion_top_logprobs_limit(
+    logprobs: int | None, return_all: bool = False
+) -> int | None:
+    """How many of a position's logprob candidates `/v1/completions` returns:
+    the first ``logprobs + 1`` (the OpenAI completions convention), and all of
+    them (``None``) for ``logprobs=-1``, ``logprob_token_ids`` (``return_all``)
+    or when ``logprobs`` is unset. Shared with completions derender so the two
+    cannot drift."""
+    if return_all or logprobs is None or logprobs == -1:
+        return None
+    return max(logprobs + 1, 0)
 
 
 def clamp_prompt_logprobs(

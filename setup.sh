@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright 2026 halt95 (Merlin modifications)
 # One-command install and serve for the Merlin engine:
 #   git clone <repo> && cd merlin-engine && ./setup.sh
 # Every option: docs/SETUP.md (or ./setup.sh --help). This file only bootstraps a repo-local uv and

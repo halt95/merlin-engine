@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by the Merlin project; see NOTICE.
 """Fused Qwen4Exp PLE kernels.
 
 N-gram IDs hash each suffix with
@@ -16,7 +17,6 @@ import torch
 
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
-from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 
 
@@ -200,8 +200,13 @@ def _ple_gate_kernel(
     BLOCK_H: tl.constexpr,
     launch_pdl: tl.constexpr,
 ):
-    t = tl.program_id(0)
+    # Widen before stride products.
+    t = tl.program_id(0).to(tl.int64)
     s = tl.program_id(1)
+    # Inductor types a Python float argument
+    # fp64 when this kernel runs inside the compiled graph, which would put the
+    # three norms in fp64; the eager launcher types it fp32.
+    eps = eps.to(tl.float32)
     lanes = tl.arange(0, BLOCK_H)
     mask = lanes < H
     offs = s * H + lanes
@@ -240,7 +245,7 @@ def _ple_gate_kernel(
     tl.store(normed_ptr + t * HC * H + offs, normed, mask=mask)
 
 
-def _ple_gate(
+def ple_gate(
     key: torch.Tensor,
     value: torch.Tensor,
     hidden: torch.Tensor,
@@ -279,40 +284,6 @@ def _ple_gate(
         launch_pdl=current_platform.is_arch_support_pdl(),
     )
     return gated, normed
-
-
-def _ple_gate_fake(
-    key: torch.Tensor,
-    value: torch.Tensor,
-    hidden: torch.Tensor,
-    norm_key_w: torch.Tensor,
-    norm_query_w: torch.Tensor,
-    norm_conv_w: torch.Tensor,
-    eps: float,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    return torch.empty_like(hidden), torch.empty_like(hidden)
-
-
-direct_register_custom_op(
-    op_name="qwen4_exp_ple_gate",
-    op_func=_ple_gate,
-    mutates_args=[],
-    fake_impl=_ple_gate_fake,
-)
-
-
-def ple_gate(
-    key: torch.Tensor,
-    value: torch.Tensor,
-    hidden: torch.Tensor,
-    norm_key_w: torch.Tensor,
-    norm_query_w: torch.Tensor,
-    norm_conv_w: torch.Tensor,
-    eps: float,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    return torch.ops.vllm.qwen4_exp_ple_gate(
-        key, value, hidden, norm_key_w, norm_query_w, norm_conv_w, eps
-    )
 
 
 # Dilated short convolution

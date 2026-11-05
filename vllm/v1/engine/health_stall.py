@@ -2,14 +2,12 @@
 # SPDX-FileCopyrightText: Copyright 2026 halt95 (Merlin modifications)
 """Engine-progress watchdog behind ``/health``.
 
-``AsyncLLM.check_health`` only reported an engine that had already died, so
-``/health`` answered 200 while a live EngineCore was hung (a stuck step or a
-deadlocked busy loop) until the 300 s execute-model deadline killed it, if it
-was in execute_model at all. With stats logging on, the EngineCore sends the
-frontend an ``EngineCoreOutputs`` after every step, scheduler stats included
-when no request produced a token, so a frontend with unfinished requests that
-has heard nothing for longer than any legitimate step is looking at a stalled
-engine, unless it is holding the requests without stepping on purpose: a
+With stats logging on, the EngineCore sends the frontend an
+``EngineCoreOutputs`` after every step, scheduler stats included when no request
+produced a token, so a frontend with unfinished requests that has heard nothing
+for longer than any legitimate step is looking at a stalled engine (a stuck
+step or a deadlocked busy loop), unless it is holding the requests without
+stepping on purpose: a
 paused scheduler (pause_generation mode "keep"), a sleeping engine, or a
 streaming-input session waiting for its next chunk. So after the silence the
 watchdog sends the EngineCore a utility call, which its busy loop answers

@@ -183,6 +183,7 @@ class QSAIndexer(nn.Module):
             vllm_config=vllm_config,
         )
 
+        # a port of vllm#60490
         from .ops.qsa_indexer import _prefill_workspace_bytes
 
         max_model_len = vllm_config.model_config.max_model_len
@@ -198,6 +199,104 @@ class QSAIndexer(nn.Module):
             page_cap,
             envs.VLLM_SPARSE_INDEXER_MAX_LOGITS_MB * 2**20,
         )
+        self._init_profile_scratch(vllm_config, spec, max_model_len)
+
+    # a port of vllm#60490
+    def _init_profile_scratch(
+        self, vllm_config: VllmConfig, spec: Any, max_model_len: int
+    ) -> None:
+        """Bound the on-demand selection scratch for the profile run.
+
+        Arithmetic in vllm/merlin/qsa_scratch.py, from the serving bounds:
+        max(prefill backing, decode logits at the runner-aligned block-table
+        width) fp32, plus the top-k workspace and block_indices.
+        """
+        from vllm.merlin import qsa_scratch
+        from vllm.v1.worker.block_table import get_block_table_width
+
+        self._scratch_mode = qsa_scratch.scratch_mode()
+        self._scratch_logits_numel = 0
+        self._scratch_transient_bytes = 0
+        if self._scratch_mode == "off":
+            return
+        sched = vllm_config.scheduler_config
+        spec_cfg = vllm_config.speculative_config
+        decode_columns = get_block_table_width(
+            spec.max_num_blocks_per_req(vllm_config, max_model_len),
+            spec.block_size,
+            token_alignment=spec.block_table_token_alignment,
+        ) * (spec.block_size // self.compress_ratio)
+        self._scratch_logits_numel = max(
+            qsa_scratch.prefill_scratch_numel(
+                max_num_batched_tokens=sched.max_num_batched_tokens,
+                max_model_len=max_model_len,
+                compress_ratio=self.compress_ratio,
+                backing_bytes=self._prefill_backing_bytes,
+                granule_mb=envs.VLLM_E2_QSA_LOGITS_GRANULE_MB,
+                max_logits_bytes=envs.VLLM_SPARSE_INDEXER_MAX_LOGITS_MB * 2**20,
+            ),
+            qsa_scratch.decode_scratch_numel(
+                max_num_seqs=sched.max_num_seqs,
+                num_speculative_tokens=(
+                    spec_cfg.num_speculative_tokens if spec_cfg is not None else 0
+                ),
+                max_num_batched_tokens=sched.max_num_batched_tokens,
+                decode_columns=decode_columns,
+            ),
+        )
+        # Transient at serve time in every mode: the top-k workspace and
+        # block_indices (live across the decode and prefill selections).
+        self._scratch_transient_bytes = (
+            qsa_scratch.TOPK_WORKSPACE_BYTES
+            + qsa_scratch.block_indices_bytes(
+                max_num_batched_tokens=sched.max_num_batched_tokens,
+                token_topk=self.token_topk,
+                compress_ratio=self.compress_ratio,
+            )
+        )
+
+    # a port of vllm#60490
+    def reserve_profile_scratch(self, device: torch.device) -> None:
+        """Touch the selection-scratch peak in the profile (dummy) run.
+
+        ``VLLM_MERLIN_QSA_SCRATCH``: ``off`` does nothing; ``reserve`` makes one
+        transient allocation of the whole bound (as upstream does);
+        ``workspace`` sizes the shared MRV2 workspace for the logits (serving
+        then slices it) and keeps the top-k workspace and block_indices
+        transient. Only before the workspace locks (the profile and warm-up
+        runs), never during graph capture.
+        """
+        mode = self._scratch_mode
+        if mode == "off" or (
+            device.type == "cuda" and torch.cuda.is_current_stream_capturing()
+        ):
+            return
+        from vllm.logger import init_logger
+        from vllm.v1.worker.workspace import (
+            current_workspace_manager,
+            is_workspace_manager_initialized,
+        )
+
+        manager = (
+            current_workspace_manager() if is_workspace_manager_initialized() else None
+        )
+        if manager is not None and manager.is_locked():
+            # Serving-time dummy runs (DP padding, ...): KV is sized already.
+            return
+        logits_bytes = self._scratch_logits_numel * 4
+        init_logger(__name__).info_once(
+            "QSA indexer profile reserve (%s): %.1f MiB logits + %.1f MiB "
+            "top-k/block_indices per rank",
+            mode,
+            logits_bytes / 2**20,
+            self._scratch_transient_bytes / 2**20,
+        )
+        if mode == "workspace" and manager is not None:
+            manager.get_simultaneous(((self._scratch_logits_numel,), torch.float32))
+            transient = self._scratch_transient_bytes
+        else:
+            transient = logits_bytes + self._scratch_transient_bytes
+        _ = torch.empty(transient, dtype=torch.uint8, device=device)
 
     @property
     def output_width(self) -> int:
@@ -494,6 +593,7 @@ class QSAIndexer(nn.Module):
                 self.compress_ratio,
                 decode_query_len,
                 block_indices[decode_slice],
+                use_workspace=self._scratch_mode == "workspace",
             )
 
         # Prefill requests follow the leading decode rows in the reordered batch.
@@ -511,6 +611,7 @@ class QSAIndexer(nn.Module):
                 compressed_metadata.max_query_len,
                 block_indices[prefill_slice],
                 compressed_metadata.max_seq_len,
+                use_workspace=self._scratch_mode == "workspace",
                 backing_bytes=self._prefill_backing_bytes,
             )
         expand_qsa_block_indices(

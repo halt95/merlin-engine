@@ -49,6 +49,8 @@ class TargetDependentARSpeculator(DraftModelSpeculator):
 
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         super().__init__(vllm_config, device)
+        # The env flag is read once, at init.
+        self._workload_tile = bool(envs.MERLIN_FLASHINFER_WORKLOAD_TILE)
 
         self.hidden_states = torch.zeros(
             self.max_num_tokens, self.hidden_size, dtype=self.dtype, device=device
@@ -83,8 +85,9 @@ class TargetDependentARSpeculator(DraftModelSpeculator):
                 _DRAFT_SEQ_LENS = None
             self._draft_seq_lens = _DRAFT_SEQ_LENS
             # Bounds are anchored to the verify build's EXACT synced target lengths (see
-            # propose), so they no longer depend on scheduler lag; the PP=1 gate below is
-            # kept as a conservative scope limit (only the measured configuration).
+            # propose), so they do not depend on scheduler lag. The
+            # max_concurrent_batches <= 2 gate below is a conservative scope limit
+            # (only the measured configuration).
             self._draft_bounded = (
                 _DRAFT_SEQ_LENS is not None
                 and bool(envs.VLLM_DRAFT_BOUNDED_PLAN)
@@ -331,7 +334,7 @@ class TargetDependentARSpeculator(DraftModelSpeculator):
 
         smallq_identity = ()
         if (
-            envs.MERLIN_FLASHINFER_WORKLOAD_TILE
+            self._workload_tile
             and prefill_batch_desc.cg_mode == CUDAGraphMode.FULL
         ):
             smallq_identity = plan_identity(attn_metadata)
@@ -362,6 +365,7 @@ class TargetDependentARSpeculator(DraftModelSpeculator):
                 num_tokens_across_dp=num_tokens_across_dp,
                 cudagraph_runtime_mode=prefill_batch_desc.cg_mode,
                 mm_inputs=mm_inputs,
+                skip_sample=num_speculative_tokens == 0,
             )
         self.on_prefill_end(num_reqs)
 
@@ -374,6 +378,10 @@ class TargetDependentARSpeculator(DraftModelSpeculator):
             self.block_tables.gather_block_tables(
                 input_batch.idx_mapping, num_reqs_padded=num_reqs
             )
+
+        # Prefill must keep the target batch shape; only decode can shrink it.
+        if dummy_run and dp_sync_state is not None:
+            num_reqs = min(num_reqs, dp_sync_state.num_reqs)
 
         # Prepare the inputs for the decode steps.
         prepare_decode_inputs(
@@ -389,7 +397,9 @@ class TargetDependentARSpeculator(DraftModelSpeculator):
 
         decode_batch_sync, num_batch_tokens = (
             self._build_uniform_batch_dp_sync(
-                dp_sync_state, num_reqs, num_query_per_req=1
+                dp_sync_state,
+                num_reqs,
+                num_query_per_req=1,
             )
             if dp_sync_state is not None
             else (None, num_reqs)
@@ -448,8 +458,9 @@ class TargetDependentARSpeculator(DraftModelSpeculator):
         input_buffers: InputBatch | InputBuffers = self.input_buffers
         is_padding = None
         if self.pcp_manager is not None:
-            input_buffers = self.pcp_manager.get_draft_input_buffers(self.input_buffers)
-            is_padding = input_buffers.is_padding[:num_tokens]
+            input_buffers, is_padding = self.pcp_manager.get_draft_input_buffers(
+                self.input_buffers, num_tokens
+            )
         batch_descriptor = BatchDescriptor(num_tokens=num_tokens)
         with set_forward_context(
             attn_metadata,
@@ -510,6 +521,7 @@ class TargetDependentARSpeculator(DraftModelSpeculator):
         num_tokens_across_dp: torch.Tensor | None,
         cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
         mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None,
+        skip_sample: bool = False,
     ) -> None:
         last_token_indices = self.last_token_indices[:num_reqs]
         positions = self.input_buffers.positions[last_token_indices]
@@ -531,6 +543,9 @@ class TargetDependentARSpeculator(DraftModelSpeculator):
             last_hidden_states, hidden_states = self.pcp_manager.restore_draft_prefill(
                 last_hidden_states, hidden_states
             )
+        if skip_sample:
+            # No drafts are needed; this pass only keeps the drafter KV in sync.
+            return
 
         sample_hidden_states = last_hidden_states[last_token_indices]
         self.draft_tokens[:num_reqs, 0] = self.sample_draft(

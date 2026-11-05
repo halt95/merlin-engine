@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright 2026 halt95 (Merlin modifications)
 # Build the Merlin engine wheel (sm_80, sm_86, sm_89) from this checkout's HEAD.
 #   release/build-wheel.sh [output-dir]          (default: ./dist under this checkout)
 # Builds in a scratch copy against the release lock, refuses a wheel that carries
@@ -7,7 +9,7 @@
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
-REQ="$REPO/release/requirements-0.32.lock"
+REQ="$REPO/release/requirements-0.33.lock"
 die() { echo "build-wheel: $*" >&2; exit 1; }
 
 [ "$#" -le 1 ] || die "usage: build-wheel.sh [output-dir]"
@@ -32,7 +34,7 @@ done < <(compgen -e)
 [ -z "$(git -C "$REPO" status --porcelain --untracked-files=no)" ] \
   || die "commit or discard tracked changes before building the release wheel"
 COMMIT="$(git -C "$REPO" rev-parse --short=10 HEAD)"
-VERSION="0.32.0+merlin.$COMMIT"
+VERSION="0.33.0+merlin.$COMMIT"
 NAME="vllm-$VERSION-cp313-cp313-linux_x86_64.whl"
 [ ! -e "$OUT/$NAME" ] || die "$OUT/$NAME already exists"
 

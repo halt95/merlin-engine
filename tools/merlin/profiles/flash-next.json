@@ -48,6 +48,9 @@
     "p2p": "on",
     "tested_gpu_names": [
      "RTX 3090$"
+    ],
+    "status_p2p_modes": [
+     "on"
     ]
    },
    "layout": {
@@ -127,6 +130,20 @@
       },
       "unset": [],
       "disable_custom_all_reduce": true
+     },
+     "ipc": {
+      "exports": {
+       "VLLM_SKIP_P2P_CHECK": "1",
+       "NCCL_P2P_DISABLE": "1",
+       "VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC": "1"
+      },
+      "unset": [
+       "NCCL_P2P_LEVEL",
+       "NCCL_PROTO",
+       "NCCL_ALGO",
+       "NCCL_SHM_DISABLE"
+      ],
+      "disable_custom_all_reduce": true
      }
     },
     "default": "on"
@@ -135,7 +152,7 @@
    "warm": 1,
    "capacity": {
     "estimate": false,
-    "basis": "Measured on every v2.5.1 / v3.0.0 boot on the reference host (--kv-cache-memory 4100000000 per rank).",
+    "basis": "Measured on every boot on the reference host (--kv-cache-memory 4100000000 per rank).",
     "pin_gib": 3.82,
     "kv_blocks": 248,
     "pool_tokens": 924993,
@@ -266,7 +283,7 @@
     "Same layout, partition and pin as fn-quad-3090: NCCL moves the TP and PP traffic through host memory.",
     "Expect lower prefill than the P2P host (about 4,000 against 5,410 tok/s at 50K on that host, which also had x8 links and two NUMA nodes).",
     "Labelled untested: no 3.0.1 run of this row without P2P has covered the needles and the 8 MP image. It ran in the 2026-10-19 measurement below and was boot-checked with --swarm on 4 x RTX 3090 without P2P on 2026-11-01.",
-    "The no-P2P default (chosen 2026-10-25): it keeps the full 924,993-token pool and the faster decode. fn-quad-3090-nop2p-pp4 is the named prefill alternative (--profile fn-quad-3090-nop2p-pp4): measured on the reference host with P2P off, c1 prefill +47-53 % and real-text c1 decode -14 % against this row (112.0 vs 130.1 tok/s), pool 906,581 tokens."
+    "The no-P2P default: it keeps the full 924,993-token pool and the faster decode. fn-quad-3090-nop2p-pp4 is the named prefill alternative (--profile fn-quad-3090-nop2p-pp4): measured on the reference host with P2P off, c1 prefill +47-53 % and real-text c1 decode -14 % against this row (112.0 vs 130.1 tok/s), pool 906,581 tokens."
    ],
    "acceptance": "A Merlin 3.x run of this row on a 4 x RTX 3090 host with P2P off that adds the needles and the 8 MP smoke to the 2026-10-19 comparison numbers (pool, prefill, decode)."
   },
@@ -366,7 +383,7 @@
     "Measured on the reference host with P2P switched off in software; other physical no-P2P hosts are not measured. No token-identity run against a P2P control yet."
    ],
    "notes": [
-    "Named alternative (chosen 2026-10-25): automatic selection keeps fn-quad-3090-nop2p (TP2xPP2+EP) as the no-P2P default; this row runs only when named: merlin serve flash-next <dir> --profile fn-quad-3090-nop2p-pp4, or bash tools/merlin/launchers/serve-quad-3090-nop2p-pp4.sh <dir>.",
+    "Named alternative: automatic selection keeps fn-quad-3090-nop2p (TP2xPP2+EP) as the no-P2P default; this row runs only when named: merlin serve flash-next <dir> --profile fn-quad-3090-nop2p-pp4, or bash tools/merlin/launchers/serve-quad-3090-nop2p-pp4.sh <dir>.",
     "Pick it for long prefills: no tensor-parallel all-reduce, so 32K-262K prompts prefill ~1.5x faster than the TP2xPP2 row without P2P; c1 decode is 14 % slower (four stages run in series at one request).",
     "Measured pool 906,581 tokens (3 x 262K / 6 x 131K resident fit) at pin 4,456,448,000 bytes (250 whole stage-3 blocks) with partition 12/13/13/10 and max_num_seqs=32; the earlier 2,500,000,000-byte pin gave 506,083 tokens. The even 12/12/12/12 partition OOMed on stage 3.",
     "No --enable-expert-parallel (EP is a no-op at TP1; whether the tree boots with the flag at TP1 is unverified).",
@@ -451,6 +468,20 @@
       "unset": [
        "NCCL_P2P_LEVEL",
        "VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC"
+      ],
+      "disable_custom_all_reduce": true
+     },
+     "ipc": {
+      "exports": {
+       "VLLM_SKIP_P2P_CHECK": "1",
+       "NCCL_P2P_DISABLE": "1",
+       "VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC": "1"
+      },
+      "unset": [
+       "NCCL_P2P_LEVEL",
+       "NCCL_PROTO",
+       "NCCL_ALGO",
+       "NCCL_SHM_DISABLE"
       ],
       "disable_custom_all_reduce": true
      }
@@ -579,6 +610,20 @@
       "unset": [
        "NCCL_P2P_LEVEL",
        "VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC"
+      ],
+      "disable_custom_all_reduce": true
+     },
+     "ipc": {
+      "exports": {
+       "VLLM_SKIP_P2P_CHECK": "1",
+       "NCCL_P2P_DISABLE": "1",
+       "VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC": "1"
+      },
+      "unset": [
+       "NCCL_P2P_LEVEL",
+       "NCCL_PROTO",
+       "NCCL_ALGO",
+       "NCCL_SHM_DISABLE"
       ],
       "disable_custom_all_reduce": true
      }
@@ -838,6 +883,20 @@
        "VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC"
       ],
       "disable_custom_all_reduce": true
+     },
+     "ipc": {
+      "exports": {
+       "VLLM_SKIP_P2P_CHECK": "1",
+       "NCCL_P2P_DISABLE": "1",
+       "VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC": "1"
+      },
+      "unset": [
+       "NCCL_P2P_LEVEL",
+       "NCCL_PROTO",
+       "NCCL_ALGO",
+       "NCCL_SHM_DISABLE"
+      ],
+      "disable_custom_all_reduce": true
      }
     },
     "default": "on"
@@ -882,6 +941,9 @@
     "p2p": "any",
     "testing_gpu_names": [
      "RTX 4090$"
+    ],
+    "status_p2p_modes": [
+     "off"
     ]
    },
    "layout": {
@@ -956,6 +1018,20 @@
        "VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC"
       ],
       "disable_custom_all_reduce": true
+     },
+     "ipc": {
+      "exports": {
+       "VLLM_SKIP_P2P_CHECK": "1",
+       "NCCL_P2P_DISABLE": "1",
+       "VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC": "1"
+      },
+      "unset": [
+       "NCCL_P2P_LEVEL",
+       "NCCL_PROTO",
+       "NCCL_ALGO",
+       "NCCL_SHM_DISABLE"
+      ],
+      "disable_custom_all_reduce": true
      }
     },
     "default": "off"
@@ -976,11 +1052,11 @@
     ]
    },
    "evidence": [
-    "Cloud-hosted 4 x RTX 4090 24 GB, measured 2026-10-18 (P2P off, fp8 KV, chunk 1024): pool 924,993 tokens, needles 262K-32K 4/4 exact (262K in 48.8 s), coherence 3/3, 8 MP image correct (1,063 MiB minimum free). The shipped chunk 2048 measured +15-20 % prefill on the same cards (131K TTFT 22.5 s against 24.4-27.0 s at 1024, step time unchanged); its 8 MP image and 262K checks have not run yet (CHUNK=1024 falls back to the checked chunk).",
+    "Cloud-hosted 4 x RTX 4090 24 GB, measured 2026-10-18 (P2P off, fp8 KV, chunk 1024): pool 924,993 tokens, needles 262K-32K 4/4 exact (262K in 48.8 s), coherence 3/3, 8 MP image correct (1,063 MiB minimum free). The shipped chunk 2048 measured +8-20 % prefill on the same cards (131K TTFT 22.5 s against 24.4-27.0 s at 1024, step time unchanged); its 8 MP image and 262K checks have not run yet (CHUNK=1024 falls back to the checked chunk).",
     "Testing: the runs above were on cloud-hosted hardware; kernel parity qualification is still to run."
    ],
    "notes": [
-    "KV default is fp8_e4m3: the 0.32 engine admits E4M3 KV on sm_89+ through upstream's native cast (vllm/models/qwen4_exp/nvidia/qsa.py, _validated_qsa_fp8_dtype), and that path ran on cloud-hosted 4 x RTX 4090 cards (2026-10-18), so the row is testing: kernel parity qualification is still to run. Pool 924,993 tokens = 3 x 262K / 6 x 131K at fp8 KV; the selectable bf16 variant (tools/merlin/launchers/serve-quad-24g-sm89-kv-bf16.sh) keeps the earlier bf16 sizing: pool 486,838 tokens = 1 x 262K / 3 x 131K, seqs 3. The fp8 default exports the VLLM_QSA_KV_SCALES sidecar (E4M3-only); the bf16 variant does not.",
+    "KV default is fp8_e4m3: the engine admits E4M3 KV on sm_89+ through upstream's native cast (vllm/models/qwen4_exp/nvidia/qsa.py, _validated_qsa_fp8_dtype), and that path ran on cloud-hosted 4 x RTX 4090 cards (2026-10-18), so the row is testing: kernel parity qualification is still to run. Pool 924,993 tokens = 3 x 262K / 6 x 131K at fp8 KV; the selectable bf16 variant (tools/merlin/launchers/serve-quad-24g-sm89-kv-bf16.sh) keeps the earlier bf16 sizing: pool 486,838 tokens = 1 x 262K / 3 x 131K, seqs 3. The fp8 default exports the VLLM_QSA_KV_SCALES sidecar (E4M3-only); the bf16 variant does not.",
     "Consumer Ada (RTX 4090) has no P2P in the stock driver: the default mode is P2P=off; use P2P=on only with a patched open kernel module.",
     "WARM defaults to 0 because the persisted Triton autotune is sm_86 only.",
     "Host RAM does not depend on the card: ~47.7 GiB pinned FP8 PLE table inside the qualified 96 GB allocation (69 GiB measured floor).",
@@ -1075,10 +1151,10 @@
     "Not run on the reference host (no Ada card here); evidence from cloud-hosted cards only."
    ],
    "notes": [
-    "Named alternative (chosen 2026-10-25): automatic selection keeps fn-quad-24g-sm89 (TP2xPP2+EP) as the default; this row runs only when named: merlin serve flash-next <dir> --profile fn-quad-24g-sm89-pp4, or bash tools/merlin/launchers/serve-quad-24g-sm89-pp4.sh <dir>.",
+    "Named alternative: automatic selection keeps fn-quad-24g-sm89 (TP2xPP2+EP) as the default; this row runs only when named: merlin serve flash-next <dir> --profile fn-quad-24g-sm89-pp4, or bash tools/merlin/launchers/serve-quad-24g-sm89-pp4.sh <dir>.",
     "TP1 removes the tensor-parallel all-reduce; only the pipeline relay between stages remains. Without P2P this is the layout whose prefill scales with Ada compute (3x the TP2xPP2 row on the same cloud-hosted cards).",
     "Pool 506,083 tokens (1 x 262K / 3 x 131K) at the 2.5e9 pin, about half of fn-quad-24g-sm89 (924,993).",
-    "KV is fp8_e4m3 through the 0.32 engine's native E4M3 cast on sm_89 (vllm/models/qwen4_exp/nvidia/qsa.py, _validated_qsa_fp8_dtype); it ran clean on the cloud-hosted 4 x RTX 4090. The fp8 default exports the VLLM_QSA_KV_SCALES sidecar. No bf16 KV variant is defined for this row.",
+    "KV is fp8_e4m3 through the engine's native E4M3 cast on sm_89 (vllm/models/qwen4_exp/nvidia/qsa.py, _validated_qsa_fp8_dtype); it ran clean on the cloud-hosted 4 x RTX 4090. The fp8 default exports the VLLM_QSA_KV_SCALES sidecar. No bf16 KV variant is defined for this row.",
     "The release wheel covers sm_80, sm_86 and sm_89; a source build needs 8.9 in TORCH_CUDA_ARCH_LIST. WARM defaults to 0 because the persisted Triton autotune is sm_86 only.",
     "No --enable-expert-parallel (EP is a no-op at TP1)."
    ],
@@ -1144,6 +1220,20 @@
        "NCCL_PROTO",
        "NCCL_ALGO",
        "VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC"
+      ],
+      "disable_custom_all_reduce": true
+     },
+     "ipc": {
+      "exports": {
+       "VLLM_SKIP_P2P_CHECK": "1",
+       "NCCL_P2P_DISABLE": "1",
+       "VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC": "1"
+      },
+      "unset": [
+       "NCCL_P2P_LEVEL",
+       "NCCL_PROTO",
+       "NCCL_ALGO",
+       "NCCL_SHM_DISABLE"
       ],
       "disable_custom_all_reduce": true
      }
@@ -1302,7 +1392,7 @@
     "None: no run report yet; the demand signal is community RTX 4090 / 4080 Super 32 GB users."
    ],
    "notes": [
-    "KV default is fp8_e4m3: the 0.32 engine admits E4M3 KV on sm_89+ through upstream's native cast (vllm/models/qwen4_exp/nvidia/qsa.py, _validated_qsa_fp8_dtype), but that path has not run on any Ada card, so the row stays untested. Pool 1,419,322 tokens = 5 x 262K / 9 x 131K at fp8 KV; the selectable bf16 variant (generate its launcher with python tools/merlin/preflight.py --emit launcher --profile fn-2x48g-pp2-sm89 --kv bf16) keeps the earlier bf16 sizing: pool 726,513 tokens = 2 x 262K / 4 x 131K, seqs 4. The fp8 default exports the VLLM_QSA_KV_SCALES sidecar (E4M3-only); the bf16 variant does not.",
+    "KV default is fp8_e4m3: the engine admits E4M3 KV on sm_89+ through upstream's native cast (vllm/models/qwen4_exp/nvidia/qsa.py, _validated_qsa_fp8_dtype), but that path has not run on any Ada card, so the row stays untested. Pool 1,419,322 tokens = 5 x 262K / 9 x 131K at fp8 KV; the selectable bf16 variant (generate its launcher with python tools/merlin/preflight.py --emit launcher --profile fn-2x48g-pp2-sm89 --kv bf16) keeps the earlier bf16 sizing: pool 726,513 tokens = 2 x 262K / 4 x 131K, seqs 4. The fp8 default exports the VLLM_QSA_KV_SCALES sidecar (E4M3-only); the bf16 variant does not.",
     "An L40S reports ~45 GiB, about 3 GiB under the 48 GiB class: lower KV_BYTES by that amount (preflight prints the figure).",
     "Ada workstation / datacenter cards have no P2P in the stock driver: default P2P=off.",
     "WARM defaults to 0 because the persisted Triton autotune is sm_86 only.",
@@ -1405,6 +1495,20 @@
        "VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC"
       ],
       "disable_custom_all_reduce": true
+     },
+     "ipc": {
+      "exports": {
+       "VLLM_SKIP_P2P_CHECK": "1",
+       "NCCL_P2P_DISABLE": "1",
+       "VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC": "1"
+      },
+      "unset": [
+       "NCCL_P2P_LEVEL",
+       "NCCL_PROTO",
+       "NCCL_ALGO",
+       "NCCL_SHM_DISABLE"
+      ],
+      "disable_custom_all_reduce": true
      }
     },
     "default": "off"
@@ -1428,7 +1532,7 @@
     "None: no run report yet; the demand signal is community RTX 4090 / 4080 Super 32 GB users."
    ],
    "notes": [
-    "KV default is fp8_e4m3: the 0.32 engine admits E4M3 KV on sm_89+ through upstream's native cast (vllm/models/qwen4_exp/nvidia/qsa.py, _validated_qsa_fp8_dtype), but that path has not run on any Ada card, so the row stays untested. Pool 6,767,060 tokens = 25 x 262K / 46 x 131K at fp8 KV; the selectable bf16 variant (tools/merlin/launchers/serve-4x48g-tp2pp2-sm89-kv-bf16.sh) keeps the earlier bf16 sizing: pool 3,580,138 tokens = 13 x 262K / 24 x 131K, seqs 8. The fp8 default exports the VLLM_QSA_KV_SCALES sidecar (E4M3-only); the bf16 variant does not.",
+    "KV default is fp8_e4m3: the engine admits E4M3 KV on sm_89+ through upstream's native cast (vllm/models/qwen4_exp/nvidia/qsa.py, _validated_qsa_fp8_dtype), but that path has not run on any Ada card, so the row stays untested. Pool 6,767,060 tokens = 25 x 262K / 46 x 131K at fp8 KV; the selectable bf16 variant (tools/merlin/launchers/serve-4x48g-tp2pp2-sm89-kv-bf16.sh) keeps the earlier bf16 sizing: pool 3,580,138 tokens = 13 x 262K / 24 x 131K, seqs 8. The fp8 default exports the VLLM_QSA_KV_SCALES sidecar (E4M3-only); the bf16 variant does not.",
     "An L40S reports ~45 GiB: lower KV_BYTES by ~3 GiB. Default P2P=off (stock driver).",
     "WARM defaults to 0 because the persisted Triton autotune is sm_86 only.",
     "Host RAM does not depend on the card: ~47.7 GiB pinned FP8 PLE table inside the qualified 96 GB allocation (69 GiB measured floor).",
@@ -1527,6 +1631,20 @@
        "VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC"
       ],
       "disable_custom_all_reduce": true
+     },
+     "ipc": {
+      "exports": {
+       "VLLM_SKIP_P2P_CHECK": "1",
+       "NCCL_P2P_DISABLE": "1",
+       "VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC": "1"
+      },
+      "unset": [
+       "NCCL_P2P_LEVEL",
+       "NCCL_PROTO",
+       "NCCL_ALGO",
+       "NCCL_SHM_DISABLE"
+      ],
+      "disable_custom_all_reduce": true
      }
     },
     "default": "off"
@@ -1550,7 +1668,7 @@
     "None: no run report yet; the demand signal is community RTX 4090 / 4080 Super 32 GB users."
    ],
    "notes": [
-    "KV default is fp8_e4m3: the 0.32 engine admits E4M3 KV on sm_89+ through upstream's native cast (vllm/models/qwen4_exp/nvidia/qsa.py, _validated_qsa_fp8_dtype), but that path has not run on any Ada card, so the row stays untested. Pool 2,857,802 tokens = 10 x 262K / 19 x 131K at fp8 KV; the selectable bf16 variant (generate its launcher with python tools/merlin/preflight.py --emit launcher --profile fn-quad-32g-sm89 --kv bf16) keeps the earlier bf16 sizing: pool 1,516,690 tokens = 5 x 262K / 10 x 131K, seqs 8. The fp8 default exports the VLLM_QSA_KV_SCALES sidecar (E4M3-only); the bf16 variant does not.",
+    "KV default is fp8_e4m3: the engine admits E4M3 KV on sm_89+ through upstream's native cast (vllm/models/qwen4_exp/nvidia/qsa.py, _validated_qsa_fp8_dtype), but that path has not run on any Ada card, so the row stays untested. Pool 2,857,802 tokens = 10 x 262K / 19 x 131K at fp8 KV; the selectable bf16 variant (generate its launcher with python tools/merlin/preflight.py --emit launcher --profile fn-quad-32g-sm89 --kv bf16) keeps the earlier bf16 sizing: pool 1,516,690 tokens = 5 x 262K / 10 x 131K, seqs 8. The fp8 default exports the VLLM_QSA_KV_SCALES sidecar (E4M3-only); the bf16 variant does not.",
     "Default P2P=off (stock driver). Pin = 32 - 17.44 - 2.75 GiB.",
     "WARM defaults to 0 because the persisted Triton autotune is sm_86 only.",
     "Host RAM does not depend on the card: ~47.7 GiB pinned FP8 PLE table inside the qualified 96 GB allocation (69 GiB measured floor).",
@@ -1706,6 +1824,20 @@
        "NCCL_PROTO",
        "NCCL_ALGO",
        "VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC"
+      ],
+      "disable_custom_all_reduce": true
+     },
+     "ipc": {
+      "exports": {
+       "VLLM_SKIP_P2P_CHECK": "1",
+       "NCCL_P2P_DISABLE": "1",
+       "VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC": "1"
+      },
+      "unset": [
+       "NCCL_P2P_LEVEL",
+       "NCCL_PROTO",
+       "NCCL_ALGO",
+       "NCCL_SHM_DISABLE"
       ],
       "disable_custom_all_reduce": true
      }
@@ -1926,6 +2058,20 @@
        "VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC"
       ],
       "disable_custom_all_reduce": true
+     },
+     "ipc": {
+      "exports": {
+       "VLLM_SKIP_P2P_CHECK": "1",
+       "NCCL_P2P_DISABLE": "1",
+       "VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC": "1"
+      },
+      "unset": [
+       "NCCL_P2P_LEVEL",
+       "NCCL_PROTO",
+       "NCCL_ALGO",
+       "NCCL_SHM_DISABLE"
+      ],
+      "disable_custom_all_reduce": true
      }
     },
     "default": "on"
@@ -1986,6 +2132,9 @@
     "p2p": "any",
     "testing_gpu_names": [
      "CMP 170HX"
+    ],
+    "status_p2p_modes": [
+     "off"
     ]
    },
    "layout": {
@@ -2455,6 +2604,9 @@
     "p2p": "any",
     "testing_gpu_names": [
      "CMP 170HX"
+    ],
+    "status_p2p_modes": [
+     "off"
     ]
    },
    "layout": {
@@ -2547,7 +2699,7 @@
    "evidence": [
     "Measured 2026-10-19 on 4 x CMP 170HX 64 GB (Gen2 x16, no P2P): this row at chunk 2048 + MTP k=3: 262K needle exact 21.6 s; 8 MP image min free 1,694 MiB (GPU 3); GSM8K-50 c8 1.00; shared-prefix TTFT 48/48; card c1 262K TTFT 19.57 s; 16K c4 122.2 tok/s; real-text prefill ~12,000 / ~13,120 / ~12,700 tok/s at 32K / 131K / 258K (2.0 x fn-sm80-64g-x2-pp2); decode 142-157 tok/s c1; 0 OOM.",
     "Same pin at the default chunk 1024: 8 x 262K 8/8 in 171 s, 8 x 131K 83 s, 8 x 32K 21 s; GSM8K 0.98; real-text prefill ~11,240 / ~11,760 / ~11,340 tok/s; agent cache (4 agents x 6 turns, append) 0.994 of ideal. MTP k=4 on this row: +4-6 % c1 decode, -24 % at 16K c4 (k=3 kept).",
-    "Labelled tested on 4 x CMP 170HX 64 GB (2026-10-19) in Merlin 3.0.0; back to testing in 3.0.1 pending re-qualification: the runs above were on cloud-hosted hardware; kernel parity qualification is still to run."
+    "Labelled testing: the runs above (4 x CMP 170HX 64 GB, 2026-10-19) were on cloud-hosted hardware; kernel parity qualification is still to run and re-qualification is pending."
    ],
    "notes": [
     "BF16 KV stays the default on sm_80: pool 4,638,492 tokens = 17 x 262K / 31 x 131K. KV_DTYPE=fp8 opts into the byte decoder with the same pin and admission cap; its engine-fit estimate is 9,007,559 tokens = 34 x 262K / 61 x 131K (capacity_fp8_opt_in), not a measured pool. FP8 status: ⚫ untested (a profile ships, not yet run by us, expected to work). Only FP8 exports the checkpoint/recipe VLLM_QSA_KV_SCALES sidecar; BF16 evidence does not qualify FP8.",
@@ -2575,6 +2727,9 @@
     "p2p": "on",
     "tested_gpu_names": [
      "RTX 3090$"
+    ],
+    "status_p2p_modes": [
+     "on"
     ]
    },
    "layout": {
@@ -2633,6 +2788,20 @@
       },
       "unset": [],
       "disable_custom_all_reduce": true
+     },
+     "ipc": {
+      "exports": {
+       "VLLM_SKIP_P2P_CHECK": "1",
+       "NCCL_P2P_DISABLE": "1",
+       "VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC": "1"
+      },
+      "unset": [
+       "NCCL_P2P_LEVEL",
+       "NCCL_PROTO",
+       "NCCL_ALGO",
+       "NCCL_SHM_DISABLE"
+      ],
+      "disable_custom_all_reduce": true
      }
     },
     "default": "on"
@@ -2641,7 +2810,7 @@
    "warm": 1,
    "capacity": {
     "estimate": false,
-    "basis": "Pool of 924,993 tokens measured on this generated launcher (2026-10-16); 3 x 262K / 6 x 131K residency is the inherited 0.30 quad target.",
+    "basis": "Pool of 924,993 tokens measured on this generated launcher (2026-10-16); 3 x 262K / 6 x 131K residency is the quad design target.",
     "pin_gib": 3.82,
     "kv_blocks": 248,
     "pool_tokens": 924993,
@@ -2660,7 +2829,7 @@
    "notes": [
     "Recipe launcher models/swift1.5/serve.sh is a shim for tools/merlin/launch.py --profile fn-swift1.5-quad-3090 (regenerate with preflight.py --emit launcher).",
     "FGPC is off. The 8 MP cap, TP2xPP2+EP partition 25,23, 4.1e9-byte KV pin and target pool 924,993 are inherited from Flash-Next.",
-    "Full-vocabulary MTP head, K=3 (DRAFT_HEAD=bf16|int8|int4 sets its precision; default bf16). The reduced draft vocabulary was removed in 3.0.1; the launcher refuses REDUCED_DRAFT_VOCAB.",
+    "Full-vocabulary MTP head, K=3 (DRAFT_HEAD=bf16|int8|int4 sets its precision; default bf16). There is no reduced draft vocabulary; the launcher refuses REDUCED_DRAFT_VOCAB.",
     "Explicitly select this profile with --profile fn-swift1.5-quad-3090; automatic hardware selection continues to choose Flash-Next.",
     "SPEC=dflash2 (with DFLASH2_MODEL=<DFlash2 drafter dir>) is an option: the DFlash2 drafter in place of the MTP head, with the serve.dflash2 geometry inherited from fn-quad-3090 (PP 24/24, chunk 2048, 245 KV blocks). MTP stays the default."
    ],
@@ -2683,6 +2852,9 @@
     "p2p": "on",
     "tested_gpu_names": [
      "RTX 3090$"
+    ],
+    "status_p2p_modes": [
+     "on"
     ]
    },
    "layout": {
@@ -2741,6 +2913,20 @@
       },
       "unset": [],
       "disable_custom_all_reduce": true
+     },
+     "ipc": {
+      "exports": {
+       "VLLM_SKIP_P2P_CHECK": "1",
+       "NCCL_P2P_DISABLE": "1",
+       "VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC": "1"
+      },
+      "unset": [
+       "NCCL_P2P_LEVEL",
+       "NCCL_PROTO",
+       "NCCL_ALGO",
+       "NCCL_SHM_DISABLE"
+      ],
+      "disable_custom_all_reduce": true
      }
     },
     "default": "on"
@@ -2749,7 +2935,7 @@
    "warm": 1,
    "capacity": {
     "estimate": false,
-    "basis": "Pool of 924,993 tokens measured on this generated launcher (2026-10-16); 3 x 262K / 6 x 131K residency is the inherited 0.30 quad target.",
+    "basis": "Pool of 924,993 tokens measured on this generated launcher (2026-10-16); 3 x 262K / 6 x 131K residency is the quad design target.",
     "pin_gib": 3.82,
     "kv_blocks": 248,
     "pool_tokens": 924993,
@@ -2768,7 +2954,7 @@
    "notes": [
     "Recipe launcher models/swift1.5-huihui/serve.sh is a shim for tools/merlin/launch.py --profile fn-swift1.5-huihui-quad-3090 (regenerate with preflight.py --emit launcher).",
     "FGPC is off. The 8 MP cap, TP2xPP2+EP partition 25,23, 4.1e9-byte KV pin and target pool 924,993 are inherited from Flash-Next.",
-    "Full-vocabulary MTP head, K=3 (DRAFT_HEAD=bf16|int8|int4 sets its precision; default bf16). The reduced draft vocabulary was removed in 3.0.1; the launcher refuses REDUCED_DRAFT_VOCAB.",
+    "Full-vocabulary MTP head, K=3 (DRAFT_HEAD=bf16|int8|int4 sets its precision; default bf16). There is no reduced draft vocabulary; the launcher refuses REDUCED_DRAFT_VOCAB.",
     "Explicitly select this profile with --profile fn-swift1.5-huihui-quad-3090; automatic hardware selection continues to choose Flash-Next.",
     "SPEC=dflash2 (with DFLASH2_MODEL=<DFlash2 drafter dir>) is an option: the DFlash2 drafter in place of the MTP head, with the serve.dflash2 geometry inherited from fn-quad-3090 (PP 24/24, chunk 2048, 245 KV blocks). MTP stays the default."
    ],
@@ -2881,6 +3067,9 @@
     "p2p": "any",
     "testing_gpu_names": [
      "RTX 4090$"
+    ],
+    "status_p2p_modes": [
+     "off"
     ]
    },
    "layout": {
@@ -2932,6 +3121,20 @@
        "NCCL_PROTO",
        "NCCL_ALGO",
        "VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC"
+      ],
+      "disable_custom_all_reduce": true
+     },
+     "ipc": {
+      "exports": {
+       "VLLM_SKIP_P2P_CHECK": "1",
+       "NCCL_P2P_DISABLE": "1",
+       "VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC": "1"
+      },
+      "unset": [
+       "NCCL_P2P_LEVEL",
+       "NCCL_PROTO",
+       "NCCL_ALGO",
+       "NCCL_SHM_DISABLE"
       ],
       "disable_custom_all_reduce": true
      }
@@ -3032,6 +3235,20 @@
        "NCCL_PROTO",
        "NCCL_ALGO",
        "VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC"
+      ],
+      "disable_custom_all_reduce": true
+     },
+     "ipc": {
+      "exports": {
+       "VLLM_SKIP_P2P_CHECK": "1",
+       "NCCL_P2P_DISABLE": "1",
+       "VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC": "1"
+      },
+      "unset": [
+       "NCCL_P2P_LEVEL",
+       "NCCL_PROTO",
+       "NCCL_ALGO",
+       "NCCL_SHM_DISABLE"
       ],
       "disable_custom_all_reduce": true
      }
@@ -3230,6 +3447,20 @@
        "VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC"
       ],
       "disable_custom_all_reduce": true
+     },
+     "ipc": {
+      "exports": {
+       "VLLM_SKIP_P2P_CHECK": "1",
+       "NCCL_P2P_DISABLE": "1",
+       "VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC": "1"
+      },
+      "unset": [
+       "NCCL_P2P_LEVEL",
+       "NCCL_PROTO",
+       "NCCL_ALGO",
+       "NCCL_SHM_DISABLE"
+      ],
+      "disable_custom_all_reduce": true
      }
     },
     "default": "off"
@@ -3414,6 +3645,20 @@
        "VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC"
       ],
       "disable_custom_all_reduce": true
+     },
+     "ipc": {
+      "exports": {
+       "VLLM_SKIP_P2P_CHECK": "1",
+       "NCCL_P2P_DISABLE": "1",
+       "VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC": "1"
+      },
+      "unset": [
+       "NCCL_P2P_LEVEL",
+       "NCCL_PROTO",
+       "NCCL_ALGO",
+       "NCCL_SHM_DISABLE"
+      ],
+      "disable_custom_all_reduce": true
      }
     },
     "default": "off"
@@ -3510,6 +3755,20 @@
        "NCCL_PROTO",
        "NCCL_ALGO",
        "VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC"
+      ],
+      "disable_custom_all_reduce": true
+     },
+     "ipc": {
+      "exports": {
+       "VLLM_SKIP_P2P_CHECK": "1",
+       "NCCL_P2P_DISABLE": "1",
+       "VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC": "1"
+      },
+      "unset": [
+       "NCCL_P2P_LEVEL",
+       "NCCL_PROTO",
+       "NCCL_ALGO",
+       "NCCL_SHM_DISABLE"
       ],
       "disable_custom_all_reduce": true
      }
@@ -3708,6 +3967,20 @@
        "VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC"
       ],
       "disable_custom_all_reduce": true
+     },
+     "ipc": {
+      "exports": {
+       "VLLM_SKIP_P2P_CHECK": "1",
+       "NCCL_P2P_DISABLE": "1",
+       "VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC": "1"
+      },
+      "unset": [
+       "NCCL_P2P_LEVEL",
+       "NCCL_PROTO",
+       "NCCL_ALGO",
+       "NCCL_SHM_DISABLE"
+      ],
+      "disable_custom_all_reduce": true
      }
     },
     "default": "off"
@@ -3902,6 +4175,20 @@
        "VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC"
       ],
       "disable_custom_all_reduce": true
+     },
+     "ipc": {
+      "exports": {
+       "VLLM_SKIP_P2P_CHECK": "1",
+       "NCCL_P2P_DISABLE": "1",
+       "VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC": "1"
+      },
+      "unset": [
+       "NCCL_P2P_LEVEL",
+       "NCCL_PROTO",
+       "NCCL_ALGO",
+       "NCCL_SHM_DISABLE"
+      ],
+      "disable_custom_all_reduce": true
      }
     },
     "default": "on"
@@ -3989,6 +4276,20 @@
        "NCCL_PROTO",
        "NCCL_ALGO",
        "VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC"
+      ],
+      "disable_custom_all_reduce": true
+     },
+     "ipc": {
+      "exports": {
+       "VLLM_SKIP_P2P_CHECK": "1",
+       "NCCL_P2P_DISABLE": "1",
+       "VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC": "1"
+      },
+      "unset": [
+       "NCCL_P2P_LEVEL",
+       "NCCL_PROTO",
+       "NCCL_ALGO",
+       "NCCL_SHM_DISABLE"
       ],
       "disable_custom_all_reduce": true
      }
@@ -4173,6 +4474,20 @@
        "NCCL_PROTO",
        "NCCL_ALGO",
        "VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC"
+      ],
+      "disable_custom_all_reduce": true
+     },
+     "ipc": {
+      "exports": {
+       "VLLM_SKIP_P2P_CHECK": "1",
+       "NCCL_P2P_DISABLE": "1",
+       "VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC": "1"
+      },
+      "unset": [
+       "NCCL_P2P_LEVEL",
+       "NCCL_PROTO",
+       "NCCL_ALGO",
+       "NCCL_SHM_DISABLE"
       ],
       "disable_custom_all_reduce": true
      }
@@ -4384,6 +4699,20 @@
        "VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC"
       ],
       "disable_custom_all_reduce": true
+     },
+     "ipc": {
+      "exports": {
+       "VLLM_SKIP_P2P_CHECK": "1",
+       "NCCL_P2P_DISABLE": "1",
+       "VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC": "1"
+      },
+      "unset": [
+       "NCCL_P2P_LEVEL",
+       "NCCL_PROTO",
+       "NCCL_ALGO",
+       "NCCL_SHM_DISABLE"
+      ],
+      "disable_custom_all_reduce": true
      }
     },
     "default": "on"
@@ -4439,6 +4768,9 @@
     "p2p": "any",
     "testing_gpu_names": [
      "CMP 170HX"
+    ],
+    "status_p2p_modes": [
+     "off"
     ]
    },
    "layout": {
@@ -5030,6 +5362,20 @@
        "VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC"
       ],
       "disable_custom_all_reduce": true
+     },
+     "ipc": {
+      "exports": {
+       "VLLM_SKIP_P2P_CHECK": "1",
+       "NCCL_P2P_DISABLE": "1",
+       "VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC": "1"
+      },
+      "unset": [
+       "NCCL_P2P_LEVEL",
+       "NCCL_PROTO",
+       "NCCL_ALGO",
+       "NCCL_SHM_DISABLE"
+      ],
+      "disable_custom_all_reduce": true
      }
     },
     "default": "on"
@@ -5117,6 +5463,20 @@
        "NCCL_PROTO",
        "NCCL_ALGO",
        "VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC"
+      ],
+      "disable_custom_all_reduce": true
+     },
+     "ipc": {
+      "exports": {
+       "VLLM_SKIP_P2P_CHECK": "1",
+       "NCCL_P2P_DISABLE": "1",
+       "VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC": "1"
+      },
+      "unset": [
+       "NCCL_P2P_LEVEL",
+       "NCCL_PROTO",
+       "NCCL_ALGO",
+       "NCCL_SHM_DISABLE"
       ],
       "disable_custom_all_reduce": true
      }
@@ -5301,6 +5661,20 @@
        "NCCL_PROTO",
        "NCCL_ALGO",
        "VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC"
+      ],
+      "disable_custom_all_reduce": true
+     },
+     "ipc": {
+      "exports": {
+       "VLLM_SKIP_P2P_CHECK": "1",
+       "NCCL_P2P_DISABLE": "1",
+       "VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC": "1"
+      },
+      "unset": [
+       "NCCL_P2P_LEVEL",
+       "NCCL_PROTO",
+       "NCCL_ALGO",
+       "NCCL_SHM_DISABLE"
       ],
       "disable_custom_all_reduce": true
      }
@@ -5510,6 +5884,20 @@
        "NCCL_PROTO",
        "NCCL_ALGO",
        "VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC"
+      ],
+      "disable_custom_all_reduce": true
+     },
+     "ipc": {
+      "exports": {
+       "VLLM_SKIP_P2P_CHECK": "1",
+       "NCCL_P2P_DISABLE": "1",
+       "VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC": "1"
+      },
+      "unset": [
+       "NCCL_P2P_LEVEL",
+       "NCCL_PROTO",
+       "NCCL_ALGO",
+       "NCCL_SHM_DISABLE"
       ],
       "disable_custom_all_reduce": true
      }

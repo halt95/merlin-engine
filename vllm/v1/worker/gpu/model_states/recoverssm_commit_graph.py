@@ -521,10 +521,10 @@ class RecoverSSMCommitGraphs:
                 del self._graphs[plan.key]
                 entry = None
             if entry is not None:
-                # The graph holds the align
-                # postprocess (guarded mamba_utils kernels); a replay inherits
-                # the caller's stream, so the producer-coverage check runs here
-                # like at every other replay site.
+                # The graph holds the align postprocess (guarded mamba_utils
+                # kernels); a replay inherits the caller's stream, so the
+                # producer-coverage check runs here like at every other replay
+                # site.
                 guard_telemetry.check_replay_stream()
                 entry.graph.replay()
                 _stats.replays += 1

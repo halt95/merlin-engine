@@ -10,7 +10,7 @@ parallelism, Mamba-2 RecoverSSM, MTP speculative decoding and prefix caching, be
 
 > **Status: tested on the reference host (registry profile `svl-quad-3090`).** The 3.0.0 release bench card passed this
 > recipe on the reference host (2026-10-20; its agents, GSM8K and needle results are from a 2026-10-17 pre-release build), and the 3.0.1 card re-measured decode,
-> prefill, agents and GSM8K (2026-11-02). The KV pin below has not had a sustained-load test yet.
+> prefill, agents and GSM8K (2026-11-02); the 3.0.2 card re-measured them on vLLM 0.33. The KV pin below has not had a sustained-load test yet.
 
 ```bash
 MODEL=~/models/nemotron-super-vl PORT=8100 bash models/nemotron-super-vl/serve.sh
@@ -23,6 +23,21 @@ Extra arguments go to `vllm serve` after the launcher's own flags (later flags w
 
 Token embeddings: with `VLLM_HOST_EMBED_TABLE` unset, the target and MTP `embed_tokens` tables sit in pinned host RAM (V2 model
 runner; about 1 GiB of bf16 per full table, split across tensor-parallel ranks). `VLLM_HOST_EMBED_TABLE=0` keeps them on the GPU.
+
+## Merlin 3.0.2 bench card (2026-11-04)
+
+Maintainer measurements on 4× RTX 3090 (220 W, PCIe Gen4) with P2P (the aikitoria patched driver) and the Zagitta [gpu-unlock](https://github.com/Zagitta/gpu-unlock) kernel module, on vLLM 0.33.0, one fresh `merlin serve` boot per configuration, 2026-11-04; method and every cell in the [bench card](benchmarks/2026-11-04/BENCH-CARD.md). Decode is one stream with thinking on (this template has no effort levels) (tok/s after the first streamed token); prefill is one cold request. With thinking on, a 512-token agent follow-up may end inside the reasoning, and reasoning tokens count. Rows marked (3.0.1 run) were not re-run for 3.0.2 and are on the 3.0.1 card below.
+
+| Measurement | Super VL |
+|---|---|
+| Decode, 4K / 131K / 262K prompt | 101 / 101 / 106 tok/s |
+| Cold prefill, 10K / 100K / 262K prompt | 4,914 / 5,111 / 4,217 tok/s |
+| Agents at once (8 × 16K conversations), total, thinking on / off | 432 / 432 tok/s (3.0.1 run) |
+| GSM8K-200 (5-shot), correct of 200, thinking on / thinking off | 197 / 195 (3.0.1 run) |
+| Sessions held at once | Not re-measured on 3.0.2. 3.0.0 run: 5 × 262K and 9 × 131K (the engine's sequence limit), every session resident (re-sent prompts ≥ 99.91 % cached), peak KV 95.0 %, 0 preemptions. |
+| 8 MP image | Not re-measured on 3.0.2 (Pillow 13). 3.0.0 run, Pillow 12: correct; the processor downscales it to its native ~3.4 MP cap; lowest free memory 686 MiB on any card. |
+| KV pool | 1,856,367 tokens |
+| Against 3.0.1 | decode -1 % / -1 % / +14 % at 4K / 131K / 262K (4K and 131K within run-to-run spread); cold prefill +8 to +9 % at every depth |
 
 ## Merlin 3.0.1 bench card (2026-11-02)
 
@@ -46,7 +61,7 @@ Maintainer measurements on 4× RTX 3090 (220 W, PCIe Gen4) with P2P (the aikitor
 | Layer partition | `VLLM_PP_LAYER_PARTITION=46,42` (`PP_PARTITION`) | pool unchanged (1,392,275 tokens at that run's 262K context length); stage 1 kept 870 MiB free under load, against 64 MiB at the even 44,44 split |
 | State space | RecoverSSM: `--use-replayssm --mamba-backend triton`, Model Runner V2 | the engine selects RecoverSSM for NemotronH and requires the Triton Mamba backend |
 | Speculation | MTP, 3 draft tokens, INT4 head | |
-| Prefix cache | `--enable-prefix-caching --mamba-cache-mode align`, `--block-size 64 --prefix-match-unit 64` | block-size A/B on the reference host kept 64 |
+| Prefix cache | `--enable-prefix-caching --mamba-cache-mode align`, `--block-size 64 --prefix-match-unit 64` | block-size A/B on the reference host kept 64; `--mamba-cache-mode` is deprecated on vLLM 0.33 and has no effect (prefix caching follows `--enable-prefix-caching`), and the launcher still passes it |
 | Chunk | `--max-num-batched-tokens 1024` | the Flash-Next default |
 | KV | FP8, `--kv-cache-memory-bytes 2684354560` (2.50 GiB per card; no sustained-load test yet) | byte-pinned, never a utilisation fraction; at the 1M default the pool is 1,856,367 tokens: one 1M session (residency-proven) or 5 × 262K |
 | Tools | `--enable-auto-tool-choice --tool-call-parser qwen3_coder` | the checkpoint card's vLLM recipe; the reasoning parser stays `nemotron_v3` |

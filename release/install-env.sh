@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# Install this Merlin checkout on vLLM 0.32.0 (Linux x86_64, CPython 3.13).
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright 2026 halt95 (Merlin modifications)
+# Install this Merlin checkout on vLLM 0.33.0 (Linux x86_64, CPython 3.13).
 #   release/install-env.sh <new-venv-path> [engine-source-path]
 # With MERLIN_WHEEL=<path to the release wheel> the compiled engine comes from that wheel (no
 # native build); release/merlin-wheel.sha256 in the engine checkout must name it, and the checkout's
@@ -14,7 +16,7 @@
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
-REQ="$REPO/release/requirements-0.32.lock"
+REQ="$REPO/release/requirements-0.33.lock"
 FLASHINFER_PATCH="$REPO/release/apply-flashinfer-patch.sh"
 TILE_PROOF="$REPO/release/check-tile-proof.sh"
 die() { echo "install-env: $*" >&2; exit 1; }
@@ -39,7 +41,7 @@ case "$VENV" in /*) ;; *) VENV="$PWD/$VENV" ;; esac
   || die "$ENGINE is not a Merlin-engine source checkout"
 [ -r "$REQ" ] || die "missing $REQ"
 if grep -nE 'TODO-(PIN|HASH)' "$REQ" >&2; then
-  die "requirements-0.32.lock contains unresolved pins or hashes; restore the complete release lock"
+  die "requirements-0.33.lock contains unresolved pins or hashes; restore the complete release lock"
 fi
 [ -r "$FLASHINFER_PATCH" ] && [ -r "$TILE_PROOF" ] \
   || die "missing FlashInfer tile tooling"
@@ -65,13 +67,13 @@ done < <(compgen -e)
 unset PYTHONPATH PYTHONHOME
 export PYTHONNOUSERSITE=1 PYTHONDONTWRITEBYTECODE=1
 
-# Record the source independently of the package version that setup.py will stamp. The engine is vLLM 0.32.0
-# (upstream commit 5df63a7203, named in NOTICE); the public history does not carry vLLM's commits, and the
+# Record the source independently of the package version that setup.py will stamp. The engine is vLLM 0.33.0
+# (upstream commit 4ba787ec99, named in NOTICE); the public history does not carry vLLM's commits, and the
 # wheel check pins the native sources by tree id.
 command -v git >/dev/null || die "git is required"
 [ "$(git -C "$ENGINE" rev-parse --show-toplevel)" = "$ENGINE" ] \
   || die "engine-source-path must be the Git checkout root"
-SOURCE_BASE="vllm-0.32.0"
+SOURCE_BASE="vllm-0.33.0"
 SOURCE_COMMIT="$(git -C "$ENGINE" rev-parse --verify HEAD)"
 SOURCE_TREE="$(git -C "$ENGINE" rev-parse --verify 'HEAD^{tree}')"
 [ -z "$(git -C "$ENGINE" status --porcelain --untracked-files=no)" ] \
@@ -139,19 +141,19 @@ for name in sorted(pins):
     got = md.version(name)
     if Version(got) != Version(pins[name]):
         sys.exit(f"{name}: installed {got}, lock requires {pins[name]}")
-if pins["flashinfer-python"] != "0.7.0.post1":
-    sys.exit("FlashInfer tile requires flashinfer-python==0.7.0.post1")
-if pins["humming-kernels"] != "0.1.17":
-    sys.exit("0.32.0 requires humming-kernels==0.1.17")
+if pins["flashinfer-python"] != "0.7.2.post1":
+    sys.exit("FlashInfer tile requires flashinfer-python==0.7.2.post1")
+if pins["humming-kernels"] != "0.1.19":
+    sys.exit("0.33.0 requires humming-kernels==0.1.19")
 if Version(pins["instanttensor"]) < Version("0.2.2"):
-    sys.exit("0.32.0 requires instanttensor>=0.2.2 (exact version in the lock)")
+    sys.exit("0.33.0 requires instanttensor>=0.2.2 (exact version in the lock)")
 try:
     md.distribution("flashinfer-jit-cache")
 except md.PackageNotFoundError:
     pass
 else:
     sys.exit("flashinfer-jit-cache would shadow the patched JIT build")
-print("0.32.0 DEPENDENCY PINS OK")
+print("0.33.0 DEPENDENCY PINS OK")
 PY
 
 if [ "$TILE_SERIES" = v2 ]; then
@@ -175,15 +177,15 @@ from pathlib import Path
 root = Path(sysconfig.get_paths()["purelib"]) / "flashinfer"
 expected = {
     "data/csrc/batch_prefill.cu":
-        "0e669eee017eb01ef5c4b23915a026c9ad4217a5edce0c99be1926a58b3824c8",
+        "6f3a7033af4426889585e6a5ab2fb959c4a965a98e106072c175631ed4d3a68e",
     "data/csrc/batch_prefill_paged_kernel_inst.jinja":
         "500fcecb03e267e6c7bd85c1240ba34581e5e1f9b1c82dd671f1a669f740e041",
     "data/include/flashinfer/attention/prefill.cuh":
-        "49cf57d1718eefe01d164a91ce36dd6bcbdf1b831d175fe5723b62a8dcc3ef61",
+        "4e371ab99e5170f6c76d9556f48cd8297e85254ce35c43edfa6cebdc0f401062",
     "data/include/flashinfer/attention/scheduler.cuh":
-        "a8a7ccf79e488e7ff41dca6512f4c9bf6cb075ca4dfed0c9fb392de61eef80a4",
+        "f45a12be6583888bb23a6fe4fed5d192c67757dbb58e9d209e8efd3a8f59ba5b",
     "jit/attention/modules.py":
-        "c38076b0c3c8a1d0e802dc6fc02a68e6da36604210bb03110df8774e220f37b5",
+        "36127818bd5c0ef66947105248398810c30c4c1999c4eb3dd0c0cfd98e75c4f4",
 }
 for name, digest in expected.items():
     path = root / name
@@ -216,16 +218,25 @@ if [ "$MODE" = install ]; then
   fi
   export CUDA_HOME="${CUDA_HOME:-$CU}"
   [ -x "$CUDA_HOME/bin/nvcc" ] || die "source build needs CUDA_HOME/bin/nvcc"
+  # Driver-less hosts (docker build): the extensions link the driver API (CUDA::cuda_driver) and the toolkit wheels ship no
+  # libcuda. MERLIN_LIBCUDA names the CUDA toolkit's stubs/libcuda.so; it is linked under the toolkit's lib/stubs exactly as
+  # release/build-wheel.sh does, so it is a link-time file only and never on the loader path. Unset: nothing changes (a host
+  # with the driver needs no stub). The container sets it for the wheel path too, the configuration that was qualified.
+  if [ -n "${MERLIN_LIBCUDA:-}" ]; then
+    [ -e "$MERLIN_LIBCUDA" ] || die "MERLIN_LIBCUDA=$MERLIN_LIBCUDA does not exist"
+    mkdir -p "$CUDA_HOME/lib/stubs"
+    ln -sfn "$MERLIN_LIBCUDA" "$CUDA_HOME/lib/stubs/libcuda.so"
+  fi
   export PATH="$VENV/bin:$CUDA_HOME/bin:$PATH"
   # No dependency resolution or isolated build may replace the locked torch/triton. setup.py loads vllm/envs.py by
   # path, and that imports vllm.merlin.envs, so the checkout must be importable for this one command.
   if [ -n "$WHEEL" ]; then
     # Upstream's precompiled route: the editable install takes the compiled products from the wheel.
-    (cd "$ENGINE" && PYTHONPATH="$ENGINE" VLLM_TARGET_DEVICE=cuda VLLM_VERSION_OVERRIDE=0.32.0 \
+    (cd "$ENGINE" && PYTHONPATH="$ENGINE" VLLM_TARGET_DEVICE=cuda VLLM_VERSION_OVERRIDE=0.33.0 \
       VLLM_USE_PRECOMPILED=1 VLLM_PRECOMPILED_WHEEL_LOCATION="$WHEEL" \
       uv pip install --python "$PY" --no-deps --no-build-isolation --editable .)
   else
-    (cd "$ENGINE" && PYTHONPATH="$ENGINE" VLLM_TARGET_DEVICE=cuda VLLM_VERSION_OVERRIDE=0.32.0 \
+    (cd "$ENGINE" && PYTHONPATH="$ENGINE" VLLM_TARGET_DEVICE=cuda VLLM_VERSION_OVERRIDE=0.33.0 \
       TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-8.0;8.6;8.9}" \
       uv pip install --python "$PY" --no-deps --no-build-isolation --editable .)
   fi
@@ -248,8 +259,8 @@ engine = Path(sys.argv[1]).resolve()
 origin = Path(vllm.__file__).resolve()
 if origin != engine / "vllm" / "__init__.py":
     sys.exit(f"vllm imported from {origin}, expected {engine}/vllm/__init__.py")
-if Version(vllm.__version__).public != "0.32.0":
-    sys.exit(f"vllm is {vllm.__version__}, expected 0.32.0")
+if Version(vllm.__version__).public != "0.33.0":
+    sys.exit(f"vllm is {vllm.__version__}, expected 0.33.0")
 if Path(flashinfer.__file__).resolve() != (
     Path(sysconfig.get_paths()["purelib"]) / "flashinfer" / "__init__.py"
 ).resolve():
@@ -257,7 +268,7 @@ if Path(flashinfer.__file__).resolve() != (
 for name, module in (
     ("torch", torch), ("triton", triton), ("flashinfer-python", flashinfer)
 ):
-    # the lock's PyPI torch reports 2.13.0+cu130 against distribution metadata 2.13.0: compare public versions
+    # the lock's PyPI torch reports 2.14.0+cu130 against distribution metadata 2.14.0: compare public versions
     if Version(module.__version__).public != Version(md.version(name)).public:
         sys.exit(f"{name}: imported module disagrees with installed distribution")
 print(f"ENGINE IMPORT OK: {vllm.__version__} from {origin}")
@@ -319,7 +330,7 @@ lines = [
 ]
 sums = engine / ".build-products.sha256"
 sums.write_text("".join(lines))
-(engine / ".build-products").write_text((sys.argv[2] or "source 0.32.0") + "\n")
+(engine / ".build-products").write_text((sys.argv[2] or "source 0.33.0") + "\n")
 print(f"BUILD PRODUCTS RECORDED: {len(products)} files")
 PY
 fi

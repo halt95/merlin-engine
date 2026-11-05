@@ -2,12 +2,11 @@
 # SPDX-FileCopyrightText: Copyright 2026 halt95 (Merlin modifications)
 """Copy-on-write block copies as row copies, with no gather temporary.
 
-``copy_kv_cache_blocks_inplace`` copied with ``blocks[dst] = blocks[src]``,
-which gathers every source row into one temporary first. With the side-cache
-layout each rank's KV pool is one storage, so that temporary is n_copies x the
-rank's full bytes per block: up to max_num_seqs x (KV groups - 1) rows per
-step, 1.3-1.6 GiB at 8 seqs on a 64 GB PP2 rank, which OOM'd tight KV pins.
-A basic-index row copy needs no temporary.
+A ``blocks[dst] = blocks[src]`` copy gathers every source row into one
+temporary first. With the side-cache layout each rank's KV pool is one storage,
+so that temporary is n_copies x the rank's full bytes per block (up to
+max_num_seqs x (KV groups - 1) rows per step), which a tight KV pin cannot
+absorb. A basic-index row copy needs no temporary.
 """
 
 from collections.abc import Sequence

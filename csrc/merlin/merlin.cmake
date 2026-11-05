@@ -1,4 +1,5 @@
-# merlin-hook: csrc-topk-vendored
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright 2026 halt95 (Merlin modifications)
 # Merlin-owned sources of the _C_stable_libtorch extension, included right after the initial
 # set(VLLM_STABLE_EXT_SRC ...) so set_gencode_flags_for_srcs() gives them the same arch flags.
 # Upstream csrc/topk.cu stays compiled and owns _C::persistent_topk; the Merlin top-k lives in

@@ -24,12 +24,7 @@ from transformers import Qwen4ExpTextConfig
 from vllm import envs
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig, replace, set_current_vllm_config
-from vllm.distributed import (
-    get_pp_group,
-    get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
-    get_tp_group,
-)
+from vllm.distributed import get_pp_group
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.utils import (
@@ -73,16 +68,7 @@ from vllm.v1.e2_guards import (
     assert_ple_mode,
 )
 
-from .draft_head import (
-    ENV_DRAFT_VOCAB_FILE,
-    check_draft_vocab_agreement,
-    d2t_offsets,
-    draft_vocab_file,
-    draft_vocab_fingerprint,
-    load_draft_vocab_ids,
-    scatter_to_full,
-    select_head_rows,
-)
+from ..common.hyperconnection import is_hc_sequence_parallel_enabled
 from .hyperconnection import GatedResidual, HyperConnectionConfig
 from .low_latency_gemm import enable_qwen4_exp_low_latency_gemm
 from .model import (
@@ -91,7 +77,6 @@ from .model import (
     Qwen4ExpDecoderLayer,
     Qwen4ExpMixtureOfExperts,
     Qwen4ExpSparseMoeBlock,
-    is_hc_sequence_parallel_enabled,
 )
 
 from .mtp_kv_scales import maybe_load_mtp_qsa_static_kv_scales
@@ -452,31 +437,6 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
         return loader.load_weights(weights, mapper=mapper)
 
 
-def _max_draft_logits_rows(vllm_config: VllmConfig) -> int:
-    """Rows of one draft compute_logits call: at most one per scheduled
-    request (padded CUDA-graph rows included), i.e. max_num_seqs."""
-    scheduler_config = getattr(vllm_config, "scheduler_config", None)
-    return int(getattr(scheduler_config, "max_num_seqs", 0) or 0)
-
-
-def _gather_tp_fingerprints(fingerprint: str) -> list[str]:
-    """This rank's draft-vocab table fingerprint, all-gathered over the drafter's TP
-    group (CPU group). Not the world group: the V2 runner builds the drafter on
-    the last pipeline stage only, so a world collective here would hang."""
-    if get_tensor_model_parallel_world_size() == 1:
-        return [fingerprint]
-    tp_group = get_tp_group()
-    gathered: list[str | None] = [None] * tp_group.world_size
-    torch.distributed.all_gather_object(
-        gathered, fingerprint, group=tp_group.cpu_group
-    )
-    return [str(fp) for fp in gathered]
-
-
-def _is_capturing(t: torch.Tensor) -> bool:
-    return t.is_cuda and torch.cuda.is_current_stream_capturing()
-
-
 @support_torch_compile(
     dynamic_arg_dims={
         "input_ids": 0,
@@ -524,84 +484,21 @@ class Qwen4ExpMTP(
         )
         assert_compiled_submodule(self.model, vllm_config, role="draft")
 
-        draft_vocab_path = draft_vocab_file()
-        self.draft_vocab_ids: torch.Tensor | None = None
-        if draft_vocab_path is not None:
-            # Recheck verification where the reduced draft vocabulary actually activates, with the path
-            # being activated: the config may predate the knob.
-            speculative_config = getattr(vllm_config, "speculative_config", None)
-            if speculative_config is not None:
-                speculative_config.verify_draft_vocab_verification(draft_vocab_path)
-            if config.tie_word_embeddings:
-                raise ValueError(
-                    f"{ENV_DRAFT_VOCAB_FILE} needs untied embeddings "
-                    "(tie_word_embeddings=True on this checkpoint)"
-                )
-            self.draft_vocab_ids = load_draft_vocab_ids(
-                draft_vocab_path,
-                config.vocab_size,
-                get_tensor_model_parallel_world_size(),
-            )
-            # All drafter ranks must serve one table, before any capture.
-            check_draft_vocab_agreement(
-                _gather_tp_fingerprints(draft_vocab_fingerprint(self.draft_vocab_ids)),
-                draft_vocab_path,
-            )
-        head_vocab_size = (
-            config.vocab_size
-            if self.draft_vocab_ids is None
-            else int(self.draft_vocab_ids.numel())
-        )
-
         if get_pp_group().is_last_rank:
             if config.tie_word_embeddings:
                 self.lm_head = self.model.embed_tokens
             else:
                 self.lm_head = ParallelLMHead(
-                    head_vocab_size,
+                    config.vocab_size,
                     config.hidden_size,
                     prefix=maybe_prefix(prefix, "lm_head"),
                 )
         else:
             self.lm_head = PPMissingLayer()
 
-        self.logits_processor = LogitsProcessor(head_vocab_size)
-        if self.draft_vocab_ids is not None:
-            self.has_own_lm_head = get_pp_group().is_last_rank
-            if get_pp_group().is_last_rank:
-                map_device = self.lm_head.weight.device
-                # Buffers, not Parameters: the loader's not-initialised check
-                # walks parameters. Filled in load_weights, after the rows load.
-                self.register_buffer(
-                    "_draft_ids",
-                    torch.zeros(head_vocab_size, dtype=torch.int64, device=map_device),
-                    persistent=False,
-                )
-                self.register_buffer(
-                    "draft_id_to_target_id",
-                    torch.zeros(head_vocab_size, dtype=torch.int64, device=map_device),
-                    persistent=False,
-                )
-                self.register_buffer(
-                    "_draft_logits_full",
-                    self._new_draft_logits_buffer(
-                        _max_draft_logits_rows(vllm_config),
-                        getattr(vllm_config.model_config, "head_dtype", None)
-                        or self.lm_head.weight.dtype,
-                        map_device,
-                    ),
-                    persistent=False,
-                )
-            else:
-                self.draft_id_to_target_id = None
-            self._draft_head_loaded = False
-            # Set after CUDA-graph capture: from then on graphs hold pointers
-            # into _draft_logits_full, so it must never be re-allocated.
-            self._draft_logits_sealed = False
-        else:
-            # Plain attribute (NOT a buffer): register_buffer refuses a name that
-            # already exists as an attribute.
-            self.draft_id_to_target_id = None
+        self.logits_processor = LogitsProcessor(config.vocab_size)
+        # Plain attribute: the drafter samples in the target vocabulary.
+        self.draft_id_to_target_id = None
         self.make_empty_intermediate_tensors = (
             self.model.make_empty_intermediate_tensors
         )
@@ -632,86 +529,14 @@ class Qwen4ExpMTP(
     def compute_logits(
         self, hidden_states: torch.Tensor, spec_step_idx: int = 0
     ) -> torch.Tensor | None:
-        logits = self.logits_processor(self.lm_head, hidden_states)
-        if self.draft_vocab_ids is None or logits is None:
-            return logits
-        return scatter_to_full(
-            logits,
-            self._draft_ids,
-            self.config.vocab_size,
-            out=self._draft_logits_out(logits),
-        )
-
-    def _new_draft_logits_buffer(
-        self, rows: int, dtype: torch.dtype, device: torch.device
-    ) -> torch.Tensor:
-        return torch.full(
-            (rows, self.config.vocab_size), float("-inf"), dtype=dtype, device=device
-        )
-
-    def _draft_logits_out(self, logits: torch.Tensor) -> torch.Tensor:
-        """The persistent scatter_to_full output buffer, checked against this
-        call. A mismatch is re-allocated only before capture (the first eager
-        warmup call); during a capture or once sealed after capture it raises,
-        since captured graphs hold pointers into the buffer."""
-        buf = self._draft_logits_full
-        rows = int(logits.shape[0])
-        if (
-            rows <= buf.shape[0]
-            and buf.dtype == logits.dtype
-            and buf.device == logits.device
-        ):
-            return buf
-        if self._draft_logits_sealed or _is_capturing(logits):
-            when = (
-                "after graph capture (sealed)"
-                if self._draft_logits_sealed
-                else "during graph capture"
-            )
-            raise RuntimeError(
-                "draft logits buffer "
-                f"{tuple(buf.shape)} {buf.dtype} {buf.device} does not fit "
-                f"{rows} rows of {logits.dtype} on {logits.device} {when}; it "
-                "must be sized before capture"
-            )
-        logger.warning(
-            "draft logits buffer %s %s on %s re-allocated for %d rows of %s "
-            "on %s (outside capture)",
-            tuple(buf.shape),
-            buf.dtype,
-            buf.device,
-            rows,
-            logits.dtype,
-            logits.device,
-        )
-        self._draft_logits_full = self._new_draft_logits_buffer(
-            max(rows, int(buf.shape[0])), logits.dtype, logits.device
-        )
-        return self._draft_logits_full
-
-    def seal_draft_logits_buffer(self) -> None:
-        """Called by the worker after CUDA-graph capture: forbid any later
-        re-allocation of the persistent draft-vocab logits buffer. No-op when the knob is
-        off or this stage holds no head."""
-        if hasattr(self, "_draft_logits_full"):
-            self._draft_logits_sealed = True
+        return self.logits_processor(self.lm_head, hidden_states)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        draft_ids = self.draft_vocab_ids
-        owns_head = draft_ids is not None and get_pp_group().is_last_rank
-
         def remap_weight_names():
             for name, weight in weights:
                 remapped_name = _remap_mtp_weight_name(name)
                 if remapped_name is None:
                     continue
-                if owns_head and remapped_name == "lm_head.weight":
-                    weight = select_head_rows(
-                        weight,
-                        draft_ids,
-                        self.config.vocab_size,
-                        self.config.hidden_size,
-                    )
                 yield remapped_name, weight
 
         mapper = WeightsMapper(
@@ -721,39 +546,9 @@ class Qwen4ExpMTP(
             self,
             ignore_unexpected_suffixes=_QWEN4_EXP_IGNORED_MISSING_SUFFIXES.copy(),
         )
-        # Before profiling/capture.
         loaded = loader.load_weights(remap_weight_names(), mapper=mapper)
-        if owns_head:
-            self._finalize_draft_head(loaded)
         maybe_load_mtp_qsa_static_kv_scales(self)
         return loaded
-
-    def _finalize_draft_head(self, loaded: set[str]) -> None:
-        """Proof of life. A silent knob is not a knob: refuse a random head."""
-        if "lm_head.weight" not in loaded:
-            raise RuntimeError(
-                f"{ENV_DRAFT_VOCAB_FILE} is set but lm_head.weight was not "
-                "loaded through Qwen4ExpMTP.load_weights - refusing to serve a "
-                "random draft head"
-            )
-        self._draft_head_loaded = True
-        ids = self.draft_vocab_ids
-        self._draft_ids.copy_(ids)
-        self.draft_id_to_target_id.copy_(d2t_offsets(ids))
-        w = self.lm_head.weight
-        logger.info(
-            "REDUCED DRAFT VOCAB ACTIVE: tp_rank=%d N=%d of %d (file %s, "
-            "table %s), lm_head local shard %s %s on %s, has_own_lm_head=%s",
-            get_tensor_model_parallel_rank(),
-            int(ids.numel()),
-            self.config.vocab_size,
-            draft_vocab_file(),
-            draft_vocab_fingerprint(ids),
-            tuple(w.shape),
-            w.dtype,
-            w.device,
-            self.has_own_lm_head,
-        )
 
 
 __all__ = ["Qwen4ExpMTP", "Qwen4ExpMultiTokenPredictor"]

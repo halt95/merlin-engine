@@ -16,10 +16,6 @@ from dataclasses import dataclass
 import msgspec
 import torch
 
-# ---------------------------------------------------------------------------
-# IPC message dataclasses
-# ---------------------------------------------------------------------------
-
 
 @dataclass
 class PleOffloadRegistration:

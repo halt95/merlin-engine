@@ -22,6 +22,7 @@ from vllm.models.qwen4_exp.common.qsa_config import (
 )
 from vllm.platforms import current_platform
 from vllm.triton_utils import HAS_TRITON, tl, triton
+from vllm.models.qwen4_exp.nvidia.ops.qsa_launch import qsa_partial_num_stages  # noqa: I001
 
 
 @lru_cache(maxsize=1)
@@ -36,6 +37,8 @@ def qsa_e4m3_uses_native_cast() -> bool:
     return capability is not None and capability.to_int() >= 89
 
 
+# Upstream tuning tables apply only on sm_90/sm_120;
+# sm_86/89 keep the default table.
 @lru_cache(maxsize=1)
 def qsa_tuning_capability() -> int | None:
     """The capability whose upstream tuning table QSA dispatch uses.
@@ -50,6 +53,8 @@ def qsa_tuning_capability() -> int | None:
     return value if value in QSA_TUNED_CAPABILITIES else None
 
 
+# E4M3 byte decode for sm_8x, which has no fp8e4nv
+# on sm_86.
 @triton.jit
 def _decode_e4m3_to_bf16(b):
     # Shifting the 7 magnitude bits left by 7 lands the E4M3 exponent in the
@@ -582,6 +587,8 @@ def _compress_qsa_groups_kernel(
     )
 
 
+# The launch profile comes from
+# qsa_tuning_capability(); upstream's per-arch selectors are not used.
 def qsa_sparse_paged_attention(
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -599,12 +606,13 @@ def qsa_sparse_paged_attention(
 ) -> torch.Tensor:
     """Run sparse GQA over paged BF16 or FP8 (E4M3 via static scalar scales) K/V caches.
 
-    ``_force_num_warps`` overrides the tuned launch profile for the warp-count
-    equivalence test only; production callers leave it None. Hardware policy
-    (E4M3 only on CUDA sm_86 or sm_89+) is enforced once at Qwen4ExpQSAAttention /
-    Qwen4ExpQSAFlashAttentionImpl construction, not per call. E4M3 storage is
-    read by the Merlin byte decoder on sm_86 and by upstream's native float8
-    cast (vllm#55557) on sm_89+; both take the scalar scale tensors.
+    ``_force_num_warps`` overrides the tuned
+    launch profile (a test hook); production callers leave it None. Hardware
+    policy (E4M3 only on CUDA sm_80/sm_86 or sm_89+) is enforced once at
+    Qwen4ExpQSAAttention / Qwen4ExpQSAFlashAttentionImpl construction, not per
+    call. E4M3 storage is read by the Merlin byte decoder on sm_80/sm_86 and by
+    upstream's native float8 cast (vllm#55557) on sm_89+; both take the scalar
+    scale tensors.
 
     logical_indices is the PACKED selection buffer: [rows, selection_width + 1]
     with the trailing column holding each row's valid-entry count (written by
@@ -628,6 +636,8 @@ def qsa_sparse_paged_attention(
         raise ValueError("QSA sparse attention requires valid grouped-query heads")
     head_dim = q.shape[2]
     assert head_dim >= 16 and (head_dim & (head_dim - 1)) == 0
+    # Dispatch on K/V dtype: BF16, E4M3 bytes
+    # (sm_8x) or native E4M3 (sm_89+).
     if q.dtype != torch.bfloat16:
         raise ValueError("QSA sparse attention requires BF16 queries")
     if k_cache.dtype != v_cache.dtype:
@@ -642,15 +652,18 @@ def qsa_sparse_paged_attention(
             k_cache = k_cache.view(torch.float8_e4m3fn)
             v_cache = v_cache.view(torch.float8_e4m3fn)
         else:
+            # Present platform E4M3 storage as
+            # uint8 bytes so Triton never materializes the unsupported fp8e4nv
+            # type on SM86.
             kv_dtype = 1
-            # Present platform E4M3 storage as bytes so Triton never
-            # materializes the unsupported fp8e4nv type on SM86.
             if k_cache.dtype == fp8_dtype:
                 k_cache = k_cache.view(torch.uint8)
                 v_cache = v_cache.view(torch.uint8)
     elif k_cache.dtype == torch.float8_e5m2:
         kv_dtype = 2
     else:
+        # Unsupported cache dtypes are refused
+        # rather than run unscaled.
         raise ValueError(
             "QSA supports only BF16, uint8/E4M3, and E5M2 K/V caches"
         )
@@ -770,7 +783,9 @@ def qsa_sparse_paged_attention(
         BLOCK_M=block_m,
         BLOCK_N=block_n,
         num_warps=partial_warps,
-        num_stages=2,
+        num_stages=qsa_partial_num_stages(
+            block_n, partial_warps, num_splits, qsa_tuning_capability()
+        ),
     )
     if num_splits == 1:
         return out
@@ -807,6 +822,8 @@ def warmup_qsa_sparse_paged_attention(
     """Compile every production-reachable split-K/merge specialization."""
     head_dim = kv_cache.shape[-1] // 2
     key_cache, value_cache = kv_cache.transpose(1, 2).split(head_dim, dim=-1)
+    # Warm-up uses the same byte-view cache as
+    # serving.
     num_kv_heads = key_cache.shape[2]
     group_size = num_query_heads // num_kv_heads
     block_m = triton.next_power_of_2(group_size)
@@ -938,7 +955,9 @@ def warmup_qsa_sparse_paged_attention(
             BLOCK_M=block_m,
             BLOCK_N=block_n,
             num_warps=warps,
-            num_stages=2,
+            num_stages=qsa_partial_num_stages(
+                block_n, warps, num_splits, qsa_tuning_capability()
+            ),
             grid=(num_rows, num_kv_heads, num_splits),
         )
         if num_splits > 1:

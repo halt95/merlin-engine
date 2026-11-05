@@ -15,7 +15,7 @@ New to serving? [How to serve](how-to-serve.md) walks through it end to end, fro
 ## What a run looks like
 
 ```
-Merlin 3.0.1 setup (by Halt95)
+Merlin 3.0.2 setup (by Halt95)
   repo     ~/merlin-engine
   host     GPUs 4 x NVIDIA GeForce RTX 3090 (24 GB), P2P on, driver 595.84, RAM 96 GiB
 
@@ -60,8 +60,8 @@ Change an answer? (Enter = no, or 1-5) [no]:
 
 Downloads
   engine wheel                                                  217 MB
-    github.com/halt95/merlin-engine release merlin-v3.0.1
-  Python packages (222 from release/requirements-0.32.lock)    3.4 GiB
+    github.com/halt95/merlin-engine release merlin-v3.0.2
+  Python packages (223 from release/requirements-0.33.lock)    3.4 GiB
     PyPI via uv (cached after the first install); about 10.2 GiB installed
   checkpoint flash-next                                      115.3 GiB
     Hugging Face halt95/Qwen3.8-Flash-Next-W4A16-Merlin @ cec53e9 -> ~/models/flash-next
@@ -179,7 +179,7 @@ on `merlin serve` alike (so the cache can be turned on without running setup aga
   Ornith 1.5 has no recorded block count, so it keeps a `4g` fallback (1 GiB per rank) that is not yet verified to
   hold one restore unit. A direct recipe launch checks `MERLIN_KV_HOST_TIER_GIB` against the same per-rank minimum.
   The plan prints the per-server, per-rank and total sizes.
-  It is experimental in 3.0.1 on the Flash-Next family (MTP drafter only) and on the 27B and ThinkingCap (RecoverSSM
+  It is experimental on the Flash-Next family (MTP drafter only) and on the 27B and ThinkingCap (RecoverSSM
   path only); Ornith 1.5 accepts it on its RecoverSSM path, untested ⚫, and the plan says so. Setup saves the flag with the other answers and passes it to
   `merlin serve`; it never exports the knob itself, and `merlin serve --kv-ram-cache` overrides an exported one.
   Capacity is computed from the resolved KV layout and the restore-unit manifest. The tier is one cache with the GPU pool (the allocator demotes a block to RAM before reusing it),
@@ -189,9 +189,12 @@ on `merlin serve` alike (so the cache can be turned on without running setup aga
   tokens, any sliding-window tail, and one recurrent (GDN/PLE) state per recurrent group; the QSA ring slots never
   move. The unit size comes from the resolved KV layout, so it differs per profile (about 4 GiB over four ranks on
   `fn-swift1.5-quad-3090`; the engine logs the exact figure). The cache needs room for at least one 262K restore
-  unit. Sizes below the minimum above are refused. Sizes above 160g are untested ⚫ and the plan says so.
+  unit. Sizes below the minimum above are refused. Sizes above 48g are untested ⚫ and the plan says so (48g is the largest size with a recorded run).
   The cache locks its memory and fails closed when it cannot (the refusal says so): under systemd set
   `LimitMEMLOCK=infinity`; in a container run `ulimit -l unlimited`, or use a privileged LXC or CAP_IPC_LOCK.
+- `--context SIZE` (experimental) serves this many tokens per request (`512k` = 524,288) and is saved per model; Enter
+  and `--yes` keep native. Setup checks the layout's KV pool before downloading; the YaRN recipe is built from the
+  checkpoint's `config.json` at serve time.
 - `--swarm` (experimental) serves the row's tested high-concurrency cap instead of its default: up to 24 sessions on the
   Flash-Next 4 x 3090 profiles (default 8), 32 on the 27B quad card, TP4 (default 24). The cap was tested with the KV RAM
   cache at 48g (12 GiB per rank over four ranks), so `--swarm` needs that: without `--kv-ram-cache` setup and `merlin
@@ -218,9 +221,27 @@ on `merlin serve` alike (so the cache can be turned on without running setup aga
   unverified; `merlin verify <folder>-int6 --ple int6` re-hashes the checkpoint and the pack and checks the overlay.
   A container must mount the common parent of the checkpoint, the pack and the overlay (e.g. `-v ~/models:/models`),
   or the relative links do not resolve. `merlin serve` refuses an INT6 checkpoint without `--ple int6`; `--ple fp8`
-  drops a saved `int6`. There is no INT4 table, and the table is never read from disk or the page cache.
+  drops a saved `int6`. There is no INT4 table.
+- `--ple-store ram|disk` picks where the PLE table lives (experimental). `ram` is the default. `disk` reads rows from the
+  checkpoint's own files through the page cache, so the server no longer holds the table (47.68 GiB FP8, 38.74 GiB INT6):
+  in our run free memory after startup was 47.7-47.8 GiB (FP8) and 38.8-38.9 GiB (INT6) higher than with `ram`, and the
+  output was token for token identical at temperature 0. It costs speed: decode is about 2 % slower once the table is
+  cached (median +1.8 % FP8, +2.3 % INT6; up to about 5 % on all-new random text at 262K), 9-11 % slower on the first send of
+  a text whose rows are not cached yet (+9 % FP8, +11 % INT6; about +3 % on the second send), and the first token of a cold
+  262K prompt takes +7 % to +53 % longer with FP8 and +16 % with INT6; cached, it is unchanged. With a large
+  `--kv-ram-cache` (96g on a 152 GiB host) the table never fully warms: about +10-11 % decode at 262K and +15-30 % first
+  token for as long as it runs. Measured with the FP8 table and the INT6 pack on 4 x RTX 3090 and one Gen4 NVMe; other disks
+  and layouts are untested ⚫, and a slower disk will cost more. The figures were measured on the 0.32 tree; the 0.33 re-run
+  has not been done for 3.0.2. Setup asks after the models folder, for the Flash-Next
+  family, only when every table file is on local NVMe; elsewhere it says why in one line and stays on RAM. Enter always
+  means RAM; the question says so when your flags would not fit with the table in RAM and would fit on NVMe. `--yes` never
+  asks. A saved `disk` is checked on every run and goes back to RAM once the table (with `--ple int6`, the pack) is no
+  longer on NVMe; an explicit `--ple-store disk` stays, and `merlin serve --ple-store disk` on other storage warns and runs.
+  The table is read once after startup only if the free memory, less any KV RAM cache and 4 GiB, can hold all of it. Do not
+  write to, touch, `chmod`, link, move or remove the table's files while the server runs: the server stops when it sees
+  one change. [How to serve](how-to-serve.md#the-ple-table-on-nvme-experimental) has the full table and its limits.
 
-The host-RAM check adds, per server, the table, the rest of the server (the measured FP8 floor less the FP8 table: about
+The host-RAM check adds, per server, the table (none under `--ple-store disk`, with a warning below 16 GiB of page cache), the rest of the server (the measured FP8 floor less the FP8 table: about
 21.3 GiB at four workers, plus 2 GiB per worker above four) and the cache, and refuses flags that do not fit, naming the
 largest `--kv-ram-cache` that would:
 
@@ -237,6 +258,12 @@ host booted and passed 262K, while 64 GiB was OOM-killed at boot, so a 64 GB hos
 below the floor; `MERLIN_SKIP_RAM_CHECK=1` keeps it a warning). The other rows are estimates from
 that floor and the measured 9 GiB table difference (67 vs 58 GiB used on the reference host); none has booted
 under a capped container yet, so setup warns on them.
+
+With `--ple-store disk` the resident need is the figure above less the PLE table (about 21 GiB at four workers with FP8 and
+no cache), computed and not booted on a capped host; the run measured the table's share (free memory rose by 47.7-47.8 GiB with
+FP8 and 38.8-38.9 GiB with INT6, on a 152 GiB host). The table then sits in the page cache, which counts as free memory
+and which the kernel can take back. For the table to stay warm, the free memory left after the server and the KV RAM cache
+must hold it (about 48 GiB with FP8, 39 GiB with INT6, plus 4 GiB of headroom); otherwise it is read as requests need it.
 
 ## Drafter: MTP or DFlash2
 
@@ -261,10 +288,11 @@ than their class the DFlash2 pin is lowered the same way as the MTP one and the 
 | `--simulate SPEC` | run the checks and plan against preflight's fabricated hardware (`4x3090`, `2x3090:ram=64`, `4x4090:nop2p`, ...); implies `--dry-run` unless `--no-start` (nothing ever starts on simulated hardware) |
 | `--no-start` | install and download, then stop before `merlin serve` |
 | `--rehash` | hash every checkpoint file again even when the verified marker is current |
-| `--kv-ram-cache SIZE` | Flash-Next and the 27B (both experimental in 3.0.1: a session evicted under heavy concurrent prefill may recompute, output identical) and Ornith 1.5 (untested ⚫): a host-RAM cache for evicted prefix KV blocks (restored instead of recomputed; no extra context or sessions; never disk), SIZE GiB per server (`24g`, `24gib`, `24`; `0` = off), split evenly over its ranks; also on `merlin serve` |
+| `--kv-ram-cache SIZE` | Flash-Next and the 27B (both experimental: a session evicted under heavy concurrent prefill may recompute, output identical) and Ornith 1.5 (untested ⚫): a host-RAM cache for evicted prefix KV blocks (restored instead of recomputed; no extra context or sessions; never disk), SIZE GiB per server (`24g`, `24gib`, `24`; `0` = off), split evenly over its ranks; also on `merlin serve` |
 | `--swarm` / `--no-swarm` | Flash-Next 4 x 3090 and 27B quad-card rows (experimental): the row's tested high-concurrency cap, 24 / 32 sessions instead of 8 / 24, with the KV RAM cache set to the tested 48g unless `--kv-ram-cache` gives at least that; a smaller cache is refused; also on `merlin serve --swarm` |
 | `--spec mtp\|dflash2` | Flash-Next: the drafter, `mtp` (default) or `dflash2` (+5-18 % decode, 3 x 262K only; downloads the drafter); also on `merlin serve` |
 | `--ple fp8\|int6` | Flash-Next: the PLE table, `fp8` (default) or `int6` (INT6 g32: the family pack laid over the FP8 checkpoint as `<folder>-int6`; flash-next and swift1.5 only, swift1.5-huihui not yet qualified); also on `merlin serve` and `merlin pull` |
+| `--ple-store ram\|disk` | Flash-Next: where the PLE table lives, `ram` (default) or `disk` (experimental: read from the checkpoint's files on NVMe, frees the table's host RAM, about 2 % slower decode once cached, 9-11 % on text not read before; measured on 4 x RTX 3090 with one NVMe, other setups untested ⚫); also on `merlin serve` |
 | `--from-source` | compile the engine (about 1.5 h on 8 cores) instead of taking the release wheel |
 | `--help` | the option list |
 
@@ -286,7 +314,7 @@ question; a saved re-run asks nothing). An unknown size is shown as unknown, nev
 - the engine wheel from the GitHub release `merlin-v<version>` named by `release/merlin-wheel.sha256`, verified against
   that sha256 (a wrong file is deleted, not installed); `curl -C -` resumes a partial download; the asset name with
   `+`, its `%2B` form and the `.` form GitHub may rename it to are all tried;
-- the Python packages of `release/requirements-0.32.lock` (222 pins with hashes), fetched by uv and cached, so a
+- the Python packages of `release/requirements-0.33.lock` (223 pins with hashes), fetched by uv and cached, so a
   reinstall takes them from the cache;
 - the checkpoint, by the venv's `hf download` (resumable), pinned to one revision: the one `checkpoint.sha256` or
   `release/download-sizes.json` records. A checkpoint whose Hugging Face repository is not public yet

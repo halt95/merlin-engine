@@ -16,6 +16,7 @@ from filelock import FileLock
 from vllm.logger import init_logger
 from vllm.triton_utils.autotune_cache import (
     META_FILE,
+    QUALIFIED_TRITON_VERSION,
     SCHEMA,
     cache_identity,
     cache_root,
@@ -105,8 +106,9 @@ def _patch_native(native, fingerprint_for, is_capturing) -> None:
     init_signature = inspect.signature(original_init)
     if "cache_results" not in init_signature.parameters:
         raise RuntimeError("unsupported Triton autotuner: no cache_results")
-    # Triton 3.7.1 names the second parameter ``tuning_key``; the call site in
-    # Autotuner.run passes all three positionally, so only the shape matters.
+    # Triton 3.7.1 and 3.8.0 name the second parameter ``tuning_key``
+    # (3.8.0 autotuner.py:175); Autotuner.run passes all three positionally
+    # (:249), so only the shape matters.
     check_params = list(inspect.signature(original_check).parameters)
     if len(check_params) != 4 or check_params[0] != "self" or check_params[1] not in (
         "key", "tuning_key"
@@ -249,8 +251,11 @@ def enable_persisted_autotune(config) -> None:
     import triton
     import triton.runtime.autotuner as native
 
-    if triton.__version__ != "3.7.1":
-        raise RuntimeError("persisted autotuning requires qualified Triton 3.7.1")
+    if triton.__version__ != QUALIFIED_TRITON_VERSION:
+        raise RuntimeError(
+            "persisted autotuning requires qualified Triton "
+            f"{QUALIFIED_TRITON_VERSION}; found {triton.__version__}"
+        )
     target = triton.runtime.driver.active.get_current_target()
     if target.backend != "cuda" or target.arch != 86:
         raise RuntimeError("persisted autotuning requires qualified CUDA sm_86")
@@ -288,7 +293,8 @@ def enable_persisted_autotune(config) -> None:
     _patch_native(native, fingerprint_for, torch.cuda.is_current_stream_capturing)
     _installed = True
     logger.info(
-        "autotune: native persistence enabled triton=3.7.1 arch=sm_86 "
+        "autotune: native persistence enabled triton=%s arch=sm_86 "
         "cache_identity=%s",
+        QUALIFIED_TRITON_VERSION,
         config.triton_autotune_cache_identity,
     )

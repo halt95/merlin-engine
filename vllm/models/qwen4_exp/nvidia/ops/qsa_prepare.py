@@ -23,7 +23,6 @@ _GUARD_MAX_ENC = tl.constexpr(guard_telemetry.GUARD_MAX_ENCODABLE)
 _GUARD_MIN_ENC = tl.constexpr(guard_telemetry.GUARD_MIN_ENCODABLE)
 
 
-
 @triton.jit
 def _norm_rope(
     x,
@@ -53,9 +52,10 @@ def _norm_rope(
         bad_h = (pos_h < 0) | (pos_h >= cos_sin_rows)
         bad_w = (pos_w < 0) | (pos_w >= cos_sin_rows)
     else:
-        # the non-mrope branch reads only pos_t (:63-66), and with NO mask at
+        # the non-mrope branch reads only pos_t, and with NO mask at
         # all, which is why this guard clamps rather than masks.
-        # always-false, but correctly shaped and typed for the max below.
+        # This mask is always false, but correctly shaped and typed for the
+        # max below.
         bad_h = pos_h < pos_h
         bad_w = pos_w < pos_w
     guard_bad = bad_t | bad_h | bad_w
@@ -248,8 +248,8 @@ def _qsa_prepare_kernel(
     num_requests,  # bounds-guard instrumentation
     guard_ctr,  # bounds-guard instrumentation: persistent int64[3]
     ring_skip_ctr,  # ring-skip telemetry, persistent int64[3], SITE_QSA_RING_SKIP
-    ring_uncommitted_ctr,  # ring-row tag fix, persistent int64[3], SITE_QSA_RING_UNCOMMITTED
-    layer_id,  # ring-row tag fix: named in the uncommitted-row record only
+    ring_uncommitted_ctr,  # ring-row tag check, persistent int64[3], SITE_QSA_RING_UNCOMMITTED
+    layer_id,  # named in the uncommitted-row record only
     HQ: tl.constexpr,
     D: tl.constexpr,
     TILE_T_Q: tl.constexpr,
@@ -511,12 +511,11 @@ def _qsa_prepare_kernel(
                 + safe_state_block * state_cache_stride_block
                 + (source_positions % STATE_SIZE)[:, None] * state_cache_stride_token
             )
-            # Ring-row tag fix: EVERY historical source row must carry the tag the
-            # writer stores for exactly this logical position, before anything
-            # reads its key or its position tail. A missing ring block (state
-            # table entry out of range) reads tag 0 and fails the same way --
-            # before the ring-row tag fix it pooled zeros silently. In-chunk rows come from
-            # this launch's own k and are never checked.
+            # EVERY historical source row must carry the tag the writer stores
+            # for exactly this logical position, before anything reads its key
+            # or its position tail. A missing ring block (state table entry
+            # out of range) reads tag 0 and fails the same check. In-chunk rows
+            # come from this launch's own k and are never checked.
             historical = valid & ~source_in_chunk
             source_tags = tl.load(
                 (
@@ -689,8 +688,8 @@ def _qsa_prepare_kernel(
                 # Ring-skip telemetry: a live token whose slot fails the range check
                 # has its ring row silently NOT written (every store below is
                 # masked by valid_slot). That token's raw key is then absent
-                # from the ring the next step reads (a candidate cause). Count
-                # it -- the write stays skipped, the reconciliation is the ring-row tag fix.
+                # from the ring the next step reads. Count it; the write stays
+                # skipped.
                 # slot == -1 is the PAD sentinel (upstream #56734: idx_mapping == -1
                 # is a CUDA-graph padding request row, whose state slot is -1). It
                 # is still skipped (valid_slot is False) but is not a fault, so it
@@ -743,7 +742,7 @@ def _qsa_prepare_kernel(
                     tl.store(tail, pos_t.to(tl.int64), mask=valid_slot)
                     tl.store(tail + 1, pos_h.to(tl.int64), mask=valid_slot)
                     tl.store(tail + 2, pos_w.to(tl.int64), mask=valid_slot)
-                # Ring-row tag fix: the tag names the logical position this row now
+                # Ring-row tag: the tag names the logical position this row now
                 # holds, taken from the authoritative per-token metadata (not
                 # re-derived from chunk arithmetic), stored after key + tail.
                 # Every committed row gets one, with or without RoPE positions.
@@ -813,7 +812,7 @@ def qsa_prepare(
     """Normalize Q, compress K, then update the circular raw state.
 
     ``state_cache`` rows are ``[key D bf16 | 4 int64: pos_t, pos_h, pos_w, tag]``
-    (``QSAKeyStateCache``, ring-row tag fix); the tail is present with or without
+    (``QSAKeyStateCache``); the tail is present with or without
     ``rope_pos_offset``. ``layer_id`` only labels the uncommitted-row record.
 
     With the ``main_*`` operands (all or none), the same launch also prepares

@@ -16,7 +16,9 @@ def commit_after_propose_eligibility(
     what the deferred tail writes or write what it reads:
 
     - a RecoverSSM model state that supports the deferral;
-    - no PP (non-last ranks defer their commits differently);
+    - no PP, or the LAST PP rank (non-last ranks defer their commits to the
+      PP broadcast pp_size steps later; the last rank's commit is an ordinary,
+      non-deferred commit, so the proof below holds there unchanged);
     - no PCP (the proposal re-gathers the batch-order block tables, a commit
       input);
     - a model-based drafter with an INITIALIZED attention-group inventory
@@ -24,8 +26,9 @@ def commit_after_propose_eligibility(
       empty or differently shaped inventory is not evidence of safety."""
     if speculator is None:
         return False, "no speculator"
-    if pp_handler is not None:
-        return False, "pipeline parallelism"
+    # Only the non-last PP ranks are refused.
+    if pp_handler is not None and not getattr(pp_handler, "is_last_rank", False):
+        return False, "pipeline parallelism (non-last rank)"
     if pcp_manager is not None:
         return False, "prefill context parallelism"
     if getattr(model_state, "recoverssm", None) is None:

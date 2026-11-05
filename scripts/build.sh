@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright 2026 halt95 (Merlin modifications)
 # Merlin 3.0.0 compatibility entry point for release/build-wheel.sh (the engine wheel).
 # Arguments: [OUTPUT_DIR].
 # Environment setup is release/install-env.sh; this command does not create a venv.

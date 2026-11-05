@@ -1,5 +1,6 @@
 /*
  * Modified by Neural Magic
+ * Modified by the Merlin project; see NOTICE.
  * Copyright (C) Marlin.2024 Elias Frantar
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -59,7 +60,9 @@ torch::stable::Tensor marlin_gemm(
     std::optional<torch::stable::Tensor> const& b_zeros_or_none,
     torch::stable::Tensor& workspace, vllm::ScalarTypeId const& b_type_id,
     int64_t size_m, int64_t size_n, int64_t size_k, bool use_atomic_add,
-    bool use_fp32_reduce, bool is_zp_float) {
+    // The thread-config overrides default to -1 (auto) in the schema.
+    bool use_fp32_reduce, bool is_zp_float, int64_t thread_k_override,
+    int64_t thread_n_override) {
   STD_TORCH_CHECK_NOT_IMPLEMENTED(false,
                                   "marlin_gemm(..) requires CUDA_ARCH >= 7.5");
   return torch::stable::empty({1, 1});
@@ -323,7 +326,15 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
     exec_config_t exec_cfg;
     thread_config_t thread_tfg;
     if (thread_k != -1 && thread_n != -1) {
-      thread_tfg = thread_config_t{thread_k, thread_n, default_threads};
+      // Only the generated tile families are accepted.
+      const bool compiled =
+          (thread_k == 64 && thread_n == 128) ||
+          (thread_k == 128 && thread_n == 64) ||
+          (thread_m_blocks == 1 && thread_k == 128 && thread_n == 128) ||
+          (thread_m_blocks > 1 && thread_k == 64 && thread_n == 256);
+      STD_TORCH_CHECK(compiled, "Uncompiled Marlin dense tile for sublaunch");
+      thread_tfg =
+          thread_config_t{thread_k, thread_n, thread_k * thread_n / 64};
       exec_cfg = exec_config_t{1, thread_tfg};
       STD_TORCH_CHECK(prob_n % thread_n == 0, "prob_n = ", prob_n,
                       " is not divisible by thread_n = ", thread_n);
@@ -429,7 +440,9 @@ torch::stable::Tensor marlin_gemm(
     std::optional<torch::stable::Tensor> const& b_zeros_or_none,
     torch::stable::Tensor& workspace, vllm::ScalarTypeId const& b_type_id,
     int64_t size_m, int64_t size_n, int64_t size_k, bool use_atomic_add,
-    bool use_fp32_reduce, bool is_zp_float) {
+    // The thread-config overrides default to -1 (auto) in the schema.
+    bool use_fp32_reduce, bool is_zp_float, int64_t thread_k_override,
+    int64_t thread_n_override) {
   vllm::ScalarTypeId a_type_id, c_type_id, s_type_id;
 
   auto c_scalar_type = a.scalar_type();
@@ -554,10 +567,35 @@ torch::stable::Tensor marlin_gemm(
 
   // thread_k: `k` size of a thread_tile in `weights` (can usually be left as
   // auto -1)
-  int thread_k = -1;
+  // A pinned tile is accepted only for channelwise W8A16 with the FP32 reduce.
+  const bool pinned = thread_k_override != -1 || thread_n_override != -1;
+  if (pinned) {
+    STD_TORCH_CHECK(
+        (thread_k_override == 64 || thread_k_override == 128) &&
+            (thread_n_override == 64 || thread_n_override == 128 ||
+             thread_n_override == 256),
+        "Invalid Marlin dense tile");
+    int major, minor;
+    cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor,
+                           a.get_device_index());
+    cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor,
+                           a.get_device_index());
+    const int sm = major * 10 + minor;
+    STD_TORCH_CHECK(
+        (sm == 80 || sm == 86 || sm == 89) &&
+            a_type == vllm::kBFloat16 && b_type == vllm::kU8B128 &&
+            b_scales.dim() == 2 && b_scales.size(0) == 1 &&
+            !b_bias_or_none.has_value() &&
+            (!b_zeros_or_none.has_value() || b_zeros_or_none->numel() == 0) &&
+            !use_atomic_add && use_fp32_reduce && !is_zp_float,
+        "Marlin dense override requires sm80/86/89 BF16 channelwise W8A16 "
+        "without bias, zero points or atomic reduction");
+  }
+  int thread_k = static_cast<int>(thread_k_override);
   // thread_n: `n` size of a thread_tile in `weights` (can usually be left as
   // auto -1)
-  int thread_n = -1;
+  // thread_n stays at -1 (auto) when the override is disabled.
+  int thread_n = static_cast<int>(thread_n_override);
   // sms: number of SMs to use for the kernel
   int sms = -1;
   const int32_t device_index = a.get_device_index();

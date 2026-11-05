@@ -9,7 +9,7 @@
  },
  "reference": {
   "note": "The 27B launchers are the recipe under models/qwen38-27b/ and are not rendered here; every number below is read from those launchers' header comments, not re-measured here.",
-  "public_release": "27B v1.3.1"
+  "public_release": "Merlin 3.0.2 recipe, checkpoint public on Hugging Face (halt95/Qwen3.8-27B-W4A16-Merlin, pinned revision 7a0af39f63dd4fb0733c23d3ec126762074a503f); tested on the reference host per the 2026-11-02 bench card (models/qwen38-27b/benchmarks/2026-11-02/BENCH-CARD.md)"
  },
  "profiles": [
   {
@@ -55,12 +55,12 @@
     "pool_tokens": 271506,
     "fit_262k": 1,
     "fit_131k": 2,
-    "basis": "KV pin = 290 whole blocks of 33,423,360 B (17 attention layers x 960 tokens x 2,048 B). The 0.32 engine reports 271,506 tokens for this pin (2026-10-21): one 262K session or two 131K sessions resident. Measured at this row's release check (2026-10-21).",
+    "basis": "KV pin = 290 whole blocks of 33,423,360 B (17 attention layers x 960 tokens x 2,048 B). On the 0.32 engine (Merlin 3.0.0) this pin gave 271,506 tokens (2026-10-21): one 262K session or two 131K sessions resident. Measured at this row's release check (2026-10-21).",
     "kv_blocks": 290
    },
    "p2p": "Not needed (one card).",
    "evidence": [
-    "Single-card recipe qualified as 27B v1.1.0 on the reference host at a 1,048,576-pixel image cap (KV pin 290 blocks), then parked in v1.3.x; re-expressed for the 0.32 engine as models/qwen38-27b/serve-1card.sh.",
+    "Single-card recipe qualified as 27B v1.1.0 on the reference host at a 1,048,576-pixel image cap (KV pin 290 blocks), then parked; re-expressed as models/qwen38-27b/serve-1card.sh.",
     "2026-10-21, 0.32 engine, KV pin 9,692,774,400 B (pool 271,506 tokens: one 262K or two 131K sessions): without the single-card settings the card runs out of memory at 3 MP (27 MiB free). With them, 4 MP passes at one and two sequences and after a 262K needle with 563 MiB (a second 3090 host) / 558 MiB (reference host) minimum free, sampled every 100 ms (bar 524 MiB), 6 of 6 rounds; text identity vs the base launch, seeded-image identity and the 262K needle OK; GSM8K-200 194/200. 8 MP stays short (483 / 478 MiB).",
     "The in-place vision rotary is bit-identical to the copying path on an RTX 3090 (production geometry, 6 of 6 cases)."
    ],
@@ -121,12 +121,12 @@
     "basis": "Launcher header (883 whole blocks per card): three 262K or six 131K sessions resident, at K=4.",
     "kv_blocks": 883
    },
-   "p2p": "Required for the tested numbers: P2P=on (this row's default) sets VLLM_SKIP_P2P_CHECK=1 NCCL_P2P_LEVEL=SYS. Without peer-to-peer, merlin serve picks 27b-tp2-3090-nop2p, or run this row with P2P=off. Bench numbers are measured with the Zagitta gpu-unlock kernel module plus P2P (3.0.1 on). RTX 3090s without P2P have no run on this release; the no-P2P passes were on cloud-hosted machines (see this row's evidence and 27b-tp2-3090-nop2p).",
+   "p2p": "Required for the tested numbers: P2P=on (this row's default) sets VLLM_SKIP_P2P_CHECK=1 NCCL_P2P_LEVEL=SYS. Without peer-to-peer, merlin serve picks 27b-tp2-3090-nop2p, or run this row with P2P=off. Bench numbers are measured with the Zagitta gpu-unlock kernel module plus P2P. RTX 3090s without P2P have no run on this release; the no-P2P passes were on cloud-hosted machines (see this row's evidence and 27b-tp2-3090-nop2p).",
    "evidence": [
-    "Qualified on the reference host: 4 x RTX 3090 at 220 W, PCIe Gen4 x16, with peer-to-peer (27B v1.3.1 release)."
+    "Qualified on the reference host: 4 x RTX 3090 at 220 W, PCIe Gen4 x16, with peer-to-peer (bench card models/qwen38-27b/benchmarks/2026-10-20)."
    ],
    "notes": [
-    "Pins and sequence caps are the K=4 figures of v1.3.1; the older K=3 numbers (794,351 tokens, seqs 32) belong to v1.0.x.",
+    "Pins and sequence caps are the K=4 figures.",
     "Images are capped at 8,388,608 pixels (8 MP) by default (MAX_PIXELS).",
     "RecoverSSM: the TP2 launcher serves --use-replayssm with --mamba-cache-mode align on Model Runner V2 (MTP + prefix caching); the 960-token block and 883-block pin are RecoverSSM-on K=4 figures. Align commits need the single-traversal fix; dense Qwen3.5 refuses Model Runner V1."
    ],
@@ -184,7 +184,7 @@
     "None on RTX 3090s without P2P on this release. On the older v1.3.0 engine (not 3.0.x), 2 x RTX 3090 (cloud-hosted, 2026-10-09) with P2P off (NCCL_P2P_DISABLE=1, PCIe 3.0 x16) ran the TP2 layout: 262K 3-needle 3/3, 255K thinking-on decode 81.5 tok/s, GSM8K 97/100. The TP2 layout ran without P2P on other hardware: 2 x CMP 170HX 64 GB (27b-tp2-sm80-64g, 2026-10-18: needles exact at 32K-262K, GSM8K-50 48/50) and 4 x CMP 170HX as two TP2 servers (523 tok/s for eight 16K agents)."
    ],
    "notes": [
-    "Pins and sequence caps are the K=4 figures of v1.3.1; the older K=3 numbers (794,351 tokens, seqs 32) belong to v1.0.x.",
+    "Pins and sequence caps are the K=4 figures.",
     "Images are capped at 8,388,608 pixels (8 MP) by default (MAX_PIXELS).",
     "RecoverSSM: the TP2 launcher serves --use-replayssm with --mamba-cache-mode align on Model Runner V2 (MTP + prefix caching); the 960-token block and 883-block pin are RecoverSSM-on K=4 figures. Align commits need the single-traversal fix; dense Qwen3.5 refuses Model Runner V1."
    ],
@@ -248,7 +248,7 @@
    },
    "p2p": "Required for the tested numbers (four-way P2P); same environment lines as TP2.",
    "evidence": [
-    "Qualified on the reference host: 4 x RTX 3090 at 220 W, PCIe Gen4 x16, with peer-to-peer (27B v1.3.1 release).",
+    "Qualified on the reference host: 4 x RTX 3090 at 220 W, PCIe Gen4 x16, with peer-to-peer (bench card models/qwen38-27b/benchmarks/2026-10-20).",
     "Merlin 3.0.0 release bench card (2026-10-20, release wheel, RecoverSSM on; models/qwen38-27b/benchmarks/2026-10-20, four cards): pool 2,012,105, decode 252.4 / 235.4 / 224.0 tok/s at 32K / 131K / 259K (thinking on), 7 x 262K and 14 x 131K resident with 0 preemptions, 8 agents 752 tok/s, GSM8K-200 197/200, needles 5/5 at 131K and 12/12 at 262K; 8 MP image headroom at chunk 4096: 862 MiB lowest free (one image, two at once, four in one prompt).",
     "Supporting: the pre-release bench run (2026-10-17, RecoverSSM on): 27B pair PASS, decode 198.7 / 172.6 / 157.7 tok/s at 32K / 131K / 258K; ThinkingCap check PASS, 32/32 checks."
    ],
@@ -371,12 +371,12 @@
     "pool_tokens": 271506,
     "fit_262k": 1,
     "fit_131k": 2,
-    "basis": "Same KV pin as 27b-tp1-3090 (per-card bytes unchanged), so the pool is that row's by construction; cards with more VRAM than 24 GiB leave the extra as headroom (image peak, transients), not as a larger pool. Not measured on sm_89. PROVISIONAL (sizing method of the TP2 launcher, not measured on 0.32): KV pin = 290 whole blocks of 33,423,360 B (17 attention layers x 960 tokens x 2,048 B); vLLM logged 271,506 tokens for this pin on the v1.1.0 single card: one 262K session or two 131K sessions resident.",
+    "basis": "Same KV pin as 27b-tp1-3090 (per-card bytes unchanged), so the pool is that row's by construction; cards with more VRAM than 24 GiB leave the extra as headroom (image peak, transients), not as a larger pool. Not measured on sm_89. PROVISIONAL (sizing method of the TP2 launcher, not measured): KV pin = 290 whole blocks of 33,423,360 B (17 attention layers x 960 tokens x 2,048 B); vLLM logged 271,506 tokens for this pin on the v1.1.0 single card: one 262K session or two 131K sessions resident.",
     "kv_blocks": 290
    },
    "p2p": "Not needed (one card).",
    "evidence": [
-    "4 x RTX 4090, measured 2026-10-18: 262K prefill ran out of memory at max_num_batched_tokens 1024 (GPU 0 at 23.50 of 23.52 GiB); the row now ships 512. At 512 a diagnosis run on the same card passed the 262K and 131K needles (269.5 s / 90.9 s); the full lane was not re-run."
+    "4 x RTX 4090, measured 2026-10-18: 262K prefill ran out of memory at max_num_batched_tokens 1024 (GPU 0 at 23.50 of 23.52 GiB); the row ships 512, which passed the 262K and 131K needles (269.5 s / 90.9 s) on the same card; the full lane was not re-run."
    ],
    "notes": [
     "Vision tower weights live in host RAM (--cpu-offload-gb 1 --cpu-offload-params visual); one image per prompt, capped at 4,194,304 pixels (4 MP; MAX_PIXELS) with VLLM_MERLIN_VISION_PEAK=1. One card keeps the 262K KV pin and takes 4 MP, not the 8 MP of the multi-card layouts.",
@@ -443,7 +443,7 @@
     "Testing: the runs above were on cloud-hosted hardware; kernel parity qualification is still to run."
    ],
    "notes": [
-    "Pins and sequence caps are the K=4 figures of v1.3.1; the older K=3 numbers (794,351 tokens, seqs 32) belong to v1.0.x.",
+    "Pins and sequence caps are the K=4 figures.",
     "Images are capped at 8,388,608 pixels (8 MP) by default (MAX_PIXELS).",
     "RecoverSSM: the TP2 launcher serves --use-replayssm with --mamba-cache-mode align on Model Runner V2 (MTP + prefix caching); the 960-token block and 883-block pin are RecoverSSM-on K=4 figures. Align commits need the single-traversal fix; dense Qwen3.5 refuses Model Runner V1.",
     "sm_89 row: untested / community-validated. The 8 MP image floor is unchanged and never lowered; on a 24 GiB card the headroom is as thin as on the 3090 (TP2 stress minimum 506-806 MiB), and the 32 and 48 GB classes only add margin."
@@ -563,7 +563,7 @@
     "pool_tokens": 271506,
     "fit_262k": 1,
     "fit_131k": 2,
-    "basis": "Same KV pin as 27b-tp1-3090 (per-card bytes unchanged), so the pool is that row's by construction; cards with more VRAM than 24 GiB leave the extra as headroom (image peak, transients), not as a larger pool. Not measured on sm_89. PROVISIONAL (sizing method of the TP2 launcher, not measured on 0.32): KV pin = 290 whole blocks of 33,423,360 B (17 attention layers x 960 tokens x 2,048 B); vLLM logged 271,506 tokens for this pin on the v1.1.0 single card: one 262K session or two 131K sessions resident.",
+    "basis": "Same KV pin as 27b-tp1-3090 (per-card bytes unchanged), so the pool is that row's by construction; cards with more VRAM than 24 GiB leave the extra as headroom (image peak, transients), not as a larger pool. Not measured on sm_89. PROVISIONAL (sizing method of the TP2 launcher, not measured): KV pin = 290 whole blocks of 33,423,360 B (17 attention layers x 960 tokens x 2,048 B); vLLM logged 271,506 tokens for this pin on the v1.1.0 single card: one 262K session or two 131K sessions resident.",
     "kv_blocks": 290
    },
    "p2p": "Not needed (one card).",
@@ -632,7 +632,7 @@
     "None on 32 GB Ada cards; the 24 GB pin ran on 4 x RTX 4090 24 GB (measured 2026-10-18)."
    ],
    "notes": [
-    "Pins and sequence caps are the K=4 figures of v1.3.1; the older K=3 numbers (794,351 tokens, seqs 32) belong to v1.0.x.",
+    "Pins and sequence caps are the K=4 figures.",
     "Images are capped at 8,388,608 pixels (8 MP) by default (MAX_PIXELS).",
     "RecoverSSM: the TP2 launcher serves --use-replayssm with --mamba-cache-mode align on Model Runner V2 (MTP + prefix caching); the 960-token block and 883-block pin are RecoverSSM-on K=4 figures. Align commits need the single-traversal fix; dense Qwen3.5 refuses Model Runner V1.",
     "sm_89 row: untested / community-validated. The 8 MP image floor is unchanged and never lowered; on a 24 GiB card the headroom is as thin as on the 3090 (TP2 stress minimum 506-806 MiB), and the 32 and 48 GB classes only add margin."
@@ -749,7 +749,7 @@
     "pool_tokens": 271506,
     "fit_262k": 1,
     "fit_131k": 2,
-    "basis": "Same KV pin as 27b-tp1-3090 (per-card bytes unchanged), so the pool is that row's by construction; cards with more VRAM than 24 GiB leave the extra as headroom (image peak, transients), not as a larger pool. Not measured on sm_89. PROVISIONAL (sizing method of the TP2 launcher, not measured on 0.32): KV pin = 290 whole blocks of 33,423,360 B (17 attention layers x 960 tokens x 2,048 B); vLLM logged 271,506 tokens for this pin on the v1.1.0 single card: one 262K session or two 131K sessions resident.",
+    "basis": "Same KV pin as 27b-tp1-3090 (per-card bytes unchanged), so the pool is that row's by construction; cards with more VRAM than 24 GiB leave the extra as headroom (image peak, transients), not as a larger pool. Not measured on sm_89. PROVISIONAL (sizing method of the TP2 launcher, not measured): KV pin = 290 whole blocks of 33,423,360 B (17 attention layers x 960 tokens x 2,048 B); vLLM logged 271,506 tokens for this pin on the v1.1.0 single card: one 262K session or two 131K sessions resident.",
     "kv_blocks": 290
    },
    "p2p": "Not needed (one card).",
@@ -818,7 +818,7 @@
     "None on 48 GB Ada cards; the 24 GB pin ran on 4 x RTX 4090 24 GB (measured 2026-10-18)."
    ],
    "notes": [
-    "Pins and sequence caps are the K=4 figures of v1.3.1; the older K=3 numbers (794,351 tokens, seqs 32) belong to v1.0.x.",
+    "Pins and sequence caps are the K=4 figures.",
     "Images are capped at 8,388,608 pixels (8 MP) by default (MAX_PIXELS).",
     "RecoverSSM: the TP2 launcher serves --use-replayssm with --mamba-cache-mode align on Model Runner V2 (MTP + prefix caching); the 960-token block and 883-block pin are RecoverSSM-on K=4 figures. Align commits need the single-traversal fix; dense Qwen3.5 refuses Model Runner V1.",
     "sm_89 row: untested / community-validated. The 8 MP image floor is unchanged and never lowered; on a 24 GiB card the headroom is as thin as on the 3090 (TP2 stress minimum 506-806 MiB), and the 32 and 48 GB classes only add margin."
@@ -1005,7 +1005,7 @@
     "None: no 27B run on RTX A6000 / A40 48 GB. The pin is the 3090 sizing applied to this card's VRAM; the sm_86 series patches apply (same arch as the 3090)."
    ],
    "notes": [
-    "Sequence caps are the K=4 figures of v1.3.1; the older K=3 numbers (794,351 tokens, seqs 32) belong to v1.0.x.",
+    "Sequence caps are the K=4 figures.",
     "Images are capped at 8,388,608 pixels (8 MP) by default (MAX_PIXELS).",
     "RecoverSSM: the TP2 launcher serves --use-replayssm with --mamba-cache-mode align on Model Runner V2 (MTP + prefix caching); the 960-token block is the RecoverSSM-on K=4 figure; this row's pin is the 2,363-block estimate. Align commits need the single-traversal fix; dense Qwen3.5 refuses Model Runner V1.",
     "sm_86 48 GB row: untested / community-validated; the KV pin is a estimate (KV_BYTES overrides it)."
@@ -1191,7 +1191,7 @@
     "None on A30 24 GB. The pin is the 3090 sizing applied to this card's VRAM; the sm_86 series patches do not apply on sm_80. FP8 KV on sm_80 ran on 4 x CMP 170HX 64 GB, measured 2026-10-18: 27b-tp2-sm80-64g, needles exact, GSM8K-50 48/50."
    ],
    "notes": [
-    "Sequence caps are the K=4 figures of v1.3.1; the older K=3 numbers (794,351 tokens, seqs 32) belong to v1.0.x.",
+    "Sequence caps are the K=4 figures.",
     "Images are capped at 8,388,608 pixels (8 MP) by default (MAX_PIXELS).",
     "RecoverSSM: the TP2 launcher serves --use-replayssm with --mamba-cache-mode align on Model Runner V2 (MTP + prefix caching); the 960-token block is the RecoverSSM-on K=4 figure; this row's pin is the 883-block estimate. Align commits need the single-traversal fix; dense Qwen3.5 refuses Model Runner V1.",
     "sm_80 24 GB row: untested / community-validated; the KV pin is a estimate (KV_BYTES overrides it)."
@@ -1377,7 +1377,7 @@
     "None on CMP 170HX 32 GB. The pin is the 3090 sizing applied to this card's VRAM; the sm_86 series patches do not apply on sm_80. FP8 KV on sm_80 ran on 4 x CMP 170HX 64 GB, measured 2026-10-18: 27b-tp2-sm80-64g, needles exact, GSM8K-50 48/50."
    ],
    "notes": [
-    "Sequence caps are the K=4 figures of v1.3.1; the older K=3 numbers (794,351 tokens, seqs 32) belong to v1.0.x.",
+    "Sequence caps are the K=4 figures.",
     "Images are capped at 8,388,608 pixels (8 MP) by default (MAX_PIXELS).",
     "RecoverSSM: the TP2 launcher serves --use-replayssm with --mamba-cache-mode align on Model Runner V2 (MTP + prefix caching); the 960-token block is the RecoverSSM-on K=4 figure; this row's pin is the 1,376-block estimate. Align commits need the single-traversal fix; dense Qwen3.5 refuses Model Runner V1.",
     "sm_80 32 GB row: untested / community-validated; the KV pin is a estimate (KV_BYTES overrides it)."
@@ -1563,7 +1563,7 @@
     "None on A100 40 GB. The pin is the 3090 sizing applied to this card's VRAM; the sm_86 series patches do not apply on sm_80. FP8 KV on sm_80 ran on 4 x CMP 170HX 64 GB, measured 2026-10-18: 27b-tp2-sm80-64g, needles exact, GSM8K-50 48/50."
    ],
    "notes": [
-    "Sequence caps are the K=4 figures of v1.3.1; the older K=3 numbers (794,351 tokens, seqs 32) belong to v1.0.x.",
+    "Sequence caps are the K=4 figures.",
     "Images are capped at 8,388,608 pixels (8 MP) by default (MAX_PIXELS).",
     "RecoverSSM: the TP2 launcher serves --use-replayssm with --mamba-cache-mode align on Model Runner V2 (MTP + prefix caching); the 960-token block is the RecoverSSM-on K=4 figure; this row's pin is the 1,869-block estimate. Align commits need the single-traversal fix; dense Qwen3.5 refuses Model Runner V1.",
     "sm_80 40 GB row: untested / community-validated; the KV pin is a estimate (KV_BYTES overrides it)."
@@ -2022,7 +2022,7 @@
   }
  ],
  "launch": {
-  "note": "The 27B family shape of tools/merlin/launch.py (the v2.0.0 models/qwen38-27b/serve*.sh argv). shapes[<launch_shape>] holds what differed between the three launchers; checkpoints[] what ThinkingCap changes.",
+  "note": "The 27B family shape of tools/merlin/launch.py. shapes[<launch_shape>] holds what differed between the three launchers; checkpoints[] what ThinkingCap changes.",
   "port": 8100,
   "max_model_len": 262144,
   "max_pixels": 8388608,

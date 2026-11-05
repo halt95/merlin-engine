@@ -2,146 +2,110 @@
 # SPDX-FileCopyrightText: Copyright 2026 halt95 (Merlin modifications)
 """Persistent, cudagraph-safe counters for the bounds guards.
 
-Every bounds guard MASKS an out-of-range access so the SM cannot fault
-on it, and records that it did. A guard that masks silently turns a crash into
-a wrong answer and tells nobody, so the recording is not optional.
+Every bounds guard MASKS an out-of-range access so the SM cannot fault on it, and
+records that it did. A guard that masks silently turns a crash into a wrong
+answer and tells nobody, so the recording is not optional.
 
-DESIGN -- follows the QSA KV-clip counter (vllm/models/qwen4_exp/nvidia/qsa.py),
-the one instrument in this tree that already survives FULL cudagraph replay:
+Design (follows the QSA KV-clip counter, vllm/models/qwen4_exp/nvidia/qsa.py,
+which survives FULL cudagraph replay):
 
   * counters are PERSISTENT int64 GPU tensors, allocated eagerly by prealloc()
     from the model runner constructor, so nothing is allocated inside a capture
     and the data_ptr is stable across replays;
   * the kernels do nothing but captured atomics, so replay keeps counting;
   * a daemon thread reads them on a cadence, OFF the engine thread, so no
-    device->host sync is added anywhere on the step path;
-  * that thread is started only AFTER warmup and cudagraph capture, from
-    gpu_worker beside enable_gpu_sync_check(). See start_reader().
+    device->host sync is added on the step path. It starts only AFTER warmup and
+    cudagraph capture, from gpu_worker beside enable_gpu_sync_check() (see
+    start_reader()).
 
-A counter allocated per launch and read back inline would not work: the
-D2H aborts cudagraph capture at startup, and under replay the Python host code
-never runs, so the counter would be re-zeroed every step and never read.
-Guards 2, 3 and 4 sit inside the captured forward (QSA declares
-AttentionCGSupport.UNIFORM_BATCH).
+A counter allocated per launch and read back inline cannot work: the D2H aborts
+capture, and under replay the Python host code never runs.
 
-NEGATIVE VALUES. Slots 1 and 2 are written with tl.atomic_max into a zeroed
-buffer, so a negative row or index would be lost. Every recorded value is
-therefore stored biased by GUARD_BIAS and the reader subtracts it; a slot that
-is still 0 means "nothing recorded", which is distinguishable from a recorded
-0 (GUARD_BIAS). Kernel modules must bind the bias as a tl.constexpr -- a plain
-module-level int is not readable from a @triton.jit body.
+Negative values. Slots 1 and 2 are written with tl.atomic_max into a zeroed
+buffer, so every recorded value is stored biased by GUARD_BIAS and the reader
+subtracts it; a slot that is still 0 means "nothing recorded". Kernel modules
+bind the bias as a tl.constexpr (a plain module-level int is not readable from a
+@triton.jit body).
 
-MODES -- VLLM_E2_GUARD_MODE:
-  raise  the reader logs and arms a flag; a LATER execute_model on
-         the engine thread raises. Mirrors VLLM_RAISE_ON_LOGIT_NANS in intent:
-         a masked fault that silently returns a wrong answer is worse for a
-         serving product than a loud stop. Read check_pending below before
-         using it -- the raise is late and it is local to one rank.
-  warn   (DEFAULT) log only -- EXCEPT for the sites in
-         _ALWAYS_FATAL_SITES, which arm the raise whatever the mode says,
-         because their masked value has already been written somewhere durable.
-         USE THIS FOR LONG STRESS BOOTS.
+Modes (VLLM_E2_GUARD_MODE):
+  raise  the reader logs and arms a flag; a LATER execute_model on the engine
+         thread raises. The raise is late and local to one rank; read
+         check_pending before using it.
+  warn   (default) log only, except for the sites in _ALWAYS_FATAL_SITES, which
+         arm the raise whatever the mode says, because their masked value has
+         already been written somewhere durable.
   Any other value, "off" included, is a boot error.
 
-WHICH RUNNER. prealloc() is called from GPUModelRunner.__init__ and
-check_pending() from its execute_model, both in vllm/v1/worker/gpu/ -- the V2
-runner. On a V1 runner the counters are allocated lazily by the first guarded
-launch instead (correct, but possibly on a capturing stream) and NOTHING calls
-check_pending, so MODE=raise degrades to MODE=warn and _ALWAYS_FATAL_SITES
-never stops anything. The guards themselves still mask and count on both.
+Runner. prealloc() and check_pending() are called from the V2 runner
+(vllm/v1/worker/gpu/). On a V1 runner the counters are allocated lazily by the
+first guarded launch and nothing calls check_pending, so raise degrades to warn
+and _ALWAYS_FATAL_SITES never stops anything. The guards still mask and count.
 
-IDLE QUIESCE (always on). A reader that copies every
-_INTERVAL forever keeps every idle GPU out of its idle P-state (P2 at boost
-clocks instead of P8). So the worker wraps
-its GPU entry points (execute_model, sample_tokens, execute_dummy_batch) in
-engine_call, which keeps a call generation and an open-call count, and the
-reader runs a completion-driven state machine instead of a timer:
+Idle quiesce (always on). A reader that copies every _INTERVAL forever keeps an
+idle GPU out of its idle P-state, so the worker wraps its GPU entry points
+(execute_model, sample_tokens, execute_dummy_batch) in engine_call, which keeps a
+call generation and an open-call count, and the reader runs a completion-driven
+state machine:
 
-  ACTIVE   poll on the cadence, exactly as before. Detection is
-           CADENCE-BOUND, not one step: the copy that sees a new count is
-           issued on the tick after the hit and consumed on the tick after
-           that (~1-2 intervals, 50-100 ms at the default), where a fatal
-           site's count is armed; the WARNING with the maxima follows one
-           interval later (~2-3 intervals); the raise lands at the next
-           execute_model, and under async scheduling several steps run in
-           that window;
-  FENCE    no engine call open and none started for a full interval: record a
-           CUDA event on every stream the guarded kernels run on (the engine
-           thread's stream, enable_idle_gate) -- from the reader, so the engine
-           thread gains no CUDA call -- and keep polling until it completes;
-  DRAIN    the fence completed, so every guarded write of every call so far
-           (forward, MTP proposal, RecoverSSM commit graph, async-scheduled
-           steps, PP stages) has finished: issue one fresh copy, report it
-           directly (it is coherent, no producer is running), fold in any
-           half-confirmed increase, leave nothing in flight;
-  PARKED   wait on a condition variable, no CUDA call of any kind, until the
-           next engine_call enter (which notifies), suspend_reader() or
-           stop_reader().
+  ACTIVE  poll on the cadence. Detection is cadence-bound, not one step: the
+          copy that sees a new count is consumed a tick or two later, where a
+          fatal site's count is armed; the raise lands at the next
+          execute_model, and under async scheduling several steps can run in
+          that window.
+  FENCE   no engine call open and none started for a full interval: record a
+          CUDA event on every stream the guarded kernels run on (from the
+          reader, so the engine thread gains no CUDA call) and keep polling
+          until it completes.
+  DRAIN   the fence completed, so every guarded write so far has finished: issue
+          one fresh copy, report it directly, fold in any half-confirmed
+          increase, leave nothing in flight.
+  PARKED  wait on a condition variable, no CUDA call of any kind, until the next
+          engine_call enter, suspend_reader() or stop_reader().
 
-SINGLE-STREAM INVARIANT: every guarded kernel runs on the engine thread's
-fenced stream (eager launches, and graph replays issued by engine calls).
-Every engine call and every eager guarded launch checks it; a violation falls
-back to polling forever with an ERROR line, never to a silent miss. Sleep:
-Worker.sleep suspends the reader (one settled read, then no CUDA call until
-wake_up resumes it), whatever the idle switch says.
+Single-stream invariant: every guarded kernel runs on the engine thread's fenced
+stream. A violation falls back to polling forever with an ERROR line, never to a
+silent miss. Worker.sleep suspends the reader (one settled read, then no CUDA
+call until wake_up), whatever the idle switch says. A call that starts before the
+park decision aborts the quiesce, so a hit from before the idle period is
+reported (and, for a fatal site, armed) before the reader parks. The gate is
+opt-in per process (enable_idle_gate).
 
-A call that starts at any point before the park decision (which re-checks the
-generation under the same lock the enter takes) aborts the quiesce. A hit from
-before the idle period is therefore reported and, for a fatal site, ARMED before
-the reader parks, so the first resumed step's check_pending raises on it.
-The gate is opt-in per process (enable_idle_gate) and fails safe: without it,
-or after a violation of the single-stream invariant (a producer this protocol
-does not cover), the reader polls forever as before.
-
-TRANSPORT (VLLM_E2_GUARD_TRANSPORT, default "mapped"). How the host sees
-the counters. Detection does not depend on it; cost and latency do.
+Transport (VLLM_E2_GUARD_TRANSPORT, default "mapped"): how the host sees the
+counters. Detection does not depend on it; cost and latency do.
 
   copy    the counters are device memory; the reader mirrors them with a
-          non-blocking side-stream D2H copy every tick (NonBlockingReader):
-          five CUDA runtime calls and ~0.15-0.3 ms of reader-thread host time
-          per tick per rank in a profiled serving trace. Fatal sites are armed by the
-          cadence reader only (CADENCE-BOUND, see above).
-  mapped  the counter buffer is page-locked host memory mapped into the
-          device address space (cudaHostAlloc under UVA: the host pointer IS
-          the device pointer), exposed to the kernels as an ordinary [12, 3]
-          int64 CUDA tensor. The guarded kernels are unchanged: same Triton
-          source, same arguments, same specialisation (16-byte aligned pointer),
-          same captured graph topology; only the address the hit-path atomics
-          land on differs, and a clean step issues no counter access at all
-          (every atomic is predicated on a hit), so a clean step's device work
-          is byte-identical.
-          HOST VISIBILITY is event-gated (_StepEvents): every engine call ends
-          with a CUDA event on the guarded stream, and the host reads the
-          mapped counters only after an event newer than its last read has
-          completed -- never for work in flight, never by a PCIe-ordering
-          argument. The reader then reads host RAM (no copy on any stream; its
-          only CUDA calls are event queries and the idle fence), and the engine
-          thread checks the fatal sites' counts (every site under raise) at the
-          top of every execute_model: a fatal hit in engine call N stops the
-          first execute_model after call N's event completes (contract in
-          check_pending). A count is claimed and armed in one critical section
-          before anything is logged (_claim_and_arm), and any failure in the
-          observe path arms a contract-failure stop. The confirm protocol, the
-          WARNING with the maxima, the idle FENCE -> DRAIN -> PARKED machine,
-          suspend/resume and the shutdown drain are unchanged; the drains read
-          host memory after their own (stronger) fence/synchronize.
+          non-blocking side-stream D2H copy every tick (NonBlockingReader).
+          Fatal sites are armed by the cadence reader only.
+  mapped  the counter buffer is page-locked host memory mapped into the device
+          address space (cudaHostAlloc under UVA), exposed to the kernels as an
+          ordinary [12, 3] int64 CUDA tensor. The guarded kernels are unchanged
+          (same source, arguments, specialisation and captured graph), and a
+          clean step issues no counter access at all, because every atomic is
+          predicated on a hit.
+          Host visibility is event-gated (_StepEvents): every engine call ends
+          with a CUDA event on the guarded stream, and the host reads the mapped
+          counters only after an event newer than its last read has completed.
+          The engine thread checks the fatal sites' counts (every site under
+          raise) at the top of every execute_model, so a fatal hit in engine
+          call N stops the first execute_model after call N's event completes
+          (contract in check_pending). A count is claimed and armed in one
+          critical section before anything is logged (_claim_and_arm), and any
+          failure in the observe path arms a contract-failure stop.
           The mapping is validated at allocation (before capture, on the engine
           thread): pointer identity, device ordinal, a host write read by a
           kernel, a kernel write, a contended run of the guards' own atomic
-          sequences (add, max, the ring CAS + exchange) over every SM checked
-          against a device-memory reference, and a D2H copy through the alias.
-          Any failure, a capture in progress (lazy allocation) or an allocation
-          after the reader started keeps that device on copy,
-          loudly; the effective transport is logged per rank. The self-test
-          makes a few small device allocations before model load, so the
-          device caching allocator's history differs from copy: a temp-0
-          identity check between the transports is part of qualifying it.
-          ASSUMES CPython WITH THE GIL: the step check's lock-free fast path
+          sequences over every SM checked against a device-memory reference, and
+          a D2H copy through the alias. Any failure, a capture in progress or an
+          allocation after the reader started keeps that device on copy, loudly;
+          the effective transport is logged per rank. The self-test makes a few
+          small device allocations before model load, so the device caching
+          allocator's history differs from copy: a temperature-0 identity check
+          between the transports is part of qualifying the mapped transport.
+          Assumes CPython with the GIL: the step check's lock-free fast path
           reads a fatal site's high-water mark and then _pending, which
-          _claim_and_arm writes in the opposite order under _fatal_lock; the
-          GIL makes that sequentially consistent, so a raised mark implies a
-          pending stop. A free-threaded build must take the slow path
-          (_fatal_lock) unconditionally.
+          _claim_and_arm writes in the opposite order under _fatal_lock. A
+          free-threaded build must take the slow path (_fatal_lock)
+          unconditionally.
 """
 
 import functools
@@ -359,19 +323,17 @@ _fatal_lock = threading.Lock()
 
 class NonBlockingReader:
     """Reads device counter tensors from a side thread without ever waiting on
-    the compute stream (v2 reader fix).
+    the compute stream.
 
-    The first reader called ``buf.tolist()`` on its cadence: a synchronous,
-    pageable device-to-host copy on the compute stream. The driver services
-    that copy holding the CUDA context lock until the stream's queued work has
-    completed. Under the PLE pull transport the stream can hold a GPU-side
-    wait whose producer needs the same lock (the connector thread's
-    ``event.synchronize()`` and the main thread's next kernel launch), so a
-    reader tick landing inside that window deadlocked the whole worker until
-    the executor timeout killed the engine (two hangs, both at
-    the end of long prefills; py-spy stacks confirmed the deadlock).
+    A synchronous, pageable device-to-host copy (``buf.tolist()``) on the
+    compute stream is serviced by the driver holding the CUDA context lock until
+    the stream's queued work has completed. Under the PLE pull transport the
+    stream can hold a GPU-side wait whose producer needs the same lock (the
+    connector thread's ``event.synchronize()`` and the main thread's next kernel
+    launch), so such a read would deadlock the whole worker. The reader must
+    never block on the compute stream.
 
-    Here every registered tensor gets a pinned host mirror and the copy runs
+    Every registered tensor gets a pinned host mirror and the copy runs
     on a dedicated side stream with ``non_blocking=True``; completion is
     observed with ``event.query()``. Nothing in this class blocks on the GPU.
     The side stream has no dependency on the compute stream, so a pending
@@ -499,7 +461,7 @@ def _normalize(device: torch.device) -> torch.device:
     """torch.device("cuda") and torch.device("cuda:0") are different dict keys.
 
     A miss here would allocate a second buffer lazily, on whatever stream is
-    current -- the replay defect re-entering through a typo.
+    current.
     """
     device = torch.device(device)
     if device.type == "cuda" and device.index is None:
@@ -968,58 +930,43 @@ class _StepEvents:
 
     The guarded kernels write the mapped page-locked counters with device-scope
     atomics from one GPU. The host reads them only for work it has observed
-    complete through a CUDA event recorded after that work in stream order:
-    "the application must synchronize memory accesses using streams or events
-    ... to avoid any potential read-after-write ... hazards" (CUDA C++
-    Programming Guide, "Mapped Memory", section 3.2.5.3 in the 12.x numbering;
-    and "Events", 3.2.8.8: an event completes when all work captured before it
-    in the stream has completed). CUDA Runtime API, cudaEventQuery: "Queries
-    the status of all work currently captured by event ... Returns cudaSuccess
-    if all captured work has been completed"; cudaEventRecord: the event
-    "captures the contents of stream at the time of this call". A successful
-    query is therefore the observation point; it is the same one the COPY
-    transport already rests on (NonBlockingReader.poll_one: event.query(), then
-    host.tolist() of a DMA-written pinned mirror), so mapped adds no new
-    visibility assumption. The host never reads a counter for work in
-    flight under this rule (it may see such writes early; nothing relies on
-    them) and never read-modify-writes one.
+    complete through a CUDA event recorded after that work in stream order (the
+    CUDA programming guide requires streams or events to order accesses to mapped
+    memory). A successful ``cudaEventQuery`` is the observation point, the same
+    one the COPY transport rests on (NonBlockingReader.poll_one: event.query(),
+    then host.tolist() of a DMA-written pinned mirror), so mapped adds no new
+    visibility assumption. The host never relies on counter writes for work in
+    flight and never read-modify-writes a counter.
 
-    THE LIVE BUFFER: event N complete does NOT mean nothing
-    writes the buffer -- call N+1's kernels may be running while the host loads
-    it. The contract needs only this, and it holds:
-      * every slot is MONOTONE NON-DECREASING over the buffer's life: counts
-        only atomic_add positive amounts; maxima only atomic_max (biased, so
-        never below 0); the ring record's slot 1 is written once by the first
-        CAS from 0 and slot 2 once by that CAS's winner (atomic_xchg from 0).
-        Nothing lowers a value once the buffer is live;
-      * each host load is a naturally aligned 8-byte load (numpy / tolist on
-        an int64 element), single-copy atomic on x86-64 (Intel SDM vol. 3
-        8.1.1; AMD APM vol. 2 7.3.2), and each device update is one naturally
-        aligned 8-byte atomic, so a load returns some value the slot actually
-        held, never a torn mix;
+    The live buffer: event N complete does NOT mean nothing writes the buffer --
+    call N+1's kernels may be running while the host loads it. The contract needs
+    only this, and it holds:
+      * every slot is MONOTONE NON-DECREASING over the buffer's life: counts only
+        atomic_add positive amounts; maxima only atomic_max (biased, so never
+        below 0); the ring record's slot 1 is written once by the first CAS from
+        0 and slot 2 once by that CAS's winner (atomic_xchg from 0);
+      * each host load is a naturally aligned 8-byte load (numpy / tolist on an
+        int64 element), single-copy atomic on x86-64, and each device update is
+        one naturally aligned 8-byte atomic, so a load returns some value the
+        slot actually held, never a torn mix;
       * so any load after event N is observed complete returns a value >= the
-        value at N's completion (monotone + visible-at-completion), possibly
-        larger (N+1's increments early). A stale-but->=-completed value is all
-        the fatal decision needs: it arms on count > last armed count;
-      * the host never read-modify-writes a live slot.
-    test_gpu_query_only_reads_overlapping_live_atomics_never_go_below_completed
-    checks the >= property on a CUDA device with NO device synchronize, while the
-    next calls' atomics hit the same buffer.
+        value at N's completion, possibly larger (N+1's increments early). That
+        is all the fatal decision needs: it arms on count > last armed count.
 
     One event is recorded at the end of every engine call (engine_call ->
     _call_exit), on the calling thread's current stream = the stream every
-    guarded kernel runs on (SINGLE-STREAM INVARIANT, enforced when the idle
-    gate is armed), plus one at creation that covers everything before the
-    reader started (warmup, capture). The idle fence keeps its own events
-    and its stronger drain: those are recorded by the reader only at idle, so
-    they cannot serve as per-step markers.
+    guarded kernel runs on (single-stream invariant, enforced when the idle gate
+    is armed), plus one at creation that covers everything before the reader
+    started (warmup, capture). The idle fence keeps its own events and its
+    stronger drain: those are recorded by the reader only at idle, so they cannot
+    serve as per-step markers.
 
-    advance(observer) queries outstanding records newest first and returns
-    True when a record newer than that observer's last read has completed:
-    only then may the observer read. A ring slot re-recorded before its old
-    record was queried is credited with the sequence number read BEFORE the
-    query (record writes the event, then the number), which can only
-    under-credit -- never credit work that has not completed.
+    advance(observer) queries outstanding records newest first and returns True
+    when a record newer than that observer's last read has completed: only then
+    may the observer read. A ring slot re-recorded before its old record was
+    queried is credited with the sequence number read BEFORE the query (record
+    writes the event, then the number), which can only under-credit, never
+    credit work that has not completed.
     """
 
     def __init__(self, device: torch.device) -> None:
@@ -1129,10 +1076,7 @@ def start_reader() -> None:
     The reader must not exist during capture. It copies device counters to the
     host, and a device-to-host copy from a second thread while a capture is
     active is exactly the call class cudaStreamCaptureModeGlobal -- the default
-    for torch.cuda.graph -- rejects. The QSA clip-counter reader survives it in
-    practice, but that one is opt-in and this one is on by default, so
-    the precedent is evidence, not proof. Starting after capture deletes the
-    question rather than arguing it.
+    for torch.cuda.graph -- rejects. Starting after capture avoids the question.
 
     Between prealloc() and this call the kernels still count; nothing reads.
     """
@@ -2100,43 +2044,41 @@ def check_pending() -> None:
     Called at the top of execute_model, ahead of anything that mutates state
     and ahead of any collective, so the step it lands on aborts cleanly.
 
-    TWO THINGS IT DOES NOT DO:
+    Two things it does not do:
 
     1. It does NOT raise on the step that fired. The reader polls on a cadence:
-       the count is armed ~1-2 VLLM_E2_GUARD_INTERVAL ticks after the hit,
-       and the raise lands at the next execute_model after that -- several
-       decode steps on, more under async scheduling. The scheduler state at the raise belongs to some later
-       step, not the offending one. Attribution comes from the counter and the
+       the count is armed a tick or two after the hit, and the raise lands at the
+       next execute_model after that -- several decode steps on, more under async
+       scheduling. The scheduler state at the raise belongs to some later step,
+       not the offending one. Attribution comes from the counter and the
        WARNING; the raise is a stop, not a snapshot.
-    2. It does NOT coordinate across ranks. The counters are per process, so
-       only the rank whose GPU fired arms. Its PP/TP peers received the same
-       execute_model RPC, proceed into the forward, and block in recv/allreduce
-       until the NCCL watchdog fires -- minutes later, as a multi-rank timeout
-       that is a worse diagnostic than the Xid being chased.
+    2. It does NOT coordinate across ranks. The counters are per process, so only
+       the rank whose GPU fired arms. Its PP/TP peers proceed into the forward
+       and block in recv/allreduce until the NCCL watchdog fires, which is a
+       worse diagnostic than the Xid being chased.
 
-    Hence: VLLM_E2_GUARD_MODE=warn for long stress boots; raise only for a
-    targeted repro where losing the group is acceptable and stopping is the
-    point.
+    Hence VLLM_E2_GUARD_MODE=warn for long stress boots; raise only for a targeted
+    repro where losing the group is acceptable and stopping is the point.
 
-    TRANSPORT=mapped tightens point 1 (not point 2). THE CONTRACT: every engine
+    TRANSPORT=mapped tightens point 1 (not point 2). The contract: every engine
     call on this rank ends with a CUDA event recorded on the stream the guarded
-    kernels run on (_StepEvents). A fatal-site hit written by the work of
-    engine call N is stopped by the first check_pending on this rank that
-    runs after call N's event has completed: the check queries the event
-    itself, reads the mapped counters only once it has completed, and arms
-    and raises here. No step-count bound is part of the contract: how many
-    calls run between N and that check depends on the scheduler (MRV2 async
-    PP2 admits three concurrent batches, and the output copy starts before the
-    MTP proposal, so consuming an output does not imply the call's exit event
-    has completed). It holds the same on every PP stage and relies on no PCIe
-    ordering argument (see _StepEvents for the visibility rule and the live-
-    buffer argument). PRECONDITIONS, each enforced fail-closed: every guarded
-    producer runs on the engine thread, inside an engine call, on the fenced
-    stream -- checked at every eager guarded launch, every engine call entry
-    and every graph replay (check_replay_stream); a violation under mapped ARMS a contract-failure stop before it is
-    logged. Bounded by the event ring: fewer than _STEP_RING (16) calls in
-    flight on the rank, which is NOT enforced (beyond it detection is later,
-    never earlier). The cadence reader reads under the same rule and is the
+    kernels run on (_StepEvents). A fatal-site hit written by the work of engine
+    call N is stopped by the first check_pending on this rank that runs after call
+    N's event has completed: the check queries the event itself, reads the mapped
+    counters only once it has completed, and arms and raises here. No step-count
+    bound is part of the contract: how many calls run between N and that check
+    depends on the scheduler (async PP admits several concurrent batches, and the
+    output copy starts before the MTP proposal, so consuming an output does not
+    imply the call's exit event has completed). It holds on every PP stage and
+    relies on no PCIe ordering argument (see _StepEvents).
+
+    Preconditions, each enforced fail-closed: every guarded producer runs on the
+    engine thread, inside an engine call, on the fenced stream -- checked at every
+    eager guarded launch, every engine call entry and every graph replay
+    (check_replay_stream); a violation under mapped ARMS a contract-failure stop
+    before it is logged. Bounded by the event ring: fewer than _STEP_RING (16)
+    calls in flight on the rank, which is NOT enforced (beyond it detection is
+    later, never earlier). The cadence reader reads under the same rule and is the
     backstop for the WARNING.
     """
     global _pending
@@ -2162,8 +2104,7 @@ def drain(
     raise_on_unsettled: bool = True,
     timeout: float | None = None,
 ) -> dict[str, list[int]]:
-    """Synchronous final read of every counter, off the cadence (added
-    later).
+    """Synchronous final read of every counter, off the cadence.
 
     The cadence reader can miss a hit on the LAST step of a run: the forward
     completes, its result is consumed, no further execute_model polls
@@ -2185,9 +2126,9 @@ def drain(
     daemon helper the drain abandons at the deadline) and the copy-transport
     read. Producers not shown complete by then: FINAL DRAIN INCOMPLETE at ERROR,
     and the device's rows are never presented as final (mapped counts, host
-    memory, are still reported as a LOWER BOUND). None = no deadline (the
-    pre-bound behaviour). Not bounded: a driver that blocks inside a host-side
-    enqueue (event create/record, copy launch).
+    memory, are still reported as a LOWER BOUND). None = no deadline. Not bounded:
+    a driver that blocks inside a host-side enqueue (event create/record, copy
+    launch).
     """
     deadline = math.inf if timeout is None else time.monotonic() + timeout
     if not _io_lock.acquire(timeout=-1 if timeout is None else timeout):

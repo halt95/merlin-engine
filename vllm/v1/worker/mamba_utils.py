@@ -478,10 +478,9 @@ def postprocess_mamba_fused_kernel(
     # the post-step new_num_computed value (V2 supplies the advanced count).
     PRECOMPUTED_NEW_COMPUTED: tl.constexpr = False,
     # BT_ROW_IS_REQ: when True, block_table_ptrs_ptr points at the *persistent*
-    # per-req-slot block tables (BlockTables.block_tables[i].gpu,
-    # block_table.py:53-59), whose rows are request state slots, so the row
-    # index is req_idx rather than batch_idx. When False it points at the
-    # batch-order gather (BlockTables.input_block_tables, block_table.py:74-76)
+    # per-req-slot block tables (BlockTables.block_tables[i].gpu), whose rows are
+    # request state slots, so the row index is req_idx rather than batch_idx. When
+    # False it points at the batch-order gather (BlockTables.input_block_tables)
     # and batch_idx is the row. Required by the PP-deferred post-process, which
     # runs pp_size steps after the gather that produced its idx_mapping.
     BT_ROW_IS_REQ: tl.constexpr = False,
@@ -552,7 +551,7 @@ def postprocess_mamba_fused_kernel(
     if src_block_idx == dest_block_idx and accept_token_bias == 0:
         return
 
-    if BT_ROW_IS_REQ:  # noqa: SIM108 -- a ternary would drop this comment
+    if BT_ROW_IS_REQ:  # noqa: SIM108
         # Persistent per-req-slot table: the row is the request's own slot, so
         # it stays correct however many steps separate the gather from this
         # launch (the PP-deferred post-process is enqueued at the top of

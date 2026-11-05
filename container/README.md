@@ -1,22 +1,24 @@
-# container/ — Merlin 3.0.1
+# container/ — Merlin 3.0.2
 
-> **unqualified until qualified on hardware**
+> **Community-qualified on 8 x RTX 3090 at P2P=off (octo, TP4xPP2), on the 3.0.1 image, by
+> [brandon-nuttall](https://github.com/brandon-nuttall). Not qualified at P2P=on, on other layouts, on other cards or
+> models, or on a 3.0.2 image build.** Details under [Hardware qualification](#hardware-qualification).
 
-The image installs **this repository checkout**, built on vLLM **0.32.0**, through
-[release/install-env.sh](../release/install-env.sh). That shared installer owns the 0.32
+The image installs **this repository checkout**, built on vLLM **0.33.0**, through
+[release/install-env.sh](../release/install-env.sh). That shared installer owns the 0.33
 hash lock, CUDA toolchain, native build and [FlashInfer tile patch](../release/apply-flashinfer-patch.sh).
-The image requires FlashInfer **0.7.0.post1**, humming-kernels **0.1.17** and instanttensor
+The image requires FlashInfer **0.7.2.post1**, humming-kernels **0.1.19** and instanttensor
 **>= 0.2.2**. It does not fetch the retired engine bundle or 0.30 compiled artifacts.
 
-The 0.32 installer, 0.7.0.post1 tile tooling and generated Swift/Huihui launchers
-are integrated. `release/requirements-0.32.lock` is complete with 222 exact pins
+The 0.33 installer, 0.7.2.post1 tile tooling and generated Swift/Huihui launchers
+are integrated. `release/requirements-0.33.lock` is complete with 223 exact pins
 and artifact SHA-256 hashes, resolved with uv; a dry-run `--require-hashes`
-install resolves. A fresh install (2026-10-21) and a from-source build (2026-10-22) passed on the reference host;
+install resolves. On the 3.0.0 release (vLLM 0.32) a fresh install (2026-10-21) and a from-source build (2026-10-22) passed on the reference host; the 3.0.2 fresh install has not been done;
 the container image itself is not yet qualified. The build context is the repository root;
 the image retains the checkout because the engine install is editable. The host's private `.git` directory is excluded.
 The build fetches source history from `SOURCE_URL` (default: the public repository)
-at `SOURCE_REF` (default: `merlin-v3.0.1`), checks that every copied tracked file matches
-that ref, and lets the installer independently verify the vLLM 0.32.0 ancestry. That fetched
+at `SOURCE_REF` (default: `merlin-v3.0.2`), checks that every copied tracked file matches
+that ref, and lets the installer verify the checkout's commit and tree identity and its native-source pins. That fetched
 history stays in the image for subsequent source-identity verification.
 Build from the matching clean ref. Use a Docker-tag-safe published tag or full commit SHA as
 `SOURCE_REF`, since it also names the local image tag. For Compose, set `SOURCE_REF` in the host shell
@@ -24,7 +26,7 @@ or a Compose `.env` file; Compose passes the same value to the build. For direct
 `--build-arg SOURCE_REF="$SOURCE_REF"` and tag the image `merlin-engine:$SOURCE_REF`, as shown below.
 For a custom source repository, also pass `--build-arg SOURCE_URL=<url>` to `docker build`.
 The image bootstraps
-[uv 0.12.13](https://github.com/astral-sh/uv/releases/tag/0.12.13) and installs the Rust
+[uv 0.12.13](https://github.com/astral-sh/uv/releases/tag/0.12.13) (downloaded over HTTPS from Astral's release host; the installer script is not checksum-pinned, unlike `setup.sh`, which pins uv 0.11.29) and installs the Rust
 version selected by the checkout's `rust-toolchain.toml`.
 Debian 13 supplies [GCC/G++ 14](https://packages.debian.org/trixie/g%2B%2B-14),
 selected explicitly through `CC`, `CXX` and `CUDAHOSTCXX`. The CUDA source build
@@ -33,15 +35,29 @@ checkout's `CMakeLists.txt`; GCC 14 is the image's selected compiler. The host
 compiler must also be supported by the selected CUDA toolkit. The lock pins CUDA
 CRT, nvcc, nvJitLink and NVVM to 13.0.88 (CCCL 13.0.85).
 
-Reference host: NVIDIA driver 610.43.02 (reports CUDA 13.3). The release lock selects a matched CUDA 13.0 toolkit (nvcc, crt, nvvm, nvJitLink 13.0.88, cccl 13.0.85, runtime 13.0.96, the pair torch 2.13.0 cu130 ships with); the release wheel is served on it by every recipe (2026-10-20). Other CUDA 13.x drivers (R580 or later) are expected to work through CUDA minor-version compatibility, but are untested.
-See the [driver requirements](../release/install-0.32.md).
+Reference host: NVIDIA driver 610.43.02 (reports CUDA 13.3). The release lock selects a matched CUDA 13.0 toolkit (nvcc, crt, nvvm, nvJitLink 13.0.88, cccl 13.0.85, runtime 13.0.96, the pair torch 2.14.0 cu130 ships with); the 3.0.0 release wheel was served on it by every recipe (2026-10-20); the 3.0.2 wheel was served on it on 2026-11-04 by Flash-Next, Qwen3.8-27B (1, 2 and 4 GPUs), Nemotron 3.5 Super VL and Ornith 1.5, each with a 262K request. Other CUDA 13.x drivers (R580 or later) are expected to work through CUDA minor-version compatibility, but are untested.
+See the [driver requirements](../release/install-0.33.md).
 
 The base is pinned to the multi-platform index digest of
-[python:3.13-slim-trixie on Docker Hub](https://hub.docker.com/layers/library/python/3.13-slim-trixie/images/sha256-7f7f96867e2bf7bee2e2d11d5d46d65760f3eca347141a2f1410d98088b0e338?tab=layers),
+[python:3.13-slim-trixie on Docker Hub](https://hub.docker.com/_/python/tags?name=3.13-slim-trixie),
 looked up read-only on 2026-10-15:
 ```text
 sha256:70729b46c69b4f1e97c4822c1af3df53a1476cf5ddc6c087c0c10bc3a5678c2f
 ```
+
+### Build options
+
+- **`MERLIN_WHEEL_URL`** (build argument, empty by default): URL of the release wheel. When set, the image installs the
+  engine from that wheel and compiles nothing (9.67 GB image against 20.7 GB for a source build on the reference run). The
+  installer still checks the wheel against `release/merlin-wheel.sha256` and the checkout's native-source tree ids, so a
+  wheel that is not this checkout's release wheel fails the build. Empty: the engine is built from source.
+  Compose forwards it: `MERLIN_WHEEL_URL=<url> docker compose -f container/docker-compose.yml up --build -d`.
+- **Driver-less builds.** `docker build` has no NVIDIA driver, and the engine's extensions link the driver API
+  (`CUDA::cuda_driver`), so a source build would fail at CMake configure. For a source build the image fetches the
+  CUDA toolkit's own link-time stub, `lib/stubs/libcuda.so` from NVIDIA's `cuda_cudart` 13.0.96 redistributable (the runtime
+  version the lock pins), checks its sha256 (`CUDA_STUB_SHA256`), and `release/install-env.sh` links it under the toolkit's
+  `lib/stubs` through `MERLIN_LIBCUDA`, the same way `release/build-wheel.sh` does. It is a link-time file only: it is not on
+  the loader path, and the container uses the host driver's real `libcuda` at run time. The stub is fetched for the wheel path too, the configuration that was qualified. It is kept off the default loader path on purpose: a `libcuda` there would shadow the driver the NVIDIA container toolkit mounts at run time, and the engine's preflight then refuses to serve against the stub's CUDA version.
 
 From the repository root, with Docker Compose v2 and the NVIDIA Container Toolkit
 configured on the host:
@@ -51,7 +67,7 @@ MODEL_DIR=/absolute/path/to/Qwen3.8-Flash-Next-W4A16-Merlin \
   docker compose -f container/docker-compose.yml up --build -d
 ```
 
-The local image is named `merlin-engine:merlin-v3.0.1` by default, with its tag taken from
+The local image is named `merlin-engine:merlin-v3.0.2` by default, with its tag taken from
 `SOURCE_REF`. Compose builds from `..` using `container/Dockerfile` and reserves all NVIDIA GPUs.
 The default Flash-Next recipe
 uses four RTX 3090s. An A100 run must choose a compatible model and parallel
@@ -73,14 +89,14 @@ MERLIN_MODEL=qwen38-27b MODEL_DIR=/absolute/path/to/Qwen3.8-27B-W4A16-Merlin \
 ```
 
 Both image-cap variables are set to **8,388,608 pixels** (8 MP): `IMG_CAP_PX` for the
-Flash-Next family and `MAX_PIXELS` for the 27B family. Launchers own the 0.32 CLI flags
+Flash-Next family and `MAX_PIXELS` for the 27B family. Launchers own the 0.33 CLI flags
 and `FLASHINFER_SM8X_FP8_SMALLQ`: the 27B launcher sets it to `cta32` by default (set it empty for stock
 FlashInfer); the image installs the patch without enabling the tile globally. On unsupported architectures the patch keeps its stock path.
 
 For direct Docker use:
 
 ```bash
-SOURCE_REF=merlin-v3.0.1
+SOURCE_REF=merlin-v3.0.2
 docker build -f container/Dockerfile --build-arg SOURCE_REF="$SOURCE_REF" -t "merlin-engine:$SOURCE_REF" .
 docker run --gpus all --stop-timeout 70 --shm-size=8g --ulimit memlock=-1 \
   -p 127.0.0.1:8000:8000 -v /absolute/path/to/checkpoint:/models/checkpoint \
@@ -92,9 +108,15 @@ it. Extra positional flags pass through to the Flash-Next family launchers. The 
 family takes environment settings (`GPUS`, `KV_BYTES`, `SERVED`, etc.); extra flags are
 rejected because those launchers do not forward them.
 
-Compose forwards `MODEL_NAME`, `SERVED`, `GPUS`, `KV_BYTES` and `WARM` from the host shell
-or a compose `.env` file (unset or empty keeps the launcher default). `KV_BYTES` applies to
-Swift, Swift1.5-Huihui and the 27B recipes; Flash-Next sizes its own pool. `WARM=0` skips the
+**`MERLIN_PROFILE`** (Flash-Next family only: `flash-next`, `swift1.5`, `swift1.5-huihui`): pins a layout other than the
+default quad one. When set, the entrypoint starts `merlin serve <recipe> <checkpoint> --profile $MERLIN_PROFILE -- <extra
+args>` instead of the recipe's fixed `serve.sh`, so the profile is checked against the cards. Unset, nothing changes. On the
+27B family it is ignored with a warning. Example on eight cards (the layout of the qualification below):
+`MERLIN_PROFILE=fn-octo-3090-tp4pp2 GPUS=0,1,2,3,4,5,6,7 P2P=off ...`. Compose forwards `P2P` (`on` or `off`; empty keeps the profile default and the cards' probe) and `DRAFT_HEAD` (`bf16` default, `int8`, `int4`; empty keeps the default) too; with `docker run` pass them with `-e`.
+
+Compose forwards `MODEL_NAME`, `SERVED`, `GPUS`, `KV_BYTES`, `MERLIN_PROFILE`, `P2P`, `DRAFT_HEAD` and `WARM` from the host shell
+or a compose `.env` file (unset or empty keeps the launcher default). `KV_BYTES` is the per-card KV pin and
+applies to every recipe (Flash-Next included); unset, each launcher uses its profile's pin. `WARM=0` skips the
 Flash-family warm-up and is the setting for exploratory non-sm_86 runs, for example
 `WARM=0 MODEL_DIR=... docker compose -f container/docker-compose.yml up --build -d`.
 
@@ -127,6 +149,29 @@ The CPU readiness regression suite can be run with:
 venv/bin/python -m unittest discover -s container -p test_healthcheck.py -v
 ```
 
-No container build, regression suite or GPU boot has been run for this recipe. Hardware qualification must
-record a successful build, model load, `/v1/models`, one-token completion, needle probes
-and image size on a supported GPU configuration before this label can be removed.
+## Hardware qualification
+
+Community qualification, reported by [brandon-nuttall](https://github.com/brandon-nuttall) in
+[halt95/merlin-engine#10](https://github.com/halt95/merlin-engine/pull/10) (2026-11-03) on the **3.0.1** image; Merlin has not
+re-run it. **Scope, exactly:**
+
+- **Interconnect: P2P off** (`P2P=off`). Nothing here qualifies P2P on.
+- **Layout: octo, profile `fn-octo-3090-tp4pp2`** (TP4 x PP2 with expert parallelism, eight cards), Flash-Next, `KV_BYTES=9e9`,
+  `DRAFT_HEAD=int8`.
+- **Host: seven RTX 3090 and one RTX 3090 Ti (sm_86), driver 595.91.07.** `GPUS` was pinned to skip a card used by the desktop
+  and a ninth, non-matching card.
+- **Image: the wheel path** (9.67 GB). A from-source build with the driver-less stub also configured and built (about 40 minutes
+  at `MAX_JOBS=16`, 20.7 GB); that run is a build check, not a serving qualification.
+
+| Check | Result (as reported) |
+|---|---|
+| Build | succeeded; source-ref verification passed |
+| Model load | about 4 minutes with warm caches, eight cards |
+| `/v1/models` | HTTP 200 with the bearer key; the four served names listed |
+| One-token completion | passed; the image HEALTHCHECK reports `healthy` |
+| Needle probe | 155,572-token prompt, one needle, answered correctly in 56.2 s |
+| Use | served the rest of the day at the layout above |
+
+These are the contributor's own figures: no Merlin run, log or artifact backs them. The 3.0.2 image (vLLM 0.33.0, FlashInfer
+0.7.2.post1, the toolkit link-time stub and wheel path above) has not been built or requalified for 3.0.2.
+The build failure this fixed: with no driver in `docker build` and no `libcuda` in the pip CUDA distribution, CMake's CUDAToolkit module cannot create the `CUDA::cuda_driver` target, and the native configure fails on every target that links it (`cumem_allocator`, `_C_stable_libtorch`, `_moe_C_stable_libtorch`, `_vllm_fa2_C`, `_vllm_fa3_C`; "CMake Generate step failed"), as reported on the 3.0.1 image.

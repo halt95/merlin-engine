@@ -7,7 +7,7 @@ One knob, default 0 (off). A positive value is GiB of host memory per rank
 upstream SimpleCPUOffloadConnector in ``kv_both`` mode, run write-back (GPU L1
 + host L2, one cache: vllm/merlin/kv_host_tier_writeback.py). There is no
 mode knob. Off leaves ``kv_transfer_config`` exactly as given, so a
-connector-less boot is the 3.0.0 path byte for byte.
+connector-less boot is unchanged.
 
 The engine tells the tier apart from a user-supplied ``--kv-transfer-config``
 by matching the exact config this module generates (``is_kv_host_tier``). Only
@@ -27,8 +27,7 @@ upstream rules:
   ring group is not prefix-cacheable, so the tier never stores, finds or loads
   it; the worker copies whole pool blocks by the other groups' ids and skips
   slot-packed tensor views; the folded PLE group offloads like any Mamba
-  group. Turning the layout off would cost Flash-Next 924,993 -> 890,571 pool
-  tokens.
+  group. Turning the layout off would cost pool capacity.
 - Prefix-cache pins: kept (``keeps_prefix_pins``). The tier holds GPU blocks
   only by additive refs (touch), which the pins' yield accounting excludes,
   and its async loads leave the request WAITING_FOR_REMOTE_KVS, never pinned.
@@ -227,6 +226,8 @@ def check_gate_envs(gib: int) -> None:
         # The demotion direction's own row and byte credits.
         wb.copy_credits_d()
         wb.copy_bytes_d()
+        wb.max_pending_store_blocks()
+        wb.fallback_boundary()
 
 
 # --- Host memory bounds ----------------------------------------------------
@@ -352,7 +353,7 @@ def host_memory() -> tuple[int, int, str]:
             headroom = max(0, limit - usage + _cgroup_reclaimable_bytes())
             if headroom < available:
                 available, source = headroom, "cgroup memory.max headroom"
-    # Nested cgroup levels (systemd MemoryMax on a scope/unit)
+    # Cgroup levels (systemd MemoryMax on a scope/unit)
     for lim, use, reclaim in _nested_cgroup_levels():
         if lim < total:
             total = lim
@@ -541,7 +542,6 @@ def warn_if_below_restore_unit(
     return msg
 
 
-
 def check_arena_fits(arena_bytes: int) -> None:
     """One rank, right before it allocates its arena (the engine's own memory
     is resident by then): refuse instead of being OOM-killed mid-boot."""
@@ -717,7 +717,7 @@ def free_before_deferred_commit(vllm_config: "VllmConfig") -> bool:
     that commit writes a block the scheduler may already have handed to a host
     load (the load copy is not ordered against it). Freeing first bumps the
     row's generation and the mask skips it. Without a connector nothing is
-    loaded into reused blocks, so the 3.0.0 order is kept there.
+    loaded into reused blocks, so upstream's order is kept there.
     """
     return (
         is_active(vllm_config)

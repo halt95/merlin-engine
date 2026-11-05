@@ -7,7 +7,7 @@
 #
 #   python3 models/flash-next/topo_select.py --dry-run      # show what it would decide on this machine
 #
-# The serve script calls it only when AUTO_TOPO=1 or AUTO_TOPO=strict (opt-in in v2.2.0; unset or 0 keeps the fixed
+# The serve script calls it only when AUTO_TOPO=1 or AUTO_TOPO=strict (opt-in; unset or 0 keeps the fixed
 # settings and never runs this file). Run by hand, it treats an unset AUTO_TOPO as 1.
 # CUDA_VISIBLE_DEVICES=GPU-<uuid>,... picks the four GPUs on a machine with more than 4 GPUs.
 # It never creates a CUDA context: it reads NVML, sysfs and /proc only.
@@ -15,7 +15,7 @@
 
 Purpose
 -------
-The serve script used to hard-code settings for one kind of host (4 GPUs on one NUMA node, PCIe
+The serve script's fixed settings cover one kind of host (4 GPUs on one NUMA node, PCIe
 peer-to-peer working, no NVLink). This module inspects the layout's GPUs and writes a small shell env
 file that the serve script sources. It decides:
 
@@ -38,7 +38,7 @@ VLLM_SKIP_P2P_CHECK, NCCL_P2P_LEVEL, NCCL_PROTO, PLE_HOME. When run by hand, exp
 A caller ``CUDA_VISIBLE_DEVICES`` that is set but empty (or only whitespace) counts as unset, as it did in the
 serve script's own ``${CUDA_VISIBLE_DEVICES:-0,1,2,3}`` default.
 
-Opt-in: in v2.2.0 the serve script runs this module only when ``AUTO_TOPO`` is ``1`` or ``strict``; with
+Opt-in: the serve script runs this module only when ``AUTO_TOPO`` is ``1`` or ``strict``; with
 ``AUTO_TOPO`` unset or ``0`` serve never invokes it and keeps its fixed settings. The module's own default is
 different on purpose: run by hand (or by anything else), an unset or empty ``AUTO_TOPO`` means ``1``, so
 ``--dry-run`` shows a decision without extra flags. ``AUTO_TOPO=0`` given to the module itself writes the fixed
@@ -741,8 +741,8 @@ def is_reference(topo: Topology, dec: Decision) -> bool:
 
 
 def caller_cvd(ctl: Controls) -> str | None:
-    """The caller's CUDA_VISIBLE_DEVICES, or None when unset, empty or whitespace-only (the serve script's old
-    ${CUDA_VISIBLE_DEVICES:-0,1,2,3} default treated an empty value as unset; whitespace is no more usable)."""
+    """The caller's CUDA_VISIBLE_DEVICES, or None when unset, empty or whitespace-only (the serve script's
+    ${CUDA_VISIBLE_DEVICES:-0,1,2,3} default treats an empty value as unset; whitespace is no more usable)."""
     cvd = ctl.caller["CUDA_VISIBLE_DEVICES"]
     if cvd is None or CVD_UNSET_EQUIVALENT.fullmatch(cvd):
         return None
@@ -982,7 +982,7 @@ def read_controls(environ: dict[str, str]) -> Controls:
     def get(name: str) -> str:
         return environ.get(name, "").strip()
 
-    # unset means on HERE: serve (opt-in in v2.2.0) only calls this module with AUTO_TOPO=1 or strict, so this
+    # unset means on HERE: serve only calls this module with AUTO_TOPO=1 or strict, so this
     # default only matters when the selector is run by hand.
     auto = get("AUTO_TOPO") or "1"
     if auto not in ("1", "0", "strict"):

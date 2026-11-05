@@ -1,5 +1,7 @@
-// merlin-hook: csrc-topk-vendored
-// Upstream v0.32.0rc0 sampled top-k, ported into the Merlin op, in its own translation unit
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+// Modified by the Merlin project; see NOTICE.
+// Sampled top-k ported from upstream, in its own translation unit
 // (see merlin_sampled_topk_launch.h for why). launch_persistent_topk() in topk.cu launches it.
 
 #include "merlin/topk/merlin_sampled_topk_launch.h"

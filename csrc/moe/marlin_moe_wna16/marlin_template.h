@@ -75,7 +75,6 @@ __global__ void Marlin(
     int prob_k,             // reduction dimension k
     int* locks,             // extra global storage for barrier synchronization
     bool use_atomic_add,    // whether to use atomic add to reduce
-    // merlin-hook: marlin-full-k
     bool use_fp32_reduce,   // whether to use fp32 global reduce
     bool use_full_k         // whether to reduce over full K per block
 ) {}
@@ -253,7 +252,6 @@ __global__ void Marlin(
     int* locks,             // extra global storage for barrier synchronization
     bool has_bias,
     bool use_atomic_add,  // whether to use atomic add to reduce
-    // merlin-hook: marlin-full-k
     bool use_fp32_reduce,  // whether to use fp32 global reduce
     bool use_full_k        // whether to reduce over full K per block
 ) {
@@ -375,12 +373,12 @@ __global__ void Marlin(
   // see https://github.com/vllm-project/vllm/pull/24722 for more details
   if (global_mn_tiles > gridDim.x) {
     part2_mn_tiles = global_mn_tiles % gridDim.x;
-    if (!use_full_k && part2_mn_tiles * 3 <= gridDim.x)  // merlin-hook: marlin-full-k
+    if (!use_full_k && part2_mn_tiles * 3 <= gridDim.x)
       part2_mn_tiles += gridDim.x;
     part1_mn_iters = (global_mn_tiles - part2_mn_tiles) / gridDim.x;
   }
 
-  int iters =  // merlin-hook: marlin-full-k
+  int iters =
       use_full_k ? k_tiles : div_ceil(k_tiles * part2_mn_tiles, gridDim.x);
 
   if constexpr (group_blocks != -1) {

@@ -1,5 +1,94 @@
 # Changelog
 
+## Merlin 3.0.2
+
+The engine-side subset; the full 3.0.2 list is in the [main changelog](../CHANGELOG.md#merlin-302). The engine moves to
+vLLM 0.33.0 (torch 2.14.0, Triton 3.8.0, FlashInfer 0.7.2.post1, Transformers 5.20.2), built for sm_80, sm_86 and sm_89 on
+CUDA 13.0; the wheel version is `0.33.0+merlin.665f43d2cf`.
+
+- **FlashInfer 0.7.2.post1 patch series (0001 sm8x FP8 small-query verify tile, 0002 workload plan mode) re-ported** under
+  `release/patches/flashinfer-0.7.2.post1/`, with new JIT suffixes (`_sm8x_smallq_072_v1`, `_v2`). Device code and planner
+  override are the 0.7.0 lines unchanged. Defaults are as before: the tile is enabled only by
+  `FLASHINFER_SM8X_FP8_SMALLQ=cta32`, patch 0002 only by `MERLIN_FLASHINFER_WORKLOAD_TILE=1` at install. GPU proof:
+  the live tile proof passed on the 27B TP2 boot (2026-11-04); the knob-off v1-versus-v2 parity check has not been done for 3.0.2.
+- **Pipeline parallel with RecoverSSM:** commit-kernel warm-up on every PP rank at boot, a counts-only receive event
+  (`VLLM_RECOVERSSM_PP_SPLIT_RECV`, default off), commit-after-propose on the last PP rank (still needs
+  `VLLM_RECOVERSSM_COMMIT_AFTER_PROPOSE=1`), one align-postprocess launch per distinct input set, and a persistent
+  `pp_size + 1` snapshot ring that reuses its storage instead of allocating a clone each step. Bit-identical by construction; the on-versus-off comparison has not been done for 3.0.2.
+- **`VLLM_MERLIN_PP_DECODE_BALANCE=1` (default off)** caps decode rows per step at `ceil(decoding / pp_size)`; tokens are
+  unchanged.
+- **Control tokens:** `--sanitize-control-tokens` (default on) encodes control tokens in chat messages, tools and
+  documents as text; `--reject-mm-with-string-template` (default off); `VLLM_MERLIN_EXTRA_CONTROL_TOKENS` (default empty;
+  the Ornith launcher sets its six FIM tokens).
+- **Per-request refusal at admission:** EngineCore applies the sampler admission limits (bad words, allowed token
+  ids, logit bias, stop ids with `min_tokens`) before the scheduler, so a request that reaches the engine by another route
+  gets a per-request error instead of ending the step.
+- Logprob counts above the vocabulary are rejected at admission (vllm#64291) and pending UTF-8 detokenization is bounded
+  (vllm#63667).
+- Boot refuses unloaded wNa16 and ModelOpt FP8 scales.
+- Held back from 0.33 and pinned: lookahead block hashes (`disable_lookahead_block_hashes=True`), the DFlash/DSpark trailing
+  block drop, small-batch split top-p, and the step-keyed RNG default. See the main changelog.
+- `--mamba-cache-mode` is deprecated and has no effect on 0.33; the launchers still pass `align`, which logs one warning.
+- **Compile-cache fault guard (`VLLM_MERLIN_COMPILE_CACHE_GUARD`, default on; `0` turns it off):** a compile-cache
+  directory marked by a sticky CUDA fault is quarantined into `.merlin-quarantine/` beside the cache, so the next boot
+  recompiles once, and each AOT compile artifact is verified against its `model.sha256` sidecar.
+- **Other new engine switches, all off by default:** `VLLM_MERLIN_DECODE_FIRST=1` (reserves running decoders' tokens
+  before a prefill chunk is sized; not proven token-identical), `VLLM_MERLIN_QSA_SCRATCH=reserve|workspace` (reserves the
+  QSA indexer's logits scratch during the profile run), `VLLM_FLA_PACKED_DECODE_VERIFY_PARITY=1`,
+  `VLLM_SPEC_STABLE_RESIDUAL=1` (changes numerics), `MERLIN_MARLIN_DENSE_CFG` (no entry ships) and
+  `MERLIN_KV_HOST_TIER__MAX_PENDING_STORE_BLOCKS` / `MERLIN_KV_HOST_TIER__FALLBACK_BOUNDARY`. The main changelog's
+  [options table](../CHANGELOG.md#new-flags-and-environment-variables) lists every switch.
+- **PLE table on NVMe (experimental):** `--ple-store disk` (on `merlin serve` and `./setup.sh`) reads the Flash-Next
+  family's embedding table from the checkpoint's own files through the page cache instead of holding it in host RAM,
+  freeing 47.7-47.8 GiB with `--ple fp8` and 38.8-38.9 GiB with `--ple int6` of free memory. `ram` stays the default.
+  Temperature-0 output was token for token identical to `ram` (304 of 304 FP8 comparisons, 225 of 225 INT6). Against `ram`
+  on 4 x RTX 3090 with one Gen4 NVMe, decode is +1.8 % (FP8) and +2.3 % (INT6) once the table is cached, +9 % and +11 % on
+  the first send of a text whose rows are not cached yet, and with a 96g `--kv-ram-cache` the table never fully warms
+  (+10-11 % decode at 262K, +15-30 % first token). These figures were measured on the 0.32 tree; the 0.33 re-run
+  has not been done for 3.0.2. Other disks and layouts are untested. The server stops if a table
+  file is written, touched, `chmod`ed, linked, moved or removed while it runs. Full figures and limits:
+  [How to serve](../how-to-serve.md#the-ple-table-on-nvme-experimental).
+- A generation failure the engine marks as transient now returns HTTP 503 instead of 500: a multimodal cache
+  miss, and, on setups with those connectors, a KV load failure under `kv_load_failure_policy=fail` or an encoder input
+  it can no longer obtain. Shipped lanes recompute on a KV load failure, so that case stays out of reach there. Grammar
+  rejection stays 500.
+- KV reuse events in full mode no longer raise `IndexError` on a partial hit, and no longer report the partial tail
+  under the hash of a full block.
+- Super VL rows with P2P on keep vLLM's custom all-reduce and now set `NCCL_PROTO=Simple` instead of `LL`.
+  On 4 x RTX 3090 one-stream decode is unchanged; a new 20K prefill runs about 6 % faster and decode during it about
+  10 % faster, with identical temperature-0 output, measured on torch 2.13; the torch 2.14 (NCCL 2.30.7) re-measure has not been done for 3.0.2. P2P-off rows, Flash-Next, the 27B and Ornith are unchanged.
+- **Ready line:** `merlin serve` prints `Ready: http://HOST:PORT/v1 · model · context · key` (and the Anthropic-compatible
+  endpoint) once `/health` answers, with a `starting...` line every minute before it. vLLM keeps the launcher's
+  PID and signals; `MERLIN_READY_BANNER=0` turns it off, and the server starts without the line if the launcher
+  cannot fork. The line says `https` when the server has `--ssl-keyfile` and `--ssl-certfile`; with `--uds`, `--headless`
+  or `--ssl-cert-reqs 2` the watcher cannot ask `/health` and a message says so. `/health` answers only after weight
+  load, kernel warmup and CUDA-graph capture (now covered by tests).
+- **`merlin doctor --report [FILE] [--log FILE] [--lines N]`** writes one file for bug reports (preflight, the serve
+  plan, the server log's last lines; mode 0600, also when the file already exists) with API keys, tokens, passwords,
+  auth headers and URL credentials redacted, in shell, JSON and Python-dict forms.
+- **[Connect a client](../clients.md):** settings for OpenAI-compatible and Anthropic-compatible clients such as
+  opencode, Cline/Roo, Aider and Continue.
+- **`tool_choice="none"` no longer loses text on the Qwen-family parsers** (`qwen3`, `qwen3_coder`, `nemotron_v3`,
+  and the parsers built on them, which are the ones Merlin's launchers use). The server already returned no tool call in
+  this mode, but it dropped any tool-call markup the model wrote and everything inside it, and markup in reasoning could
+  end reasoning early. That text now comes back in the field it was written in, stream and non-stream, chat and
+  Responses. Other parsers are unchanged: no calls, with the markup removed. Special tokens outside the parser's own
+  markup are still removed, as `skip_special_tokens` would. Behaviour you may notice:
+  - A request with no tools is `tool_choice="none"` at the API, so plain chat keeps tool markup as text as well, and an
+    empty `<tool_call></tool_call>` block now reaches the user as text.
+  - A later `<think>` or a repeated `</think>` is kept only when the request offers tools. Plain chat still removes
+    them, so a plain-chat answer explaining `</think>` loses the tag; send `tools` with `tool_choice="none"` to keep it.
+  - An answer written after a tool block in unclosed reasoning (no `</think>`) stays in `reasoning` when streaming, as
+    it already did non-stream. Streaming used to return it as `content`, so a client reading only `content` gets nothing
+    for such an output. This was 3 of 2,000 recorded outputs.
+
+**Known limitations (open):**
+- With `tool_choice="auto"` (the default when a request sends tools) a model that quotes or explains tool-call markup
+  can still have it returned as a real tool call, which an agent harness would then execute. This release does not fix
+  that. For an explain-only request, send `tool_choice="none"`.
+- `response_format` with thinking on is not covered: a quoted `<tool_call>` in reasoning can start the grammar early,
+  which leaves the JSON in `reasoning`.
+
 ## Merlin 3.0.1
 
 The engine-side subset; the full 3.0.1 list is in the [main changelog](../CHANGELOG.md#merlin-301).
@@ -131,7 +220,7 @@ See the [Flash-Next controls and limits](../../models/flash-next/docs/reference.
   the reference host) and `ornith-quad-3090-nop2p` (tested on a 4 × RTX 3090 host without P2P); `merlin serve ornith1.5 <dir>`.
 - Host-resident embedding table: unset `VLLM_HOST_EMBED_TABLE` now also enables it for Qwen3.5 MoE (the Ornith 1.5 engine support;
   set `VLLM_HOST_EMBED_TABLE=0` to keep the table on the GPU).
-- Uses the shared [release/install-env.sh](../../release/install-env.sh) path in place of separate engine bundles and per-package patch series. The 0.32 installer and tile tooling are integrated; `release/requirements-0.32.lock` is complete with 222 exact pins and SHA-256 hashes, resolved with uv and checked by a dry-run `--require-hashes` install. The CUDA toolkit wheels are the 13.0 series matching torch's cuda-toolkit pin (see "Why the toolkit wheels are 13.0" in [release/install-0.32.md](../../release/install-0.32.md)); the lock is compile-qualified on CPU, and the GPU serve check is pending.
+- Uses the shared [release/install-env.sh](../../release/install-env.sh) path in place of separate engine bundles and per-package patch series. The 0.32 installer and tile tooling are integrated; the 3.0.0 dependency lock was complete with 222 exact pins and SHA-256 hashes, resolved with uv and checked by a dry-run `--require-hashes` install. The CUDA toolkit wheels are the 13.0 series matching torch's cuda-toolkit pin (see "Why the toolkit wheels are 13.0" in [release/install-0.33.md](../../release/install-0.33.md)); the lock is compile-qualified on CPU, and the GPU serve check is pending.
 - Ships the engine as one prebuilt wheel for sm_80, sm_86 and sm_89 (`release/build-wheel.sh`). `MERLIN_WHEEL=<wheel> release/install-env.sh <venv>` installs it without compiling; the installer accepts only the wheel named in `release/merlin-wheel.sha256`, built from the checkout's native sources. A source install builds the same three architectures. The separate compiled-ops tarball and the experimental native-Marlin build option are removed.
 - Links the [upstream vLLM README](https://github.com/vllm-project/vllm/blob/v0.32.0/README.md) and [vLLM documentation](https://docs.vllm.ai/) from Merlin's root [README](../../README.md), with [NOTICE](../../NOTICE) and [security policy](../../SECURITY.md).
 
@@ -153,7 +242,7 @@ See the [Flash-Next controls and limits](../../models/flash-next/docs/reference.
 - **Super VL (Nemotron) ships with RecoverSSM** on the Mamba-2 path; its first-boot front end no longer opens a CUDA context on GPU 0 (the image preprocessor runs eagerly), which returns ~260 MiB to rank 0.
 - **Cache-thrash fixes on by default** for hybrid models: cost-aware admission (`VLLM_E2_SCHED_MISS_DEFER_S`, default 120 s) and session-coherent yields. Measured on Flash-Next under 8×131K and 12×80K oversubscription: follow-up reuse 74.7 % and 82.1 %.
 - **Cold requests behind cached follow-ups:** a cold request is held back behind waiting prefix-cache hits only when admitting its whole prompt would need a waiting request's pin released or would evict cached blocks a waiting request still needs; otherwise it is admitted at once. A prefix-cache reset that cannot complete keeps the retained follow-up prefixes.
-- **Every Qwen recipe serves Froggeric's fixed Qwen3.8 template (v22.5)**: Flash-Next, Swift and Huihui now use the template 27B and ThinkingCap already shipped. It accepts system messages after the first turn, so `/v1/messages` keeps coding agents' per-turn notes in place instead of merging them into the leading prompt, which broke the prefix cache (reported against Flash-Next). `CHAT_TEMPLATE=<path>` serves another template; `CHAT_TEMPLATE=` serves the checkpoint's own.
+- **Every Flash-Next-family and Qwen3.8-27B-family recipe serves Froggeric's fixed Qwen3.8 template (v22.5)**: Flash-Next, Swift and Huihui now use the template 27B and ThinkingCap already shipped. It accepts system messages after the first turn, so `/v1/messages` keeps coding agents' per-turn notes in place instead of merging them into the leading prompt, which broke the prefix cache (reported against Flash-Next). `CHAT_TEMPLATE=<path>` serves another template; `CHAT_TEMPLATE=` serves the checkpoint's own.
 - **Checkpoint-local FP8 KV scales:** a Flash-Next-family checkpoint that ships `qsa_kv_scales.json` beside its weights is served with its own scales (`SCALES=` still overrides), so a new variant of a supported family runs on this release with `merlin serve flash-next <dir>` and no repository update.
 - **27B shared-prefix checkpoints (FGPC)** are reworked as evict-first soft junction checkpoints, one per prefix, with no extra blocks held at rest; 27B prefix-hit counts are unchanged.
 

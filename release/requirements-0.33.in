@@ -1,0 +1,25 @@
+# Merlin / vLLM 0.33.0 release lock input. Engine requirements:
+-r ../requirements/cuda.txt
+# CUDA 13.0 compiler toolkit for the native build, one release with the cu130 runtime
+nvidia-cuda-nvcc==13.0.88
+nvidia-cuda-crt==13.0.88
+nvidia-nvvm==13.0.88
+nvidia-nvjitlink==13.0.88
+nvidia-cuda-cccl==13.0.85
+# Build and test tooling carried from the previous release lock
+accelerate
+build
+cmake
+hypothesis
+pytest
+pytest-asyncio
+pytest-forked
+pytest-mock
+pytest-rerunfailures
+pytest-timeout
+scikit-learn
+sentence-transformers
+setuptools-rust
+setuptools-scm
+tblib
+wheel

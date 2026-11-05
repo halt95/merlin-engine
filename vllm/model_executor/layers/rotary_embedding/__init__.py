@@ -242,6 +242,20 @@ def get_rope(
                 "Dynamic rope scaling must contain either 'alpha' or 'factor' field"
             )
     elif scaling_type == "yarn":
+        missing = [
+            key for key in ("factor", "original_max_position_embeddings")
+            if key not in rope_parameters
+        ]
+        if missing:
+            raise ValueError(
+                "YaRN rope_parameters missing " + ", ".join(missing) + ". "
+                "Set rope_type='yarn', factor, and "
+                "original_max_position_embeddings to the model's native "
+                "context; retain its rope_theta/partial_rotary_factor and "
+                "M-RoPE fields. max_position_embeddings may be set to "
+                "native context * factor. Merlin can build this recipe "
+                "with --context SIZE."
+            )
         scaling_factor = rope_parameters["factor"]
         original_max_position = rope_parameters["original_max_position_embeddings"]
         extra_kwargs = {

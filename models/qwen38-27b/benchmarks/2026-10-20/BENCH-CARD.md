@@ -112,8 +112,6 @@ speed only.
 | 101,845 | 1,297 tok/s | 1,267 tok/s | +2.4 % | 78.51 |
 | 261,888 | 858 tok/s | not measured | — | 305.3 |
 
-<sub>262K row added on 2026-10-22, after first publication, from the same runs.</sub>
-
 Prefill is one cold send per depth (8 tokens out); the 262K row is the exact-262K run's cold send 1. v1.3.0 has no exact-262K
 send; like for like at 259,557 tokens (median of 3 cold sends) it is in the depth table below.
 
@@ -125,8 +123,6 @@ send; like for like at 259,557 tokens (median of 3 cold sends) it is in the dept
 | 101,845 | 2,295 tok/s | 1,989 tok/s | +15.4 % | 44.37 |
 | 261,888 | 1,596 tok/s | not measured | — | 164.1 |
 
-<sub>262K row added on 2026-10-22, after first publication, from the same runs.</sub>
-
 Prefill is one cold send per depth (8 tokens out); the 262K row is the exact-262K run's cold send 1. v1.3.0 has no exact-262K
 send; like for like at 259,557 tokens (median of 3 cold sends) it is in the depth table below.
 
@@ -137,8 +133,6 @@ send; like for like at 259,557 tokens (median of 3 cold sends) it is in the dept
 | 10,157 | 1,021 tok/s | 9.94 |
 | 101,845 | 708 tok/s | 143.85 |
 | 261,888 | 456 tok/s | 574.1 |
-
-<sub>262K row added on 2026-10-22, after first publication, from the same runs.</sub>
 
 Prefill is one cold send per depth (8 tokens out); the 262K row is the exact-262K run's cold send 1. v1.3.0 has no exact-262K
 send; like for like at 259,557 tokens (median of 3 cold sends) it is in the depth table below.

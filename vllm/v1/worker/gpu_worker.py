@@ -64,6 +64,10 @@ from vllm.distributed.weight_transfer import (
 )
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
+from vllm.model_executor.layers.quantization.online.lm_head import (
+    restore_quantized_lm_heads,
+    share_source_lm_heads,
+)
 from vllm.model_executor.model_loader import get_model_loader
 from vllm.model_executor.model_loader.weight_checksum import (
     compute_tensor_digests,
@@ -81,6 +85,7 @@ from vllm.profiler.wrapper import (
 from vllm.sequence import IntermediateTensors
 from vllm.tasks import SupportedTask
 from vllm.tracing import instrument
+from vllm.triton_utils import HAS_TRITON
 from vllm.utils.flashinfer import warn_if_flashinfer_kernels_missing
 from vllm.utils.gc_utils import freeze_gc_heap, maybe_attach_gc_debug_callback
 from vllm.utils.gpu_sync_debug import enable_gpu_sync_check, with_gpu_sync_check
@@ -221,8 +226,6 @@ def _derived_draft_head_kind(model_runner: Any) -> str | None:
 
     if isinstance(getattr(draft, "lm_head", None), QuantizedDraftLMHead):
         return "quantized draft lm_head (draft_lm_head_quant)"
-    if getattr(draft, "draft_vocab_ids", None) is not None:
-        return "reduced draft lm_head (VLLM_DRAFT_VOCAB_FILE)"
     return None
 
 
@@ -235,6 +238,10 @@ class Worker(WorkerBase):
         distributed_init_method: str,
         is_driver_worker: bool = False,
     ):
+        self.use_v2_model_runner = vllm_config.use_v2_model_runner
+        if self.use_v2_model_runner and not HAS_TRITON:
+            raise ValueError("Model Runner V2 requires Triton.")
+
         super().__init__(
             vllm_config=vllm_config,
             local_rank=local_rank,
@@ -271,7 +278,8 @@ class Worker(WorkerBase):
         self.profiler_config = vllm_config.profiler_config
         validate_worker_profiler_config(self.profiler_config)
 
-        self.use_v2_model_runner = vllm_config.use_v2_model_runner
+        # V1 refusals (guard, KV host tier) and PLE
+        # pull transport state
         _refuse_guard_raise_on_v1(self.use_v2_model_runner)
         from vllm.merlin import kv_host_tier
 
@@ -284,7 +292,8 @@ class Worker(WorkerBase):
         if self._ple_offload_enabled:
             self._validate_ple_offload_config()
         elif self.rank == 0 and self.parallel_config.data_parallel_rank == 0:
-            text_config = self.model_config.hf_text_config
+            # null-safe like _has_ple_layers.
+            text_config = getattr(self.model_config, "hf_text_config", None)
             ple_layer_ids = getattr(text_config, "ple_layer_ids", None)
             # A model with no PLE layers at all (every non-Qwen4Exp model, e.g.
             # the 27B) is the expected case: INFO. A Qwen4Exp rank that owns no
@@ -305,6 +314,10 @@ class Worker(WorkerBase):
 
     def _has_ple_layers(self) -> bool:
         """Return whether this model configuration constructs PLE layers."""
+        # a worker built without a model
+        # config (upstream's CPU-worker test) has no PLE layers.
+        if self.model_config is None:
+            return False
         text_config = self.model_config.hf_text_config
         ple_layer_ids = getattr(text_config, "ple_layer_ids", None)
         if not ple_layer_ids:
@@ -363,7 +376,8 @@ class Worker(WorkerBase):
     def spawn_ple_offload(self) -> None:
         """Spawn one node-local PLE CPU worker from DP0/TP0."""
         if (
-            not self._ple_offload_enabled
+            # getattr: Workers built without __init__
+            not getattr(self, "_ple_offload_enabled", False)
             or self.rank != 0
             or self.parallel_config.data_parallel_rank != 0
         ):
@@ -418,6 +432,11 @@ class Worker(WorkerBase):
                 handle.proc.pid,
                 returncode,
             )
+            if returncode == -7:  # signal.SIGBUS
+                logger.error(
+                    "PLE offload process died of SIGBUS; with --ple-store disk, a table "
+                    "file may be truncated or a device read may have failed"
+                )
             notify_parent_fatal()
             os._exit(1)
 
@@ -498,6 +517,8 @@ class Worker(WorkerBase):
                 self._sleep_saved_buffers = {
                     name: buffer.cpu().clone() for name, buffer in model.named_buffers()
                 }
+                # Level-2 sleep also saves the
+                # draft model's buffers.
                 draft = self.get_draft_model()
                 if draft is not None:
                     self._sleep_saved_draft_buffers = {
@@ -505,6 +526,8 @@ class Worker(WorkerBase):
                         for name, buffer in draft.named_buffers()
                     }
 
+            if has_kv_transfer_group():
+                get_kv_transfer_group().unregister_kv_caches()
             self.sleep_mode_backend.suspend(level)
             if self.vllm_config.model_config.enable_nccl_comm_suspend:
                 suspend_device_comms()
@@ -532,8 +555,12 @@ class Worker(WorkerBase):
             raise
 
     def wake_up(self, tags: list[str] | None = None) -> None:
+        # Wake restores draft buffers and resumes
+        # guard telemetry
         try:
             self.sleep_mode_backend.resume(tags)
+            if has_kv_transfer_group() and (tags is None or "kv_cache" in tags):
+                get_kv_transfer_group().restore_kv_caches()
             if self.vllm_config.model_config.enable_nccl_comm_suspend:
                 resume_device_comms()
 
@@ -563,6 +590,8 @@ class Worker(WorkerBase):
             guard_telemetry.resume_reader()
 
     def discard(self, tags: tuple[str, ...]) -> None:
+        if has_kv_transfer_group() and "kv_cache" in tags:
+            get_kv_transfer_group().unregister_kv_caches()
         self.sleep_mode_backend.discard(tags)
 
     def checkpoint_prepare(self) -> None:
@@ -645,25 +674,7 @@ class Worker(WorkerBase):
             # This env var set by Ray causes exceptions with graph building.
             os.environ.pop("NCCL_ASYNC_ERROR_HANDLING", None)
             parallel_config = self.parallel_config
-            if (
-                parallel_config.distributed_executor_backend
-                not in ("ray", "external_launcher")
-                and parallel_config.data_parallel_backend != "ray"
-                and parallel_config.nnodes_within_dp == 1
-            ):
-                # Use local DP rank if available, otherwise use global DP rank.
-                dp_local_rank = self.parallel_config.data_parallel_rank_local
-                if dp_local_rank is None:
-                    dp_local_rank = self.parallel_config.data_parallel_index
-
-                tp_pcp_pp_world_size = (
-                    self.parallel_config.pipeline_parallel_size
-                    * self.parallel_config.prefill_context_parallel_size
-                    * self.parallel_config.tensor_parallel_size
-                )
-
-                # DP_LOCAL_RANK * TP_PCP_PP_WORLD_SIZE + TP_LOCAL_RANK
-                self.local_rank += dp_local_rank * tp_pcp_pp_world_size
+            self.local_rank = parallel_config.get_local_gpu_index(self.local_rank)
 
             # Publish the logical-to-physical mapping for topology queries
             # such as NIC affinity and P2P checks.
@@ -706,6 +717,16 @@ class Worker(WorkerBase):
             )
             self.device = torch.device(f"cuda:{visible_device_index}")
             torch.accelerator.set_device_index(self.device)
+            # Resolve the plain PDL bool eagerly, on
+            # this worker's device, before any compiled forward reads it.
+            current_platform.is_arch_support_pdl()
+            # Hold a caller-set
+            # TRITON_CACHE_DIR's in-use lock from device init, before any use.
+            from vllm.merlin import compile_cache_guard
+
+            compile_cache_guard.prepare_triton_cache_dir(
+                os.environ.get("TRITON_CACHE_DIR")
+            )
 
             if self.vllm_config.kernel_config.persist_triton_autotune:
                 from vllm.triton_utils.persisted_autotune import (
@@ -735,8 +756,8 @@ class Worker(WorkerBase):
             # Set random seed.
             set_random_seed(self.model_config.seed)
 
-            # Preserve the explicit-pin gate's original view, after allocator
-            # cleanup and external weights are ready, but before BLAS warmup.
+            # The explicit-pin gate reads memory here: after allocator cleanup and
+            # once external weights are ready, but before BLAS warmup.
             gc.collect()
             torch.accelerator.empty_cache()
             external_weight_memory = get_model_loader(
@@ -832,12 +853,15 @@ class Worker(WorkerBase):
             self._scoped_allocator_max_split(max_split_size_mb=20),
         ):
             self.model_runner.load_model(load_dummy_weights=load_dummy_weights)
+        # After load: draft-head record, PLE transport
+        # setup (null-safe), launch identity log
         # Record what was actually built; the reload guard keys on it.
         self._mark_derived_draft_head()
 
         # Model loading constructs the PLE placeholders whose buffers are
         # registered with the offload process by the model runner V2 connector.
-        if self._ple_offload_enabled:
+        # getattr: Workers built without __init__
+        if getattr(self, "_ple_offload_enabled", False):
             model_runner = cast("GPUModelRunnerV2", self.model_runner)
             model_runner._setup_ple_offload(self.parallel_config._ple_offload_ipc_path)
 
@@ -878,18 +902,9 @@ class Worker(WorkerBase):
             setattr(self.model_runner, config_name, new_config)
             setattr(self, config_name, new_config)
 
-    def _seal_draft_buffers_after_capture(self) -> None:
-        """Graphs now hold pointers into the drafter's persistent buffers; ask
-        the drafter (if it has any) to refuse re-allocating them from here on."""
-        speculator = getattr(self.model_runner, "speculator", None)
-        draft = getattr(speculator, "model", None)
-        seal = getattr(draft, "seal_draft_logits_buffer", None)
-        if callable(seal):
-            seal()
-
     def _mark_derived_draft_head(self) -> None:
         """Write-once record that this rank built a draft head derived from the
-        checkpoint at load (quantized or reduced-vocabulary). Never cleared: a later
+        checkpoint at load (quantized). Never cleared: a later
         config or environment change cannot make the loaded head fresh."""
         if getattr(self, "_derived_draft_head", None):
             return
@@ -912,16 +927,11 @@ class Worker(WorkerBase):
                 "Weight reload/update is not supported with "
                 "speculative_config.draft_lm_head_quant set; restart the engine."
             )
-        if envs.VLLM_DRAFT_VOCAB_FILE:
-            raise NotImplementedError(
-                "Weight reload/update is not supported with "
-                f"VLLM_DRAFT_VOCAB_FILE={envs.VLLM_DRAFT_VOCAB_FILE} (reduced draft "
-                "vocabulary): the drafter's reduced head would be stale; restart "
-                "the engine."
-            )
 
     def reload_weights(self, *args, **kwargs) -> None:
-        if self._ple_offload_enabled:
+        # a Worker built without __init__
+        # (upstream's weight-transfer test) has no PLE transport.
+        if getattr(self, "_ple_offload_enabled", False):
             raise NotImplementedError(
                 "Weight reload is not supported with the PLE pull transport"
             )
@@ -1001,9 +1011,15 @@ class Worker(WorkerBase):
         # the AMD-CI mem tests), and graph_pool_handle resolves to the same
         # torch.cuda handle the live capture path already uses on ROCm.
         cudagraph_memory_estimate = 0
-        if (
-            current_platform.is_cuda_alike() or current_platform.is_xpu()
-        ) and self.vllm_config.compilation_config.cudagraph_mode != CUDAGraphMode.NONE:
+        compilation_config = self.vllm_config.compilation_config
+        if (current_platform.is_cuda_alike() or current_platform.is_xpu()) and (
+            compilation_config.cudagraph_mode != CUDAGraphMode.NONE
+            or (
+                self.use_v2_model_runner
+                and compilation_config.cudagraph_mm_encoder
+                and not self.model_config.enforce_eager
+            )
+        ):
             cudagraph_memory_estimate = self.model_runner.profile_cudagraph_memory()
 
         # Respect the opt-in flag as originally designed.
@@ -1213,8 +1229,27 @@ class Worker(WorkerBase):
         ):
             self.model_runner._init_kv_zero_meta()
 
+    def get_simple_cpu_offload_num_cpu_blocks(self) -> int | None:
+        from vllm.distributed.kv_transfer.kv_connector.v1.simple_cpu_offload_connector import (  # noqa: E501
+            _find_simple_cpu_offload_connector,
+        )
+
+        if not has_kv_transfer_group():
+            return None
+        connector = _find_simple_cpu_offload_connector(get_kv_transfer_group())
+        if connector is None:
+            return None
+        return connector.get_aligned_num_cpu_blocks()
+
     @instrument(span_name="Warmup (GPU)")
     def compile_or_warm_up_model(self) -> CompilationTimes:
+        if not self.use_v2_model_runner:
+            return self._compile_or_warm_up_model()
+        # MRV2 warmup forwards record expert load like real ones.
+        with self.model_runner.eplb.suppress():  # type: ignore
+            return self._compile_or_warm_up_model()
+
+    def _compile_or_warm_up_model(self) -> CompilationTimes:
         warmup_sizes: list[int] = []
 
         if (
@@ -1272,7 +1307,6 @@ class Worker(WorkerBase):
             with self._get_cudagraph_capture_context():
                 with startup_warmup_phase(self.vllm_config, "graph_capture"):
                     cuda_graph_memory_bytes = self.model_runner.capture_model()
-            self._seal_draft_buffers_after_capture()
 
         from vllm.v1.worker import e2_toggles
 
@@ -1732,6 +1766,7 @@ class Worker(WorkerBase):
         *,
         delay_iterations: int | None = None,
         max_iterations: int | None = None,
+        profiler_kwargs: dict | None = None,
     ):
         # Check if profiling is enabled
         if self.profiler_config is None or self.profiler_config.profiler is None:
@@ -1762,9 +1797,11 @@ class Worker(WorkerBase):
                     self.profiler_config,
                     worker_name=trace_name,
                     local_rank=self.local_rank,
+                    profiler_kwargs=profiler_kwargs,
                 )
 
             self.profiler.set_output_name(trace_name)
+            self.profiler.set_profiler_kwargs(profiler_kwargs)
             self.profiler.start(
                 delay_iterations=delay_iterations,
                 max_iterations=max_iterations,
@@ -1922,12 +1959,19 @@ class Worker(WorkerBase):
                 "active. Call finish_weight_update first."
             )
 
+        draft_model = self.get_draft_model() if is_draft else None
         try:
             if is_draft:
                 self._set_draft_weight_update_target()
+            if draft_model is not None:
+                # Load through the unquantized target head, as without
+                # draft_lm_head_quantization; finish re-derives the copies.
+                share_source_lm_heads(draft_model)
             self.weight_transfer_engine.start_weight_update()
         except BaseException:
             self.weight_transfer_engine.reset_weight_update_target()
+            if draft_model is not None:
+                restore_quantized_lm_heads(draft_model, refresh=False)
             raise
         self._weight_update_active = True
         self._weight_update_is_draft = is_draft
@@ -1967,6 +2011,10 @@ class Worker(WorkerBase):
             except BaseException:
                 self._weight_update_active = False
                 self.weight_transfer_engine.reset_weight_update_target()
+                if self._weight_update_is_draft and (
+                    (draft_model := self.get_draft_model()) is not None
+                ):
+                    restore_quantized_lm_heads(draft_model, refresh=False)
                 raise
 
     def finish_weight_update(self) -> None:
@@ -1983,6 +2031,10 @@ class Worker(WorkerBase):
             self.weight_transfer_engine.finish_weight_update()
             self.weight_transfer_engine.reset_weight_update_target()
             self._weight_update_active = False
+            if self._weight_update_is_draft and (
+                (draft_model := self.get_draft_model()) is not None
+            ):
+                restore_quantized_lm_heads(draft_model)
 
         # Weight transfer bypasses GPUModelRunner.reload_weights().
         if not self._weight_update_is_draft:

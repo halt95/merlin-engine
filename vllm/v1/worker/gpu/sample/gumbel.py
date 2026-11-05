@@ -84,6 +84,12 @@ def tl_rand32(seed, offset, includes_zero: tl.constexpr):
 
 
 @triton.jit
+def spec_step_seed(seed, step):
+    """Mix a speculative step into the high bits of a request seed."""
+    return seed ^ (tl.cast(step, tl.int64) << 32)
+
+
+@triton.jit
 def _murmur3_rotl32(value, shift: tl.constexpr):
     return (value << shift) | (value >> (32 - shift))
 
@@ -357,6 +363,7 @@ def gumbel_block_argmax(
 
     seed = tl.load(seeds_ptr + req_state_idx, mask=is_valid_req, other=0)
     pos = tl.load(pos_ptr + token_idx)
+    # Step-keyed draws are opt-in (off by default).
     if STEP_KEYED:
         # The draft step is read from a persistent device buffer (never a
         # host scalar), so a captured graph replays the current step's keys.

@@ -1,9 +1,9 @@
 # Topology selector
 
-For Merlin 3.0.1, built on vLLM 0.32.0. The controls below describe the selector and launcher;
+For Merlin 3.0.2, built on vLLM 0.33.0. The controls below describe the selector and launcher;
 synthetic-topology coverage does not qualify performance on NVLink or other unmeasured hardware.
 
-> **Opt-in in v2.2.0.** The selector runs only when you set `AUTO_TOPO=1` (or `AUTO_TOPO=strict`). With `AUTO_TOPO`
+> **Opt-in.** The selector runs only when you set `AUTO_TOPO=1` (or `AUTO_TOPO=strict`). With `AUTO_TOPO`
 > unset or `0`, the default, `models/flash-next/serve.sh` never calls it and behaves exactly as it did without it: the
 > same fixed settings, the same environment, the same vLLM command.
 >
@@ -47,7 +47,7 @@ an effect only when the selector is on.
 
 | variable | values | effect |
 |---|---|---|
-| `AUTO_TOPO` | unset or `0` (default in v2.2.0) | do not run the selector. Serve behaves exactly as before the selector existed |
+| `AUTO_TOPO` | unset or `0` (default) | do not run the selector. Serve behaves exactly as before the selector existed |
 | | `1` | run the selector; fall back to the fixed settings on any doubt |
 | | `strict` | run the selector, but refuse to start (exit 1) instead of guessing: when more than four GPUs are visible and `CUDA_VISIBLE_DEVICES` is not set (even with `GPU_SET=auto`), and when the selector cannot run (fails, times out, or writes an unusable file) |
 | `AUTO_TOPO_NCCL` | unset or `legacy` (default) | keep `NCCL_PROTO=Simple` everywhere |

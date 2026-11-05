@@ -73,7 +73,7 @@ transferring weights, and finishing the update. It also supports draft-model
 updates and `/update_weight_version` and `/weight_info` for version tracking.
 
 For trainer-side usage, see the IPC and NCCL examples (`examples/rl/rlhf_http_ipc.py` and
-`examples/rl/rlhf_http_nccl.py`) in upstream vLLM v0.32.0; this release does not ship them. Configure the weight-transfer
+`examples/rl/rlhf_http_nccl.py`) in upstream vLLM v0.33.0; this release does not ship them. Configure the weight-transfer
 backend on the server and pause generation during updates, as shown there.
 
 ### External Engine

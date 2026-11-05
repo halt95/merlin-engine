@@ -951,12 +951,18 @@ def copy_kv_cache_blocks_inplace(
 
     indices_np = np.array(kv_cache_block_copies, dtype=np.int64)
     indices: torch.Tensor | None = None
-    seen: set[tuple[torch.device, int]] = set()
+    # Deduplicate identical views only.
+    seen: set[tuple[torch.device, int, tuple[int, ...], tuple[int, ...], int]] = set()
     copied_storages: set[tuple[torch.device, int]] = set()
     for cache in kv_caches:
-        # Layers sharing KV (cross-layer sharing) alias the same view; copy it
-        # once. data_ptr distinguishes per-layer views of a shared allocation.
-        key = (cache.device, cache.data_ptr())
+        # Key by the complete view geometry.
+        key = (
+            cache.device,
+            cache.data_ptr(),
+            tuple(cache.shape),
+            tuple(cache.stride()),
+            cache.element_size(),
+        )
         if key in seen:
             continue
         seen.add(key)

@@ -3,7 +3,7 @@
 
 This directory is the canonical source for vLLM's gRPC schema.
 
-See the context parallel deployment guide in upstream vLLM v0.32.0
+See the context parallel deployment guide in upstream vLLM v0.33.0
 (`docs/serving/context_parallel_deployment.md`; not shipped in this release) for effective attention block-size metadata in Python and `Control.GetServerInfo`.
 
 Schema updates are no longer published to the Buf Schema Registry. Rust consumers
@@ -17,7 +17,7 @@ the schemas on pull requests, including on forks.
 
 ```toml
 [dependencies]
-vllm-proto = "0.5"
+vllm-proto = "0.6"
 ```
 
 For example, import `vllm_proto::inference_client::InferenceClient` or

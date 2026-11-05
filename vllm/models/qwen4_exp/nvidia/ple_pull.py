@@ -23,8 +23,8 @@ unquantized -- the two ``Qwen4ExpPLEEmbeddingMethod`` families upstream itself
 supports -- plus the fork's packed tables (``ple_formats.py``): INT6
 g32 (the shipped opt-in) and INT8 per row (a reference table), whose rows cross
 as U8 ``[tokens, ngram_heads * row_bytes]``
-and are expanded on the GPU at ``dequantize_pulled``. Upstream has no NVFP4 PLE
-method to select, so there is no NVFP4 path.
+and are expanded on the GPU at ``dequantize_pulled``. NVFP4 tables are refused:
+the pull transport does not support ``Qwen4ExpPLENvFp4EmbeddingMethod``.
 """
 
 from collections.abc import Iterable
@@ -45,11 +45,13 @@ from vllm.model_executor.layers.quantization.base_config import QuantizationConf
 
 from .ngram_embedding import (
     Qwen4ExpNGramEmbedding,
+    Qwen4ExpPLEDeviceEmbedding,
     Qwen4ExpPLEEmbeddingMethod,
     Qwen4ExpPLEFp8EmbeddingMethod,
     Qwen4ExpPLEUnquantizedEmbeddingMethod,
 )
 from .ple_formats import (
+    Qwen4ExpPLEInt6G32EmbeddingMethod,
     Qwen4ExpPLEPackedRowEmbeddingMethod,
     select_ple_embedding_method,
 )
@@ -60,6 +62,21 @@ logger = init_logger(__name__)
 PULL_BACKEND_NAME = "E2PullTransport"
 
 _FAST_IDS: bool = envs.VLLM_E2_PLE_FAST_IDS
+_PLE_STORE: str = envs.VLLM_E2_PLE_STORE
+_PLE_WARM: bool = envs.VLLM_E2_PLE_WARM
+_PLE_DISK_THREADS: int = envs.VLLM_E2_PLE_DISK_THREADS
+
+
+class Qwen4ExpPLEFileBackedEmbedding(Qwen4ExpPLEDeviceEmbedding):
+    """The table's shape and dtype with no storage: rows come from the files."""
+
+    def allocate_embedding_weight(
+        self,
+        num_embeddings: int,
+        embedding_dim: int,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        return torch.empty(num_embeddings, embedding_dim, dtype=dtype, device="meta")
 
 
 @dataclass(frozen=True)
@@ -115,6 +132,9 @@ class Qwen4ExpNGramEmbeddingPull(PleOffloadLayer, Qwen4ExpNGramEmbedding):
                 "PLE pull transport: the offload process resolved "
                 "cpu_offload=True; refusing to build upstream's UVA table here."
             )
+        if _PLE_STORE == "disk":
+            # Read by the table hook in Qwen4ExpNGramEmbedding.__init__.
+            self.__dict__["_ple_table_cls"] = Qwen4ExpPLEFileBackedEmbedding
         Qwen4ExpNGramEmbedding.__init__(
             self,
             config,
@@ -126,12 +146,49 @@ class Qwen4ExpNGramEmbeddingPull(PleOffloadLayer, Qwen4ExpNGramEmbedding):
             quant_config=quant_config,
             params_dtype=params_dtype,
         )
-        # Proof line for A/B arms: which ID path this offload process serves.
+        if _PLE_STORE == "disk":
+            self.__dict__["_ple_file_table"] = self._open_file_table(prefix)
+        # Logged once per layer so the ID path is visible in the engine log.
         logger.info(
             "PLE offload n-gram IDs: %s path (VLLM_E2_PLE_FAST_IDS=%d)",
             "numpy" if _FAST_IDS else "torch",
             int(_FAST_IDS),
         )
+
+    def _open_file_table(self, prefix: str) -> object:
+        """The table's files, checked now so that a bad one fails at boot."""
+        from vllm.model_executor.models.utils import extract_layer_index
+
+        from .ple_file_table import PleFileTable, fp8_parts, int6_parts
+
+        vllm_config = get_current_vllm_config()
+        if str(vllm_config.load_config.load_format) == "dummy":
+            raise RuntimeError(
+                "--ple-store disk reads the table from checkpoint files; a dummy "
+                "load has none"
+            )
+        embedding = self.ngram_embedding
+        method = embedding.embedding_method
+        if isinstance(method, Qwen4ExpPLEFp8EmbeddingMethod):
+            parts = fp8_parts(embedding.weight.shape[1])
+        elif isinstance(method, Qwen4ExpPLEInt6G32EmbeddingMethod):
+            parts = int6_parts()
+        else:
+            raise RuntimeError(
+                "--ple-store disk serves the FP8 and INT6 g32 tables only, not "
+                f"{type(method).__name__}; use --ple-store ram"
+            )
+        table = PleFileTable(
+            vllm_config.model_config.model,
+            extract_layer_index(prefix),
+            embedding.org_vocab_size,
+            self.split_ngram_parts,
+            parts,
+            threads=_PLE_DISK_THREADS,
+            warm=_PLE_WARM,
+        )
+        logger.info("%s", table.proof_line())
+        return table
 
     @classmethod
     def build(
@@ -244,8 +301,7 @@ class Qwen4ExpNGramEmbeddingPull(PleOffloadLayer, Qwen4ExpNGramEmbedding):
     ) -> torch.Tensor:
         """GPU-side dequantization of rows DMA'd from the offload process.
 
-        Same arithmetic as upstream ``Qwen4ExpPLEFp8EmbeddingMethod.dequantize``
-        (and the earlier ``_dequantize_embeddings`` FP8 branch).
+        Same arithmetic as upstream ``Qwen4ExpPLEFp8EmbeddingMethod.dequantize``.
         """
         method = self._offload_quant_method
         if isinstance(method, Qwen4ExpPLEUnquantizedEmbeddingMethod):
@@ -270,11 +326,7 @@ class Qwen4ExpNGramEmbeddingPull(PleOffloadLayer, Qwen4ExpNGramEmbedding):
         query_start_loc: torch.Tensor,
         ngram_context: torch.Tensor,
     ) -> None:
-        """No prefetch: rows are published by the offload process.
-
-        Signature of the 0.32 caller (``Qwen4ExpPLELayer.start_prefetch``),
-        which no longer passes ``hidden_states``; nothing here ever read it.
-        """
+        """No prefetch: rows are published by the offload process."""
         return None
 
     def _prepare_ngram_ids_offload(
@@ -517,6 +569,18 @@ class Qwen4ExpNGramEmbeddingPull(PleOffloadLayer, Qwen4ExpNGramEmbedding):
             ngram_ids = self._compute_ngram_ids_from_common(prepared_ngram_ids)
         num_tokens = input_ids.reshape(-1).shape[0]
         weight = self.ngram_embedding.weight
+        file_table = self.__dict__.get("_ple_file_table")
+        if file_table is not None:
+            # The same rows in the same layout as the index_select paths below.
+            width = weight.shape[1] * self.ngram_heads
+            output = (
+                output_buffer[:num_tokens, :width]
+                if output_buffer is not None
+                else torch.empty(num_tokens, width, dtype=weight.dtype, device="cpu")
+            )
+            rows = output.reshape(-1, weight.shape[1]).view(torch.uint8)
+            file_table.gather(ngram_ids.reshape(-1), rows)
+            return output
         if isinstance(self._offload_quant_method, Qwen4ExpPLEPackedRowEmbeddingMethod):
             # Packed rows: U8 [tokens, ngram_heads * row_bytes], gathered as bytes.
             row_bytes = self._offload_quant_method.ROW_BYTES
@@ -556,6 +620,20 @@ class Qwen4ExpNGramEmbeddingPull(PleOffloadLayer, Qwen4ExpNGramEmbedding):
         the table itself). Prefix grouping may call this more than once.
         """
         if is_offload_process():
+            if "_ple_file_table" in self.__dict__:
+                # The rows stay in the files, opened and checked at construction;
+                # the rest (FP8's scale) loads as ever. Reported loaded for the
+                # child's every-parameter-loaded check.
+                loaded = Qwen4ExpNGramEmbedding.load_weights(
+                    self,
+                    (
+                        (name, tensor)
+                        for name, tensor in weights
+                        if not name.startswith("ngram_embedding.shard_")
+                    ),
+                )
+                loaded.add("ngram_embedding.weight")
+                return loaded
             method = self.ngram_embedding.embedding_method
             if isinstance(method, Qwen4ExpPLEPackedRowEmbeddingMethod):
                 weights = self._pair_packed_shards(method, weights)

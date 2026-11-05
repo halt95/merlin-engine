@@ -39,8 +39,8 @@ VERIFY_LAUNCH_CONFIGS: dict[str, tuple[int, int, int]] = {
     for w in (1, 2, 4, 8)
     for s in (1, 2, 3)
 }
-# The shipped config (BV <= 32, 4 warps, 2 stages). Folding a microbenchmark
-# winner is this one line; the old config is this id.
+# The shipped config (BV <= 32, 4 warps, 2 stages). Changing the shipped
+# config means changing this id.
 VERIFY_LAUNCH_CONFIG_ID = "bv32_w4_s2"
 
 

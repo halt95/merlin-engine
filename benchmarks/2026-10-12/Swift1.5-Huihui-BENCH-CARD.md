@@ -88,7 +88,7 @@ parking; the engine's own release check), all four cards sit in P8 at 22-32 W af
 ## Install and serve, as a user
 
 Same host, 2026-10-12, both routes a user can take to this checkpoint, on the release checkpoint files
-(`release/checkpoint-huihui.sha256` verified every file):
+(`models/swift1.5-huihui/checkpoint.sha256` verified every file):
 
 - **This repository**, built from the v2.5.2 bundle with `scripts/build-v2.5.sh`, served with `scripts/serve-huihui.sh`:
   ready in 480 s, serving `flash-next-swift-huihui` and

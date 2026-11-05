@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by the Merlin project; see NOTICE.
 
 from typing import Any
 
@@ -58,6 +59,7 @@ def _selector_walk_kernel(
             scores,
             candidates,
             mask & valid,
+            # The draw is keyed by the request seed and position.
             seed,
             sample_pos,
             temperature if SAMPLE_PROBABILISTIC else 0.0,

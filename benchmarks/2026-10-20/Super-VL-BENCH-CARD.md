@@ -34,8 +34,6 @@ send 3 reused the prefix before the needle from the prefix cache). The table giv
 | 136,625 | on | 101.3 | 36.35 | 3.61 | 38.84 | 3/3 |
 | 261,888 | on | 91.5 | 37.06 | 3.20 | 88.8 | 3 sends (section 2) |
 
-<sub>262K row added on 2026-10-22, after first publication, from the same runs.</sub>
-
 ## 2. Exact 262K
 
 | prompt tokens | thinking | decode tok/s (median of 3) | ITL ms | tokens/event | cold TTFT s | needle found |
@@ -55,8 +53,6 @@ speed only.
 | 10,187 | 3,737 tok/s | 2.73 |
 | 101,885 | 3,744 tok/s | 27.21 |
 | 261,888 | 2,951 tok/s | 88.8 |
-
-<sub>262K row added on 2026-10-22, after first publication, from the same runs.</sub>
 
 Prefill is one cold send per depth (8 tokens out); the 262K row is the exact-262K run's cold send 1 (section 2).
 

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # SPDX-FileCopyrightText: Tri Dao
+# Modified by the Merlin project; see NOTICE.
 #
 # This file contains code copied from the flash-linear-attention project.
 # The original source code was licensed under the MIT license and included
@@ -95,7 +96,8 @@ def layer_norm_fwd_kernel(
     ACTIVATION: tl.constexpr,
 ):
     # Map the program id to the starting row of X and Y it should compute.
-    row_start = tl.program_id(0) * ROWS_PER_BLOCK
+    # Widen before stride products.
+    row_start = tl.program_id(0).to(tl.int64) * ROWS_PER_BLOCK
     group = tl.program_id(1)
 
     # Create 2D tile: [ROWS_PER_BLOCK, BLOCK_N]

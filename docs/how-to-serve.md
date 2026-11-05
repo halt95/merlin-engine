@@ -31,8 +31,10 @@ git clone https://github.com/halt95/merlin-engine.git && cd merlin-engine && ./s
 4. **Shows every download with its size** (the prebuilt engine, the Python packages, the checkpoint) and asks once.
    `n` stops with nothing downloaded and nothing saved.
 5. **Installs and starts**: the prebuilt engine into `venv/`, the checkpoint checked file by file against its
-   checksums, then the server on `127.0.0.1` (port 8000; 8100 for the 27B and ThinkingCap). It is ready when the log says `Application startup complete`; the
-   first start compiles kernels and takes longer than later ones.
+   checksums, then the server on `127.0.0.1` (port 8000; 8100 for the 27B and ThinkingCap). It is ready when
+   `merlin: Ready: ...` prints the URL, model name, context length and where the key is (until then a `starting...`
+   line every minute); the first start compiles kernels and takes longer than later ones. `MERLIN_READY_BANNER=0`
+   turns the Ready line off.
 
 Nothing is installed system-wide and nothing needs sudo: uv and Python 3.13 live in `.merlin/`, the engine in `venv/`.
 
@@ -62,6 +64,7 @@ setting without running setup again. The full setup option list is in [SETUP.md]
 | `venv/bin/merlin pull <model>` | download and verify only |
 | `venv/bin/merlin verify <dir>` | re-hash every file of a checkpoint against its published checksums |
 | `venv/bin/merlin doctor` | the hardware report: GPUs, PCIe links, P2P, driver, RAM, shared memory, GPU unlock state per card |
+| `venv/bin/merlin doctor --report [FILE] [--log FILE] [--lines N]` | one redacted file for bug reports: the hardware report, the serve plan and the last `N` (default 200) lines of the newest `merlin-*.log` or of `--log FILE`; mode 0600 |
 
 ### Turn on the Merlin features
 
@@ -70,6 +73,7 @@ setting without running setup again. The full setup option list is in [SETUP.md]
 ./setup.sh --kv-ram-cache 24g     # experimental: keep evicted prefixes in host RAM and restore them
 ./setup.sh --spec dflash2         # Flash-Next family on 4× RTX 3090 with P2P: faster decode (downloads the 1.2 GB drafter)
 ./setup.sh --ple int6             # Flash-Next and Swift1.5: about 9 GiB less host RAM
+./setup.sh --ple-store disk       # experimental, Flash-Next family on NVMe: frees the 47.7 GiB table's host RAM for about 2 % slower decode
 venv/bin/merlin serve ~/models/flash-next --swarm   # the same flags without running setup
 ```
 
@@ -77,19 +81,54 @@ The table below has each flag's limits.
 
 ### `merlin serve` options
 
-`./setup.sh` takes `--tp`, `--instances`, `--spec`, `--kv-ram-cache`, `--swarm` and `--ple` too.
+`./setup.sh` takes `--tp`, `--instances`, `--spec`, `--kv-ram-cache`, `--swarm`, `--ple`, `--ple-store` and `--context` too.
 
 | Option | Effect |
 |---|---|
 | `--tp N` | pick the layout with this tensor-parallel size |
-| `--instances N` | start N servers on separate cards, on consecutive ports; all start or none do |
-| `--wait-ready SECONDS` | with `--instances`: wait until every instance answers `/health` and is still running; if one dies (even after answering) or misses the deadline, all are stopped and the command exits 1 |
+| `--instances N` | run N servers in the foreground on separate cards and consecutive ports; Ctrl+C stops them all |
+| `--wait-ready SECONDS` | with `--instances`: wait until every instance answers `/health` and is still running; if one dies or misses the deadline, all are stopped and the command exits 1; after readiness the command stays in the foreground |
 | `--profile <id>` | force one profile (checked against your hardware) |
+| `--context SIZE` | serve this many tokens per request, in tokens or binary `k`/`m` (`512k` = 524,288). Past 262K it adds YaRN from the checkpoint's `config.json`; a size above the layout's KV pool is refused. See the [Flash-Next reference](../models/flash-next/docs/reference.md#context-size-302) for what has been tested |
 | `--spec mtp\|dflash2` | Flash-Next family: the drafter. `mtp` is the default. `dflash2` decodes 5–18 % faster and holds three 262K sessions instead of six 131K ones |
 | `--kv-ram-cache SIZE` | **Experimental.** Keeps conversation prefixes the GPU evicts in host RAM (for example `24g`) and restores them instead of recomputing them; output is identical. Flash-Next family with MTP and Qwen3.8-27B; Ornith 1.5 accepts it, untested ⚫. Off by default; adds no context or sessions. Not with `--spec dflash2`. Tuning knobs: [Flash-Next reference](../models/flash-next/docs/reference.md#kv-ram-cache-tuning-knobs) |
 | `--swarm` | **Experimental.** Raises the session cap on 4× RTX 3090, with or without P2P: 8 → 24 on Flash-Next, Swift1.5 and Swift1.5-Huihui, 24 → 32 on Qwen3.8-27B and ThinkingCap (four cards). Tested on Flash-Next and the 27B with P2P; untested ⚫ on Swift1.5 and Swift1.5-Huihui and on every row without P2P (the server prints a warning there). Sets a 48g KV RAM cache; a smaller `--kv-ram-cache` is refused. Refused on profiles without a swarm cap and with `--spec dflash2`. An exported `SEQS` overrides every cap. `./setup.sh --no-swarm` turns off a saved answer |
 | `--ple fp8\|int6` | Flash-Next and Swift1.5: the embedding table. `fp8` is the default; `int6` saves about 9 GiB of host RAM; `merlin verify <dir> --ple int6` checks the pack and `MERLIN_PLE_PACK_DIR` points at a local copy. Swift1.5-Huihui serves `fp8` only |
+| `--ple-store ram\|disk` | **Experimental.** Flash-Next family: where the embedding (PLE, n-gram) table lives. `ram` is the default. `disk` reads its rows from the checkpoint's own files on NVMe, so the server no longer holds the table in its own memory (47.7 GiB with `--ple fp8`, 38.7 GiB with `--ple int6`). Decode is about 2 % slower once the table is cached and 9–11 % slower on text whose rows are not cached yet; output matched `ram` token for token. Measured on 4× RTX 3090 with one NVMe, with the FP8 table and the INT6 pack; everything else is untested ⚫. Figures are from the 0.32 tree (the 0.33 re-run has not been done for 3.0.2). See [the costs below](#the-ple-table-on-nvme-experimental) |
 | `-- <vLLM args>` | pass anything after `--` straight to vLLM. Merlin notes a recipe value you override; an extra `--speculative-config` (any spelling vLLM accepts: `--speculative_config`, `-sc` or `--speculative-config.KEY`) merges with the recipe's, and changing its method or K is refused |
+
+#### The PLE table on NVMe (experimental)
+
+The Flash-Next family reads rows of a large embedding table (the PLE or n-gram table: 47.7 GiB with `--ple fp8`, 38.7 GiB with `--ple int6`) at every step. `--ple-store ram`, the default, holds it in the server's own memory. `--ple-store disk` leaves it in the checkpoint's own files on NVMe and reads the rows from there through the kernel's page cache. The rows are the same bytes either way: in our run the output was token for token identical to `ram` (304 of 304 comparisons with FP8, 225 of 225 with INT6, all at temperature 0).
+
+**How to choose.** Stay on `ram` if the host has the memory: it costs no speed. Use `disk` when you need that memory for something else, such as a smaller host, a larger `--kv-ram-cache` or other programs, and the checkpoint (with `--ple int6`, the pack too) is on local NVMe. In return you pay about 2 % of decode speed once the table is cached, and more for text whose table rows have not been read yet. All costs are against `ram` on the same host:
+
+| Decode, one session | FP8 table | INT6 pack |
+|---|---|---|
+| Table cached (warm-up done) | +1.8 % median (+1.1 to +2.3 % by text); +5.5 % on all-new random text at 262K | +2.3 % median (+1.2 to +2.7 % by text); +5.3 % on all-new random text at 262K |
+| First send of a text, table not cached | +9 % (+8 to +13 % by text) | +11 % (+7 to +17 % by text) |
+| Second send of the same text | +3 % (+1 to +4 %) | +3 % (+1 to +8 %) |
+
+| Time to first token | FP8 table | INT6 pack |
+|---|---|---|
+| Table cached | +0.4 % median, worst +1.3 % | 0.0 % median, worst +0.7 % |
+| First send, 262K real text, table empty | +7 % (chat) and +16 % (long document): +2.9 s and +6.3 s on about 39 s | +16 % (chat): +6.2 s |
+| First send, 262K all-new random text, table empty | +53 %: +19 s on 36 s | not measured |
+| First send, 32K all-new random text, table empty | not measured | +114 %: +4.9 s on 4.3 s |
+| First send, 4K to 131K real text, 8 to 10 % of the table cached | +15 to +37 %: +0.3 to +2.8 s | +43 to +90 %: +0.6 to +2.0 s |
+| Second send of the same text | within +1.2 % | within +2.1 % |
+
+Warm decode figures are the median of 16 text-and-boot aggregates (8 texts, 2 boots) against 2 `ram` boots. Two `ram` boots differed from each other by up to 1.9 % (FP8) and 1.6 % (INT6) per text, and by 4.9 % and 2.2 % on 262K random text, so single texts are not resolved. Warm first-token figures cover 30 sends of 4K to 262K tokens.
+
+- **When the table is "not cached".** Right after the server starts and before the warm-up has finished, with `PLE_WARM=0`, when the warm-up was skipped (below), and after the kernel has taken the table's pages back because other programs needed the memory. The cold rows above come from a restart with the warm-up off and the table evicted from the page cache. Each new text reads the rows it needs: a first send of a 262K text brought 4 to 15 % of the table into the cache for real text and 23 to 29 % for all-new random text (FP8). A second send of the same text found them there, with no disk reads at all in any of the 35 second sends. On first token, short prompts show the largest percentages.
+- **Pauses.** While the table is cold or partly cold, the longest gap between two streamed tokens in a send reached 60 ms (INT6: 48 ms), against a typical gap of 18 ms. In the 4K steady-text send the longest gap was 19 ms on `ram`, 24 to 27 ms warm, and 60 ms (FP8) or 48 ms (INT6) cold.
+- **Warm-up.** After the server is ready it reads the table once in the background (39 s for FP8 and 32 s for INT6 on the NVMe below), but only if the free memory, less any KV RAM cache and 4 GiB of headroom, can hold the whole table. Otherwise it is skipped and the table stays cold until requests have read it. `PLE_WARM=0` turns the warm-up off.
+- **Memory.** The process that held the table went from 48.6 GiB of private memory with `ram` to 0.9 GiB with `disk` (INT6: 39.7 to 0.9 GiB), and free memory (`MemAvailable`) after the server was ready was 47.7 to 47.8 GiB higher with FP8 and 38.8 to 38.9 GiB higher with INT6. The table does not vanish: once the warm-up has read it, it sits in the page cache (about 48 GiB for FP8 and 39 GiB for INT6, plus about 100 and 83 MiB of page tables). Page cache counts as free memory because the kernel can take it back, at the price of reading those rows from the disk again. So the server's own need is about 21 GiB at four workers (the 69 GiB it needs with `ram`, less the table: computed, not booted on a capped host), plus any KV RAM cache, plus enough free memory for the page cache to hold the table if you want it to stay warm. Below that plus 16 GiB of page cache you get a warning.
+- **With a large `--kv-ram-cache` the table never fully warms.** With `--ple-store disk --kv-ram-cache 96g` on a 152 GiB host, the free memory left room for only 38.8 GiB of the 47.7 GiB table, so the warm-up was skipped, and the table was still 11 % cached after 11 minutes of requests. For as long as the cache leaves too little memory for the table, every new text pays the cold cost. Decode was +10.6 % on average over four 262K sends (+8.7 to +11.7 %; +8.9 % timed from the stream) and +3.5 % on 4K steady text, where the first token took +20 % (0.81 s against 0.67 s). At 262K the first token took +15 % to +30 % longer (chat +15.0 % and +16.8 %, long document +30.0 % and +18.5 %). A 32K all-new random prompt took +7.3 % decode and +70 % first token on its first send. Three new 262K random prompts sent together took +58 % longer to the last first token (177 s against 110 to 114 s). These compare with `ram` without a KV RAM cache, and were measured with FP8 only.
+- **What was measured, and what was not.** Flash-Next with the FP8 table and with the INT6 pack, on 4× RTX 3090 with the GPU unlock (the layout of the 3.0.1 bench card, 924,993-token KV pool), MTP, on one NVMe: an MSI M460 1 TB (PCIe Gen4, no DRAM cache), which read about 183,000 random 4 KiB blocks a second with 32 threads. Other disks are untested ⚫, and a slower disk will cost more. Swift1.5, Swift1.5-Huihui, `--spec dflash2`, other GPU layouts and other cards are untested ⚫. Setup offers `disk` only on local NVMe; `merlin serve --ple-store disk` on SATA, rotating, network or unidentified storage prints a warning and runs, and it can be far slower there. The token comparison covers 28 short documents, the 4K to 262K prompts, a 258K needle test, an 8 MP image and the steady text; 259 of the 304 FP8 comparisons and 180 of the 225 INT6 comparisons are from `disk` boots, the rest a second `ram` boot against the first.
+- **Which tree these figures come from.** Every figure in this section was measured on the 0.32 tree (Merlin 3.0.1 base) with the layout of the 3.0.1 bench card. The 0.33 re-run of the PLE-on-NVMe arms has not been done for 3.0.2; until then, read the figures as 0.32 results.
+- **How the percentages were taken.** Decode cost is the engine's own step time: decode time divided by the engine's count of speculative-decoding steps. The bench cards time decode from the streamed events, and at 262K the stream carries fewer events than the engine has steps (for example 27 events for 37 steps on random text), so event-timed figures at 262K are smaller: warm +0.5 to +2.7 % instead of +1.5 to +5.5 %, and first sends that started with the table empty +2.8 to +8.9 % (FP8) instead of +7.8 to +10.0 %. Each setting was booted twice, except FP8 cold (three boots) and the 96g run (one). The 3.0.1 figures on the bench cards are unchanged by any of this.
+- **The files must not change while serving.** The server checks each table file's size and timestamps (including the change time) every time it reads rows from it, and stops with an error before using those rows if anything differs from when it started. That counts as a change: a write, `touch`, `chmod`, a new hard link, removing or moving the file, and `rsync -a` with or without `--inplace` (by default rsync renames a new file over the old one, which also changes the old file). A truncated file or a disk read error stops the server at once. Reading the files, as `merlin verify` does, is fine.
 
 Environment: `GPUS=0,1` picks the cards, `PORT=8101` the port (a port already in use stops the launch;
 `MERLIN_SKIP_PORT_CHECK=1` skips that check), `HOST=0.0.0.0` with `VLLM_API_KEY` serves on your
@@ -97,10 +136,17 @@ network ([step 4](#4-serve-on-your-network)). `SWARM=1` is the same as `--swarm`
 into FP8 KV for the Flash-Next family. `SEQS` and `MAXLEN` override the session cap and context length on
 Flash-Next family models, the 27B and Ornith 1.5 (a note is printed when either is off the tested row); `PP_PARTITION` sets Flash-Next's pipeline split.
 
+New in 3.0.2: `P2P=on` or `P2P=off` now also picks the Ornith 1.5 row (without it, Ornith's `serve.sh` reads the cards' peer access and stops with "set P2P=on or P2P=off" if it cannot); the P2P mode alone decides `NCCL_P2P_DISABLE`, `NCCL_P2P_LEVEL`, `NCCL_PROTO`, `NCCL_ALGO` and `VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC`, and a value inherited from your shell is replaced with a note; `VLLM_SERVER_DEV_MODE` is dropped unless `MERLIN_ALLOW_SERVER_DEV_MODE=1` (the development routes have no API-key protection); `MERLIN_READY_BANNER=0` turns the Ready line off. Pipeline-parallel layouts take two optional engine switches, both off by default: `VLLM_RECOVERSSM_PP_SPLIT_RECV=1` (commit the deferred RecoverSSM step after the token counts arrive) and `VLLM_MERLIN_PP_DECODE_BALANCE=1` (**experimental**: cap decode rows per step to even out pipeline microbatches). Neither changes the tokens.
+
+`P2P=ipc` (new in 3.0.2, Flash-Next family rows with tensor parallelism, **untested**): NCCL runs without its P2P transport
+(shared memory between ranks, as with `P2P=off`) while the PCIe-IPC all-reduce still uses CUDA peer access. It is for
+hosts where NCCL's P2P bootstrap hangs but peer access works; the cards still need P2P and BAR1 of 1 GiB or more
+(`merlin doctor --p2p ipc` checks both). It is never a default, a row without it refuses it, and the Ready line names it.
+
 ### Longer context with YaRN (Flash-Next)
 
-No profile turns YaRN on; you add it as a vLLM override. Asking for more than 262K without it is refused. 393,216
-tokens:
+No profile turns YaRN on by default. `--context SIZE`, or a bare `-- --max-model-len N` above 262K, adds the YaRN
+override for you; an explicit `--hf-overrides` always wins. This override gives 393,216 tokens:
 
 ```bash
 venv/bin/merlin serve ~/models/flash-next -- --max-model-len 393216 --hf-overrides '{"text_config": {"max_position_embeddings": 393216, "rope_parameters": {"rope_type": "yarn", "factor": 1.5, "original_max_position_embeddings": 262144, "rope_theta": 10000000, "partial_rotary_factor": 0.25, "mrope_section": [11, 11, 10], "mrope_interleaved": true}}}'
@@ -109,11 +155,11 @@ venv/bin/merlin serve ~/models/flash-next -- --max-model-len 393216 --hf-overrid
 | Length | `factor` | `max_position_embeddings` | `--max-model-len` | Tested with |
 |---|---|---|---|---|
 | 393K | 1.5 | 393216 | 393216 | 🟢 MTP and DFlash2 |
-| 524K | 2.0 | 524288 | 524288 | 🟢 MTP and DFlash2 |
+| 524K | 2.0 | 524288 | 524288 | 🟢 MTP; DFlash2 ⚫ untested with this override |
 | 917K | 4.0 | 1048576 | 917504 | 🟢 MTP |
 | 1M | 4.0 | 1048576 | 1048576 | ⚫ untested |
 
-YaRN on Qwen3.8-27B is untested. The drafter follows the target's YaRN table past 262K.
+YaRN on Qwen3.8-27B is untested. The drafter keeps its native RoPE, so acceptance can drop past 262K.
 
 ## 3. Talk to it
 
@@ -143,6 +189,9 @@ client = OpenAI(base_url="http://127.0.0.1:8000/v1")
 reply = client.chat.completions.create(model="flash-next-v2", messages=[{"role": "user", "content": "Say hello."}])
 print(reply.choices[0].message.content)
 ```
+
+**Coding agents and chat clients** (OpenAI-compatible and Anthropic-compatible clients such as opencode, Cline/Roo, Aider and Continue): copy-paste settings in
+[Connect a client](clients.md).
 
 **Thinking.** The Qwen3.8 checkpoints think before answering by default. Turn it off for one request with
 `"chat_template_kwargs": {"enable_thinking": false}`; with thinking on, a short `max_tokens` can end inside the
@@ -186,7 +235,7 @@ other number of seconds replaces the 15.
 required. The unlock lifts the GeForce limit on FP16/BF16 math: about 16 % faster prefill on Flash-Next and 29 % on the
 27B, with decode and output unchanged. It needs a cold boot to take effect, and `merlin doctor` reports each card's
 unlock state (run it as root on the host). See the
-[hardware matrix](merlin/hardware-matrix.md#optional-host-upgrade-gpu-unlock-geforce-ga102) before installing it; our 3.0.1 bench numbers are measured with it.
+[hardware matrix](merlin/hardware-matrix.md#optional-host-upgrade-gpu-unlock-geforce-ga102) before installing it; our bench numbers are measured with it.
 
 Setup's Layout question covers the common cases. On a bigger host, or to run things by hand, `merlin serve` takes
 the same choices directly:
@@ -201,7 +250,12 @@ venv/bin/merlin list                                                # every chec
 
 - **`GPUS=`** (or `CUDA_VISIBLE_DEVICES=`) uses exactly those cards; the layout follows the count.
 - **`--tp N`** picks the layout by tensor-parallel size; **`--profile <id>`** forces one profile.
-- **`--instances N`** starts N servers on separate cards, each on its own port.
+- **`--instances N`** starts N servers on separate cards, each on its own port, and stays in the foreground.
+  Ctrl+C, SIGTERM or a closed terminal (SIGHUP) stops all process groups started by this command (exit 130, 143 or
+  129). If any instance exits, the command stops the others and exits 1. Each instance writes to the printed log path.
+  `--wait-ready SECONDS` adds a startup deadline; reaching readiness does not detach the servers.
+  The command does not return while the servers run, so `merlin serve ... --instances N --wait-ready S && next` never
+  reaches `next`. In a script, start it in the background and poll `/health` on each port.
 - **Flash-Next on four cards without P2P** can also run PP4: `--profile fn-quad-3090-nop2p-pp4` (RTX 3090, tested:
   prefill 47–53 % faster, decode 14 % slower) or `--profile fn-quad-24g-sm89-pp4` (RTX 4090, untested). TP2×PP2
   stays the default.
@@ -479,9 +533,10 @@ Answers are kept per model, so one model's folder, port and layout never apply t
 | Setup stops with `FAIL` lines | Each line carries its fix; nothing was downloaded. Fix it and run `./setup.sh` again. |
 | Unsure the host is ready | `venv/bin/merlin doctor` prints the hardware report: GPUs, P2P, driver, RAM, shared memory, GPU unlock state. |
 | Unsure what will start | `venv/bin/merlin serve <model> --dry-run` prints the profile, cards, environment and command. |
-| First start seems stuck | It compiles kernels first; wait for `Application startup complete`. The first 27B start after upgrading to 3.0.1 compiles again. |
+| First start seems stuck | It compiles kernels first; wait for the `Ready` line (`/health` answers only after warmup). The first start of each model after upgrading to 3.0.2 compiles again (new torch and Triton caches). |
 | `/health` returns 503 | The engine has stalled for 120 s or hit an error; the log has it at ERROR. Restart the server. |
-| A download broke off | Run `./setup.sh` again; downloads resume. |
+| Filing a bug | `venv/bin/merlin doctor --report` writes one file (hardware report, serve plan, server log tail) with the API key, tokens and auth headers redacted; read it, then attach it. |
+| A download broke off | Run `./setup.sh` again. Finished files stay; a file that was only partly downloaded starts over. |
 | Checksum check failed | The message names the files: delete them and run `./setup.sh` again to fetch them anew. |
 | Slow on cards without P2P | See [Choose your GPUs](#5-choose-your-gpus): several smaller servers may serve you better. |
 

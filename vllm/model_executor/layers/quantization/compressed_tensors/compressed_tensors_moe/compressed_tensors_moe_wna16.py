@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by the Merlin project; see NOTICE.
 
 import math
 from fractions import Fraction
@@ -10,6 +11,7 @@ from compressed_tensors.quantization import (
 )
 
 from vllm.logger import init_logger
+from vllm.merlin.quant_scales import validate_checkpoint_scale
 from vllm.model_executor.layers.fused_moe import (
     RoutedExperts,
     SharedExperts,
@@ -310,6 +312,27 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
         layer.register_parameter("w2_weight_scale", w2_scale)
         set_weight_attrs(w2_scale, extra_weight_attrs)
 
+        # Only checkpoint-owned cells get sentinels; kernel padding keeps ones.
+        hidden = self.moe.hidden_dim_unpadded or hidden_size
+        intermediate = (
+            self.moe.intermediate_size_per_partition_unpadded
+            or intermediate_size_per_partition
+        )
+        hidden_groups = (
+            1 if self.strategy == "channel" else math.ceil(hidden / self.group_size)
+        )
+        intermediate_groups = (
+            1
+            if self.strategy == "channel"
+            else math.ceil(intermediate / self.group_size)
+        )
+        for shard in range(2 if self.moe.is_act_and_mul else 1):
+            start = shard * intermediate_size_per_partition
+            w13_scale.data[
+                :, start : start + intermediate, :hidden_groups
+            ].fill_(float("nan"))
+        w2_scale.data[:, :hidden, :intermediate_groups].fill_(float("nan"))
+
         if not self.symmetric:
             w13_zp = torch.nn.Parameter(
                 torch.zeros(
@@ -377,6 +400,8 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
             self.moe_kernel.fused_experts.process_weights_after_loading(layer)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        validate_checkpoint_scale(layer, "w13_weight_scale")
+        validate_checkpoint_scale(layer, "w2_weight_scale")
         from vllm.model_executor.layers.fused_moe.experts.cpu_moe import (
             swigluoai_w13_interleave_perm,
         )

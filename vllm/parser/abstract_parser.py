@@ -35,6 +35,7 @@ from vllm.entrypoints.openai.chat_completion.protocol import (
 from vllm.entrypoints.openai.responses.protocol import ResponsesRequest
 from vllm.exceptions import VLLMValidationError
 from vllm.logger import init_logger
+from vllm.merlin.tool_none import mark_delegates
 from vllm.parser.engine.adapters import ParserEngineToolAdapter
 from vllm.parser.metrics import record_tool_parser_invocation
 from vllm.parser.utils import count_history_tool_calls
@@ -106,6 +107,16 @@ class StreamState:
             self.previous_token_ids = current_token_ids
 
 
+@contextlib.contextmanager
+def _token_aligned(parser: object, token_ids: Sequence[int] | None):
+    """Hand ``token_ids`` to an engine adapter for one non-streaming call."""
+    if token_ids is None or not hasattr(parser, "token_aligned"):
+        yield
+        return
+    with parser.token_aligned(token_ids):  # type: ignore[attr-defined]
+        yield
+
+
 class Parser:
     """Parse model output into reasoning, content and tool calls.
 
@@ -119,8 +130,9 @@ class Parser:
     # Subclasses should override these if they use specific parser classes
     reasoning_parser_cls: type[ReasoningParser] | None = None
     tool_parser_cls: type[ToolParser] | None = None
-    # Server-side floor for tool-call structural tags (--tool-strict-level).
-    tool_strict_level: ToolStrictLevel = ToolStrictLevel.AUTO
+    # Server-side floor for tool-call structural tags (--tool-strict-level), or
+    # None for the tool parser's default level.
+    tool_strict_level: ToolStrictLevel | None = None
     always_adjust_request: bool = False
 
     def __init__(
@@ -194,6 +206,12 @@ class Parser:
             state.history_tool_call_cnt_initialized = True
             return
         state.history_tool_call_cnt = count_history_tool_calls(request)
+        state.history_tool_call_cnt_initialized = True
+
+    def set_history_tool_call_count(self, count: int) -> None:
+        """Seed the history count when `request.messages` is not available."""
+        state = self._stream_state
+        state.history_tool_call_cnt = count
         state.history_tool_call_cnt_initialized = True
 
     def adjust_request(
@@ -361,7 +379,9 @@ class DelegatingParser(Parser):
     def _prompt_check_applies(self) -> bool:
         return bool(getattr(self._reasoning_parser, "engine_based_streaming", False))
 
-    def set_prompt_token_ids(self, prompt_token_ids: Sequence[int]) -> None:
+    def _set_prompt_reasoning_ended(self, prompt_token_ids: Sequence[int]) -> None:
+        # Called by set_prompt_token_ids below. A later method of the same name
+        # would shadow this hook.
         # is_reasoning_end is a pure function of its input, so a prompt that
         # is already a list is passed as is instead of copied per request.
         self._prompt_reasoning_ended = self._prompt_check_applies() and (
@@ -544,10 +564,7 @@ class DelegatingParser(Parser):
         is_auto = request.tool_choice == "auto"
         single_call = request.parallel_tool_calls is False
         strict_level = self.tool_strict_level
-        if (
-            strict_level == ToolStrictLevel.AUTO
-            and tool_parser.default_tool_strict_level is not None
-        ):
+        if strict_level is None:
             strict_level = tool_parser.default_tool_strict_level
         if single_call and not (is_auto and structured_outputs is not None):
             # Limiting the call count needs the call envelope in the grammar.
@@ -796,6 +813,11 @@ class DelegatingParser(Parser):
             return False
         return self._reasoning_parser.is_reasoning_end(input_ids)
 
+    def set_prompt_token_ids(self, prompt_token_ids: Sequence[int]) -> None:
+        if self._reasoning_parser is not None:
+            self._reasoning_parser.set_prompt_token_ids(prompt_token_ids)
+        self._set_prompt_reasoning_ended(prompt_token_ids)
+
     def _is_reasoning_end_streaming(
         self, input_ids: list[int], delta_ids: list[int]
     ) -> bool:
@@ -863,17 +885,82 @@ class DelegatingParser(Parser):
         model_output_token_ids: Sequence[int] = (),
     ) -> tuple[str | None, str | None, list[FunctionCall] | None]:
         self._initialize_history_tool_call_cnt(request)
+        mark_delegates(self, request)
+        # Parse with the token ids, as
+        # streaming does, so a marker spelled in ordinary tokens stays text.
+        ids = self._aligned_output_ids(model_output, model_output_token_ids)
         # Prompt closed reasoning.
         if self._prompt_reasoning_ended:
             reasoning, content = None, model_output
         else:
-            reasoning, content = self.extract_reasoning(model_output, request)
-        tool_calls, content = self._extract_tool_calls(
-            content=content,
-            request=request,
-            enable_auto_tools=enable_auto_tools,
-        )
+            with _token_aligned(self._reasoning_parser, ids):
+                reasoning, content = self.extract_reasoning(model_output, request)
+        # The content's own ids.
+        content_ids = self._aligned_content_ids(ids, model_output, reasoning, content)
+        with _token_aligned(self._tool_parser, content_ids):
+            tool_calls, content = self._extract_tool_calls(
+                content=content,
+                request=request,
+                enable_auto_tools=enable_auto_tools,
+            )
         return reasoning, content, tool_calls
+
+    def _decode_ids(self, ids: Sequence[int]) -> str | None:
+        try:
+            text = self.model_tokenizer.decode(list(ids))
+        except Exception:
+            return None
+        return text if isinstance(text, str) else None
+
+    def _aligned_output_ids(
+        self, model_output: str, token_ids: Sequence[int]
+    ) -> list[int] | None:
+        """The output's token ids when engine parsers can use them and they
+        decode to exactly ``model_output`` (a stop token that is not in the
+        text is dropped); None keeps the text-only path."""
+        if not token_ids or not any(
+            hasattr(p, "token_aligned")
+            for p in (self._reasoning_parser, self._tool_parser)
+        ):
+            return None
+        ids = list(token_ids)
+        for cut in (len(ids), len(ids) - 1):
+            if cut > 0 and self._decode_ids(ids[:cut]) == model_output:
+                return ids[:cut]
+        return None
+
+    def _aligned_content_ids(
+        self,
+        ids: list[int] | None,
+        model_output: str,
+        reasoning: str | None,
+        content: str | None,
+    ) -> list[int] | None:
+        """The token ids of ``content`` when they decode to exactly it."""
+        if ids is None or not content:
+            return None
+        if reasoning is None and content == model_output:
+            return ids
+        parser = self._reasoning_parser
+        find_end = getattr(parser, "find_reasoning_end", None)
+        end = find_end(ids) if find_end is not None else None
+        if end is None:
+            return None
+        start = end.offset if end.implicit else end.offset + 1
+        candidate = ids[start:]
+        text = self._decode_ids(candidate) if candidate else None
+        if text == content:
+            return candidate
+        if text is None or text.strip() != content.strip():
+            return None
+        # The parser trimmed whitespace around the content: drop the few
+        # whitespace-only ids at either end.
+        for lead in range(5):
+            for trail in range(5):
+                trimmed = candidate[lead : len(candidate) - trail]
+                if trimmed and self._decode_ids(trimmed) == content:
+                    return trimmed
+        return None
 
     def parse_delta(
         self,
@@ -885,10 +972,12 @@ class DelegatingParser(Parser):
         finished: bool,
     ) -> DeltaMessage | None:
         self._initialize_history_tool_call_cnt(request)
+        mark_delegates(self, request)
         state = self._stream_state
 
         if not state.prompt_reasoning_checked and prompt_token_ids is not None:
             state.prompt_reasoning_checked = True
+            self.set_prompt_token_ids(prompt_token_ids)
             if self._reasoning_parser is None or self.is_reasoning_end(
                 prompt_token_ids
             ):

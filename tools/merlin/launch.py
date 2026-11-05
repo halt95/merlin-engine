@@ -28,12 +28,15 @@ import shlex
 import subprocess
 import sys
 import tempfile
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import ple_store as PS  # noqa: E402
 import registry as R  # noqa: E402
+import context_size as C  # noqa: E402
 
 REPO = Path(__file__).resolve().parents[2]
 
@@ -52,8 +55,8 @@ FAMILY = {"flash-next": "flash-next", "27b": "27b", "svl": "svl", "ornith": "orn
 # Family constants: values no profile or checkpoint has ever varied (the engine's CLI contract per family).
 FN_GENERATION = '{"temperature":1.0,"top_p":0.95,"top_k":20,"min_p":0.0,"presence_penalty":0.0,"repetition_penalty":1.0}'
 CKPT_SCALES = "qsa_kv_scales.json"  # Flash-Next family: a checkpoint's own FP8 KV scales, next to its weights
-VERIFIED_MARKER = ".merlin-verified.json"  # written by merlin setup after hashing every listed file (setup_cli)
-FN_CHAT_TEMPLATE ="models/qwen38-27b/templates/froggeric-qwen-v22.5.jinja"  # shared with 27B / ThinkingCap
+VERIFIED_MARKER = ".merlin-verified.json"  # written by ./setup.sh and merlin pull after hashing every file (setup_cli)
+FN_CHAT_TEMPLATE = "models/qwen38-27b/templates/froggeric-qwen-v22.5.jinja"  # shared with 27B / ThinkingCap
 FN_KERNEL_CONFIG = '{"qsa_warmup_use_serving_bounds":true,"reuse_gdn_prefill_warmup":true,"persist_triton_autotune":true}'
 FN_UNSET = (
     "VLLM_PLE_CPU_OFFLOAD VLLM_PLE_TEST_FAULT VLLM_PLE_TEST_FAULT_GATE VLLM_PLE_TEST_FAULT_LOG "
@@ -76,11 +79,11 @@ FN_RAM_TESTED_MIN_GIB = 72
 FN_PLE_FP8_GIB = 47.68
 FN_SHM_MIN_KB = 1048576
 FN_KV_HOST_TIER = "MERLIN_KV_HOST_TIER_GIB"  # host-RAM KV tier, GiB per rank (engine knob; merlin serve --kv-ram-cache sets it)
-# The KV RAM cache ships as experimental in 3.0.1 on the Flash-Next family.
-FN_KV_TIER_EXPERIMENTAL = ("WARNING: KV RAM cache on Flash-Next is experimental in 3.0.1: a session evicted under heavy "
+# The KV RAM cache ships as experimental on the Flash-Next family.
+FN_KV_TIER_EXPERIMENTAL = ("WARNING: KV RAM cache on Flash-Next is experimental: a session evicted under heavy "
                            "concurrent prefill may recompute (output identical)")
-# The 27B KV RAM cache (TP1 / TP2 / TP4, ThinkingCap, no-P2P twins) is experimental in 3.0.1 as well.
-KV_TIER_EXPERIMENTAL_27B = ("WARNING: KV RAM cache on the 27B is experimental in 3.0.1: a session evicted under heavy "
+# The 27B KV RAM cache (TP1 / TP2 / TP4, ThinkingCap, no-P2P twins) is experimental as well.
+KV_TIER_EXPERIMENTAL_27B = ("WARNING: KV RAM cache on the 27B is experimental: a session evicted under heavy "
                             "concurrent prefill may recompute (output identical)")
 FN_MARLIN_MOE_CFG = "MERLIN_MARLIN_MOE_CFG"  # per-shape Marlin MoE kernel choice; the engine parses it (vllm/merlin/marlin_moe_cfg.py)
 # DEBUG ONLY host-tier fault injection: fail the first N restore / demotion transfers per rank so a fault-injection
@@ -95,7 +98,11 @@ FN_KV_HOST_TIER_ADMISSION_MODES = ("0", "off", "lru", "slru")
 FN_KV_HOST_TIER_GATES = ("MERLIN_KV_HOST_TIER__COPY_CREDITS", "MERLIN_KV_HOST_TIER__ESCAPE_STEPS",
                          "MERLIN_KV_HOST_TIER__N_RESTORE", "MERLIN_KV_HOST_TIER__MAX_ASSEMBLING",
                          FN_KV_HOST_TIER_ADMISSION, "MERLIN_KV_HOST_TIER__COPY_CREDITS_D",
-                         "MERLIN_KV_HOST_TIER__COPY_BYTES_D_MIB")
+                         "MERLIN_KV_HOST_TIER__COPY_BYTES_D_MIB",
+                         # Opt-in cap on distinct copy-source blocks (0 = off).
+                         "MERLIN_KV_HOST_TIER__MAX_PENDING_STORE_BLOCKS",
+                         # switch, exactly 0 or 1 (0 = off).
+                         "MERLIN_KV_HOST_TIER__FALLBACK_BOUNDARY")
 FN_KV_HOST_TIER_CENSUS = "MERLIN_KV_HOST_TIER_CENSUS"
 FN_WORKLOAD_TILE = "MERLIN_FLASHINFER_WORKLOAD_TILE"  # the opt-in FlashInfer prefill tile; not used on Flash-Next
 # Every knob that is refused unless the tier is on: a layout pass that plans with the tier off leaves them out.
@@ -105,11 +112,40 @@ FN_KV_HOST_TIER_NEEDS_ON = (*FN_KV_HOST_TIER_FAULTS, *FN_KV_HOST_TIER_GATES, FN_
 # common proxies. The engine's own default is 0 (off); a
 # trailing "--sse-keep-alive-interval 0" turns it off again (extra args come last, win).
 SSE_KEEP_ALIVE_S = 15
+# Ornith's non-special FIM added tokens, encoded as text in client
+# content by sanitize_control_tokens (the engine copy is vllm/merlin/control_tokens.py ORNITH_FIM_CONTROL_TOKENS).
+ORNITH_FIM_CONTROL_TOKENS = (
+    "<|fim_prefix|>", "<|fim_middle|>", "<|fim_suffix|>", "<|fim_pad|>", "<|repo_name|>", "<|file_sep|>",
+)
 HOOK_VARS = (
     "CUDA_VISIBLE_DEVICES", "CUDA_DEVICE_ORDER", "VLLM_SKIP_P2P_CHECK", "VLLM_PP_LAYER_PARTITION",
     "NCCL_P2P_LEVEL", "NCCL_P2P_DISABLE", "NCCL_PROTO", "NCCL_ALGO", "VLLM_QSA_KV_SCALES",
     "VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC", "VLLM_WSL2_ENABLE_PIN_MEMORY",
 )
+# The interconnect settings a profile's P2P mode decides. Every multi-card
+# builder clears the whole set first and then sets its mode's values, so a variable exported in the caller's shell
+# (an earlier P2P=off run, an A/B) can neither contradict the reported mode nor turn on IPC all-reduce.
+P2P_COMM_VARS = (
+    "NCCL_P2P_DISABLE", "NCCL_P2P_LEVEL", "NCCL_PROTO", "NCCL_ALGO", "VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC",
+)
+# VLLM_SERVER_DEV_MODE registers vllm's dev routers (/collective_rpc, sleep,
+# cache reset) outside the API-key prefixes; an inherited value is dropped unless this launcher knob is exactly 1.
+DEV_MODE_OPT_IN = "MERLIN_ALLOW_SERVER_DEV_MODE"
+
+
+def _clear_comm_env(env: dict[str, str]) -> dict[str, str]:
+    """Pop every P2P_COMM_VARS entry; return the inherited values."""
+    return {v: env.pop(v) for v in P2P_COMM_VARS if v in env}
+
+
+def _comm_note(inherited: dict[str, str], env: dict[str, str], mode: str | None, skip: tuple[str, ...] = ()) -> str | None:
+    """A note naming the inherited interconnect settings the profile's mode replaced or dropped."""
+    changed = [f"{v}={inherited[v]!r}" for v in P2P_COMM_VARS
+               if v in inherited and v not in skip and env.get(v) != inherited[v]]
+    if not changed:
+        return None
+    return (f"note: inherited {', '.join(changed)} not used: the profile's P2P={mode} mode sets the NCCL / IPC "
+            "environment")
 
 
 class LaunchError(Exception):
@@ -155,6 +191,14 @@ class Plan:
 # MERLIN_PLE_TEST_TABLE names the checkpoint's exact format.
 PLE_OPT_IN_TABLES = {"int6_g32": 38.74}
 PLE_TEST_TABLES = {"bfloat16": 95.37, "int8_row": 48.28}
+
+
+def ple_store_of(env: dict[str, str]) -> str:
+    """PLE_STORE (``--ple-store``): where the Flash-Next PLE table lives, ram (default) or disk."""
+    store = env.get(PS.STORE_ENV) or "ram"
+    if store not in PS.STORES:
+        raise LaunchError(f"{PS.STORE_ENV}={store!r}: use ram or disk", 2)
+    return store
 
 
 def ple_table_gib(ple: str | None) -> float:
@@ -215,7 +259,10 @@ def distributed_ports(port: str) -> tuple[int, int]:
 
 # Gate knobs the engine takes as 0 = rows only (``_e2_nonneg_int``); every other whole-number gate is a positive count
 # (``_e2_positive_int``), so 0 is refused here as the engine would at boot.
-FN_KV_HOST_TIER_GATES_NONNEG = ("MERLIN_KV_HOST_TIER__COPY_BYTES_D_MIB",)
+FN_KV_HOST_TIER_GATES_NONNEG = ("MERLIN_KV_HOST_TIER__COPY_BYTES_D_MIB",
+                                "MERLIN_KV_HOST_TIER__MAX_PENDING_STORE_BLOCKS")
+# On/off gate knobs: exactly 0 or 1, as the engine's _e2_strict_switch takes them.
+FN_KV_HOST_TIER_GATES_SWITCH = ("MERLIN_KV_HOST_TIER__FALLBACK_BOUNDARY",)
 
 
 def _kv_tier_gates(environ_in: dict[str, str], env: dict[str, str]) -> None:
@@ -230,6 +277,9 @@ def _kv_tier_gates(environ_in: dict[str, str], env: dict[str, str]) -> None:
         if name == FN_KV_HOST_TIER_ADMISSION:
             if n.lower() not in FN_KV_HOST_TIER_ADMISSION_MODES:
                 raise LaunchError(f"{name} must be one of {', '.join(FN_KV_HOST_TIER_ADMISSION_MODES)} (got {n!r})", 1)
+        elif name in FN_KV_HOST_TIER_GATES_SWITCH:
+            if n not in ("0", "1"):
+                raise LaunchError(f"{name} must be 0 or 1 (got {n!r})", 1)
         elif name in FN_KV_HOST_TIER_GATES_NONNEG:
             _whole_knob(name, n, n.isascii() and n.isdigit(), "a non-negative whole number")
         elif not _whole_knob(name, n, n.isascii() and n.isdigit(), "a positive whole number"):
@@ -368,9 +418,13 @@ def build(
         raise LaunchError(f"profile {profile_id} serves {p.get('checkpoint') or 'flash-next'}, not {checkpoint}", 2)
     env = dict(environ)
     extra = list(extra or [])
-    if any(a.split("=", 1)[0].replace("_", "-") == "--skip-tokenizer-init" for a in extra):
-        raise LaunchError("--skip-tokenizer-init is unsupported by Merlin: tokenizer initialization is required "
-                          "to validate prompt token IDs; remove this flag from the extra arguments", 2)
+    for arg in extra:
+        flag = arg.split("=", 1)[0].replace("_", "-")
+        # argparse also accepts any unique prefix of these (--tokens, --skip-tok); a shorter one is ambiguous and vllm serve refuses it
+        for name in ("--skip-tokenizer-init", "--tokens-only"):
+            if len(flag) > 2 and flag.startswith("--") and name.startswith(flag):
+                raise LaunchError(f"{name} is unsupported by Merlin: tokenizer initialization is required "
+                                  "to validate prompt token IDs; remove this flag from the extra arguments", 2)
     # --swarm (SWARM=1): checked before any builder runs, on every family; sets the KV RAM cache when unset
     swarm_note = _swarm_prepare(p, env) if swarm_requested(env) else None
     if model == "flash-next":
@@ -381,6 +435,17 @@ def build(
         plan = _build_ornith(reg, p, checkpoint, ckpt, env, extra, repo)
     else:
         plan = _build_svl(reg, p, checkpoint, ckpt, env, extra, repo)
+    # vllm's dev routers sit outside the API-key prefixes
+    plan.env.pop("VLLM_SERVER_DEV_MODE", None)
+    plan.env.pop(DEV_MODE_OPT_IN, None)
+    dev_mode = environ.get("VLLM_SERVER_DEV_MODE")  # read from the caller: Flash-Next strips every MERLIN_ export
+    if environ.get(DEV_MODE_OPT_IN) == "1":
+        plan.env["VLLM_SERVER_DEV_MODE"] = "1"
+        plan.notes.append(f"warning: {DEV_MODE_OPT_IN}=1: VLLM_SERVER_DEV_MODE=1 registers vllm's dev routes "
+                          "(/collective_rpc, sleep, cache reset) without API-key protection; for a trusted host only")
+    elif dev_mode is not None:
+        plan.notes.append(f"note: inherited VLLM_SERVER_DEV_MODE={dev_mode!r} dropped: its dev routes are not covered by "
+                          f"the API key; set {DEV_MODE_OPT_IN}=1 to keep them on purpose")
     warning = R.sm80_fp8_warning(model, p)
     if warning:
         plan.notes.append(warning)
@@ -393,6 +458,11 @@ def build(
     plan.env.pop(SWARM_ENV, None)  # a launcher knob, not the engine's
     _merge_speculative_config(plan)
     plan.args += ["--sse-keep-alive-interval", str(SSE_KEEP_ALIVE_S)]
+    try:
+        default_length = p["serve"].get("max_model_len") or (reg.get("base") or reg.get("launch", {})).get("max_model_len", 0)
+        C.apply(plan, _flag_values(plan.args + plan.extra), _flag_values(plan.extra), default_length)
+    except ValueError as e:
+        raise LaunchError(str(e), 2) from None
     _note_extra_overrides(plan)
     shown = (R.LABEL_TESTED, R.LABEL_TESTING, R.LABEL_UNTESTED)
     if status in shown and not p.get("fp8_opt_in"):
@@ -613,8 +683,7 @@ def _max_pixels_27b(v: str) -> None:
 
 
 # ---------------------------------------------------------------------------------------------------------------
-# Session caps (these replace the earlier cache-gated raise and the unconditional 27B TP4 32):
-# concurrency is decoupled from the KV RAM cache. Every row serves its 3.0.0 ``max_num_seqs`` whether or not the cache is
+# Session caps: concurrency is decoupled from the KV RAM cache. Every row serves its profile's ``max_num_seqs`` whether or not the cache is
 # on. A row that has a tested high-concurrency cap (``serve.kv_tier_seqs``: the cap, and the GiB per rank of KV RAM cache
 # it was qualified with) gets it only when asked for: ``merlin serve --swarm`` / ``SWARM=1``. An exported SEQS wins.
 # ---------------------------------------------------------------------------------------------------------------
@@ -698,7 +767,7 @@ def _swarm_prepare(p: dict, env: dict[str, str]) -> str | None:
         raise LaunchError(swarm_not_qualified(p["id"]), 2)
     if (env.get("SPEC") or "").strip() == "dflash2":
         raise LaunchError("--swarm (SWARM=1) with SPEC=dflash2 (--spec dflash2): the KV RAM cache the swarm cap needs is qualified "
-                          "with MTP only in 3.0.1. Drop --swarm (or unset SWARM), or use --spec mtp (the default)", 2)
+                          "with MTP only. Drop --swarm (or unset SWARM), or use --spec mtp (the default)", 2)
     cap, need, ranks = int(gate["max_num_seqs"]), int(gate["min_gib_per_rank"]), int(p["match"]["cards"])
     raw = (env.get(FN_KV_HOST_TIER) or "").strip()
     if not raw:
@@ -746,7 +815,7 @@ def cap_report(p: dict, swarm: bool, seqs: str, gib: int) -> tuple[str, list[str
 
 
 def _session_cap(p: dict, environ_in: dict[str, str], notes: list[str]) -> str:
-    """The row's sequence cap: its 3.0.0 ``max_num_seqs``, or the swarm cap (``kv_tier_seqs``) under SWARM=1. The KV RAM
+    """The row's sequence cap: its profile's ``max_num_seqs``, or the swarm cap (``kv_tier_seqs``) under SWARM=1. The KV RAM
     cache never changes it. An exported SEQS wins either way (``_shape_knobs`` applies it); the notes say which cap
     applies and why."""
     cap, said = cap_report(p, swarm_requested(environ_in), environ_in.get("SEQS") or "", _tier_gib(environ_in))
@@ -766,8 +835,8 @@ def _shape_knobs(env: dict[str, str], seqs_row: str, maxlen_row: str, code: int,
         notes.append(f"note: SEQS={seqs} is off the qualified row ({seqs_row}): its KV pin was measured at {seqs_row} "
                      "sequences; the CUDA-graph capture sizes follow SEQS")
     if int(maxlen) > int(maxlen_row):
-        notes.append(f"note: MAXLEN={maxlen} is above the row's {maxlen_row}-token context: pass the matching rope/YaRN "
-                     "override (--hf-overrides) as an extra argument, or vLLM refuses to start")
+        notes.append(f"note: MAXLEN={maxlen} is above the row's {maxlen_row}-token context; "
+                     "auto-YaRN resolves from config.json unless an explicit --hf-overrides is supplied")
     elif int(maxlen) != int(maxlen_row):
         notes.append(f"note: MAXLEN={maxlen} is off the qualified row ({maxlen_row})")
     return seqs, maxlen
@@ -814,7 +883,7 @@ FN_FAMILY_NAMES = "flash-next, swift1.5, swift1.5-huihui"
 
 def _spec_mtp_only(env: dict[str, str], who: str) -> None:
     """A checkpoint outside the Flash-Next family runs its own MTP head: SPEC=mtp (or unset) is that, anything else is
-    refused instead of being ignored (3.0.1: DFlash2 is a Flash-Next-family drafter)."""
+    refused instead of being ignored (DFlash2 is a Flash-Next-family drafter)."""
     spec = env.get("SPEC") or "mtp"
     if spec == "dflash2":
         raise LaunchError(f"DFlash2 is only available for the Flash-Next family ({FN_FAMILY_NAMES}); {who} uses its MTP head", 1)
@@ -943,10 +1012,13 @@ def _build_flash_next(reg, p, checkpoint, ckpt, env, extra, repo: Path) -> Plan:
     p2p_mode: str | None = None
     if switch:
         p2p_mode = env.get("P2P") or ic["default"]
-        if p2p_mode not in modes:
-            raise LaunchError(f"P2P must be on or off, got '{p2p_mode}'", 1)
+        if p2p_mode not in modes:  # name the row's own modes
+            named = [m for m in R.P2P_MODES if m in modes]
+            raise LaunchError(f"P2P must be {', '.join(named[:-1])} or {named[-1]} for {p['id']}, got '{p2p_mode}'", 1)
     elif len(p["cuda_visible_devices"].split(",")) > 1:
         p2p_mode = next(iter(modes))
+        if env.get("P2P") == "ipc" and "ipc" not in modes:  # opt-in, never ignored
+            raise LaunchError(f"P2P must be {p2p_mode} for {p['id']}, got 'ipc'", 1)
     mode = modes[p2p_mode] if p2p_mode else next(iter(modes.values()))
     if topo_on and not (p["match"]["cards"] == 4 and (p2p_mode or "on") == "on"):
         # the selector is for the four-card P2P-on layout; a no-P2P or non-quad row never used it
@@ -956,12 +1028,18 @@ def _build_flash_next(reg, p, checkpoint, ckpt, env, extra, repo: Path) -> Plan:
     def platform_env(e: dict[str, str]) -> None:
         e["CUDA_VISIBLE_DEVICES"] = e.get("CUDA_VISIBLE_DEVICES") or p["cuda_visible_devices"]
         e["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+        if p2p_mode:  # the mode's exports below decide the whole set
+            _clear_comm_env(e)
         for var in mode.get("unset", []):
             e.pop(var, None)
         for k, v in mode.get("exports", {}).items():
             e[k] = str(v)
 
+    comm_inherited = {v: env[v] for v in P2P_COMM_VARS if v in env} if p2p_mode else {}
     platform_env(env)
+    comm_note = _comm_note(comm_inherited, env, p2p_mode)
+    if comm_note:
+        notes.append(comm_note)
     if lay["pp"] > 1:
         # PP_PARTITION: per-stage layer counts (e.g. 24,24) for a layout A/B; default = the profile's partition.
         partition = env.get("PP_PARTITION") or ",".join(str(x) for x in (dfl or lay)["partition"])
@@ -984,12 +1062,12 @@ def _build_flash_next(reg, p, checkpoint, ckpt, env, extra, repo: Path) -> Plan:
     tier = (environ_in.get(FN_KV_HOST_TIER) or "").strip()
     tier_gib = _whole_knob(FN_KV_HOST_TIER, tier, tier.isdigit(), "a whole number of GiB per rank (0 = off)")
     if tier_gib:
-        # 3.0.1 qualifies the tier with MTP only: with DFlash2 the host arena fills with draft-window pages and units are
+        # the tier is qualified with MTP only: with DFlash2 the host arena fills with draft-window pages and units are
         # lost to missed copies, so it pins host RAM for no restore.
         if spec_method == "dflash2":
             raise LaunchError(f"the KV RAM cache ({FN_KV_HOST_TIER}={tier_gib}, from merlin serve --kv-ram-cache, --swarm or an "
-                              f"exported {FN_KV_HOST_TIER}) with SPEC=dflash2: the KV RAM cache is qualified with MTP only "
-                              f"in 3.0.1; use SPEC=mtp (--spec mtp, the default) or turn the cache off (--kv-ram-cache 0, "
+                              f"exported {FN_KV_HOST_TIER}) with SPEC=dflash2: the KV RAM cache is qualified with MTP only; "
+                              f"use SPEC=mtp (--spec mtp, the default) or turn the cache off (--kv-ram-cache 0, "
                               f"or {FN_KV_HOST_TIER}=0)", 2)
         _restore_unit_gate("flash-next", p, tier_gib)
         env[FN_KV_HOST_TIER] = str(tier_gib)
@@ -998,6 +1076,11 @@ def _build_flash_next(reg, p, checkpoint, ckpt, env, extra, repo: Path) -> Plan:
     moe_cfg = (environ_in.get(FN_MARLIN_MOE_CFG) or "").strip()
     if moe_cfg:
         env[FN_MARLIN_MOE_CFG] = moe_cfg
+    # The dense Marlin config is forwarded only when a table is given.
+    dense_cfg = (environ_in.get("MERLIN_MARLIN_DENSE_CFG") or "").strip()
+    if dense_cfg:
+        env["MERLIN_MARLIN_DENSE_CFG"] = dense_cfg
+        notes.append("MERLIN_MARLIN_DENSE_CFG: experimental per-shape table active")
     # Debug-only exception: the host-tier fault-injection knobs pass through so a fault-injection test
     # reaches the engine. Same rule as the engine (plain non-negative integer; nonzero needs the tier
     # on), checked here so a typo fails before the boot; blank or 0 = off and not exported; a loud note when active.
@@ -1067,6 +1150,18 @@ def _build_flash_next(reg, p, checkpoint, ckpt, env, extra, repo: Path) -> Plan:
     env["VLLM_USE_V2_MODEL_RUNNER"] = "1"
     env["VLLM_E2_PLE_FAST_IDS"] = "1"
     env["VLLM_E2_PLE_EARLY_REQUEST"] = "1"
+    # Only the launcher's knob picks the store: a stale engine export cannot, and a RAM plan is unchanged by this feature.
+    store = ple_store_of(environ_in)
+    env.pop("VLLM_E2_PLE_STORE", None)
+    if store == "disk":
+        env["VLLM_E2_PLE_STORE"] = store
+        env["VLLM_E2_PLE_WARM"] = _knob(env, "PLE_WARM", "1", True)
+        if env["VLLM_E2_PLE_WARM"] not in ("0", "1"):
+            raise LaunchError(f"PLE_WARM={env['VLLM_E2_PLE_WARM']!r}: use 0 or 1", 2)
+        notes.append(PS.EXPERIMENTAL_NOTE)
+    else:
+        env.pop("VLLM_E2_PLE_WARM", None)
+        env.pop("VLLM_E2_PLE_DISK_THREADS", None)
     # One constant 256 MiB QSA prefill-logits block (granule = cap): exact-size per-chunk blocks ratchet the
     # allocator reserve towards the card wall at 262K.
     env["VLLM_SPARSE_INDEXER_MAX_LOGITS_MB"] = "256"
@@ -1193,20 +1288,22 @@ def _build_27b(reg, p, checkpoint, ckpt, env, extra, repo: Path) -> Plan:
     env["VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS"] = "0"
     p2p_mode = None
     dropped_disable = None
+    comm_note = None
     if shape.get("p2p_switch"):
         # a no-P2P row (27b-tp2/tp4-3090-nop2p) defaults to P2P off; the others default to on and take P2P=on|off
         p2p_mode = _knob(env, "P2P", "off" if p["match"].get("p2p") == "off" else "on", True)
+        comm_inherited = _clear_comm_env(env)  # the mode decides the set
         if p2p_mode == "on":
             env["VLLM_SKIP_P2P_CHECK"] = "1"
             env["NCCL_P2P_LEVEL"] = "SYS"
-            dropped_disable = env.pop("NCCL_P2P_DISABLE", None)  # an inherited =1 would contradict P2P=on
+            dropped_disable = comm_inherited.get("NCCL_P2P_DISABLE")  # an inherited =1 would contradict P2P=on
         elif p2p_mode == "off":
             env["VLLM_SKIP_P2P_CHECK"] = "1"
             env["NCCL_P2P_DISABLE"] = "1"
-            for v in ("NCCL_P2P_LEVEL", "NCCL_PROTO", "NCCL_ALGO"):
-                env.pop(v, None)
         else:
             raise LaunchError(f"P2P must be on or off (got '{p2p_mode}')", 2)
+        # The note below still names NCCL_P2P_DISABLE on P2P=on
+        comm_note = _comm_note(comm_inherited, env, p2p_mode, skip=("NCCL_P2P_DISABLE",) if p2p_mode == "on" else ())
     smallq = _knob(env, "FLASHINFER_SM8X_FP8_SMALLQ", "cta32", True, keep_empty=True)
     env["FLASHINFER_SM8X_FP8_SMALLQ"] = smallq
     if smallq not in ("", "0", "cta32"):
@@ -1323,6 +1420,8 @@ def _build_27b(reg, p, checkpoint, ckpt, env, extra, repo: Path) -> Plan:
         plan.notes.append(KV_TIER_EXPERIMENTAL_27B)
     if census_note:
         plan.notes.append(census_note)
+    if comm_note:
+        plan.notes.append(comm_note)
     if dropped_disable is not None:
         plan.notes.append(f"note: NCCL_P2P_DISABLE={dropped_disable!r} dropped: P2P=on; on a host without peer-to-peer "
                           "set P2P=off (merlin serve picks the no-P2P row)")
@@ -1378,14 +1477,14 @@ def _build_svl(reg, p, checkpoint, ckpt, env, extra, repo: Path) -> Plan:
     # a no-P2P row (svl-quad-3090-nop2p) defaults to P2P off; the others default to on and take P2P=on|off
     p2p_mode = _knob(env, "P2P", "off" if p["match"].get("p2p") == "off" else "on", True)
     p2p_args: list[str] = []
+    svl_comm_inherited = _clear_comm_env(env)  # the mode decides the set
     if p2p_mode == "on":
-        # Super VL keeps custom all-reduce with NCCL LL: the hybrid all-reduce changed its temperature-0 output.
-        env["NCCL_P2P_LEVEL"], env["NCCL_PROTO"], env["VLLM_SKIP_P2P_CHECK"] = "SYS", "LL", "1"
-        env.pop("VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC", None)
+        # Super VL keeps custom all-reduce (the hybrid all-reduce changed its temperature-0 output) with NCCL Simple for
+        # the messages NCCL carries: on 4x3090 Simple matches LL on one-stream decode, is faster than LL on a new long
+        # prefill and on decode during it (torch 2.13 qualification), and keeps temperature-0 output identical.
+        env["NCCL_P2P_LEVEL"], env["NCCL_PROTO"], env["VLLM_SKIP_P2P_CHECK"] = "SYS", "Simple", "1"
     elif p2p_mode == "off":
         env["VLLM_SKIP_P2P_CHECK"], env["NCCL_P2P_DISABLE"] = "1", "1"
-        for v in ("NCCL_P2P_LEVEL", "NCCL_PROTO", "NCCL_ALGO", "VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC"):
-            env.pop(v, None)
         p2p_args = ["--disable-custom-all-reduce"]
     else:
         raise LaunchError(f"P2P must be on or off (got '{p2p_mode}')", 2)
@@ -1423,6 +1522,9 @@ def _build_svl(reg, p, checkpoint, ckpt, env, extra, repo: Path) -> Plan:
     ]
     plan = Plan("svl", checkpoint, p, ckpt, env, args, extra, repo, venv, tree, cache_root, R.label_text(reg, p), p2p_mode)
     plan.caller_env = environ_in
+    comm_note = _comm_note(svl_comm_inherited, env, p2p_mode)
+    if comm_note:
+        plan.notes.append(comm_note)
     return plan
 
 
@@ -1476,22 +1578,24 @@ def _build_ornith(reg, p, checkpoint, ckpt, env, extra, repo: Path) -> Plan:
         other = "ornith-quad-3090" if p2p_mode == "on" else "ornith-quad-3090-nop2p"
         raise LaunchError(f"P2P={p2p_mode} does not match {p['id']} (qualified with P2P {row_p2p}; its KV pin was measured on that "
                           f"interconnect): use --profile {other}", 2)
+    ornith_comm_inherited = _clear_comm_env(env)  # the mode decides the set
     if p2p_mode == "on":
         env["VLLM_SKIP_P2P_CHECK"], env["NCCL_P2P_LEVEL"], env["NCCL_PROTO"] = "1", "SYS", "Simple"
         env["VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC"] = "1"
-        env.pop("NCCL_P2P_DISABLE", None)
     elif p2p_mode == "off":
         env["NCCL_P2P_DISABLE"] = "1"
-        for v in ("VLLM_SKIP_P2P_CHECK", "NCCL_P2P_LEVEL", "NCCL_PROTO", "NCCL_ALGO", "VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC"):
-            env.pop(v, None)
+        env.pop("VLLM_SKIP_P2P_CHECK", None)
     else:
         raise LaunchError(f"P2P must be on or off (got '{p2p_mode}')", 2)
+    comm_note = _comm_note(ornith_comm_inherited, env, p2p_mode)
+    if comm_note:
+        notes.append(comm_note)
     # The host-RAM KV tier (merlin serve --kv-ram-cache), an untested opt-in on Ornith: parsed as on the 27B, and held to
     # the restore-unit minimum, which falls back to 4 GiB per server because no Ornith row records its KV block count.
     # Ornith always runs RecoverSSM on Model Runner V2 in align mode, the path the engine accepts it on
-    # (vllm/merlin/kv_host_tier.py).
-    # ASCII digits only, and int() guarded: superscript two (U+00B2) passes isdigit() but int() refuses it, and so
-    # does a value over Python's 4300-digit limit; either is a LaunchError, never a traceback (as on Flash-Next).
+    # (vllm/merlin/kv_host_tier.py). ASCII digits only, and int() guarded, as in the 27B builder: superscript two
+    # (U+00B2) passes isdigit() but int() refuses it, and so does a value over Python's 4300-digit limit; either is a
+    # LaunchError, never a traceback.
     tier = (environ_in.get(FN_KV_HOST_TIER) or "").strip()
     tier_gib = 0
     if tier:
@@ -1517,6 +1621,9 @@ def _build_ornith(reg, p, checkpoint, ckpt, env, extra, repo: Path) -> Plan:
     env["VLLM_USE_V2_MODEL_RUNNER"] = "1"
     env["VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS"] = "0"
     env["MERLIN_MOE_UNIFORM_VERIFY"] = uv
+    # The six non-special FIM added tokens join the
+    # sanitize_control_tokens control set, so client text cannot supply their ids
+    env["VLLM_MERLIN_EXTRA_CONTROL_TOKENS"] = ",".join(ORNITH_FIM_CONTROL_TOKENS)
     env["VLLM_CACHE_ROOT"] = cache_root
     env["TRITON_CACHE_DIR"] = f"{cache_root}/triton"
     master, dist = distributed_ports(port)
@@ -1638,7 +1745,7 @@ def check_inherited_cuda_home(cuda_home: str) -> None:
 
 
 def _toolchain(plan: Plan, full: bool) -> None:
-    """CUDA_HOME default = the venv's locked CUDA 13.0 toolkit (release/install-0.32.md); ``full`` adds the
+    """CUDA_HOME default = the venv's locked CUDA 13.0 toolkit (release/install-0.33.md); ``full`` adds the
     first-serve checks of the Flash-Next recipe (CC or cc, CXX or c++, ninja, Python.h, nvcc, libcudart, nvcc-vs-driver).
     The venv's bin follows the CUDA tools on PATH: the lock installs Ninja there."""
     env, venv = plan.env, plan.venv
@@ -1688,7 +1795,7 @@ def _toolchain(plan: Plan, full: bool) -> None:
     if tuple(map(int, drv.split("."))) < tuple(map(int, min_drv.split("."))):
         raise LaunchError(
             f"nvcc at {cuda_home} is CUDA {nv_rel} but the driver supports CUDA {drv}; this toolkit requires CUDA {min_drv} or later.\n"
-            "  Upgrade the driver or set CUDA_HOME to a compatible toolkit (see release/install-0.32.md).", 1)
+            "  Upgrade the driver or set CUDA_HOME to a compatible toolkit (see release/install-0.33.md).", 1)
 
 
 _TOPO_VAL = r"([A-Za-z0-9_@%+=:,./-]+|'[^']*'(\"'\"'[^']*')*)"
@@ -1754,7 +1861,8 @@ def _topology(plan: Plan) -> None:
         return
     snapshot: dict[str, str | None] = {}
     for v in ("CUDA_VISIBLE_DEVICES", "CUDA_DEVICE_ORDER", "VLLM_SKIP_P2P_CHECK", "NCCL_P2P_LEVEL", "NCCL_PROTO", "PLE_HOME"):
-        caller = plan.caller_env.get(v)
+        # An inherited NCCL setting is not a caller choice the selector honours
+        caller = None if v in P2P_COMM_VARS else plan.caller_env.get(v)
         snapshot[v] = caller
         if caller is not None:
             env[f"TOPO_CALLER_SET_{v}"], env[f"TOPO_CALLER_{v}"] = "1", caller
@@ -1794,7 +1902,7 @@ def _topology(plan: Plan) -> None:
 
     # the platform block ran in build() with the caller's CUDA_VISIBLE_DEVICES; the selector decides from the snapshot
     try:
-        # like mktemp(1): honour TMPDIR as given (a missing TMPDIR is a failure, not a fallback)
+        # like mktemp(1): honour TMPDIR when set; unset or empty uses the system temp directory
         fd, tmp = tempfile.mkstemp(dir=os.environ.get("TMPDIR") or None)
         os.close(fd)
     except OSError:
@@ -1897,13 +2005,23 @@ def _cgroup_stat_bytes(path: str, key: str) -> int | None:
     return int(m.group(1)) if m else None
 
 
+def check_ple_store(plan: Plan, ple: str) -> None:
+    """``--ple-store disk``: the tables it can read, and a warning (only that) on storage setup would not offer."""
+    if plan.env.get("VLLM_E2_PLE_STORE") != "disk":
+        return
+    if ple in PLE_TEST_TABLES:
+        raise LaunchError(f"--ple-store disk serves the FP8 and INT6 g32 tables only, not the {ple} test table: use --ple-store ram", 1)
+    for text in PS.storage_warnings(plan.ckpt):
+        _say(f"WARNING: {text}")
+
+
 def _host_memory_warnings(workers: int = 4, tier_gib: int = 0, ple_gib: float = FN_PLE_FP8_GIB) -> str | None:
-    # Warns on the live memory reading, as the hand-written launchers did; host_phase refuses on the one reading that
+    # Warns on the live memory reading; host_phase refuses on the one reading that
     # cannot recover, a host RAM (MemTotal or the cgroup limit) under the resident floor, with the returned text.
     # merlin serve refuses on the same reading (serve_cli.py). ``workers`` = TP x PP of the layout: the resident floor
     # is the measured four-worker figure plus ~2 GiB per worker above four, plus the KV host tier's arena of
     # ``tier_gib`` per rank when it is on (preflight.ram_floor_gib; the qualified 96 GB is for the tier off), with the
-    # FP8 table term swapped for ``ple_gib`` (the checkpoint's table: INT6 g32 is 38.74 GiB).
+    # FP8 table term swapped for ``ple_gib`` (the checkpoint's table: INT6 g32 is 38.74 GiB; 0 under --ple-store disk).
     tier_kb = max(0, tier_gib) * workers * 1048576
     floor_kb = FN_RAM_FLOOR_KB + max(0, workers - 4) * 2097152 + tier_kb - int(round((FN_PLE_FP8_GIB - ple_gib) * 1048576))
     floor_gib = floor_kb // 1048576
@@ -1936,7 +2054,19 @@ def _host_memory_warnings(workers: int = 4, tier_gib: int = 0, ple_gib: float = 
                 left_kb = max(0, lim - use) // 1024
                 if avail_kb is None or left_kb < avail_kb:
                     avail_kb = left_kb
-    if mem_kb is not None and (mem_kb < FN_RAM_QUALIFIED_KB + tier_kb or mem_kb < floor_kb):
+    if ple_gib == 0 and mem_kb is not None and floor_kb <= mem_kb < floor_kb + PS.CACHE_WARN_GIB * 1048576:
+        _say(f"WARNING: host RAM (MemTotal or the cgroup limit) is {mem_kb // 1048576} GiB: with --ple-store disk that leaves under "
+             f"{PS.CACHE_WARN_GIB} GiB of page cache for the n-gram table above the ~{floor_gib} GiB floor; decode and prefill slow down")
+    if mem_kb is not None and ple_gib == 0 and mem_kb < floor_kb:
+        # computed: the measured RAM-mode floor less the table; a disk boot was measured on a 152 GiB host, none on a capped one
+        _say(f"WARNING: host RAM (MemTotal or the cgroup limit) is {mem_kb // 1048576} GiB (computed resident floor with the "
+             f"n-gram table on disk ~{floor_gib} GiB for {workers} workers: ~4.2 GiB pinned embeddings + workers{tier_s}).")
+        _say(f"         Below the ~{floor_gib} GiB resident floor the model load is expected to OOM.")
+        refusal = (f"host RAM (MemTotal or the cgroup limit) is {mem_kb // 1048576} GiB, below the computed ~{floor_gib} GiB resident "
+                   f"floor for {workers} workers{tier_s} with the n-gram table on disk: the model load is expected to be OOM-killed "
+                   "during the boot. Raise the memory limit or add RAM"
+                   + (", or lower --kv-ram-cache" if tier_kb else "") + ".")
+    elif mem_kb is not None and ple_gib != 0 and (mem_kb < FN_RAM_QUALIFIED_KB + tier_kb or mem_kb < floor_kb):
         _say(f"WARNING: host RAM (MemTotal or the cgroup limit) is {mem_kb // 1048576} GiB; the qualified configuration is 96 GB"
              + (f" plus the KV host tier ({tier_kb // 1048576} GiB)" if tier_kb else ""))
         _say(f"         (measured resident floor ~{floor_gib} GiB for {workers} workers: ~{ple_gib:.0f} GiB n-gram table + ~4.2 GiB pinned "
@@ -2013,10 +2143,12 @@ def check_scales_provenance(plan: Plan) -> None:
 
 def _check_recipe_scales(plan: Plan) -> None:
     """Recipe FP8 KV scales only on the checkpoint they were calibrated on. Quiet when the directory carries the
-    recipe's own scales file (the release ships it with the weights) or a ``merlin setup`` verified marker for it; a
-    warning when only config.json matches the recipe (same architecture, weights unverified: a fine-tune of it needs its
-    own calibration); a refusal when config.json matches no revision of the recipe (a new model). SCALES= or a
-    qsa_kv_scales.json next to the weights bypasses all of it (``scales_recipe`` is then None)."""
+    recipe's own scales file (the release ships it with the weights) or a verified marker for it (``./setup.sh`` or
+    ``merlin pull`` writes it); a refusal otherwise: when only config.json matches the recipe (same architecture,
+    weights unverified: config.json is byte-identical across Flash-Next, Swift 1.5 and Swift 1.5 Huihui, so a variant
+    name alone does not prove the weights), and when config.json matches no revision of the recipe (a new model).
+    SCALES= (the recipe's own file included, as an explicit choice) or a qsa_kv_scales.json next to the weights
+    bypasses all of it (``scales_recipe`` is then None)."""
     name = plan.scales_recipe
     d = Path(plan.ckpt)
     scales = plan.env.get("VLLM_QSA_KV_SCALES", "")
@@ -2038,10 +2170,14 @@ def _check_recipe_scales(plan: Plan) -> None:
         return
     cfg = d / "config.json"
     if cfg.is_file() and lst.get("config.json") == _sha256_file(cfg):
-        print(f"WARN scales: {d} has {name}'s config.json but its weights are not verified as {name} (no release scales "
-              f"file, no merlin setup marker). The FP8 KV scales {scales} were calibrated on {name}; for a fine-tune of "
-              f"it, {fix}.", file=sys.stderr)
-        return
+        # a matching config.json does not identify the weights;
+        # refuse rather than serve another checkpoint's calibration unannounced
+        raise LaunchError(
+            f"unverified: {d} has {name}'s config.json but its weights are not verified as {name} (no release scales "
+            f"file, no {VERIFIED_MARKER}: ./setup.sh or merlin pull writes it), and config.json alone does not tell "
+            f"{name} from its siblings. The FP8 KV scales {scales} were calibrated on {name}. If this is {name}, run "
+            f"merlin pull / ./setup.sh to verify it, or accept the recipe's scales explicitly with SCALES={scales}; "
+            f"for a fine-tune, {fix}.", 1)
     raise LaunchError(
         f"uncalibrated: {d} is not a {name} checkpoint (its config.json differs from "
         f"{CHECKPOINTS[name][1]}/checkpoint.sha256), so the FP8 KV scales {scales}, calibrated on {name}, do not "
@@ -2140,6 +2276,7 @@ def host_phase(plan: Plan) -> None:
         if marker and not os.path.isfile(os.path.join(plan.ckpt, marker)):
             raise LaunchError(f"wrong checkpoint: missing {marker} in {plan.ckpt}", 1)
         ple = check_ple_table(plan.ckpt, plan.caller_env, plan.checkpoint)
+        check_ple_store(plan, ple)
         check_scales_provenance(plan)
         _check_shadow(tree)
         _toolchain(plan, full=True)
@@ -2157,7 +2294,8 @@ def host_phase(plan: Plan) -> None:
         lay = plan.profile.get("layout") or {}
         # the KV host tier as the Flash-Next env builder passed it (set only when on, already checked)
         refusal = _host_memory_warnings(int(lay.get("tp", 1)) * int(lay.get("pp", 1)) if lay else 4,
-                                        int(env.get(FN_KV_HOST_TIER) or 0), ple_table_gib(ple))
+                                        int(env.get(FN_KV_HOST_TIER) or 0),
+                                        0.0 if env.get("VLLM_E2_PLE_STORE") == "disk" else ple_table_gib(ple))
         if refusal and os.environ.get("MERLIN_SKIP_RAM_CHECK") != "1":  # =1 keeps the warning only
             raise LaunchError(refusal, 1)
     if fam in ("svl", "ornith"):
@@ -2247,6 +2385,171 @@ def unauthenticated_exposure(host: str, env: dict[str, str], args: list[str], ex
             "set VLLM_API_KEY (bearer key) or HOST=127.0.0.1")
 
 
+def _last_flag(seq: list[str], name: str) -> str | None:
+    """The value of ``name`` in vllm's argv, in any spelling vllm accepts (``--x_y v``, ``--x-y=v``, short flags); the
+    last one wins, as in vllm's parser."""
+    return _flag_values(seq).get(name)
+
+
+def _ready_scheme(seq: list[str]) -> str:
+    """https when vllm gets both a key and a cert file (its own rule), else http."""
+    return "https" if _last_flag(seq, "--ssl-keyfile") and _last_flag(seq, "--ssl-certfile") else "http"
+
+
+def _no_ready_probe(seq: list[str]) -> str | None:
+    """Why the watcher cannot ask /health (a unix socket, no API server, client certificates required), or None."""
+    if _last_flag(seq, "--uds"):
+        return "the server listens on a unix socket"
+    if _flag_values(seq).get("--headless", "off") != "off":
+        return "--headless runs no API server"
+    if _ready_scheme(seq) == "https" and _last_flag(seq, "--ssl-cert-reqs") == "2":
+        return "the server requires client certificates"
+    return None
+
+
+def ready_banner(plan: Plan, host: str, port: int) -> list[str]:
+    """The Ready lines: the URL, model, context and key as vllm actually serves them (the profile's flags with the
+    caller's overrides), never stored in a profile. The key itself is never printed."""
+    seq = [*plan.args, *plan.extra]
+    shown = host if host not in ("0.0.0.0", "::", "") else "<this-host>"
+    shown = f"[{shown}]" if ":" in shown and not shown.startswith("[") else shown  # an IPv6 literal, as a URL needs it
+    served = _last_flag(seq, "--served-model-name") or plan.ckpt
+    ctx = _last_flag(seq, "--max-model-len") or "the model's default"
+    key_file = plan.repo / ".merlin" / "api-key"
+    given = _last_flag(seq, "--api-key") or plan.env.get("VLLM_API_KEY") or os.environ.get("VLLM_API_KEY")
+    try:
+        saved = key_file.read_text().strip() if key_file.is_file() else None
+    except OSError:
+        saved = None
+    if not given:
+        key = "no API key"
+    elif saved and given.strip() == saved:  # setup's key (.merlin/api-key, 0600)
+        key = f"key in {key_file}"
+    else:
+        key = "API key required (the one you set)"
+    base = f"{_ready_scheme(seq)}://{shown}:{port}"
+    lines = [f"Ready: {base}/v1 \u00b7 model {served} \u00b7 context {ctx} \u00b7 {key}",
+             f"  Anthropic-compatible endpoint: {base}/v1/messages (same model and key)"]
+    if plan.p2p_mode == "ipc":  # say which interconnect is serving
+        lines.append("  Interconnect: P2P=ipc (NCCL over shared memory, FlashInfer PCIe-IPC all-reduce)")
+    return lines
+
+
+READY_POLL_S = 2.0  # how often the watcher asks /health
+READY_NOTE_S = 60.0  # a "still starting" line this often until Ready
+READY_GIVE_UP_S = 4 * 3600.0  # the watcher stops quietly after this (a first boot with cold caches takes well under it)
+
+
+def _health_ok(url: str) -> bool:
+    import ssl
+    import urllib.request
+
+    # our own server: never through an http_proxy from the environment, and by IP, so no cert name to match
+    handlers: list[Any] = [urllib.request.ProxyHandler({})]
+    if url.startswith("https:"):
+        handlers.append(urllib.request.HTTPSHandler(context=ssl._create_unverified_context()))
+    try:
+        with urllib.request.build_opener(*handlers).open(url, timeout=2) as r:  # noqa: S310 - the local server's own /health
+            return r.status == 200
+    except OSError:
+        return False
+
+
+def _pid_alive(pid: int) -> bool:
+    """True while ``pid`` runs. A zombie counts as gone: a caller that reads the server's output to EOF before reaping
+    it (subprocess.run with capture) would otherwise wait on the watcher's copy of the pipe for READY_GIVE_UP_S."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        pass
+    try:
+        with open(f"/proc/{pid}/stat", encoding="ascii", errors="replace") as fh:
+            return fh.read().rsplit(")", 1)[1].split()[0] not in ("Z", "X")
+    except (OSError, IndexError):
+        return True
+
+
+def watch_ready(url: str, lines: list[str], server_pid: int, *, clock=None, sleep=None, ok=_health_ok,
+                alive=_pid_alive, say=_say) -> bool:
+    """Poll ``url`` until the server answers, then print ``lines``. vllm only listens once engine init (weight load,
+    kernel warmup, CUDA-graph capture) has returned, so the first 200 means ready. Stops quietly when the server
+    exits or after READY_GIVE_UP_S. True when Ready was printed."""
+    import time
+
+    clock, sleep = clock or time.monotonic, sleep or time.sleep
+    start = last = clock()
+    while clock() - start < READY_GIVE_UP_S:
+        if not alive(server_pid):
+            return False
+        if ok(url):
+            secs = int(clock() - start)
+            say(f"merlin: {lines[0]} (started in {secs // 60}m{secs % 60:02d}s)")
+            for extra in lines[1:]:
+                say(f"merlin: {extra}")
+            return True
+        now = clock()
+        if now - last >= READY_NOTE_S:
+            secs = int(now - start)
+            say(f"merlin: starting... {secs // 60}m{secs % 60:02d}s (weights, kernel warmup, CUDA graphs; Ready prints here)")
+            last = now
+        sleep(READY_POLL_S)
+    return False
+
+
+def hold_as_pid1_orphan(server_pid: int, *, alive=_pid_alive, sleep=None) -> bool:
+    """When the launcher is PID 1 (a container without an init), the orphaned watcher is re-parented to vllm, which never
+    reaps it: exiting would leave a zombie for the container's life. So it stays, idle, until the server is gone."""
+    import time
+
+    if server_pid != 1:
+        return False
+    while alive(server_pid):
+        (sleep or time.sleep)(30.0)
+    return True
+
+
+def start_ready_watcher(plan: Plan, host: str, port: int) -> int | None:
+    """Fork the side watcher just before vllm replaces this process: vllm keeps
+    this PID and its signals; the watcher only prints. MERLIN_READY_BANNER=0 turns it off. In the parent, returns the
+    PID of the intermediate child (already reaped; the watcher is its grandchild), or None when off or unsupported."""
+    if plan.env.get("MERLIN_READY_BANNER", os.environ.get("MERLIN_READY_BANNER", "1")) == "0" or not hasattr(os, "fork"):
+        return None
+    seq = [*plan.args, *plan.extra]
+    why = _no_ready_probe(seq)
+    if why:
+        _say(f"merlin: no Ready line ({why}); the server is up when its log says 'Application startup complete'")
+        return None
+    probe = {"0.0.0.0": "127.0.0.1", "::": "::1", "": "127.0.0.1"}.get(host, host)
+    netloc = f"[{probe}]:{port}" if ":" in probe else f"{probe}:{port}"
+    url = f"{_ready_scheme(seq)}://{netloc}/health"
+    lines = ready_banner(plan, host, port)
+    server_pid = os.getpid()
+    sys.stdout.flush()
+    sys.stderr.flush()
+    # Double fork: the intermediate child exits at once and is reaped here, so the watcher is re-parented away from
+    # vllm (which never reaps it) and leaves no zombie behind the server; as PID 1 it holds instead, see hold_as_pid1_orphan.
+    try:
+        pid = os.fork()
+        if pid:
+            os.waitpid(pid, 0)
+            return pid
+    except OSError as e:  # fork refused, or SIGCHLD ignored so there is nothing to reap: the server must still start
+        _say(f"merlin: warning: no Ready line ({e}); the server starts anyway")
+        return None
+    try:  # pragma: no cover - the forked children
+        if os.fork():
+            os._exit(0)
+        import signal
+
+        signal.signal(signal.SIGINT, signal.SIG_IGN)  # Ctrl-C stops vllm; the watcher then sees it gone and exits
+        watch_ready(url, lines, server_pid)
+        hold_as_pid1_orphan(server_pid)
+    finally:
+        os._exit(0)
+
+
 def run(plan: Plan) -> int:
     host_phase(plan)
     if os.environ.get("SERVE_PRINT_ENV_AND_EXIT", "0") == "1":
@@ -2268,6 +2571,7 @@ def run(plan: Plan) -> int:
             f"port {port} on {host} is already in use (another server? the Flash-Next / Super VL / Ornith default is 8000, the 27B "
             f"default 8100); set PORT={port + 1} or stop the other server", 2)
     argv = plan.argv()
+    start_ready_watcher(plan, host, port)
     sys.stdout.flush()
     sys.stderr.flush()
     os.execvpe(argv[0], argv, plan.env)
@@ -2380,6 +2684,100 @@ def identify_checkpoint(ckpt: str, repo: Path | None = None) -> tuple[str, list[
 # --------------------------------------------------------------------------------------------
 # CLI
 # --------------------------------------------------------------------------------------------
+# The rows --p2p-probe chooses between, by the cards' peer access (P2P-on row,
+# no-P2P row). models/ornith1.5/serve.sh uses it instead of pinning the P2P-on row.
+P2P_PROBE_TWINS = {
+    "ornith-quad-3090": ("ornith-quad-3090", "ornith-quad-3090-nop2p"),
+    "ornith-quad-3090-nop2p": ("ornith-quad-3090", "ornith-quad-3090-nop2p"),
+}
+
+
+PEER_BAR1_MIN_MIB = 1024  # preflight.BAR1_MIN_MIB: a card below 1 GiB BAR1 hangs NCCL warmup on any P2P pair
+
+
+def _smi(args: list[str]) -> str | None:
+    try:
+        cp = subprocess.run(["nvidia-smi", *args], capture_output=True, text=True, timeout=30, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return cp.stdout if cp.returncode == 0 else None
+
+
+def _p2p_ok_pairs(text: str) -> set[tuple[int, int]] | None:
+    """The (row, col) pairs ``nvidia-smi topo -p2p r`` reports OK; None when no matrix row parsed (the launcher stays
+    standalone, so this mirrors preflight.parse_p2p_pairs)."""
+    pairs: set[tuple[int, int]] = set()
+    seen = False
+    for line in text.splitlines():
+        m = re.match(r"\s*GPU(\d+)\s+(.*)$", line)
+        if not m:
+            continue
+        toks = m.group(2).split()
+        if any(re.fullmatch(r"GPU\d+", t) for t in toks):
+            continue  # the header row
+        seen = True
+        row = int(m.group(1))
+        pairs |= {(row, col) for col, tok in enumerate(toks) if col != row and tok.upper() == "OK"}
+    return pairs if seen else None
+
+
+def _small_bar1(text: str) -> set[int]:
+    """GPU indices (nvidia-smi order) whose BAR1 total is under PEER_BAR1_MIN_MIB, from ``nvidia-smi -q -d MEMORY``."""
+    small = set()
+    for i, block in enumerate(re.split(r"(?m)^GPU\s+[0-9A-Fa-f:.]+\s*$", text)[1:]):
+        m = re.search(r"BAR1 Memory Usage\s*\n\s*Total\s*:\s*(\d+)\s*MiB", block)
+        if m and int(m.group(1)) < PEER_BAR1_MIN_MIB:
+            small.add(i)
+    return small
+
+
+def peer_access(gpus: list[int], topo: str | None, memory: str | None) -> str:
+    """on / off / partial among ``gpus`` from the two nvidia-smi reports; unknown when the matrix is unreadable."""
+    ok = _p2p_ok_pairs(topo) if topo else None
+    if ok is None:
+        return "unknown"
+    small = _small_bar1(memory or "")
+    ok = {(a, b) for a, b in ok if a not in small and b not in small}
+    ok |= {(b, a) for a, b in ok}
+    states = [(a, b) in ok for a in gpus for b in gpus if a != b]
+    return "on" if states and all(states) else "off" if not any(states) else "partial"
+
+
+def _probe_peer_access(gpus: list[int]) -> str:
+    """The driver's peer access among ``gpus`` (on / off / partial / unknown), read as preflight reads it: nvidia-smi
+    topo -p2p r, with BAR1 under 1 GiB counting as no peer."""
+    return peer_access(gpus, _smi(["topo", "-p2p", "r"]), _smi(["-q", "-d", "MEMORY"]))
+
+
+def select_p2p_twin(profile_id: str, environ: dict[str, str],
+                    probe: Callable[[list[int]], str] = _probe_peer_access) -> tuple[str, str]:
+    """The P2P-on or no-P2P twin of ``profile_id`` for this host, and a note saying why. An explicit P2P=on|off
+    picks the matching row; otherwise the cards' peer access does: on -> the P2P row, off or partial -> the no-P2P
+    row, unreadable -> refuse (set P2P=on or P2P=off)."""
+    if profile_id not in P2P_PROBE_TWINS:
+        raise LaunchError(f"--p2p-probe is only for {', '.join(sorted(P2P_PROBE_TWINS))} (got {profile_id})", 2)
+    on_row, off_row = P2P_PROBE_TWINS[profile_id]
+    want = (environ.get("P2P") or "").strip()
+    if want in ("on", "off"):
+        row = on_row if want == "on" else off_row
+        return row, f"p2p: P2P={want} set: serving {row}"
+    if want:
+        raise LaunchError(f"P2P must be on or off (got '{want}')", 2)
+    raw = environ.get("GPUS") or environ.get("CUDA_VISIBLE_DEVICES") or "0,1,2,3"
+    try:
+        gpus = [int(x) for x in raw.split(",") if x.strip()]
+    except ValueError:
+        raise LaunchError(f"--p2p-probe needs numeric GPU indices in GPUS / CUDA_VISIBLE_DEVICES (got '{raw}'); "
+                          "set P2P=on or P2P=off instead", 2) from None
+    state = probe(gpus)
+    if state == "on":
+        return on_row, f"p2p: peer access on among GPUs {raw}: serving {on_row}"
+    if state in ("off", "partial"):
+        return off_row, f"p2p: peer access {state} among GPUs {raw}: serving {off_row}"
+    raise LaunchError(f"could not read peer access among GPUs {raw} (nvidia-smi topo -p2p r); set P2P=on (serves "
+                      f"{on_row}) or P2P=off (serves {off_row})", 2)
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="launch.py", description=__doc__.split("\n\n")[0])
     ap.add_argument("--model", choices=("flash-next", "27b", "svl", "ornith"), help="registry (default: the profile's)")
@@ -2389,6 +2787,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--status",
                     choices=(R.LABEL_TESTED, R.LABEL_TESTING, R.LABEL_UNTESTED),
                     help="the label merlin serve evaluated on these cards (default: the registry row's)")
+    ap.add_argument("--p2p-probe", action="store_true",
+                    help="serve the P2P-on or no-P2P twin of --profile by the cards' peer access (or P2P=on|off)")
     ap.add_argument("rest", nargs=argparse.REMAINDER, help="[--] <checkpoint-dir> [extra vllm args]")
     a = ap.parse_args(argv)
     rest = a.rest[1:] if a.rest[:1] == ["--"] else a.rest
@@ -2409,7 +2809,11 @@ def main(argv: list[str] | None = None) -> int:
         print(f"usage: launch.py --profile {a.profile} -- <checkpoint-dir> [extra vllm args]   (or MODEL=<dir>)", file=sys.stderr)
         return 2
     try:
-        plan = build(model, a.profile, ckpt, dict(os.environ), extra, a.kv, a.checkpoint, status=a.status)
+        profile = a.profile
+        if a.p2p_probe:
+            profile, why = select_p2p_twin(profile, dict(os.environ))
+            print(why, file=sys.stderr)
+        plan = build(model, profile, ckpt, dict(os.environ), extra, a.kv, a.checkpoint, status=a.status)
         return run(plan)
     except LaunchError as e:
         if str(e):

@@ -4,9 +4,9 @@
 read-only fp32 checkpoint and accepted-state recovery after sampling.
 
 Mamba-2 port of the GDN RecoverSSM kernels (gdn/recoverssm_gdn.py). The verify kernel
-runs the stock selective-state-update recurrence (ops/mamba_ssm.py:402-454, tied head
-dim) over a speculative window of ``T = 1 + K`` tokens with the state carried in
-registers, emits every token's output and, instead of storing per-token states, writes
+runs the stock selective-state-update recurrence (``_selective_scan_update_kernel`` in
+ops/mamba_ssm.py, tied head dim) over a speculative window of ``T = 1 + K`` tokens with
+the state carried in registers, emits every token's output and, instead of storing per-token states, writes
 one fp32 "replay" record per token: per head ``x_t`` (P floats), ``dt_t`` (after bias
 and softplus) and ``dA_t = exp(A dt_t)``; per group ``B_t`` (N floats). ``C`` is
 output-only and not recorded; the checkpoint is never written.
@@ -167,7 +167,7 @@ def _recoverssm_mamba2_verify_kernel(
     for t in tl.static_range(SPEC_QUERY_LEN):
         valid = t < query_len
         tok = bos + t
-        # Stock operation order (ops/mamba_ssm.py:402-454, TIE_HDIM branch).
+        # Stock operation order (``_selective_scan_update_kernel``, TIE_HDIM branch).
         x = tl.load(
             x_ptr + tok * stride_x_token + offs_m * stride_x_dim,
             mask=valid & mask_m,
@@ -253,7 +253,8 @@ def mamba2_recoverssm_verify(
 ) -> torch.Tensor:
     """Verify Mamba-2 speculative windows against their checkpoints without modifying
     them. Same tensors as the stock ``selective_state_update`` call in the mixer
-    (``mamba_mixer2.py:1080-1096``): x/out ``[tokens, HL, P]``, dt ``[tokens, HL(, P)]``,
+    (the ``selective_state_update`` call in ``mamba_mixer2.py``): x/out
+    ``[tokens, HL, P]``, dt ``[tokens, HL(, P)]``,
     A ``[HL(, P, N)]``, B/C ``[tokens, G, N]``, D/dt_bias ``[HL(, P)]``; plus the record
     ``replay_cache`` ``[blocks, G, T, N + HPG*(P+2)]`` fp32, the spec rows'
     ``query_start_loc`` ``[n+1]`` and their checkpoint blocks ``state_indices`` ``[n]``.

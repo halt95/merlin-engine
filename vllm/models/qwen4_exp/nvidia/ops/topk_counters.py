@@ -6,38 +6,33 @@ The counters themselves are device-global uint64s owned by
 `csrc/merlin/topk/topk.cu`; `torch.ops._C.merlin_persistent_topk_exact_counters`
 snapshots them into an **int64** CUDA tensor. Without this module nothing in a
 running engine ever calls that op, so the instrument records into a buffer no
-one reads -- which measures nothing.
+one reads.
 
-DTYPE IS PART OF THE PROTOCOL (large-path determinism change). Version 1 was u32
-device counters read into a signed int32 tensor, which goes negative after
-~33k all-equal rows at k=512 and wraps after ~66k, so a delta taken across the
-boundary is a wrong number that looks like a measurement. Version 2 widens
-both sides, and the op REJECTS an int32 buffer rather than filling it from half
-of each counter. An older build whose op still demands int32 will therefore
-raise here; that is the intended signal, not a regression to paper over.
+DTYPE IS PART OF THE PROTOCOL. The op takes an int64 buffer and rejects any other
+width: a 32-bit signed buffer would wrap on large counts, and a delta taken across
+the wrap is a wrong number that looks like a measurement.
 
-SLOT LAYOUT is build-dependent, so nothing here hard-codes it. `slot_count()`
-asks the build (the `..._slots` op); a build without that op has no readable
-counters here. The op demands EXACTLY that many elements, so a guessed length
-is an error, not a short read; names come from a table keyed by that length:
+SLOT LAYOUT is not hard-coded here. `slot_count()` asks the build (the `..._slots`
+op). The op demands EXACTLY that many elements, so a guessed length is an error,
+not a short read; names come from a table keyed by that length:
 
   5  rows overflow fallbacks faults switch
   10  rows overflow fallbacks faults rows_large ties_cut ties_dropped
              faults_large switch switch_large
   11  the ten above, plus decode_overflow
 
-An unknown length degrades to `slot<i>` names rather than mislabelling.
-
-WHY 11 AND NOT 10. The decode counter is numbered around the large-path block
-instead of after the medium-path one, so nothing is renumbered: slots 4-7 are
-the large-path counters, 8-9 the two switch flags, 10 the decode overflow.
-Every one of the eleven is live on this build; on a build that
-drives only some of them the rest are structurally zero and the line still
-reports them by name -- they are the slots they will hold, not a
-mislabelling. `decode_overflow` is the number that has to be read before any
-claim that the DECODE path is deterministic: it counts rows whose buffered
-candidates exceeded the 3,708-slot capacity before the tie ranking ran, which
-ranking cannot repair.
+An unknown length degrades to `slot<i>` names rather than mislabelling. The decode
+counter is numbered after the large-path block, so no existing slot is renumbered:
+slots 4-7 are the large-path counters, 8-9 the two switch flags, 10 the decode
+overflow. `decode_overflow` counts decode rows whose buffered candidates exceeded
+the 3,708-slot capacity; tie ranking cannot recover a dropped candidate. With the
+decode exact restart on (the compiled policy in topk.cu) each such row is
+re-selected by the medium path's exact restart, which is exact and emits in
+ascending index order, so a nonzero `decode_overflow` is the repair rate, not an
+error. A restart that cannot complete counts in `faults` (shared with the medium
+path), fills the row with -1 and, in the default build, traps the kernel. Only a
+build with the decode restart off ranks the truncated set, and there a nonzero
+`decode_overflow` means rows may have lost a winner.
 
 HOW TO READ IT. Set `MERLIN_TOPK_EXACT_COUNTERS_LOG=<seconds>` on the
 engine; each GPU worker then emits, at most that often and once more at
@@ -52,7 +47,7 @@ line plus the four large-path fields, `switch_large` and `decode_overflow`.
 
 Counts are cumulative per worker process, so take the LATEST line
 per rank -- `grep topk-exact-counters <engine log> | ...` keyed on the `rank=`
-field -- and reads `faults` as the pass/fail number (it must stay 0) with
+field -- and read `faults` as the pass/fail number (it must stay 0) with
 `rows` as the denominator. Earlier lines are only useful as a rate.
 
 COST. `read()` passes `sync=1`, i.e. a full device synchronize, because a
@@ -88,8 +83,8 @@ _LARGEDET_NAMES = (
     "switch",
     "switch_large",
 )
-# The decode-overflow counter comes after the large-path block; see the module
-# docstring for why it is slot 10 and not slot 4.
+# The decode-overflow counter comes after the large-path block, so no existing
+# slot is renumbered.
 _TIEDET_NAMES = _LARGEDET_NAMES + ("decode_overflow",)
 _SLOT_NAMES: dict[int, tuple[str, ...]] = {
     5: _MEDIUM_NAMES,
@@ -117,9 +112,7 @@ def slot_count() -> int:
     """How many int64 slots this build's counter array carries.
 
     Asked of the build, never guessed: a length that does not match the
-    extension is rejected by the op's own length check. (The
-    MERLIN_TOPK_COUNTER_SLOTS fallback for builds older than the slot-count op
-    was pruned; the merlin_* ops always come with it.)
+    extension is rejected by the op's own length check.
     """
     query = _get_op(_OP_NAME + "_slots")
     if query is None:
@@ -155,7 +148,7 @@ def read(reset: bool = False, sync: bool = True) -> dict[str, int]:
     count = slot_count()
     device = torch.device("cuda", torch.cuda.current_device())
     # int64: the device counters are 64-bit and the op refuses any other
-    # width. See the module docstring -- this is protocol version 2.
+    # width. See the module docstring.
     out = torch.zeros(count, dtype=torch.int64, device=device)
     op(out, 1 if reset else 0, 1 if sync else 0)
     return dict(zip(slot_names(count), out.tolist(), strict=True))

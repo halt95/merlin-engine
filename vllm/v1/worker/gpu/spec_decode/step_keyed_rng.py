@@ -2,22 +2,16 @@
 # SPDX-FileCopyrightText: Copyright 2026 halt95 (Merlin modifications)
 """Step-keyed random draws for block verification.
 
-The defect
-----------
-MRV2 keys its spec-decode draws by request seed and absolute position:
-the acceptance uniform is ``tl_rand32(seed, pos)`` and the draft Gumbel noise
-is ``murmur3(seed, pos + _DRAFT_NOISE_SALT, token)``. Standard verification
-stops at the first rejection, so every acceptance draw it reads decides once
-and the draft noise past the rejection never reaches the output. Block
-verification (Sun et al. 2024, ``rejection_sample_method="block"``) reads the
-draw at EVERY drafted row. After a partial accept the next round re-verifies the
-positions past the resampled token with the same uniforms (already known to
-have exceeded their thresholds) and re-drafts them with the same noise, so the
-rounds are not independent and the output distribution is biased (CPU joint
-chi-square 1,828 / 8,160 against a 488 threshold; upstream vLLM #61114).
+MRV2 keys its spec-decode draws by request seed and absolute position: the
+acceptance uniform is ``tl_rand32(seed, pos)`` and the draft Gumbel noise is
+``murmur3(seed, pos + _DRAFT_NOISE_SALT, token)``. Standard verification stops
+at the first rejection, so each draw it reads decides once. Block verification
+(Sun et al. 2024, ``rejection_sample_method="block"``) reads the draw at EVERY
+drafted row, so after a partial accept the next round would re-verify the
+positions past the resampled token with the same uniforms and re-draft them
+with the same noise. The rounds would not be independent and the output
+distribution would be biased (upstream vLLM #61114).
 
-The fix
--------
 With ``VLLM_SPEC_STEP_KEYED_RNG=1`` and block verification, the two draws a
 later round could reuse are keyed by the ROUND:
 
@@ -37,21 +31,18 @@ a host RNG, so the draws are invariant to batch composition, preemption/resume
 buffer and the draft step from the speculator's persistent ``current_draft_step``
 tensor, both device buffers the captured kernels read at replay.
 
-What stays as it was
---------------------
-* Greedy (T=0): no noise is drawn and the greedy branch never reads ``u``.
-* Standard and synthetic verification: their keying is unchanged bit for bit;
-  the flag only takes effect together with block verification.
-* Resample / bonus noise stays position-keyed: each committed position is
-  resampled exactly once, in the round that commits it.
-* Seed semantics: seeded requests stay reproducible run to run. Unseeded
-  requests keep the stock seed (drawn at admission, redrawn when a preempted
-  request is re-added), which keeps the output exact but not reproducible
-  across preemption, exactly as upstream.
+Unaffected: greedy (T=0) draws no noise and never reads ``u``; standard and
+synthetic verification keep their keying bit for bit (the flag only takes
+effect together with block verification); resample and bonus noise stays
+position-keyed, because each committed position is resampled exactly once, in
+the round that commits it. Seeded requests stay reproducible run to run;
+unseeded requests keep the stock seed (drawn at admission, redrawn when a
+preempted request is re-added), exact but not reproducible across preemption,
+as upstream.
 
-Deviation from upstream: under block verification a seeded request produces a
-different (still deterministic) token sequence with the flag on than upstream's
-position-keyed block mode, which is itself not distribution-exact.
+Under block verification a seeded request produces a different (still
+deterministic) token sequence with the flag on than upstream's position-keyed
+block mode, which is itself not distribution-exact.
 
 Flag: ``VLLM_SPEC_STEP_KEYED_RNG`` -- strict "0"/"1", default OFF, read once at
 init (rejection sampler and speculator). OFF launches every kernel with the

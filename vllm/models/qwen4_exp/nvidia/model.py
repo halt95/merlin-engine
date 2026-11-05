@@ -98,6 +98,7 @@ from vllm.v1.e2_guards import (
 )
 from vllm.v1.kv_cache_interface import MambaSpec
 
+from ..common.hyperconnection import is_hc_sequence_parallel_enabled
 from .hyperconnection import GatedResidual, HyperConnectionConfig
 from .low_latency_gemm import enable_qwen4_exp_low_latency_gemm
 from .ops.cute_dsl.hc_down_silu import request_hc_down_silu_warmup
@@ -109,14 +110,6 @@ logger = init_logger(__name__)
 # Transformers v5.18 renamed `qwen_sparse_attention` to `indexed_attention`
 # The qwen_sparse_attention alias can go once Transformers 5.18.0 is the minimum.
 _QSA_LAYER_TYPES = ("qwen_sparse_attention", "indexed_attention")
-
-
-def is_hc_sequence_parallel_enabled(vllm_config: VllmConfig) -> bool:
-    """Enable GR/PLE SP explicitly or automatically with sequence-parallel MoE."""
-    parallel_config = vllm_config.parallel_config
-    return parallel_config.tensor_parallel_size > 1 and (
-        parallel_config.enable_hc_sp or parallel_config.use_sequence_parallel_moe
-    )
 
 
 def without_modelopt_fp4(
@@ -973,8 +966,7 @@ class Qwen4ExpForCausalLM(
         # has_compiled_submodule() (vllm/v1/worker/gpu/cudagraph_utils.py) is what
         # capture actually tests; check the same property here.
         assert_compiled_submodule(self.model, vllm_config, role="target")
-        # PP ownership: logits are computed on the
-        # last stage only; earlier stages carried an unused 0.59 GiB head.
+        # PP ownership: logits are computed on the last stage only.
         if get_pp_group().is_last_rank:
             self.lm_head = ParallelLMHead(
                 config.vocab_size,
@@ -1324,6 +1316,8 @@ class Qwen4ExpForConditionalGeneration(
         self.make_empty_intermediate_tensors = (
             self.language_model.make_empty_intermediate_tensors
         )
+        # No deepstack buffers on later PP ranks of a
+        # language-only model
         if (
             not get_pp_group().is_first_rank
             and not self.language_model_only

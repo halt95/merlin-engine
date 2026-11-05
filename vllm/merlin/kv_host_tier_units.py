@@ -136,10 +136,17 @@ class UnitCounters:
     supersede_deferred: int = 0  # published predecessors kept for a successor
     supersede_completed: int = 0  # ... dropped once the successor published
     constrained_successor: int = 0  # a predecessor evicted for its successor
-    # Staged rows of an abandoned unit still recorded (a stall release or
-    # the per-unit stall release gave up its start) that lost their host keys before it restarted:
-    # the copy work the liveness release threw away.
+    # Staged rows of an abandoned unit that lost their host keys before the unit
+    # restarted (a stall release, or the per-unit stall release giving up its
+    # start): the copy work the liveness release threw away.
     abandoned_fragment_evicted: int = 0
+    # Fallback boundary (flag ``FALLBACK_BOUNDARY``; 0 with it off): a
+    # published predecessor kept as its published successor's fallback, and
+    # the times host eviction took a successor while its fallback stayed
+    # restorable (the session's host prefix shrank to the predecessor's
+    # boundary instead of going whole).
+    fallback_kept: int = 0
+    fallback_shrinks: int = 0
 
 
 # Victim classes, in eviction order (iface ``EvictionPolicy``).
@@ -264,15 +271,30 @@ class UnitTable:
 
         mode = read_registered("MERLIN_KV_HOST_TIER__ADMISSION")
         self.policy = make_admission_policy(mode)
+        # Fallback boundary (default off): a published successor keeps
+        # its deepest published, host-complete predecessor as a live unit,
+        # ordered right behind it for eviction. Evicting the successor then
+        # frees only its own exclusive rows (the FA tail past the
+        # predecessor's boundary, its recurrent endpoint and SW window) and
+        # the predecessor stays restorable: the session's host prefix shrinks
+        # to the predecessor boundary instead of going whole. No copy and no
+        # publication: every kept row was published (all-rank acked) with
+        # the predecessor, and only its ownership changes. Off: the
+        # predecessor is dropped when its successor publishes, as before.
+        self._fallback_on = bool(
+            read_registered("MERLIN_KV_HOST_TIER__FALLBACK_BOUNDARY")
+        )
+        self._fallback_of: dict[int, int] = {}  # predecessor -> successor
+        self._fallback: dict[int, int] = {}  # successor -> predecessor
         # Classifies a GPU twin: "running" (a running request's table holds
         # it), "imminent" (grace-held / in the free queue: it leaves the GPU
         # next). Installed by the copy scheduler (SessionYield knows graces);
         # the fallback reads the ref count alone (grace pins count as running).
         self.twin_kind: Callable[[KVCacheBlock], str] | None = None
-        # Backing revocation (the copy scheduler's REPAIR lane): ``apply`` calls it with the GPU
-        # twins of every host row it evicts while the GPU still holds the key
-        # (duplicate victims), so that GPU content is dirty again and
-        # eligible for a repair copy. ``hook(gpu_blocks, step)``.
+        # Backing revocation (the copy scheduler's REPAIR lane): ``apply`` calls
+        # it with the GPU twins of every host row it evicts while the GPU still
+        # holds the key (duplicate victims), so that GPU content is dirty again
+        # and eligible for a repair copy. ``hook(gpu_blocks, step)``.
         self.revoke_hook: Callable[[list[KVCacheBlock], int], None] | None = None
         # Directory version: bumped by every change of units, keys or host
         # ownership; the eviction candidate index is rebuilt only when it (or
@@ -674,8 +696,7 @@ class UnitTable:
                     unit.uid, len(self.host_members(unit)),
                     inherit=keep_preds, keys=self._plain_keys(unit),
                 )
-                for pred in sorted(keep_preds):
-                    self._complete_supersede(pred)
+                self._settle_preds(unit.uid, keep_preds)
             else:
                 for pred in sorted(keep_preds):
                     prev = self._superseded_by.get(pred)
@@ -807,6 +828,8 @@ class UnitTable:
 
     def _drop_unit(self, unit: RestoreUnit) -> None:
         self._bump()
+        if self._fallback or self._fallback_of:
+            self._unlink_fallback(unit.uid)
         # Supersede-at-publish links: a dropped successor releases its kept
         # predecessors (they stay ordinary published units, the fallback
         # boundary); a dropped predecessor leaves its successor's list.
@@ -839,6 +862,25 @@ class UnitTable:
                 owners.discard(unit.uid)
                 if not owners:
                     del self._key_units[key]
+
+    def _unlink_fallback(self, uid: UnitId) -> None:
+        """``uid`` leaves the table. A successor's kept fallback becomes
+        the session's restore point: an ordinary unit with the successor's
+        recency (it rode right behind it). A fallback leaving just unlinks."""
+        pred = self._fallback.pop(uid, None)
+        if pred is not None:
+            self._fallback_of.pop(pred, None)
+            if pred in self.units:
+                if self._loss_cause == "host_evicted":
+                    self.counters.fallback_shrinks += 1
+                last = self._last_use.get(uid)
+                if last is not None:
+                    self._last_use[pred] = max(
+                        last, self._last_use.get(pred, last)
+                    )
+        succ = self._fallback_of.pop(uid, None)
+        if succ is not None:
+            self._fallback.pop(succ, None)
 
     # -- transaction publication -----------------------------------------------
 
@@ -875,10 +917,72 @@ class UnitTable:
             unit_id, len(members), inherit=preds, keys=self._plain_keys(unit)
         )
         # Supersede-at-publish: the successor is restorable now.
-        for pred in sorted(self._pending_preds.pop(unit_id, set())):
+        # The deepest restorable
+        # predecessor stays as its fallback when the flag is on.
+        preds = sorted(self._pending_preds.pop(unit_id, set()))
+        keep = self._fallback_pick(unit_id, preds) if self._fallback_on else None
+        for pred in preds:
             self._superseded_by.pop(pred, None)
-            self._complete_supersede(pred)
+            if pred != keep:
+                self._complete_supersede(pred)
+        if keep is not None:
+            self._keep_fallback(unit_id, keep)
         return True
+
+    def _settle_preds(self, succ_uid: UnitId, preds: Iterable[UnitId]) -> None:
+        """The published successor ``succ_uid`` replaces ``preds``: drop
+        them (flag off: every one), or with the fallback-boundary flag keep the
+        deepest restorable one as its fallback and drop the rest."""
+        preds = sorted(preds)
+        keep = self._fallback_pick(succ_uid, preds) if self._fallback_on else None
+        for pred in preds:
+            if pred != keep:
+                self._complete_supersede(pred)
+        if keep is not None:
+            self._keep_fallback(succ_uid, keep)
+
+    def _fallback_pick(
+        self, succ_uid: UnitId, preds: Sequence[UnitId]
+    ) -> UnitId | None:
+        """The deepest predecessor that is a restore point now (published,
+        every required key on the host, a shorter boundary)."""
+        succ = self.units.get(succ_uid)
+        if succ is None:
+            return None
+        best: RestoreUnit | None = None
+        for uid in preds:
+            pred = self.units.get(uid)
+            if (
+                pred is None or uid not in self._published
+                or pred.boundary >= succ.boundary
+                or not self.is_host_complete(pred)
+            ):
+                continue
+            if best is None or (pred.boundary, uid) > (best.boundary, best.uid):
+                best = pred
+        return None if best is None else best.uid
+
+    def _keep_fallback(self, succ_uid: UnitId, pred_uid: UnitId) -> None:
+        """Keep ``pred_uid`` as the one fallback of ``succ_uid`` (one level:
+        the predecessor's own fallback, if any, becomes an ordinary unit)."""
+        self._bump()
+        old = self._fallback.pop(pred_uid, None)
+        if old is not None:
+            self._fallback_of.pop(old, None)
+        prev = self._fallback.pop(succ_uid, None)
+        if prev is not None:
+            self._fallback_of.pop(prev, None)
+        self._fallback_of[pred_uid] = succ_uid
+        self._fallback[succ_uid] = pred_uid
+        self.counters.fallback_kept += 1
+
+    def fallback_of(self, unit_id: UnitId) -> UnitId | None:
+        """The successor ``unit_id`` is the kept fallback of, or None."""
+        return self._fallback_of.get(unit_id)
+
+    def fallback(self, unit_id: UnitId) -> UnitId | None:
+        """The kept fallback predecessor of ``unit_id``, or None."""
+        return self._fallback.get(unit_id)
 
     # -- host use and eviction --------------------------------------------------
 
@@ -1023,8 +1127,8 @@ class UnitTable:
         )
 
     def _twin_kind(self, host_block: KVCacheBlock) -> str:
-        """"running" when every GPU twin of a duplicate host row is held by
-        a running request, else "imminent" (it leaves the GPU next)."""
+        """Classify a duplicate host row: "running" when every GPU twin is held
+        by a running request, else "imminent" (it leaves the GPU next)."""
         kind_of = self.twin_kind
         for key in self._keys_of(self.host_pool, host_block):
             twin = self._gpu_block(key)
@@ -1082,12 +1186,32 @@ class UnitTable:
                 self._last_use.get(uid, 0), uid in self._published,
                 uid in self._abandoned, self.policy.rank(uid),
             ))
-        out.sort(key=lambda c: (
-            _CLASS_RANK[c.cls], c.rank if c.cls == CLASS_LRU else 0,
-            c.last_use, c.uid,
-        ))
+        if self._fallback_of:
+            out.sort(key=self._fallback_order)
+        else:
+            out.sort(key=lambda c: (
+                _CLASS_RANK[c.cls], c.rank if c.cls == CLASS_LRU else 0,
+                c.last_use, c.uid,
+            ))
         self._cand_cache = (key, out)
         return out
+
+    def _fallback_order(self, c: _Candidate) -> tuple:
+        """Victim order with kept fallbacks: a fallback takes its
+        successor's admission rank and recency and sorts right behind it
+        within its own class, so the successor's exclusive rows go first
+        (the shrink) and the fallback only after it. Every other unit keeps
+        the plain order (class, rank, last use, uid)."""
+        anchor, rank, last, behind = c.uid, c.rank, c.last_use, 0
+        succ = self._fallback_of.get(c.uid)
+        if succ is not None and succ in self.units:
+            anchor, behind = succ, 1
+            rank = self.policy.rank(succ)
+            last = max(last, self._last_use.get(succ, 0))
+        return (
+            _CLASS_RANK[c.cls], rank if c.cls == CLASS_LRU else 0,
+            last, anchor, behind,
+        )
 
     def _row_free_now(self, block: KVCacheBlock) -> bool:
         return (
@@ -1203,9 +1327,9 @@ class UnitTable:
                     c.evict_skipped_leased += 1
                     continue
                 # Classify what is actually taken, live (rows a released
-                # co-owner left; a GPU ref or grace change since the index
-                # was cached), BEFORE the lane's
-                # permission and the admission filter, exactly as ``apply``.
+                # co-owner left; a GPU ref or grace change since the index was
+                # cached), BEFORE the lane's permission and the admission
+                # filter, exactly as ``apply``.
                 cls = self._victim_class(take)
                 if not displace_published and cls != CLASS_RUNNING_DUP:
                     continue
@@ -1213,9 +1337,10 @@ class UnitTable:
                     cls == CLASS_LRU and cand.rank > 0
                     and not own and not may_protected
                 ):
+                    # Admission flag: a probation copy never displaces
+                    # protected content.
                     bypassed = True
-                    continue  # admission flag: a probation copy never
-                    # displaces protected content
+                    continue
                 victims.append(cand.uid)
                 ids = [b.block_id for b in take]
                 rows.extend(ids)
@@ -1617,6 +1742,8 @@ class UnitTable:
         # No published predecessor survives a host reset.
         self._superseded_by.clear()
         self._pending_preds.clear()
+        self._fallback_of.clear()
+        self._fallback.clear()
         self.policy.clear()
         for unit in list(self.units.values()):
             unit.host_group = False
@@ -1636,6 +1763,8 @@ class UnitTable:
         self._unkeying.clear()
         self._superseded_by.clear()
         self._pending_preds.clear()
+        self._fallback_of.clear()
+        self._fallback.clear()
         self.policy.clear()
         self._cand_cache = None
         self._bump()

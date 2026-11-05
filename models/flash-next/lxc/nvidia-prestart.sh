@@ -1,4 +1,6 @@
 #!/bin/bash
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright 2026 halt95 (Merlin modifications)
 # Proxmox VE hookscript for the Flash-Next container (lxc/pve-create.sh): create the NVIDIA device nodes on the HOST
 # before the container starts. After a host reboot the /dev/nvidia* nodes (the uvm ones in particular) do not exist
 # until something opens the driver, and `pct start` then fails on the missing device passthrough.

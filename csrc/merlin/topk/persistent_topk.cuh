@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+// Modified by the Merlin project; see NOTICE.
 /*
  * Persistent TopK Scheduler for DSA Indexer
  */
@@ -13,7 +16,7 @@
 
 #include "topk_histogram_4096.cuh"
 
-namespace merlin {  // was vllm; merlin-hook: csrc-topk-vendored
+namespace merlin {
 namespace persistent {
 
 // ============================================================================
@@ -27,8 +30,8 @@ constexpr int RADIX = 256;
 // which would inflate the kernel's smem footprint and kill occupancy
 // for the decode/trivial paths).
 constexpr size_t kMediumHistBytes = 2 * (RADIX + 128) * sizeof(int);  // 3072
-// 6 scalars, not 5: the medium-path exact restart adds a per-row "overflow already counted" flag.
-// kMediumHeaderSize rounds to 128 B either way, so kSmemMedium is unchanged.
+// 6 scalars: the last is the per-row "overflow already counted" flag of the
+// medium-path exact restart. kMediumHeaderSize rounds up to 128 B.
 constexpr size_t kMediumScalarsBytes = 6 * sizeof(int);               // 24
 constexpr size_t kMediumHeaderSize =
     (kMediumHistBytes + kMediumScalarsBytes + 127) & ~size_t(127);  // 3200
@@ -54,14 +57,13 @@ __device__ __forceinline__ auto convert_to_uint32_v2(float x) -> uint32_t {
   return (bits & 0x80000000u) ? ~bits : (bits | 0x80000000u);
 }
 
-// THE definition of the effective tie direction, called by
-// both the host (to report it) and the device (to obey it), so the reported
-// policy and the executed policy cannot drift.
+// The definition of the effective tie direction, called by both the host (to
+// report it) and the device (to obey it), so the reported policy and the
+// executed policy cannot drift.
 //
-// `det_ties` off (topk.cu folds it on) leaves the buffered paths on
-// their original racy atomicAdd rule, which has no direction; the medium-path exact
-// restart is deterministic whatever happens, so it keeps the most-recent-wins
-// direction the medium-path restart shipped and was measured with.
+// With `det_ties` off the buffered paths keep their original racy atomicAdd
+// rule, which has no direction; the medium-path exact restart is deterministic
+// either way, so it keeps the most-recent-wins direction.
 __host__ __device__ __forceinline__ bool effective_tie_recent(bool det_ties,
                                                               bool tie_recent) {
   return det_ties ? tie_recent : true;
@@ -153,30 +155,27 @@ struct PersistentTopKParams {
   uint32_t chunk_size;      // large path: elements per CTA
   uint32_t ctas_per_group;  // 1=medium, >1=large
   uint32_t max_seq_len;     // max seq_len across all rows (for early CTA exit)
-  // The switches below were environment variables (names kept for reference);
-  // they are folded to compile-time constants in topk.cu (*_enabled()), no
-  // variable is read, and every launch passes the same values, which a
-  // cudagraph bakes in at capture.
+  // The policy fields below are launch constants: topk.cu passes the same
+  // values on every launch, which a cudagraph bakes in at capture.
   //
-  // Medium-path exact top-k restart (was MERLIN_TOPK_EXACT_MEDIUM; folded ON).
+  // Medium-path exact top-k restart.
   // `exact_counters` is a process-lifetime device buffer of
   // kNumTopKExactCounters 64-bit counters, or nullptr; the kernel only ever
   // atomicAdds into it, never reads back.
   bool exact_medium;
   unsigned long long* exact_counters;
-  // Deterministic tie-break at the k-th cutoff (was MERLIN_TIE_DET; folded ON).
+  // Deterministic tie-break at the k-th cutoff.
   bool det_ties;
   // Ranks ties by DESCENDING element index, so the surviving blocks are the
-  // most recent rather than the oldest (was MERLIN_TIE_RECENT; folded ON).
-  // Both rules are deterministic; they differ in which tied blocks survive,
-  // and measurably in draft acceptance at depth. Only read when det_ties is set.
+  // most recent rather than the oldest. Both rules are deterministic; they
+  // differ in which tied blocks survive, and measurably in draft acceptance at
+  // depth. Only read when det_ties is set.
   bool tie_recent;
   // On an overflowing DECODE row, take the same exact restart the medium path
-  // takes instead of ranking a truncated candidate set (folded ON). It costs
-  // four full-row rescans on the overflowing rows only; counter [10] counts
-  // them.
+  // takes instead of ranking a truncated candidate set. It costs four full-row
+  // rescans on the overflowing rows only; counter [10] counts them.
   bool exact_decode;
-  // Large-path deterministic emission (was MERLIN_TOPK_DET_LARGE; folded ON),
+  // Large-path deterministic emission,
   // ANDed per launch with the capacity gate 4 * ctas_per_group <= RADIX (the
   // per-CTA counts and the two fault-verdict regions are staged in one
   // 256-slot RadixRowState histogram row). With det ties on, a launch that
@@ -193,65 +192,51 @@ struct PersistentTopKParams {
   // the EMISSION-BOUND slot check in the placement loop (X4, the only way to
   // exercise `suffix_sum[6]`).  The host always passes false.
   bool fault_inject_emit;
-  // MERLIN_TOPK_SORTED_EMIT: every row leaves
-  // the kernel in the canonical order MERLIN_QSA_SORT would impose in
-  // Python -- ascending index, padding last as -1 -- so the Python sort can be
-  // dropped.  Paths that already emit that order by construction (trivial,
-  // medium-path restart, deterministic large path) are untouched; the paths that
-  // place by atomic arrival (decode-buffered, medium-buffered, the legacy
-  // large tail) re-emit their OWN selected set through sorted_emit_row().
-  // Selection is never re-derived, so the selected set cannot change.
-  // Folded on in topk.cu, so it is a launch constant a cudagraph bakes in.
+  // Sorted emission: every row leaves the kernel in canonical order --
+  // ascending index, padding last as -1 -- so the Python sort can be dropped.
+  // Paths that already emit that order by construction (trivial, medium-path
+  // restart, deterministic large path) are untouched; the paths that place by
+  // atomic arrival (decode-buffered, medium-buffered, the baseline large tail)
+  // re-emit their own selected set through sorted_emit_row(). Selection is never
+  // re-derived, so the selected set cannot change. A launch constant that a
+  // cudagraph bakes in.
   bool sorted_emit;
 };
 
 // ============================================================================
-// Device-global exact-path counters -- DECLARED HERE, ABOVE EVERY USER.
+// Device-global exact-path counters, declared here above every user.
 //
 // The decode template increments `kCtrDecodeOverflow` through `counters`, a
-// plain `unsigned long long*` parameter, so that enumerator is a NON-DEPENDENT
-// name: two-phase lookup resolves it when the template is DEFINED, not when it
-// is instantiated, and with the enum declared below the template the Linux
-// build rejects the tree with
-//   identifier "kCtrDecodeOverflow" is undefined.
-// An offline `nvcc -cubin` on a non-Linux host does NOT reproduce that on its own: nvcc
-// can drive cicc in Microsoft mode (`--ms_c++17 --microsoft_version=`), and that mode
-// defers non-dependent lookup to instantiation, where the enum is already
-// visible.  `-Xcudafe --dep_name` restores strict two-phase lookup and the
-// offline harness then reproduces the Linux diagnostic verbatim.
+// plain `unsigned long long*` parameter, so that enumerator is a non-dependent
+// name: two-phase lookup resolves it when the template is defined, not when it
+// is instantiated, so the enum must be declared before the template.
 //
-// The safeguard is the declaration ORDER, not a literal: every increment still
+// The safeguard is the declaration order, not a literal: every increment still
 // names its enumerator, so a slot renumbering stays a one-line edit here.
 // ============================================================================
 
-// Device-global counters.  Plain device atomics on a process-lifetime buffer:
+// Device-global counters. Plain device atomics on a process-lifetime buffer:
 // no host sync and no host-visible allocation on the launch path, so this is
-// safe to record inside a cudagraph capture and on every replay.  Read from
+// safe to record inside a cudagraph capture and on every replay. Read from
 // Python with `torch.ops._C.persistent_topk_exact_counters`.
 //
-// The counters are `unsigned long long`, not `unsigned int`,
-// and the reader tensor is int64.  A u32 counter copied into a SIGNED int32
-// tensor goes negative, then wraps: at 65,536 columns with k=512 an all-equal
-// row drops 65,024 ties, so slot 6 crosses the signed boundary after 33,027
-// rows and wraps after 66,053, and a delta taken across that boundary is a
-// wrong number that looks like a measurement.  `atomicAdd(unsigned long long*)`
-// is native on sm_86, so the width costs nothing on the increment path.
+// The counters are `unsigned long long`, not `unsigned int`, and the reader
+// tensor is int64: a 32-bit counter read through a signed tensor goes negative
+// and then wraps. atomicAdd(unsigned long long*) is native on sm_86, so the
+// width costs nothing on the increment path.
 //
-// SLOT MAP (11 slots).  The decode
-// counter is numbered AROUND the large-path block rather than after the medium-path one, so
-// nothing is renumbered and no external probe
-// silently re-reads a row count as a switch.
+// Slot map:
 //
 //   [0] medium rows      [1] medium overflow   [2] medium exact fallback
 //   [3] medium exact fault
 //   [4]-[7]  large path (rows_large, ties_cut, ties_dropped, faults_large)
-//   [8] MERLIN_TOPK_EXACT_MEDIUM   [9] MERLIN_TOPK_DET_LARGE
+//   [8] exact medium restart on   [9] deterministic large path on
 //   [10] decode overflow
 //
 // Slots 8-9 are written by the HOST after the device copy; the device never
-// touches them, and they are slots INSIDE the array, not two elements appended
-// after it.  A stale five- or ten-element reader buffer is rejected outright by
-// the length check in the reader op, which is the fail-loud direction.
+// touches them, and they are slots inside the array, not two elements appended
+// after it. A reader buffer of any other length is rejected outright by the
+// length check in the reader op, which is the fail-loud direction.
 enum TopKExactCounter : int {
   kCtrMediumRows = 0,           // denominator: medium-path rows entered
   kCtrMediumOverflow = 1,       // rows where a 4,096-slot guard would drop
@@ -263,7 +248,8 @@ enum TopKExactCounter : int {
   // co-resident, or 4 * ctas_per_group > RADIX) touches no counter, so
   // `[9] == 1 && [4] == 0` while large rows ran means those rows took the exact
   // one-CTA-per-row kernel (still deterministic), not a degraded tail; slot [9]
-  // reports the folded switch, not the per-launch path.
+  // reports the compiled policy value (det_large_enabled() in topk.cu), not the
+  // per-launch path.
   kCtrLargeDetRows = 4,       // large rows emitted deterministically
   kCtrLargeTiesCut = 5,       // rows where the pivot-equal group was cut
   kCtrLargeTiesDropped = 6,   // pivot-equal elements discarded by those cuts
@@ -276,10 +262,10 @@ enum TopKExactCounter : int {
 };
 
 // ============================================================================
-// MERLIN_TOPK_SORTED_EMIT -- in-kernel ascending emission of a row's OWN
-// selected set.  Declared here, above every caller (decode/medium dispatch,
-// the legacy large tail, and the standalone fallback kernel), for the
-// two-phase-lookup reason given above the counter enum.
+// In-kernel ascending emission of a row's OWN selected set. Declared here,
+// above every caller (decode/medium dispatch, the baseline large tail, and the
+// standalone fallback kernel), for the two-phase-lookup reason given above the
+// counter enum.
 //
 // CONTRACT.  On return, row[0, TopK) is byte-identical to what
 // `_qsa_canonicalise` (vllm/models/qwen4_exp/nvidia/ops/qsa_indexer.py) makes
@@ -312,9 +298,9 @@ enum TopKExactCounter : int {
 // bit already set) cannot be expressed as a bitmap, so the row is ranked
 // instead: rank(i) = #{j : key_j < key_i} + #{j < i : key_j == key_i}, a stable
 // counting sort that equals torch.sort on ANY int32 multiset.  O(TopK^2 / 1024)
-// shared reads per thread; reached only by the legacy large tail (indices past
-// 32,768, control arm only) and by rows whose unfilled slots hold stale
-// values (buffered overflow with its exact repair switched off).
+// shared reads per thread; reached only by the baseline large tail (indices
+// past 32,768) and by rows whose unfilled slots hold stale values (buffered
+// overflow without the exact repair).
 //
 // SHARED MEMORY.  Aliases the dynamic window from byte 0.  The caller's shared
 // state is dead on entry -- the leading barrier makes sure no thread is still
@@ -451,9 +437,8 @@ __device__ __noinline__ bool histogram_2048_topk(
   constexpr int MAX_ITEMS_PER_THREAD =
       (HIST2048_THRESHOLD + kThreadsPerBlock - 1) / kThreadsPerBlock;
 
-  // sOVF claims one of the two scalars that were already
-  // being zeroed by the `tx < 8` loop below and never used, so the decode
-  // shared-memory budget is unchanged.
+  // sOVF uses a scalar slot that the `tx < 8` loop below already zeroes, so
+  // the decode shared-memory budget is unchanged.
   enum : int {
     sTHR = 0,
     sOUT = 1,
@@ -642,21 +627,25 @@ __device__ __noinline__ bool histogram_2048_topk(
 
     const int raw_buf = decode_smem[SBASE + sBUF0 + src];
 
-    // ---- DECODE TRUNCATION, DETECTED ------------------
+    // ---- Decode truncation, detected ----
     //
-    // `DBUF` is 3,708 and the Phase-2 append guard drops everything past it,
-    // but the atomicAdd that hands out slots sits OUTSIDE that guard -- so
-    // `raw_buf` keeps counting and a post-hoc test here is exact, exactly as
-    // the medium path's M2 is.  Dropped candidates are invisible to
-    // refinement AND to the deterministic tie ranking further down: ranking
-    // orders the survivors, it cannot recall a winner that was never
-    // buffered.  The failing class: an 8,192-element row inside one coarse bin
-    // with one element larger at FP32 but in the same half-precision bin; a
-    // legal append order drops that winner and the row is silently wrong.
-    //
-    // The historical zero-overflow measurements cover a workload, not a
-    // capacity.  Until this counter has been read on the real traffic, the
-    // determinism claim for the decode path is conditional on it reading 0.
+    // `DBUF` is 3,708 and the Phase-2 append guard drops everything past it, but
+    // the atomicAdd that hands out slots sits outside that guard, so `raw_buf`
+    // keeps counting and a post-hoc test here is exact, as for the medium path.
+    // Dropped candidates are invisible to refinement and to the deterministic
+    // tie ranking further down: ranking orders the survivors, it cannot recall
+    // a winner that was never buffered. The failing class: an 8,192-element row
+    // inside one coarse bin with one element larger at FP32 but in the same
+    // half-precision bin; a legal append order drops that winner, so ranking
+    // the truncated set would be silently wrong. Counter [10] counts every
+    // overflowing row once. With exact_decode on (the compiled policy,
+    // exact_decode_enabled() in topk.cu) the row is handed back and
+    // medium_exact_restart re-selects it from a full-row rescan with
+    // ascending-index emission, so the row is exact and deterministic and a
+    // nonzero counter [10] is the repair rate, not an error. A restart that
+    // cannot complete counts in [3] (shared with the medium path), fills the
+    // row with -1 and traps unless MERLIN_TOPK_EXACT_TRAP is 0. Only with
+    // exact_decode off is an overflowing row ranked from the truncated set.
     if (__builtin_expect(raw_buf > DBUF, 0)) {
       if (tx == 0 && decode_smem[SBASE + sOVF] == 0) {
         decode_smem[SBASE + sOVF] = 1;  // once per row, not once per pass
@@ -727,15 +716,13 @@ __device__ __noinline__ bool histogram_2048_topk(
           if (det_ties) {
             // Every candidate that reaches here has an identical 32-bit value,
             // and the racy branch below hands out slots by atomicAdd -- first
-            // warp to arrive wins, so WHICH tied block survives the cutoff is
+            // warp to arrive wins, so which tied block survives the cutoff is
             // a race. Rank by element index instead and place at a position
             // derived from that rank, so the surviving set is arrival-order
             // independent. No atomics on this path.
             //
-            // O(t^2) over the exactly-tied set t. Exact 32-bit ties are rare
-            // (19 occurrences across 12 measured requests, one element each), so
-            // t is small in practice -- but that is measurement at one shape,
-            // not a bound.
+            // O(t^2) over the exactly-tied set t. Exact 32-bit ties are rare,
+            // so t is small in practice, but that is not a bound.
             int rank = 0;
             for (int j = 0; j < num_buffered; ++j) {
               const int jdx = bufs[src][j];
@@ -772,47 +759,36 @@ __device__ __noinline__ bool histogram_2048_topk(
 // Medium-path exact top-k restart
 //
 // The medium path buffers the coarse threshold bin's candidates into a fixed
-// 4,096-slot shared buffer and increments the NEXT-LEVEL histogram *inside*
-// the capacity guard, so a candidate dropped on overflow is invisible to
-// refinement in both the buffer and the histogram.  At 51,481 prompt tokens
-// (~12.9K candidate blocks) that makes the returned set non-exact on 88 % of
-// the rows that overflow, and which candidates survive is decided by atomicAdd
-// arrival order.
+// 4,096-slot shared buffer and increments the NEXT-LEVEL histogram inside the
+// capacity guard, so a candidate dropped on overflow is invisible to
+// refinement in both the buffer and the histogram. The returned set is then
+// non-exact on overflowing rows, and which candidates survive is decided by
+// atomicAdd arrival order.
 //
 // The repair is the mechanism of vLLM PR #52149 with a different emission
 // rule: detect the overflow, then throw away everything the buffered path did
 // and re-select from scratch (`prefix = 0`, `remaining = TopK`) with a
-// full-row radix rescan.  Because the restart starts from an empty prefix and
+// full-row radix rescan. Because the restart starts from an empty prefix and
 // an undebited `remaining`, the coarse pass's winners are re-counted rather
-// than double-counted: a coarse-pass handoff that double-counts cannot occur
-// by construction.
+// than double-counted.
 //
-// Where we diverge from #52149: its rescan emits by raw `atomicAdd` arrival
+// Where this diverges from #52149: its rescan emits by raw `atomicAdd` arrival
 // order in both the `> pivot` and `== pivot` phases, which is set-exact but
-// order- and tie-membership-nondeterministic.  Sparse attention sums the
-// selected keys in output order, so that would re-introduce exactly the
-// nondeterminism MERLIN_QSA_SORT / MERLIN_TIE_DET / MERLIN_TIE_RECENT exist
-// to remove.  Ours emits in **ascending index order** via a block scan (no
-// atomics anywhere on the placement path).
+// order- and tie-membership-nondeterministic. Sparse attention sums the
+// selected keys in output order, so that would re-introduce the
+// nondeterminism the deterministic tie policy exists to remove. This restart
+// emits in **ascending index order** via a block scan (no atomics anywhere on
+// the placement path).
 //
-// TIE DIRECTION IS ONE POLICY, DECIDED CENTRALLY.  The medium-path restart
-// hard-coded most-recent-wins here while the buffered decode/medium paths took
-// their direction from `tie_recent`, so a medium row that grew from 4,096 to
-// 4,097 candidates silently changed tie direction without the configuration
-// changing.  The direction is now a parameter and the ONE place that resolves
-// it is `effective_tie_recent()` in topk.cu:
+// Tie direction is one policy, decided centrally: `effective_tie_recent()`
+// (above) resolves it as `det_ties ? tie_recent : true`, and the dispatch site
+// passes the result down, so the medium-path restart and the buffered
+// decode/medium paths agree on it.
 //
-//     det_ties ? tie_recent : true
-//
-// i.e. `MERLIN_TIE_DET=1 MERLIN_TIE_RECENT=0` is oldest-wins on the whole
-// medium path (buffered AND restart), and with `MERLIN_TIE_DET=0` the restart
-// keeps its shipped most-recent-wins default (the direction that was
-// measured at +3.4 % tokens/step at 12K over oldest-wins).
-//
-// The deterministic large path takes the SAME value.
+// The deterministic large path takes the same value.
 // `radix_emit_deterministic` receives `effective_tie_recent(det_ties,
-// tie_recent)` from the dispatch site and mirrors both halves of its cut --
-// the cross-CTA walk and the within-chunk window -- so all five paths
+// tie_recent)` from the dispatch site and mirrors both halves of its cut -- the
+// cross-CTA walk and the within-chunk window -- so all five paths
 // (decode-buffered, decode-restart, medium-buffered, medium-restart, large)
 // obey one decision and the host's policy line prints it for all five.
 // ============================================================================
@@ -829,12 +805,9 @@ __device__ __noinline__ bool histogram_2048_topk(
 // DIAGNOSTIC BUILDS ONLY -- never set in a release or serving build.
 //
 // The compile-time defines below build the diagnostic variants of the
-// large-path fault cases.  Every one defaults to 0 and every use
-// sits behind `#if`, so the default build's device code is identical to the
-// tree without them (checked offline on sm_86: SASS identical, cubin
-// identical after masking nvcc's per-compile internal-linkage TU hash,
-// which differs even between two compiles of the SAME source).
-// A build carrying any of them prints a
+// large-path fault cases. Every one defaults to 0 and every use sits behind
+// `#if`, so the default build's device code does not include them. A build
+// carrying any of them prints a
 // `[merlin] persistent_topk DIAGNOSTIC BUILD` line on its first launch
 // (topk.cu), which a startup-warning scan must reject.
 //
@@ -843,17 +816,15 @@ __device__ __noinline__ bool histogram_2048_topk(
 //       every NON-LEADER CTA (cta_in_group != 0) spins <cycles> clock64 ticks
 //       before merging its shared bins into the group's global histogram.
 //       Warp 0 holds thread 0, the arrival publisher, so it is never delayed:
-//       the delay opens exactly the window the histogram-publication barrier closes -- a
-//       publisher that announces arrival before its own CTA's other warps have
-//       produced.  CTA 0 is never delayed, so it reads the histogram as soon
-//       as the arrival count completes.
+//       the delay opens exactly the window the histogram-publication barrier
+//       closes, a publisher that announces arrival before its own CTA's other
+//       warps have produced. CTA 0 is never delayed, so it reads the histogram
+//       as soon as the arrival count completes.
 //   MERLIN_TOPK_DIAG_PREREPAIR=1
 //       Compile out the histogram-publication barrier.  This is the
 //       negative control for the delayed-publication stress: with a delay it
 //       is expected to return wrong or faulted rows; the normal build with
 //       the same delay must not.  Only meaningful with MERLIN_TOPK_DIAG_DELAY.
-//       Do NOT run it with MERLIN_TOPK_DET_LARGE=0: the legacy tail bounds no
-//       emission slot, so a disagreeing pivot writes out of bounds there.
 //   MERLIN_TOPK_DIAG_FORCE_FAULT=1  (+ MERLIN_TOPK_DIAG_FORCE_FAULT_CTA, 1)
 //       Force the CTA-local X3 predicate in that CTA on every deterministic
 //       large row, as `fault_inject_cta` does -- but WITHOUT
@@ -897,8 +868,7 @@ __device__ __noinline__ void merlin_topk_diag_spin(long long cycles) {
 //
 // `scores` is already offset to the row.  Every radix round rescans the whole
 // row, so correctness does not depend on how many values share a coarse bin.
-// Entered only after an overflow has been detected, which is 0.1-0.2 % of
-// medium rows at 38K-51K prompt tokens.
+// Entered only after an overflow has been detected.
 //
 // `tie_recent` is the EFFECTIVE tie direction for this launch, resolved once
 // on the host (see the header comment above): true keeps the highest element
@@ -1042,9 +1012,8 @@ __device__ __noinline__ void medium_exact_restart(
     // on the far side of the walk" in both directions and the crossing test is
     // unchanged.
     //
-    // Exact 32-bit ties at the cutoff are rare (19 occurrences across
-    // 12 requests, one element each), so the common case is tie_total ==
-    // equal_count and the whole group is kept with no extra pass.
+    // Exact 32-bit ties at the cutoff are rare, so the common case is
+    // tie_total == equal_count and the whole group is kept with no extra pass.
     if (tie_total > equal_count) {
       uint32_t need = equal_count;
       uint32_t high_byte = 0;
@@ -1069,7 +1038,7 @@ __device__ __noinline__ void medium_exact_restart(
           const int bin = first_bin + n * bin_step;
           const uint32_t count = smem->histogram[bin];
           if (count_above + count >= need) {
-            smem->tie_cut = static_cast<uint32_t>(bin);  // high byte, for now
+            smem->tie_cut = static_cast<uint32_t>(bin);  // the high byte
             smem->remaining = need - count_above;        // carried into round B
             found = true;
             break;
@@ -1117,11 +1086,11 @@ __device__ __noinline__ void medium_exact_restart(
     }
   }
 
-  // Re-test AFTER the tie walks.  The guard above was
-  // entered before them, so a fault raised at their bin-walk failure sites
-  // is caught here, before emission.  No barrier is needed
-  // between the two tests: the tie walks write the flag from tx == 0 and
-  // each is followed by a barrier inside the block above.
+  // Re-test after the tie walks. The guard above was entered before them, so a
+  // fault raised at their bin-walk failure sites is caught here, before
+  // emission. No barrier is needed between the two tests: the tie walks write
+  // the flag from tx == 0 and each is followed by a barrier inside the block
+  // above.
   if (smem->fault == 0u) {
     const uint32_t tie_cut = smem->tie_cut;
 
@@ -1134,8 +1103,7 @@ __device__ __noinline__ void medium_exact_restart(
     // is a pure function of the element, so the output slot is a prefix sum
     // over the row rather than an arrival rank.  Tiles run in ascending base
     // and within a tile thread `tx` owns `base + tx`, so output[] comes out
-    // strictly ascending in index -- bit-reproducible run to run, and a no-op
-    // for the Python-side MERLIN_QSA_SORT rather than something it corrects.
+    // strictly ascending in index and bit-reproducible run to run.
     uint32_t base_rank = 0;
     const uint32_t tiles =
         (length + kThreadsPerBlock - 1u) / kThreadsPerBlock * kThreadsPerBlock;
@@ -1221,7 +1189,7 @@ __device__ __noinline__ void medium_exact_restart(
 // kernel
 //
 // Returns TRUE when the row was handed to medium_exact_restart(), whose
-// emission is already ascending (MERLIN_TOPK_SORTED_EMIT skips those rows);
+// emission is already ascending (sorted emission skips those rows);
 // FALSE when the buffered path placed the row by atomic arrival.  The return
 // value is block-uniform (every return below is taken by the whole block).
 template <int TopK>
@@ -1231,8 +1199,9 @@ __device__ __noinline__ bool histogram_256_topk(
     unsigned long long* __restrict__ counters, bool det_ties,
     bool tie_recent) {
   // No default arguments on purpose: a new call site must state whether it
-  // wants the exact path, rather than silently inheriting the broken one.
+  // wants the exact path, rather than silently inheriting a default.
   // All shared state lives in dynamic shared memory to avoid static
+  // __shared__ storage.
   extern __shared__ char medium_smem[];
 
   int (*shared_histogram)[RADIX + 128] =
@@ -1328,7 +1297,7 @@ __device__ __noinline__ bool histogram_256_topk(
   }
 
   // Past the early return the threshold bin WILL be collected, so the M1
-  // prediction is now a real overflow event.
+  // prediction is a real overflow event.
   if (thread_id == 0 && shared_overflow_counted == 1 && counters != nullptr) {
     atomicAdd(&counters[kCtrMediumOverflow], 1ull);
   }
@@ -1397,11 +1366,11 @@ __device__ __noinline__ bool histogram_256_topk(
           atomicAdd(&counters[kCtrMediumExactFallback], 1ull);
         }
         __syncthreads();  // no thread may clobber medium_smem before this
-        // The restart takes the SAME effective direction as
-        // the buffered branch below, so crossing the 4,096-candidate capacity
-        // no longer flips the tie policy.  `det_ties == false` means the
-        // buffered branch is the racy atomicAdd rule with no direction at all,
-        // and the restart then keeps the medium path's shipped most-recent-wins.
+        // The restart takes the same effective direction as the buffered branch
+        // below, so crossing the 4,096-candidate capacity does not flip the tie
+        // policy.  `det_ties == false` means the buffered branch is the racy
+        // atomicAdd rule with no direction at all, and the restart then keeps
+        // the medium path's most-recent-wins.
         medium_exact_restart<TopK>(logits + logits_offset, output_indices,
                                    static_cast<uint32_t>(seq_len), counters,
                                    effective_tie_recent(det_ties, tie_recent));
@@ -1464,10 +1433,10 @@ __device__ __noinline__ bool histogram_256_topk(
             // Same rule as the decode path: every candidate here is bit-equal,
             // so rank by element index rather than by warp arrival order.
             //
-            // NOTE the medium-path restart interaction: when exact_medium is on AND this row
-            // overflowed the candidate buffer, medium_exact_restart() has
-            // already returned and this branch is never reached.  Since the fix,
-            // that path is handed THIS same `tie_recent`, so the
+            // NOTE the medium-path restart interaction: when exact_medium is on
+            // AND this row overflowed the candidate buffer,
+            // medium_exact_restart() has already returned and this branch is
+            // never reached.  That path is handed this same `tie_recent`, so the
             // medium path has one tie direction either side of the capacity
             // boundary.
             int rank = 0;
@@ -1511,29 +1480,18 @@ __device__ __noinline__ bool histogram_256_topk(
 // Inter-CTA sync primitives
 // ============================================================================
 
-// `asm volatile` alone is NOT a compiler memory barrier.  It
-// stops the statement being deleted or duplicated and keeps volatile asms in
-// order relative to one another, but it says nothing about the surrounding
-// loads and stores, so nvcc was free to sink a publication store past the
-// release fence or hoist a payload load above the acquire load.  NVIDIA
-// documents exactly this in "Inline PTX Assembly: Incorrect Optimization".
-// Every helper below therefore declares a `"memory"` clobber, and the fence is
-// fused into the SAME asm statement as the atomic it orders so that no
+// `asm volatile` alone is NOT a compiler memory barrier: it stops the statement
+// being deleted or duplicated, but says nothing about the surrounding loads and
+// stores. Every helper below therefore declares a `"memory"` clobber, and the
+// fence is fused into the SAME asm statement as the atomic it orders so that no
 // optimizer pass can separate them.
 //
-// Why inline PTX and not `cuda::atomic_ref` / `__threadfence()`:
-//   * `__threadfence()` compiles to `membar.gl` on this toolchain (verified:
-//     nvcc 12.8 -arch=sm_86 -ptx), which is the sequentially-consistent device
-//     fence, strictly stronger than the `fence.acq_rel.gpu` this protocol
-//     needs.  Swapping it in would change the emitted ordering primitive on
-//     the hottest barrier in the kernel, which is a performance change smuggled
-//     into a correctness fix.
-//   * `cuda::atomic_ref<int, thread_scope_device>` expresses the same
-//     acquire/release semantics, but it would pull libcu++ into a header that
-//     is compiled for every arch this extension builds, and `red` (a reduction
-//     with no return value) has no atomic_ref spelling -- `fetch_add` returns
-//     the old value and costs the return path.
-// So: keep the PTX, and make it honest about its memory effects.
+// Inline PTX rather than `cuda::atomic_ref` / `__threadfence()`:
+// `__threadfence()` compiles to the sequentially-consistent `membar.gl`, which
+// is stronger than the `fence.acq_rel.gpu` this protocol needs, on the hottest
+// barrier in the kernel; `atomic_ref` would pull libcu++ into a header compiled
+// for every arch, and `red` (a reduction with no return value) has no
+// `atomic_ref` spelling.
 __device__ __forceinline__ int ld_acquire(int* ptr) {
   int state = 0;
 #if (__CUDA_ARCH__ >= 700)
@@ -1695,11 +1653,10 @@ __device__ __noinline__ void radix_emit_deterministic(
   // red_release issues `fence.acq_rel.gpu` before the arrival add and wait_ge
   // reads with `ld.global.acquire.gpu`, so the two plain stores above are
   // visible at device scope to every CTA that leaves this barrier.  This is
-  // the same release/acquire pairing the shipped kernel already relies on for
-  // CTA-0's plain-store zeroing of `next_hist`.  Caveat: that
-  // argument is about the GPU memory model and only holds if the COMPILER also
-  // emits the stores before the fence; the `"memory"` clobber on red_release
-  // is what makes that true, and the emitted PTX for this site confirms it.
+  // the same release/acquire pairing the kernel relies on for CTA-0's
+  // plain-store zeroing of `next_hist`.  The argument holds only if the
+  // compiler also emits the stores before the fence; the `"memory"` clobber on
+  // red_release is what makes that true.
   if (tx == 0) {
     red_release(&state->arrival_counter, 1);
   }
@@ -1767,17 +1724,15 @@ __device__ __noinline__ void radix_emit_deterministic(
     // equal_needed and equal_needed <= #{key == pivot}, and the two together
     // make the emission a bijection onto [0, TopK).
     //
-    // The first two ARE group-uniform -- every CTA derives
-    // them from the same published integers in the same fixed order -- but the
-    // third, `my_keep > local_eq`, compares a value that came back through
-    // global memory against this CTA's own shared-memory count, and a local
+    // The first two ARE group-uniform -- every CTA derives them from the same
+    // published integers in the same fixed order -- but the third,
+    // `my_keep > local_eq`, compares a value that came back through global
+    // memory against this CTA's own shared-memory count, and a local
     // inconsistency is exactly what it exists to detect.  It can therefore be
-    // true in CTA 1 and false in CTA 0, and the previous code let CTA 0 emit a
-    // perfectly ordinary-looking row while CTA 1 silently took the fault arm.
-    // The verdict is now published and ORed across the group below (X3) before
-    // ANY CTA emits.  The fourth check is new and bounds this CTA's highest
-    // emission slot ahead of time, so the per-element `slot < TopK` test in the
-    // loop is a backstop rather than the only guard.
+    // true in CTA 1 and false in CTA 0, so the verdict is published and ORed
+    // across the group below (X3) before ANY CTA emits.  The fourth check bounds
+    // this CTA's highest emission slot ahead of time, so the per-element
+    // `slot < TopK` test in the loop is a backstop rather than the only guard.
     uint32_t fault = 0u;
     if (gt_total + equal_needed != static_cast<uint32_t>(TopK)) fault = 1u;
     if (equal_needed > eq_total) fault = 1u;
@@ -1830,10 +1785,8 @@ __device__ __noinline__ void radix_emit_deterministic(
   __syncthreads();
 
   // Tie measurement staged in thread 0's register; recorded only after BOTH
-  // verdicts (X3 here, X4 after emission) have cleared the row. Recording it
-  // here, behind X3 alone, counted tie cuts for rows an emission-bound fault
-  // later failed closed (FAULT_KIND=emit: ties_cut +8 on 8
-  // all -1 rows).
+  // verdicts (X3 here, X4 after emission) have cleared the row, so a row that
+  // an emission-bound fault later fails closed does not count tie cuts.
   uint32_t staged_ties_dropped = 0u;
   if (tx == 0) {
     uint32_t row_fault = 0u;
@@ -1859,9 +1812,8 @@ __device__ __noinline__ void radix_emit_deterministic(
   // named CTA.  Block-uniform (both operands are launch constants and
   // `cta_in_group` is block-uniform), so it changes no control flow the whole
   // block does not take together.  It deliberately fires for EVERY emitting
-  // thread of that CTA rather than one: the defect under repair is a
-  // concurrent write to `suffix_sum[6]`, and a single-writer injection would
-  // pass with the broken code.
+  // thread of that CTA rather than one: the failure it models is several
+  // threads reaching the same write to `suffix_sum[6]` at once.
   const bool force_emit_fault =
       fault_inject_emit && fault_inject_cta >= 0 &&
       static_cast<int>(cta_in_group) == fault_inject_cta;
@@ -1951,14 +1903,13 @@ __device__ __noinline__ void radix_emit_deterministic(
           // goes through the SAME policy as the pre-emission faults below: no
           // store here, and the row is filled with -1 after the group agrees.
           //
-          // ATOMIC, not a plain store.  Every thread whose
-          // slot is out of range reaches this line, and an invariant failure
-          // is precisely the situation in which several of them do at once --
-          // so the plain `suffix_sum[6] = 1u` was a concurrent non-atomic
-          // write inside the mechanism that exists to detect the failure.  It
-          // is a shared-memory word and the flag is monotonic, so `atomicOr`
-          // is the whole fix; the healthy path never executes it.  The medium
-          // restart already uses atomicOr for the same job.
+          // ATOMIC, not a plain store.  Every thread whose slot is out of range
+          // reaches this line, and an invariant failure is precisely the
+          // situation in which several of them do at once, so a plain store
+          // would be a concurrent non-atomic write.  It is a shared-memory word
+          // and the flag is monotonic, so `atomicOr` suffices; the healthy path
+          // never executes it.  The medium restart uses atomicOr for the same
+          // job.
           atomicOr(&suffix_sum[6], 1u);
         }
       }
@@ -2214,8 +2165,8 @@ __device__ void radix_topk(const float* __restrict__ row_input,
   // -- Count local > pivot elements --
   const uint32_t ordered_pivot = shared_scalars[0];
 
-  // Deterministic placement + tie membership.  Everything below this
-  // branch is v2.0.1 verbatim and is what MERLIN_TOPK_DET_LARGE=0 runs.
+  // Deterministic placement + tie membership.  Everything below this branch is
+  // the baseline tail, which runs only when det_large is off.
   if (det_large) {
     radix_emit_deterministic<TopK>(
         row_output, ordered_pivot, shared_scalars[1], my_chunk_start,
@@ -2275,30 +2226,25 @@ __device__ void radix_topk(const float* __restrict__ row_input,
       }
     }
   }
-  // BASELINE repair (inherited from v2.0.1): the tie loop
-  // above reads shared_ordered, and the next row this CTA processes -- a
-  // large row's Stage-1 chunk load, or a decode/medium row reusing the same
-  // dynamic shared memory -- writes it before its first barrier. Without a
-  // closing barrier a fast warp can overwrite entries a slow warp is still
-  // comparing against the pivot, changing tie MEMBERSHIP, not only order.
-  // Every thread of the block reaches this point (the loop bound is
-  // block-uniform and there is no early return in the legacy tail), so the
-  // barrier is uniform. Applies to both comparison arms: the legacy path is
-  // the MERLIN_TOPK_DET_LARGE=0 control, so the control now carries this
-  // repair too, like the histogram-publication barrier.
+  // The tie loop above reads shared_ordered, and the next row this CTA
+  // processes -- a large row's Stage-1 chunk load, or a decode/medium row
+  // reusing the same dynamic shared memory -- writes it before its first
+  // barrier. Without a closing barrier a fast warp can overwrite entries a
+  // slow warp is still comparing against the pivot, changing tie MEMBERSHIP,
+  // not only order. Every thread of the block reaches this point (the loop
+  // bound is block-uniform and there is no early return in the baseline tail),
+  // so the barrier is uniform.
   __syncthreads();
 
-  // MERLIN_TOPK_SORTED_EMIT on the legacy tail (MERLIN_TOPK_DET_LARGE=0, or
-  // the host's staging-capacity gate): the row was written by EVERY CTA of the
-  // group, by arrival order, so CTA 0 may only re-emit it after all of them
-  // have finished.  One more inter-CTA barrier -- the same red_release /
-  // wait_ge pair as every other barrier here, taken by every CTA of the group
-  // because `sorted_emit` is a launch constant, so barrier_phase stays
-  // group-uniform.  The closing __syncthreads() just above orders each CTA's
-  // stores before its thread 0's release fence.  Indices here run past
-  // 32,768, so sorted_emit_row() takes its counting-sort fallback: this is the
-  // control arm, never the production large path (which is the deterministic one and is
-  // already ascending).
+  // Sorted emission on the baseline tail (det_large off, or the host's
+  // staging-capacity gate): the row was written by EVERY CTA of the group, by
+  // arrival order, so CTA 0 may only re-emit it after all of them have
+  // finished.  One more inter-CTA barrier -- the same red_release / wait_ge
+  // pair as every other barrier here, taken by every CTA of the group because
+  // `sorted_emit` is a launch constant, so barrier_phase stays group-uniform.
+  // The closing __syncthreads() just above orders each CTA's stores before its
+  // thread 0's release fence.  Indices here run past 32,768, so
+  // sorted_emit_row() takes its counting-sort fallback.
   if (sorted_emit) {
     if (tx == 0) {
       red_release(&state->arrival_counter, 1);
@@ -2315,8 +2261,6 @@ __device__ void radix_topk(const float* __restrict__ row_input,
 
 // ============================================================================
 // Persistent kernel -- BS<=32, decode/medium/large paths with RadixTopK
-// BS>32 uses standalone histogram_256_buffered_topk (separate kernel,
-// see filtered_topk.cuh)
 // ============================================================================
 
 template <int TopK = 2048, uint32_t VEC_SIZE = 1>
@@ -2349,10 +2293,8 @@ __global__ void __launch_bounds__(kThreadsPerBlock, 2)
 
   // RadixRowState for multi-CTA cooperative radix.
   // Zero-initialization is done host-side via cudaMemsetAsync in topk.cu
-  // before launch -- that gives a stream-ordered happens-before edge for all
-  // CTAs, which the previous in-kernel init (CTA-0 only + intra-CTA
-  // __syncthreads) did not provide and which manifested as a race against
-  // CTA-1+'s first red_release on arrival_counter.
+  // before launch: that gives a stream-ordered happens-before edge for all
+  // CTAs, which an in-kernel init by CTA 0 alone would not provide.
   RadixRowState* state = &params.row_states[group_id];
 
   int barrier_phase = 0;
@@ -2396,11 +2338,10 @@ __global__ void __launch_bounds__(kThreadsPerBlock, 2)
             row_output[i] = (i < seq_len) ? static_cast<int32_t>(i) : -1;
           }
         } else if (seq_len <= static_cast<uint32_t>(HIST2048_THRESHOLD)) {
-          // An overflowing decode row comes back here for
-          // the same exact restart the medium path takes.  The return is
-          // block-uniform and nothing has been emitted that the restart does
-          // not overwrite.  With MERLIN_TOPK_EXACT_DECODE off this is always
-          // false and the decode path is byte-identical to the medium-path restart's.
+          // An overflowing decode row comes back here for the same exact
+          // restart the medium path takes.  The return is block-uniform and
+          // nothing has been emitted that the restart does not overwrite.  With
+          // exact_decode off this is always false.
           const bool decode_needs_exact = histogram_2048_topk<TopK>(
               row_input, row_output, seq_len, params.det_ties,
               params.tie_recent, params.exact_counters, params.exact_decode);
@@ -2441,14 +2382,13 @@ __global__ void __launch_bounds__(kThreadsPerBlock, 2)
   }
 }
 
-// MERLIN_TOPK_SORTED_EMIT for the atomic host-side fallbacks that bypass
+// Sorted emission for the atomic host-side fallbacks that bypass
 // persistent_topk_kernel when det ties are off (sampled_topk and FilteredTopK,
 // which need >= 144 / 128 KiB opt-in smem, and top_k_per_row_decode, for a
-// cooperative launch that does not fit).  None dispatches on a 3090 at the
-// shapes Flash-Next serves, but with the knob on the Python sort is gone, so the op's
-// contract -- canonical order on EVERY dispatch -- is kept here rather than
-// assumed.  One block per row, launched on the same stream right after the
-// fallback, so it is stream-ordered after the fallback's stores.
+// cooperative launch that does not fit).  The op's contract is canonical order
+// on EVERY dispatch, so those rows are re-emitted here.  One block per row,
+// launched on the same stream right after the fallback, so it is
+// stream-ordered after the fallback's stores.
 template <int TopK>
 __global__ void __launch_bounds__(kThreadsPerBlock)
     sorted_emit_rows_kernel(int32_t* __restrict__ output, uint32_t num_rows) {
@@ -2568,9 +2508,7 @@ __global__ void __launch_bounds__(kThreadsPerBlock)
 }  // namespace persistent
 
 // ============================================================================
-// ============================================================================
 // Optimized FilteredTopK -- single CTA per row for bs > 32.
-// Kept with persistent_topk so the portable fallback owns the non-cluster path.
 // ============================================================================
 namespace filtered_topk {
 
@@ -2640,13 +2578,7 @@ constexpr uint32_t FILTERED_TOPK_SMEM_INPUT_SIZE =
 constexpr size_t FILTERED_TOPK_SMEM_DYNAMIC =
     sizeof(int) * 2 * FILTERED_TOPK_SMEM_INPUT_SIZE;  // 128KB
 
-/*!
- * \brief Filtered Top-K kernel for ragged sequences.
- *
- * \tparam DType Data type (float, half, nv_bfloat16)
- * \tparam IdType Index type (int32_t)
- * \tparam VEC_SIZE Vector size for input loads (1, 2, 4, or 8)
- */
+// Filtered Top-K kernel for ragged sequences.
 template <typename DType, typename IdType, int VEC_SIZE, uint32_t MAX_K = 2048,
           bool UsePredicatedShortLoads = false>
 __global__ void __launch_bounds__(FILTERED_TOPK_BLOCK_THREADS)
@@ -2906,8 +2838,7 @@ constexpr uint32_t gcd(uint32_t a, uint32_t b) {
   return a;
 }
 
-// Compute optimal VEC_SIZE based on max_len and dtype
-// Returns 1, 2, 4, or 8
+// Compute optimal VEC_SIZE (1, 2, 4 or 8) from max_len and dtype.
 template <typename DType>
 constexpr int ComputeFilteredTopKVecSize(uint32_t max_len) {
   constexpr int MAX_VEC = 16 / sizeof(DType);  // 4 for float32, 8 for fp16/bf16

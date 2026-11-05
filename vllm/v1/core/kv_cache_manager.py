@@ -21,7 +21,7 @@ from vllm.v1.core.kv_cache_coordinator import (
     get_kv_cache_coordinator,
 )
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
-from vllm.v1.core.kv_cache_utils import KVCacheBlock, KVCacheBlockCopy
+from vllm.v1.core.kv_cache_utils import KVCacheBlock, KVCacheBlockCopy, trim_null_head
 from vllm.v1.core.single_type_kv_cache_manager import MambaManager
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
@@ -124,7 +124,7 @@ class KVCacheBlocks:
         return [
             [
                 block.block_id
-                for block in group
+                for block in trim_null_head(group)
                 if block.block_hash is None and not block.is_null
             ]
             for group in self.blocks
@@ -145,6 +145,7 @@ class KVCacheManager:
         max_in_flight_tokens: int | None = None,
         enable_caching: bool = True,
         use_eagle: bool = False,
+        num_hash_lookahead_tokens: int = 0,
         num_prefill_lookahead: int = 0,
         log_stats: bool = False,
         enable_kv_cache_events: bool = False,
@@ -178,6 +179,7 @@ class KVCacheManager:
             max_model_len=self.max_model_len,
             max_in_flight_tokens=max_in_flight_tokens,
             use_eagle=self.use_eagle,
+            num_hash_lookahead_tokens=num_hash_lookahead_tokens,
             enable_caching=self.enable_caching,
             enable_kv_cache_events=enable_kv_cache_events,
             dcp_world_size=dcp_world_size,
@@ -324,12 +326,16 @@ class KVCacheManager:
             preempted=request.num_preemptions > 0,
         )
 
-    def get_computed_blocks(self, request: Request) -> tuple[KVCacheBlocks, int, int]:
+    def get_computed_blocks(
+        self, request: Request, max_cache_hit_length: int | None = None
+    ) -> tuple[KVCacheBlocks, int, int]:
         """Get the computed (cached) blocks for the request.
         Note that the computed blocks must be full.
 
         Args:
             request: The request to get the computed blocks.
+            max_cache_hit_length: Upper bound on the hit length. Defaults to
+                ``request.num_tokens - 1``.
 
         Returns:
             A tuple containing:
@@ -355,7 +361,8 @@ class KVCacheManager:
         # the single last token, because allocate_slots() requires
         # num_computed_tokens to be block-size aligned. Removing this limitation
         # could slightly improve performance in the future.
-        max_cache_hit_length = request.num_tokens - 1
+        if max_cache_hit_length is None:
+            max_cache_hit_length = request.num_tokens - 1
         computed_blocks, num_new_computed_tokens, num_uncached = (
             self.coordinator.find_longest_cache_hit(
                 request.block_hashes, max_cache_hit_length
@@ -370,7 +377,9 @@ class KVCacheManager:
             and self.enable_kv_cache_events
             and getattr(request, "kv_cache_report_mode", "incremental") == "full"
         ):
-            self.coordinator.emit_cached_block_events(request, computed_blocks)
+            self.coordinator.emit_cached_block_events(
+                request, computed_blocks, num_new_computed_tokens
+            )
 
         # The junction to pin is where the lagging sparse-retention group stops
         # (``num_new_computed_tokens``) plus the uncached shared prefix -- i.e.
@@ -384,7 +393,7 @@ class KVCacheManager:
         return blocks, num_new_computed_tokens, shared_prefix_boundary
 
     def get_computed_blocks_for_connector(
-        self, request: Request
+        self, request: Request, max_cache_hit_length: int | None = None
     ) -> tuple[KVCacheBlocks, int, int, bool]:
         """Local prefix-cache lookup for a request scheduled with a KV connector.
 
@@ -411,14 +420,16 @@ class KVCacheManager:
             and isinstance(coordinator, HybridKVCacheCoordinator)
             and coordinator.full_attention_group_id is not None
         ):
-            return *self.get_computed_blocks(request), False
+            return *self.get_computed_blocks(request, max_cache_hit_length), False
 
         if not self.prefix_cache_lookup_enabled(request):
             return self.empty_kv_cache_blocks, 0, 0, False
 
+        if max_cache_hit_length is None:
+            max_cache_hit_length = request.num_tokens - 1
         fa_group_id = coordinator.full_attention_group_id
         computed, per_group_hits = coordinator.find_longest_cache_hit_per_group(
-            request.block_hashes, request.num_tokens - 1
+            request.block_hashes, max_cache_hit_length
         )
         num_local = per_group_hits[fa_group_id]
         if any(hit > num_local for hit in per_group_hits) or any(
@@ -433,7 +444,7 @@ class KVCacheManager:
             # it: the connector restores that state, but not the window of
             # a sliding-window group, whose table would also be too short
             # for `truncate_computed_blocks`.
-            return *self.get_computed_blocks(request), False
+            return *self.get_computed_blocks(request, max_cache_hit_length), False
 
         blocks = self.create_kv_cache_blocks(computed)
         # Per-group lookups do not detect an uncached shared prefix (boundary 0).
@@ -608,10 +619,16 @@ class KVCacheManager:
         if full_sequence_must_fit:
             # First check and fail if the full request sequence won't fit.
             full_num_tokens = min(request.num_tokens, self.max_model_len)
+            # Count the spec-decode lookahead slots past the prompt as the
+            # chunk gate below does: without them a prompt that fits only
+            # without them is admitted, and its last chunk can never allocate.
+            full_num_slot_tokens = min(
+                full_num_tokens + num_lookahead_tokens, self.max_model_len
+            )
 
             num_blocks_to_allocate = self.coordinator.get_num_blocks_to_allocate(
                 request_id=request.request_id,
-                num_tokens=full_num_tokens,
+                num_tokens=full_num_slot_tokens,
                 new_computed_blocks=new_computed_block_list,
                 num_encoder_tokens=num_encoder_tokens,
                 total_computed_tokens=total_computed_tokens,
@@ -667,6 +684,7 @@ class KVCacheManager:
             max(0, total_computed_tokens - request.num_in_flight_tokens),
             num_prompt_tokens=request.num_prompt_tokens,
         )
+        # re-measures the gate's slots
         if full_shortfall:
             # Coherent yields only: the cleanup may have freed blocks, so
             # measure the full gate again.
@@ -674,7 +692,7 @@ class KVCacheManager:
                 0,
                 self.coordinator.get_num_blocks_to_allocate(
                     request_id=request.request_id,
-                    num_tokens=full_num_tokens,
+                    num_tokens=full_num_slot_tokens,
                     new_computed_blocks=new_computed_block_list,
                     num_encoder_tokens=num_encoder_tokens,
                     total_computed_tokens=total_computed_tokens,

@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright 2026 halt95 (Merlin modifications)
 # Select a canonical recipe; its launcher owns the serving flags and tile opt-in.
 set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -35,13 +37,20 @@ else
     echo "27B/ThinkingCap launchers take environment settings rather than extra vLLM arguments" >&2
     exit 2
   }
-  # SERVED only when supplied: the launcher's default name (qwen38-27b for both recipes) stays the same as on bare metal
+  # Only MODEL is exported; the launcher's default served name (qwen38-27b for both recipes) stays the same as on bare metal
   export MODEL="$CKPT"
 fi
 if ! command -v nvidia-smi >/dev/null 2>&1 || ! nvidia-smi -L >/dev/null 2>&1; then
   echo "WARNING: no NVIDIA GPU visible; use --gpus all and configure nvidia-container-toolkit on the host" >&2
 fi
 cd "$REPO"
+if [ "$family" != flash ] && [ -n "${MERLIN_PROFILE:-}" ]; then
+  echo "WARNING: MERLIN_PROFILE=$MERLIN_PROFILE ignored: it applies to the Flash-Next family (flash-next, swift1.5, swift1.5-huihui) only" >&2
+fi
+if [ "$family" = flash ] && [ -n "${MERLIN_PROFILE:-}" ]; then
+  # A layout other than serve.sh's default (quad) is a profile of the one launcher; `merlin serve` checks it against the cards.
+  exec "$VENV/bin/merlin" serve "$recipe" "$CKPT" --profile "$MERLIN_PROFILE" -- "$@"
+fi
 if [ "$family" = flash ]; then
   exec bash "$REPO/models/$recipe/serve.sh" "$CKPT" "$@"
 fi

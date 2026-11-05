@@ -9,16 +9,17 @@ where T is the verify step's target length and ``rej`` the number of drafts the 
 rejected. Both live only on the GPU, so the FlashInfer build calls ``seq_lens.cpu()`` (a
 blocking device->host copy behind the whole verify forward) to plan the decode.
 
-What the plan actually depends on. With CUDA graphs on (fa2, sm_86), FlashInfer 0.6.18's
+What the plan actually depends on. With CUDA graphs on (fa2, sm_86), the FlashInfer
 planner reads only per-request PAGE counts (kv_indptr), never kv lengths
-(include/flashinfer/attention/scheduler.cuh PrefillSplitQOKVIndptr L545-683, csrc/batch_prefill.cu
-L63-70: kv_len_arr is not passed to PrefillPlan). Everything it writes to the int workspace
+(include/flashinfer/attention/scheduler.cuh PrefillSplitQOKVIndptr;
+csrc/batch_prefill.cu does not pass kv_len_arr to PrefillPlan). Everything it writes
+to the int workspace
 (request/qo/kv tile indices, o_indptr, merge_indptr, block_valid_mask, kv_chunk_size) is a
 function of two things only:
-  * c      = the KV chunk size in pages (PrefillBinarySearchKVChunkSize, scheduler.cuh L101-130),
-  * n_i    = ceil(max(pages_i, 1) / c), the chunk count of each request (L651-652).
+  * c      = the KV chunk size in pages (scheduler.cuh PrefillBinarySearchKVChunkSize),
+  * n_i    = ceil(max(pages_i, 1) / c), the chunk count of each request.
 The kernel reads the true length from the GPU page table at replay
-(page.cuh L820-825 get_length; prefill.cuh L3602-3616).
+(page.cuh get_length; prefill.cuh).
 
 So the plan built from an upper bound is BIT-IDENTICAL to the plan built from the true
 lengths whenever c and every n_i agree. The CPU knows a per-row interval [lb, ub] that
@@ -59,9 +60,9 @@ def fa2_binary_search_chunk_pages(
     max_batch_size_if_split: int,
     min_kv_chunk_pages: int,
 ) -> int:
-    """Replica of PrefillBinarySearchKVChunkSize (FlashInfer 0.6.18 scheduler.cuh L101-130).
+    """Replica of FlashInfer's PrefillBinarySearchKVChunkSize (scheduler.cuh).
 
-    window_left < 0 (no sliding window), so effective_kv_len == kv_len (L628-634).
+    window_left < 0 (no sliding window), so effective_kv_len == kv_len.
     q_tiles_per_req = ceil(packed_qo_len / cta_tile_q), identical for every row of a
     uniform q_len=1 decode batch.
     """
@@ -221,7 +222,7 @@ def plan_bytes_schedule(
 ) -> Fa2DecodeSchedule:
     """Read (c, n_i) back from a FlashInfer fa2 plan in the host int workspace.
 
-    plan_info is PrefillPlanInfo::ToVector (scheduler.cuh L720-736): [8] o_indptr_offset,
+    plan_info is PrefillPlanInfo::ToVector (scheduler.cuh): [8] o_indptr_offset,
     [9] kv_chunk_size_ptr_offset. q_len = 1, so o_indptr[i+1] - o_indptr[i] = n_i.
     """
     o_off = int(plan_info[8])

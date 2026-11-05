@@ -1,17 +1,19 @@
 # From the repository root:
 # MODEL_DIR=/absolute/path/to/checkpoint docker compose -f container/docker-compose.yml up --build -d
-# unqualified until qualified on hardware
+# Community-qualified on 8 x RTX 3090 at P2P=off (octo, TP4xPP2), on the 3.0.1 image; not qualified on a
+# 3.0.2 image build. See container/README.md.
 services:
   merlin:
-    image: merlin-engine:${SOURCE_REF:-merlin-v3.0.1}
+    image: merlin-engine:${SOURCE_REF:-merlin-v3.0.2}
     pull_policy: build
     platform: linux/amd64
     build:
       context: ..
       dockerfile: container/Dockerfile
       args:
-        SOURCE_REF: "${SOURCE_REF:-merlin-v3.0.1}"
+        SOURCE_REF: "${SOURCE_REF:-merlin-v3.0.2}"
         MAX_JOBS: "${MAX_JOBS:-4}"
+        MERLIN_WHEEL_URL: "${MERLIN_WHEEL_URL:-}"   # empty = build from source; set = install the release wheel (sha256-checked)
         TORCH_CUDA_ARCH_LIST: "8.0;8.6;8.9"
     deploy:
       resources:
@@ -38,7 +40,10 @@ services:
       MODEL_NAME: "${MODEL_NAME:-}"   # Flash-Next family served names (space-separated)
       SERVED: "${SERVED:-}"           # 27B / ThinkingCap served name
       GPUS: "${GPUS:-}"               # 27B / ThinkingCap devices, e.g. 0,1 (TP2) or 0,1,2,3 (TP4)
-      KV_BYTES: "${KV_BYTES:-}"       # per-GPU KV pin (Swift, Huihui, 27B; Flash-Next sizes its own pool)
+      KV_BYTES: "${KV_BYTES:-}"       # per-GPU KV pin (every recipe; unset keeps the profile's pin)
+      MERLIN_PROFILE: "${MERLIN_PROFILE:-}"   # Flash-Next family: pin a layout by `merlin serve --profile` instead of serve.sh's default
+      P2P: "${P2P:-}"                 # multi-card rows: on or off; empty = the profile default / the cards' probe (qualified octo run: off)
+      DRAFT_HEAD: "${DRAFT_HEAD:-}"   # Flash-Next family MTP head precision: bf16 (default), int8 or int4; empty = the default
       WARM: "${WARM:-}"               # Flash-Next family warm-up: 1 (default) or 0; use 0 on non-sm_86 exploratory runs
       # VLLM_API_KEY: "<key>"
     volumes:

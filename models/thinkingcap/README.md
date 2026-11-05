@@ -13,17 +13,17 @@ with vision, tool calls and MTP speculative decoding, behind one OpenAI-compatib
 [![Context](https://img.shields.io/badge/context-262K_per_request-ffb000)](../qwen38-27b/docs/reference.md#the-kv-budget)
 [![ThinkingCap](https://img.shields.io/badge/%F0%9F%A4%97_checkpoint-ThinkingCap--Qwen3.8--27B--W4A16--Merlin-ffd21e)](https://huggingface.co/halt95/ThinkingCap-Qwen3.8-27B-W4A16-Merlin)
 
-> **Recipe 3.0.0 / Merlin 3.0.1:** **vLLM 0.32.0**. ThinkingCap is a profile of the
+> **Recipe 3.0.0 / Merlin 3.0.2:** **vLLM 0.33.0**. ThinkingCap is a profile of the
 > [Qwen3.8-27B recipe](../qwen38-27b/README.md). Its wrappers forward to the TP2/TP4 base launchers.
 > Both use **FGPC ON** (`--enable-mamba-shared-prefix-checkpoint`), pools **826,689 / 2,012,105 tokens** (TP4 = RecoverSSM on; ThinkingCap TP4 check PASS, 32/32 checks),
 > and the **8 MP (8,388,608 pixel)** release cap. The integrated launchers default to this cap.
-> The measured FlashInfer **0.7.0.post1** tile patch is packaged in the shared installer; the dependency lock is complete with 222 exact pins and SHA-256 hashes.
+> The FlashInfer **0.7.2.post1** tile patch (a port of the measured 0.7.0.post1 one) is packaged in the shared installer; the dependency lock is complete with 223 exact pins and SHA-256 hashes.
 
 The [2026-10-15 base-checkpoint card](../qwen38-27b/benchmarks/2026-10-15/BENCH-CARD.md) records TP2 ITL at
 4K / 32K / 131K of **19.99 / 21.41 / 25.27 ms**, TP4 **15.83 / 16.62 / 18.37 ms**,
 and GSM8K-200 tile on mean **192.0/200** against v1.3.0's **196/200** (−2.0 pp,
 95 % Newcombe CI **[−5.89, +1.61] pp**, within CI and not significantly worse).
-27B TP2 serves images up to 8 MP. With the vision-peak option on (`VLLM_MERLIN_VISION_PEAK=1`, the TP2 launcher default), the 50-item TP2 stress sweep's worst minimum free was 806 MiB per card (2026-10-15), above the 524 MiB floor. A separate knob OFF/ON identity check matched tokens and logprobs on 6/6 prompts. This was measured on the Qwen3.8-27B checkpoint (TP2); On the ThinkingCap checkpoint itself (TP2, 2026-10-16 release mini check), four ~8 MP images after an 8K prefill left a minimum of 806 MiB free per card, sampled every 100 ms, above the 524 MiB floor. Flash-Next (902 MiB) meets the target. 27B TP4 left 690 MiB free on the retired RecoverSSM-off pin; at the shipped chunk 4096 with RecoverSSM on, the 2026-10-20 bench card measured 862 MiB lowest free (one 8 MP image, two at once, and four in one prompt; 2 cards: 886 MiB), above the 524 MiB floor.
+27B TP2 serves images up to 8 MP. With the vision-peak option on (`VLLM_MERLIN_VISION_PEAK=1`, the TP2 launcher default), the 50-item TP2 stress sweep's worst minimum free was 806 MiB per card (2026-10-15), above the 524 MiB floor. A separate knob OFF/ON identity check matched tokens and logprobs on 6/6 prompts. This was measured on the Qwen3.8-27B checkpoint (TP2); on the ThinkingCap checkpoint itself (TP2, 2026-10-16 release mini check), four ~8 MP images after an 8K prefill left a minimum of 806 MiB free per card, sampled every 100 ms, above the 524 MiB floor. Flash-Next (902 MiB) meets the target. 27B TP4 left 690 MiB free on the retired RecoverSSM-off pin; at the shipped chunk 4096 with RecoverSSM on, the 2026-10-20 bench card measured 862 MiB lowest free (one 8 MP image, two at once, and four in one prompt; 2 cards: 886 MiB), above the 524 MiB floor.
 These are base-checkpoint results. ThinkingCap's own decode, prefill, agents and GSM8K at medium were measured for 3.0.1 on
 2026-11-01 to 2026-11-02 (below); its **token savings have not been remeasured on 0.32**, and the table and the 2026-10-12 card keep historical **vLLM 0.30** measurements.
 
@@ -42,9 +42,13 @@ it is **not** published, reviewed or endorsed by BottleCap AI or Qwen.
 | Weights licence | Apache-2.0 | PolyForm Small Business 1.0.0 plus BottleCap AI's personal-use permission ([License](#license)) |
 | Historical 0.30 numbers | single-stream thinking decode at 32K: 198 tok/s dual card, 249 quad card | x0.860 of the base's median thinking tokens at medium effort at the same GSM8K accuracy (97.27 %, 1,319 items); 172.8 tok/s at 32K on dual card (2026-10-08 check) and 223.4 on quad card (2026-10-12) |
 
-Both checkpoints run on the same engine, pins, port (8100) and served name (`qwen38-27b`). The 3.0.1 measurements are in the
+Both checkpoints run on the same engine, pins, port (8100) and served name (`qwen38-27b`). The 3.0.2 and 3.0.1 measurements are in the
 [2026-11-02 card](benchmarks/2026-11-02/BENCH-CARD.md), and the older ones, dated per row, in the [2026-10-12 card](benchmarks/2026-10-12/ThinkingCap-BENCH-CARD.md); the profile's detail (what differs, token cost by effort,
 capacity rows) is in [ThinkingCap checkpoint profile](../qwen38-27b/docs/reference.md#thinkingcap-checkpoint-profile).
+
+## Merlin 3.0.2
+
+This checkpoint was not benchmarked for 3.0.2. It was not run on the 3.0.2 wheel before release. The 3.0.1 bench card below is the latest measurement and was taken on vLLM 0.32. There is no 3.0.2 card.
 
 ## Merlin 3.0.1 bench card (2026-11-02)
 
@@ -62,7 +66,7 @@ Maintainer measurements on 4× RTX 3090 (220 W, PCIe Gen4) with P2P (the aikitor
 ## Quick start
 
 Install the shared engine and its environment as described in the
-[Qwen3.8-27B Quick start](../qwen38-27b/README.md#quick-start). The shared installer and 0.7.0.post1 tile
+[Qwen3.8-27B Quick start](../qwen38-27b/README.md#quick-start). The shared installer and 0.7.2.post1 tile
 are integrated; the archived 0.30 bundle does not install 3.0.0. Then, from the repository root:
 
 ```bash
@@ -80,7 +84,7 @@ own effort with `"chat_template_kwargs": {"reasoning_effort": "xhigh"}`, and
 ## Known limitations
 
 - The historical 0.30 ThinkingCap token saving was measured on arithmetic word problems only.
-- No new ThinkingCap 0.32 quality or speed result is claimed here. The 27B TP2 8 MP headroom result above applies, since ThinkingCap forwards to the 27B launchers.
+- No ThinkingCap token-savings result is claimed on 0.33 beyond the 3.0.2 card. The 27B TP2 8 MP headroom result above applies, since ThinkingCap forwards to the 27B launchers.
 - Everything in the [Qwen3.8-27B known limitations](../qwen38-27b/README.md#known-limitations) applies.
 
 ## Credits

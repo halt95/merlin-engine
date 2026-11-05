@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by the Merlin project; see NOTICE.
 """Code inside this file can safely assume cuda platform, e.g. importing
 pynvml. However, it should not initialize cuda context.
 """
@@ -27,6 +28,7 @@ with contextlib.suppress(ImportError):
 import vllm.envs as envs
 from vllm.logger import init_logger
 from vllm.utils.import_utils import import_pynvml
+from vllm.utils.platform_utils import cuda_get_device_properties
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
 from .interface import DeviceCapability, Platform, PlatformEnum, in_wsl
@@ -90,7 +92,7 @@ def _get_backend_priorities(
     use_mm_prefix: bool = False,
 ) -> list[AttentionBackendEnum]:
     """Get backend priorities with lazy import to avoid circular dependency."""
-    from vllm.utils.torch_utils import is_quantized_kv_cache
+    from vllm.v1.kv_cache_interface import is_quantized_kv_cache
 
     if use_mla:
         if device_capability.major == 10:
@@ -105,9 +107,10 @@ def _get_backend_priorities(
                 ]
             else:
                 # BF16 KV Cache
-                # Prefer FlashInfer at low head counts (FlashMLA uses padding)
+                # Prefer FA4, then FlashInfer at low head counts (FlashMLA uses padding)
                 if num_heads is not None and num_heads <= 16:
                     sparse_backends = [
+                        AttentionBackendEnum.FLASH_ATTN_MLA_SPARSE_FA4,
                         AttentionBackendEnum.FLASHINFER_MLA_SPARSE,
                         AttentionBackendEnum.FLASHMLA_SPARSE,
                     ]
@@ -731,14 +734,32 @@ class CudaPlatformBase(Platform):
             gelu_and_mul_sparse=["triton", "native"],
         )
 
-    @classmethod
-    def is_arch_support_pdl(cls) -> bool:
+    # PDL support is a plain class bool, not @cache. Kernel launches
+    # inside torch.compile'd forwards read this (launch_pdl=...), and dynamo
+    # cannot trace an lru_cache-wrapped classmethod (Dynamo graph break gb0177,
+    # torch 2.14).
+    # The worker resolves it eagerly after selecting its device (gpu_worker
+    # init_device); like @cache, the first resolved value holds per process.
+    _arch_support_pdl: bool | None = None
+
+    @staticmethod
+    def _probe_arch_support_pdl() -> bool:
         try:
             device = torch.cuda.current_device()
             major, _ = torch.cuda.get_device_capability(device)
         except Exception:
             return False
         return major >= 9
+
+    # Read the plain bool; probe without storing while dynamo traces (fullgraph cannot replay a class-attribute write).
+    @classmethod
+    def is_arch_support_pdl(cls) -> bool:
+        pdl = cls._arch_support_pdl
+        if pdl is None:
+            pdl = cls._probe_arch_support_pdl()
+            if not torch.compiler.is_compiling():
+                cls._arch_support_pdl = pdl
+        return pdl
 
 
 # NVML utils
@@ -801,7 +822,14 @@ class NvmlCudaPlatform(CudaPlatformBase):
     def get_device_total_memory(cls, device_id: int = 0) -> int:
         physical_device_id = cls.device_id_to_physical_device_id(device_id)
         handle = pynvml.nvmlDeviceGetHandleByIndex(physical_device_id)
-        return int(pynvml.nvmlDeviceGetMemoryInfo(handle).total)
+        try:
+            return int(pynvml.nvmlDeviceGetMemoryInfo(handle).total)
+        except pynvml.NVMLError:
+            # Integrated parts (e.g. GB10 / DGX Spark) do not implement the
+            # device-level NVML memory query - nvidia-smi reports [N/A] for
+            # memory.total there. Fall back to the same source
+            # NonNvmlCudaPlatform reads.
+            return int(cuda_get_device_properties(device_id, ("total_memory",))[0])
 
     @classmethod
     @with_nvml_context

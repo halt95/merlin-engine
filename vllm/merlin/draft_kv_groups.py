@@ -2,10 +2,12 @@
 # SPDX-FileCopyrightText: Copyright 2026 halt95 (Merlin modifications)
 """The KV cache groups that hold a DFlash drafter's layers.
 
-``kv_cache_utils._annotate_eagle_groups`` flags the groups whose prefix hits
-drop the EAGLE trailing unit (``KVCacheGroupSpec.is_eagle_group``). It finds a
-drafter group by a spec marker (DSpark) or by position for MTP. A DFlash
-drafter matches neither, so without this module every DFlash boot falls
+``kv_cache_planning.get_global_kv_cache_groups`` flags the groups whose
+prefix hits drop the EAGLE trailing unit (``KVCacheGroupSpec.is_eagle_group``)
+from the proposer's draft-layer tags (``KVCacheSpec.is_draft``, vllm#61455).
+This module is the fallback when no layer carries the tag: without it the
+annotator finds drafters only by a spec marker (DSpark) or by position for
+MTP. A DFlash drafter matches neither, so every DFlash boot falls
 through to the coordinator's flag-all fallback
 (``KVCacheCoordinator.eagle_group_ids`` = every group) and logs "no KV cache
 group could be identified as the draft model's". On a hybrid target that

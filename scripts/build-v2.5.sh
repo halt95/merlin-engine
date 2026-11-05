@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright 2026 halt95 (Merlin modifications)
 # Deprecated entry point (the v2.5 build name): forwards to scripts/build.sh (the wheel builder); the serving
 # environment is created by release/install-env.sh. Kept through Merlin 3.0.x; to be removed in a later release.
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

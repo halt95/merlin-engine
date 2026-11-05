@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by the Merlin project; see NOTICE.
 
 import inspect
 import os
@@ -177,6 +178,19 @@ class WorkspaceManager:
                 f"dtype={workspace.dtype}; requested shape={shape}, dtype={dtype}."
             )
         return workspace
+
+    # An opt-in user takes the shared buffer only when it already holds the shapes,
+    # so it never grows it after the profile run (growth after capture is a hazard).
+    def fits_without_growth(
+        self, *shapes_and_dtypes: tuple[tuple[int, ...], torch.dtype]
+    ) -> bool:
+        """Whether get_simultaneous(*shapes_and_dtypes) would not resize the
+        current ubatch/lane workspace."""
+        total_bytes = sum(
+            round_up(_compute_bytes(s, d), 256) for s, d in shapes_and_dtypes
+        )
+        current = self._current_workspaces[self._get_workspace_id()]
+        return self._workspace_size_bytes(current) >= total_bytes
 
     def get_simultaneous(
         self, *shapes_and_dtypes: tuple[tuple[int, ...], torch.dtype]

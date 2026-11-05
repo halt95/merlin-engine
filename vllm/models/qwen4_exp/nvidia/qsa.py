@@ -73,7 +73,6 @@ from vllm.v1.kv_cache_interface import (
 
 from ..common.qsa_cache import QSAForwardMetadata
 from .indexer_qsa import QSAIndexer
-# Separate calibration namespaces.
 from .mtp_kv_scales import qsa_kv_scale_entries
 from .ops.qsa import qsa_e4m3_uses_native_cast
 
@@ -202,7 +201,7 @@ def _qsa_clip_count(
         v_over = v_over[:n] & written
     ctr[0] += k_over.sum()
     ctr[1] += v_over.sum()
-# ------------------------------------------------------------------------------
+
 
 _QSA_FP8_CACHE_DTYPES = ("fp8", "fp8_e4m3")
 _QSA_SUPPORTED_CACHE_DTYPES = ("auto", "bfloat16", *_QSA_FP8_CACHE_DTYPES)
@@ -309,7 +308,7 @@ class Qwen4ExpQSAQKVIndexerLinear(MergedColumnParallelLinear):
         return super().load_weights(remap_shards())
 
 
-def qsa_kv_cache_dtype(cache_config: CacheConfig, prefix: str) -> CacheDType:
+def qsa_kv_cache_dtype(cache_config: CacheConfig, prefix: str) -> CacheDType | str:
     """The layer's KV cache dtype, honoring ``--kv-cache-dtype-skip-layers``."""
     if str(extract_layer_index(prefix)) in cache_config.kv_cache_dtype_skip_layers:
         return "auto"
@@ -482,6 +481,8 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
         logical_indices = topk_buffer[:num_tokens]
         token_to_req = token_to_req[:num_tokens]
         key_cache, value_cache = kv_cache.transpose(1, 2).split(self.head_size, dim=-1)
+        # Layer-side cache dtype checks for the
+        # byte-decode path.
         if query.dtype != torch.bfloat16:
             raise NotImplementedError("Qwen4Exp QSA requires a BF16 query")
         if key_cache.dtype != value_cache.dtype:
@@ -613,7 +614,8 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         # gate next to Q, even when an inherited config default says otherwise.
         self.attn_output_gate = True
 
-        # deferred: model.py imports this module at top level.
+        # Deferred import: model.py imports this
+        # module at top level.
         from . import model
 
         self.qkv_proj = QKVParallelLinear(
@@ -708,10 +710,15 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             prefix=f"{prefix}.indexer",
         )
         # One launch does the indexer prepare, the main QK-norm/RoPE/gate and
+        # the main K/V cache write (see QSAIndexer.forward); otherwise all of
+        # them take the separate kernels.
         fp8_layer = _is_qsa_fp8_cache_dtype(self.kv_cache_dtype)
         self.use_fused_qsa_prepare = (
             self.use_fused_qk_norm_rope_gate
             and self.indexer.use_fused_pre_indexer
+            # The fused writer takes an FP8 cache
+            # only with a native E4M3 cast (Triton cannot lower an fp8 pointer
+            # below sm_89) and no clip interval.
             and (not fp8_layer or qsa_e4m3_uses_native_cast())
             and not (fp8_layer and _qsa_clip_interval > 0.0)
         )
@@ -797,6 +804,10 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         if isinstance(metadata, list):
             metadata = metadata[0]
         if not isinstance(metadata, dict):
+            # The profile run never
+            # reaches the indexer, so touch its on-demand
+            # selection scratch here (VLLM_MERLIN_QSA_SCRATCH; off by default).
+            self.indexer.reserve_profile_scratch(output.device)
             output.zero_()
             return
         main_metadata = cast(FlashAttentionMetadata, metadata[self.layer_name])
@@ -875,9 +886,11 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             # Norm/RoPE/gate and the K/V cache write happen inside _run_qsa.
             query = key = value = gate = None
         attn_output = qkv.new_empty(num_tokens, self.num_heads, self.head_dim)
+        # QSA runs through the opaque custom op when
+        # the platform requires it
         encoded_layer_name = _encode_layer_name(self.layer_name)
         if current_platform.opaque_attention_op():
-            torch.ops.vllm.qwen4_exp_qsa_with_output(
+            torch.ops.vllm.qwen4_exp_nv_qsa_with_output(
                 projected_qk,
                 positions,
                 query,
@@ -938,7 +951,7 @@ def load_qsa_static_kv_scales(
     validated against that set, ``strict`` requires the sidecar to cover all
     of it (checkable on every rank), and the scales are applied to the local
     intersection only. Without it (TP-only callers) the local layers are the
-    universe, as before.
+    universe.
     """
 
     path = Path(sidecar_path)
@@ -1096,8 +1109,11 @@ def qwen4_exp_qsa_with_output_fake(
     del layer_name
 
 
+# Registered as qwen4_exp_nv_qsa_with_output (like
+# qwen4_exp_nv_ple_short_conv) under a distinct name, so this module and amd/qsa.py,
+# whose op has a different schema, can load in one process.
 direct_register_custom_op(
-    op_name="qwen4_exp_qsa_with_output",
+    op_name="qwen4_exp_nv_qsa_with_output",
     op_func=qwen4_exp_qsa_with_output,
     mutates_args=["output"],
     fake_impl=qwen4_exp_qsa_with_output_fake,

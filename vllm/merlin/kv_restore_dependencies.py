@@ -69,8 +69,8 @@ def group_dependency_pages(
     margin: int = 0,
 ) -> tuple[range, range]:
     """Data and proof-only physical pages one group needs at accepted
-    boundary ``boundary``: the single geometry the manifest (capacity, L_max)
-    and the unit builder (which keys a unit requires) both use.
+    boundary ``boundary``: the single geometry the manifest (capacity,
+    L_max) and the unit builder (which keys a unit requires) both use.
 
     ``kind``: "full", "sliding" or "recurrent". ``margin``: the EAGLE proof
     margin in tokens (0 without EAGLE). A full group needs pages [0, B) and

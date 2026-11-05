@@ -14,6 +14,10 @@ from filelock import FileLock
 
 SCHEMA = 2
 META_FILE = "flash_next.autotune.meta.json"
+# The one qualified Triton version, matching the
+# ``triton==`` pin in release/requirements-0.33.lock. Persisted autotuning refuses
+# any other version at worker init.
+QUALIFIED_TRITON_VERSION = "3.8.0"
 
 
 def cache_root() -> Path:
@@ -123,8 +127,10 @@ def import_records(root: Path, source: Path) -> int:
         safe_filename(metadata["filename"])
         if not metadata["filename"].endswith(".autotune.json"):
             raise ValueError("invalid native autotune filename")
-        if metadata["fingerprint"]["triton_version"] != "3.7.1":
-            raise ValueError("release winners require Triton 3.7.1")
+        if metadata["fingerprint"]["triton_version"] != QUALIFIED_TRITON_VERSION:
+            raise ValueError(
+                f"release winners require Triton {QUALIFIED_TRITON_VERSION}"
+            )
         if metadata["fingerprint"]["arch"] != "sm_86":
             raise ValueError("release winners require sm_86")
         if directory in seen:

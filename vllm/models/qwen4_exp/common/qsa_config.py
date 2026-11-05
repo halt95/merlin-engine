@@ -16,7 +16,7 @@ def _select_sm120_config(
     sm_120, most visibly on the large-prefill region. Each entry is the fastest
     config that stays correct on its own path; the main win is more warps.
 
-    Upstream vLLM 0.32 table, verbatim.
+    Copied verbatim from the upstream table.
     """
     if is_fp8:
         if base_programs > 2048:
@@ -55,7 +55,7 @@ def _select_sm90_config(
 ) -> tuple[int, int, int]:
     """(block_n, target_splits, num_warps) tuned on sm_90 (H20).
 
-    Upstream vLLM 0.32 table, verbatim.
+    Copied verbatim from the upstream table.
     """
     if base_programs > 2048:
         return (32, 1, 1) if use_prefill_config else (64, 1, 2)

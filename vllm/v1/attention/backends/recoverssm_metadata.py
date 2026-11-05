@@ -3,6 +3,7 @@
 # Modified by the Merlin project; see NOTICE.
 
 import abc
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 
 import numpy as np
@@ -31,7 +32,9 @@ class RecoverSSMMetadata(abc.ABC):
         """Whether this step's metadata carries a commit (any spec row)."""
         return getattr(self, "recoverssm_commit", None) is not None
 
-    def snapshot_for_deferred_commit(self) -> "RecoverSSMMetadata":
+    def snapshot_for_deferred_commit(
+        self, copy: "SnapshotCopy | None" = None
+    ) -> "RecoverSSMMetadata":
         """A copy whose commit inputs no longer alias per-step buffers.
 
         Under pipeline parallelism a non-last rank learns the accepted counts
@@ -40,7 +43,11 @@ class RecoverSSMMetadata(abc.ABC):
         buffers (spec state indices, query offsets, the batch-order block
         table). The deferred commit must read this step's values, so they are
         cloned here, on the current stream, before the next build overwrites
-        them. Implementations that do not support the PP deferral raise."""
+        them. Implementations that do not support the PP deferral raise.
+
+        ``copy`` replaces ``Tensor.clone`` for
+        every cloned tensor: the snapshot ring copies into persistent buffers
+        with the same values and layout (see clone_commit_tensors)."""
         raise NotImplementedError(
             f"{type(self).__name__} does not support the pipeline-parallel "
             "RecoverSSM commit deferral"
@@ -91,20 +98,27 @@ def recoverssm_request_indices(
     return rows.to(torch.int32).to(device, non_blocking=True)
 
 
-def clone_commit_tensors(commit, num_spec_decodes: int):
+SnapshotCopy = Callable[[torch.Tensor], torch.Tensor]
+
+
+def clone_commit_tensors(
+    commit, num_spec_decodes: int, copy: SnapshotCopy | None = None
+):
     """Clone the commit inputs a deferred (PP) commit reads, trimmed to the real
     spec rows. Works for every RecoverSSM commit dataclass with the fields
     state_indices, query_start_loc, request_indices, block_table and
-    num_computed_tokens."""
+    num_computed_tokens. ``copy`` replaces
+    ``Tensor.clone``; None keeps clone."""
     n = num_spec_decodes
+    cp: SnapshotCopy = torch.Tensor.clone if copy is None else copy
 
     def c(t: torch.Tensor | None) -> torch.Tensor | None:
-        return None if t is None else t.clone()
+        return None if t is None else cp(t)
 
     return replace(
         commit,
-        state_indices=commit.state_indices[:n].clone(),
-        query_start_loc=commit.query_start_loc[: n + 1].clone(),
+        state_indices=cp(commit.state_indices[:n]),
+        query_start_loc=cp(commit.query_start_loc[: n + 1]),
         request_indices=c(commit.request_indices),
         block_table=c(commit.block_table),
         num_computed_tokens=c(commit.num_computed_tokens),

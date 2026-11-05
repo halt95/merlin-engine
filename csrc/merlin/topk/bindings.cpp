@@ -1,4 +1,5 @@
-// merlin-hook: csrc-topk-vendored
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright 2026 halt95 (Merlin modifications)
 // torch.ops._C registrations for the vendored persistent top-k, in our own
 // STABLE_TORCH_LIBRARY_FRAGMENT(_C, ...) so upstream torch_bindings.cpp needs
 // no Merlin lines (the same pattern marlin_moe_wna16/ops.cu uses for _moe_C).
@@ -6,11 +7,10 @@
 // The merlin_persistent_topk* names are what Python calls (qsa_indexer.py).
 // merlin_persistent_topk binds merlin::topk::persistent_topk (the vendored
 // topk.cu); upstream's _C::persistent_topk stays bound, in upstream
-// torch_bindings.cpp, to upstream's own csrc/topk.cu (separated entry points,
-// see csrc/merlin/merlin.cmake). The three
-// persistent_topk_exact_counters / _slots / toggle_state registrations moved
-// here verbatim from (0.30) libtorch_stable/torch_bindings.cpp; they are legacy
-// aliases kept for out-of-tree callers until the additive stage drops them.
+// torch_bindings.cpp, to upstream's own csrc/topk.cu (separate entry points,
+// see csrc/merlin/merlin.cmake). The three persistent_topk_exact_counters /
+// _slots / toggle_state registrations are also kept under their unprefixed
+// names, as legacy aliases for out-of-tree callers.
 #include "ops.h"
 #include "merlin/topk/merlin_topk_ops.h"
 
@@ -26,15 +26,15 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
       "merlin_persistent_topk_exact_counters(Tensor! out, int reset, int sync) "
       "-> ()");
   ops.def("merlin_persistent_topk_exact_counters_slots() -> int");
-  // v2.2 -- the switches as this process cached them (topk.cu for the layout).
+  // The switches as this process cached them (topk.cu for the layout).
   ops.def("merlin_persistent_topk_toggle_state() -> int");
 
-  // Legacy aliases (moved from libtorch_stable/torch_bindings.cpp).
+  // Legacy aliases for out-of-tree callers.
   // Read (and optionally reset) the medium-path exact-restart counters.
   ops.def(
       "persistent_topk_exact_counters(Tensor! out, int reset, int sync) -> ()");
   ops.def("persistent_topk_exact_counters_slots() -> int");
-  // v2.2 -- the switches as this process cached them (topk.cu for the layout).
+  // The switches as this process cached them (topk.cu for the layout).
   ops.def("persistent_topk_toggle_state() -> int");
 }
 

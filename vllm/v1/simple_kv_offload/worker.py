@@ -22,6 +22,7 @@ from vllm.v1.simple_kv_offload.metadata import (
     SimpleCPUOffloadMetadata,
     SimpleCPUOffloadWorkerMetadata,
 )
+from vllm.v1.simple_kv_offload.sizing import sync_num_offload_blocks_across_workers
 
 if TYPE_CHECKING:
     from vllm.v1.kv_cache_interface import KVCacheConfig
@@ -54,22 +55,25 @@ class SimpleCPUOffloadWorker:
         disk_capacity_bytes: int = 0,
         disk_buffer_slots: int = 2,
         use_page_cache: bool = False,
+        num_cpu_blocks: int | None = None,
     ):
         self.vllm_config = vllm_config
         self.kv_cache_config = kv_cache_config
         self.cpu_capacity_bytes = cpu_capacity_bytes
+        self._num_cpu_blocks_override = num_cpu_blocks
         self.disk_path = disk_path
         self.disk_capacity_bytes = disk_capacity_bytes
         self.disk_buffer_slots = disk_buffer_slots
         self.use_page_cache = use_page_cache
         self.disk_mode = kv_offload_backend == "disk"
-        # Its arena is not registered with CUDA
-        # (see _init_cpu_mode) and its loads wait for prior compute.
+        # The host tier's arena is not registered
+        # with CUDA (see _init_cpu_mode) and its loads wait for prior compute.
         self.host_tier = vllm_config is not None and kv_host_tier.is_active(
             vllm_config
         )
 
-        # The runner retires actual writer events.
+        # Commit acks for the writer events the runner
+        # retires.
         self.commit_acks = kv_commit_acks.WorkerCommitAcks() if self.host_tier else None
 
         self.gpu_kv_caches: dict[str, torch.Tensor] | None = None
@@ -113,7 +117,8 @@ class SimpleCPUOffloadWorker:
         self._store_event_epochs: dict[int, int] = {}
         self._store_outcomes: dict[tuple[int, int], bool] = {}
         self._load_outcomes: dict[tuple[int, int], bool] = {}
-        # Survive clear/rebind on idle drain steps.
+        # Load event -> request ids; kept across
+        # clear/rebind on idle drain steps.
         self._load_event_to_reqs: dict[int, tuple[str, ...]] = {}
         self._load_event_epochs: dict[int, int] = {}
         self._cache_epoch = 0
@@ -152,7 +157,7 @@ class SimpleCPUOffloadWorker:
         seen: dict[tuple[torch.device, int], int] = {}
         for kv_cache_tensor in self.kv_cache_config.kv_cache_tensors:
             if kv_cache_tensor.slots_per_block > 1:
-                # v2.5 side-cache layout: a slot-packed ring view (block stride
+                # Side-cache layout: a slot-packed ring view (block stride
                 # = one slot, ids pool_block * slots + slot). Its group is not
                 # prefix-cacheable, so the scheduler never stores or loads its
                 # ids, and its slots lie inside pool blocks the ring manager
@@ -218,12 +223,20 @@ class SimpleCPUOffloadWorker:
         ]
         total_bytes_per_block = sum(per_tensor_bpb)
 
-        self.num_cpu_blocks = max(1, self.cpu_capacity_bytes // total_bytes_per_block)
-        # Ring views and narrower PP stages need
-        # fewer bytes per block, but cannot use more IDs than the scheduler.
+        # host-tier block count resolved once for every rank
         if self.host_tier:
+            # Ring views and narrower PP stages need
+            # fewer bytes per block, but cannot use more IDs than the scheduler.
+            # The engine resolved one count for every rank (widest PP stage), so
+            # the tier skips the cross-rank MIN sync and the explicit override.
             self.num_cpu_blocks = kv_host_tier.worker_block_count(
-                self.kv_cache_config, self.num_cpu_blocks
+                self.kv_cache_config,
+                max(1, self.cpu_capacity_bytes // total_bytes_per_block),
+            )
+        else:
+            self.num_cpu_blocks = self._resolve_num_cpu_blocks(
+                self.disk_capacity_bytes if self.disk_mode else self.cpu_capacity_bytes,
+                total_bytes_per_block,
             )
 
         # Use lowest priority so KV cache I/O yields to compute streams.
@@ -249,20 +262,29 @@ class SimpleCPUOffloadWorker:
         else:
             self._init_cpu_mode(unique_gpu_caches, total_bytes_per_block, self.device)
 
+    def _resolve_num_cpu_blocks(self, capacity_bytes: int, bytes_per_block: int) -> int:
+        local_capacity = capacity_bytes // bytes_per_block
+        requested = self._num_cpu_blocks_override
+        if requested is None:
+            return sync_num_offload_blocks_across_workers(max(1, local_capacity))
+        if type(requested) is not int or not 0 < requested <= local_capacity:
+            raise ValueError(
+                f"num_cpu_blocks={requested!r} must be between 1 and "
+                f"local offload capacity {local_capacity}"
+            )
+        return requested
+
     def _init_disk_mode(
         self,
         unique_gpu_caches: dict[str, torch.Tensor],
         total_bytes_per_block: int,
         device: torch.device,
     ) -> None:
-        num_disk_slots = max(1, self.disk_capacity_bytes // total_bytes_per_block)
-        self.num_cpu_blocks = num_disk_slots
-
         logger.info(
             "SimpleCPUOffloadWorker [DISK]: %d tensors, %d disk slots (%.2f GB)",
             len(unique_gpu_caches),
-            num_disk_slots,
-            (num_disk_slots * total_bytes_per_block) / (1024**3),
+            self.num_cpu_blocks,
+            (self.num_cpu_blocks * total_bytes_per_block) / (1024**3),
         )
 
         assert self.disk_path is not None
@@ -274,7 +296,7 @@ class SimpleCPUOffloadWorker:
             self.load_stream,
             self.store_stream,
             rank_path,
-            num_disk_slots,
+            self.num_cpu_blocks,
             total_bytes_per_block,
             self.disk_buffer_slots,
             self.use_page_cache,
@@ -314,7 +336,10 @@ class SimpleCPUOffloadWorker:
             # Allocate non-pinned first, then pin via cudaHostRegister to
             # bypass PyTorch's CUDACachingHostAllocator which rounds up to
             # the next power of 2 (e.g. 100 GB -> 128 GB).
-            tensor = torch.zeros(cpu_shape, dtype=gpu_tensor.dtype, device="cpu")
+            # vllm#64345: CPU
+            # blocks are loaded only after a completed store, so the arena
+            # needs no zero fill (pin / mlock still fault in every page).
+            tensor = torch.empty(cpu_shape, dtype=gpu_tensor.dtype, device="cpu")
             if pin_memory:
                 pin_tensor(tensor)
             # Host RAM only: an arena that cannot

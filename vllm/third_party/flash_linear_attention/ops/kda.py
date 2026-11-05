@@ -83,7 +83,8 @@ def fused_recurrent_kda_fwd(
         cu_seqlens=cu_seqlens,
         ssm_state_indices=ssm_state_indices,
         num_accepted_tokens=num_accepted_tokens,
-        # Bounds-guard instrumentation: the same kernel object as fused_recurrent.py:249, so it
+        # Bounds-guard instrumentation: the same kernel object as
+        # fused_recurrent_gated_delta_rule_fwd_kernel, so it
         # takes the same guard counter. Same site: the defect being guarded is
         # the kernel's, not the caller's.
         guard_ctr=guard_telemetry.counter(

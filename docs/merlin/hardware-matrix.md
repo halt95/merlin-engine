@@ -1,6 +1,6 @@
 # Merlin engine hardware matrix (v3)
 
-Applies to Flash-Next and the other recipes on the Merlin engine (Merlin 3.0.1, vLLM 0.32 base).
+Applies to Flash-Next and the other recipes on the Merlin engine (Merlin 3.0.2, vLLM 0.33 base).
 
 This page says, for every GPU platform the v3 engine is meant to run on: the layout to use, the concurrency cap, how much
 context fits, whether peer-to-peer (P2P) is needed, and **how much evidence there is**. Every row carries one of four labels:
@@ -9,7 +9,9 @@ context fits, whether peer-to-peer (P2P) is needed, and **how much evidence ther
   patch, 96 GiB (98,304 MiB) RAM allocation). Which rows carry it: the Label and Status columns below.
 - **🟡 testing**: full-model serving runs passed on cloud-hosted hardware of that kind (boot and pool, 262K needles, concurrency, image,
   GSM8K), but kernel parity qualification has not run. On other cards that resolve to the row it is reported untested
-  (`match.testing_gpu_names`). `merlin serve` picks a testing row exactly like an untested one.
+  (`match.testing_gpu_names`). `merlin serve` picks a testing row exactly like an untested one. A tested or testing row
+  whose evidence covers only some P2P modes (`match.status_p2p_modes`, set on the CMP 170HX and RTX 4090 rows, all P2P-off
+  evidence) is reported untested, with a `WARN status-p2p` line, when the resolved P2P mode is outside that list.
 - **parked, not in this release**: no row at present.
 - **🟠 partly tested** (only in the README and how-to-serve summaries, never on a row): a hardware class where some models or layouts were measured and others weren't; each row below carries its own label.
 - **untested / community-validated**: shipped so that it can be tried; the full matrix qualification has **not been completed by the maintainers** (targeted launcher checks may have passed). Not every platform can be
@@ -159,7 +161,7 @@ Generated from `tools/merlin/profiles/flash-next.json` by `python tools/merlin/p
 <!-- END matrix -->
 
 The Super VL row is the reference entry in `tools/merlin/profiles/nemotron-super-vl.json`; its launcher is [`models/nemotron-super-vl/serve.sh`](../../models/nemotron-super-vl/serve.sh).
-The Ornith 1.5 rows are in `tools/merlin/profiles/ornith.json`; [`models/ornith1.5/serve.sh`](../../models/ornith1.5/serve.sh) pins the P2P row, and `merlin serve ornith1.5 <dir>` picks the no-P2P row on a host without peer-to-peer.
+The Ornith 1.5 rows are in `tools/merlin/profiles/ornith.json`; [`models/ornith1.5/serve.sh`](../../models/ornith1.5/serve.sh) and `merlin serve ornith1.5 <dir>` both pick the no-P2P row on a host without peer-to-peer (the shim reads `nvidia-smi topo -p2p r`, or takes `P2P=on|off`).
 The 27B rows are reference entries in `tools/merlin/profiles/qwen38-27b.json`. The launchers they describe are
 [`models/qwen38-27b/serve.sh`](../../models/qwen38-27b/serve.sh) (TP2) and [`models/qwen38-27b/serve-tp4.sh`](../../models/qwen38-27b/serve-tp4.sh) (TP4);
 the single-card profile is [`models/qwen38-27b/serve-1card.sh`](../../models/qwen38-27b/serve-1card.sh) (tested 2026-10-21: pool 271,506, 4 MP images).
@@ -185,7 +187,7 @@ The reference pool can calibrate a capacity model, but does not validate another
 
 The merged-engine identity run on 2026-10-15 compared the merged engine with the 0.32 reference build: tokens and logprobs matched at temperature zero for 28 documents plus four controls on each of four served configurations. The release-candidate identity run agreed. Identity does not re-measure memory, throughput or another hardware platform. The separate 27B verify-tile run changes arithmetic when enabled and must not be conflated with this identity result.
 
-**FP8 KV by architecture.** The Flash-Next QSA reader admits FP8 E4M3 KV on sm_80 and sm_86 (the same Merlin byte decoder) and on sm_89 or newer (the native cast), via `_validated_qsa_fp8_dtype` in `vllm/models/qwen4_exp/nvidia/qsa.py` and `qsa_e4m3_uses_native_cast` in `nvidia/ops/qsa.py`. `registry.FP8_KV_ARCHS` records engine admission, not the default: every sm_80 Flash-Next row stays BF16. `KV_DTYPE=fp8` selects the FP8 opt-in capacity and the E4M3-only `VLLM_QSA_KV_SCALES` sidecar. Its pools are engine-fit estimates, not measured or simply doubled BF16 pools: the compressed indexer and ring state keep their existing dtypes. The 4 x 64 GB PP4 row retains its measured BF16 pool of 4,638,492 tokens; its FP8 opt-in pool ~9,007,559 (~34 x 262K / ~61 x 131K, admission still capped at 8) is an untested engine-fit estimate. Historical BF16 evidence does not qualify FP8. All sm_80 Flash-Next FP8 opt-ins are ⚫ untested (a profile ships, not yet run by us, expected to work). No sm_80 FP8 hardware validation is claimed. The 27B and Super VL FlashInfer paths have no such engine guard, so their sm_80 rows are sized with FP8 KV like every other row. FP8 KV has now booted on sm_80 for both (4 x CMP 170HX smoke, 2026-10-18): 27B TP1 / TP2 / TP4 and Super VL TP2xPP2 ran with fp8_e4m3 KV through FlashInfer, every needle exact, GSM8K-50 48/50 on each. The 27B sm_80 TP2/TP4 MTP verify runs PIECEWISE (the series patches are limited to sm_86). These 64 GB rows are 🟡 testing: kernel parity qualification is still to run. The selector can return FP8 for sm_89 with an uncalibrated-pool warning; the BF16 capacity figures do not predict that FP8 pool.
+**FP8 KV by architecture.** The Flash-Next QSA reader admits FP8 E4M3 KV on sm_80 and sm_86 (the same Merlin byte decoder) and on sm_89 or newer (the native cast), via `_validated_qsa_fp8_dtype` in `vllm/models/qwen4_exp/nvidia/qsa.py` and `qsa_e4m3_uses_native_cast` in `vllm/models/qwen4_exp/nvidia/ops/qsa.py`. `registry.FP8_KV_ARCHS` records engine admission, not the default: every sm_80 Flash-Next row stays BF16. `KV_DTYPE=fp8` selects the FP8 opt-in capacity and the E4M3-only `VLLM_QSA_KV_SCALES` sidecar. Its pools are engine-fit estimates, not measured or simply doubled BF16 pools: the compressed indexer and ring state keep their existing dtypes. The 4 x 64 GB PP4 row retains its measured BF16 pool of 4,638,492 tokens; its FP8 opt-in pool ~9,007,559 (~34 x 262K / ~61 x 131K, admission still capped at 8) is an untested engine-fit estimate. Historical BF16 evidence does not qualify FP8. All sm_80 Flash-Next FP8 opt-ins are ⚫ untested (a profile ships, not yet run by us, expected to work). No sm_80 FP8 hardware validation is claimed. The 27B and Super VL FlashInfer paths have no such engine guard, so their sm_80 rows are sized with FP8 KV like every other row. FP8 KV has now booted on sm_80 for both (4 x CMP 170HX smoke, 2026-10-18): 27B TP1 / TP2 / TP4 and Super VL TP2xPP2 ran with fp8_e4m3 KV through FlashInfer, every needle exact, GSM8K-50 48/50 on each. The 27B sm_80 TP2/TP4 MTP verify runs PIECEWISE (the series patches are limited to sm_86). These 64 GB rows are 🟡 testing: kernel parity qualification is still to run. The selector can return FP8 for sm_89 with an uncalibrated-pool warning; the BF16 capacity figures do not predict that FP8 pool.
 
 ## Flash-Next on 8 x RTX 3090 (octo)
 
@@ -223,7 +225,7 @@ Before either profile is validated, report a pool-only boot, peak memory, the ch
   These profiles still need full qualification, the release bench routine, on the actual hardware.
 - **Consumer Ada has no P2P by default.** NVIDIA's stock driver exposes no peer access on GeForce Ada (tinygrad/open-gpu-kernel-modules is the patched module that adds it), and a community 2 x RTX 4090 run of the 27B family without P2P ran slower with TP2 than on one card (HyperQwen's multi-GPU notes). So the 4090 rows default to `P2P=off` and preflight picks `on` only when the driver reports it. On a no-P2P host the 27B default stays the largest TP (the largest pool); `merlin serve` prints a NOTE with the measured aggregate (4 x CMP 170HX 64 GB without P2P, 8 agents x 16K: TP1 x 4 = 873 tok/s, TP2 x 2 = 523, TP4 = 371; 4 x 4090 without P2P showed the same order for prefill, TP1 ~970-1,435 > TP2 ~909-1,096 > TP4 ~830-964 tok/s) and the `merlin serve 27b <dir> --tp 1 --instances N` command for that host.
 - **Lovelace sm_89 (RTX 4090, modified RTX 4080 Super, L40S, RTX 6000 Ada, L4).** Build for sm_89 and use `WARM=0`; the profiles default to fp8 KV with bf16 selectable. The native E4M3 path has run on cloud-hosted 4 x RTX 4090 24 GB (2026-10-18: six of seven lanes passed, Flash-Next on fp8 KV with the 924,993-token pool; 2026-10-20: the release wheel passed all three lanes), so that row is 🟡 testing; kernel parity qualification is still to run, and the other Ada cards and the bf16 variant still need hardware calibration. Feed reported VRAM into preflight so a shortfall lowers the pin; a GPU product label is not a pool measurement. There is no persisted Triton autotune cache on sm_89 (`WARM` is sm_86 only), but the GDN chunked-prefill kernels do not autotune on any compute-capability-8.x card: on sm_80, sm_86 and sm_89 alike they launch one fixed configuration, the one the sm_86 reference caches ran (`autotune_off_sm8x` / `sm8x_launch` in `vllm/third_party/flash_linear_attention/ops/utils.py`, `is_nvidia_sm8x` = major version 8). The first boot therefore compiles those kernels without an autotune search; the q/k L2-norm kernels still autotune live. The fixed configurations were chosen on sm_86, not tuned for Ada: a pool-only boot plus a decode check at 4K and 131K is the validation. On WSL2 the driver's free-memory reading is reported unreliable by the community; preflight warns.
-- **No P2P.** NCCL transports communication through host memory when peer access is unavailable. The unchanged-layout and PP-heavy alternatives remain untested for this release. The PP4 registry pool is an estimate here; no qualifying source for the previously claimed four-card smoke and partition result was found. A four-card pipeline test would not establish the eight-card memory budget.
+- **No P2P.** NCCL transports communication through host memory when peer access is unavailable. The unchanged-layout and PP-heavy alternatives remain untested for this release. The PP4 pool is measured on the reference host with software P2P off (906,581 tokens, `fn-quad-3090-nop2p-pp4`, 2026-10-19; physical no-P2P hosts are not measured), and pools on other no-P2P hosts are estimates. A four-card pipeline test does not establish the eight-card memory budget.
 
 ## Host requirements
 
@@ -231,9 +233,9 @@ Same for every Flash-Next row unless noted. The preflight checks all of them. Th
 
 | Requirement | Value | Source |
 |---|---|---|
-| Host RAM | **96 GiB (98,304 MiB)** allocation. The FP8 PLE table occupies about 47.7 GiB of host memory; pinned embedding tables are separate. The roughly 69 GiB resident floor was measured on v2.0.1 and has not been re-measured on vLLM 0.32. Additional-worker RAM is estimated by preflight, not measured. | Historical memory and launcher reviews, 2026-09-25; claims review, 2026-10-15 |
+| Host RAM | **96 GiB (98,304 MiB)** allocation. The FP8 PLE table occupies about 47.7 GiB of host memory; pinned embedding tables are separate. The roughly 69 GiB resident floor was measured on v2.0.1 and has not been re-measured on vLLM 0.32 or 0.33. Additional-worker RAM is estimated by preflight, not measured. `--ple-store disk` (experimental) reads the table from NVMe instead, which raised free memory by 47.7–47.8 GiB (FP8) and 38.8–38.9 GiB (INT6) on a 4× RTX 3090 run; costs and limits are in [How to serve](../how-to-serve.md#the-ple-table-on-nvme-experimental). | Historical memory and launcher reviews, 2026-09-25; claims review, 2026-10-15 |
 | `/dev/shm` | Preflight warns below 1 GiB; container recipes allocate 8 GiB. This is a sizing policy, not a measured boot peak. | Flash-Next reference and preflight |
-| Driver | Preflight's 580-series check matches the CUDA 13.x floor. Reference host: NVIDIA driver 610.43.02 (reports CUDA 13.3). The release lock selects a matched CUDA 13.0 toolkit (nvcc, crt, nvvm, nvJitLink 13.0.88, cccl 13.0.85, runtime 13.0.96, the pair torch 2.13.0 cu130 ships with); the release wheel is served on it by every recipe (2026-10-20). Other CUDA 13.x drivers (R580 or later) are expected to work through CUDA minor-version compatibility, but are untested. See the [driver requirements](../../release/install-0.32.md). | Reference-host qualification, 2026-10-15; current lock; preflight |
+| Driver | Preflight's 580-series check matches the CUDA 13.x floor. Reference host: NVIDIA driver 610.43.02 (reports CUDA 13.3). The release lock selects a matched CUDA 13.0 toolkit (nvcc, crt, nvvm, nvJitLink 13.0.88, cccl 13.0.85, runtime 13.0.96, the pair torch 2.14.0 cu130 ships with); the 3.0.0 release wheel was served on it by every recipe (2026-10-20); the 3.0.2 wheel was served on it on 2026-11-04 by Flash-Next, Qwen3.8-27B (1, 2 and 4 GPUs), Nemotron 3.5 Super VL and Ornith 1.5, each with a 262K request. Other CUDA 13.x drivers (R580 or later) are expected to work through CUDA minor-version compatibility, but are untested. See the [driver requirements](../../release/install-0.33.md). | Reference-host qualification, 2026-10-15; current lock; preflight |
 | GPU state | Headless, with no other CUDA process. Use the image-run minima above rather than a generic per-card headroom claim. | Image-floor run, 2026-10-15 |
 | glibc | **2.38 or newer** (Ubuntu 24.04, Debian 13, RHEL 10 or newer): the release wheel's `_C_stable_libtorch.abi3.so` needs GLIBC_2.38. | Release wheel symbol requirements |
 | Host type | Bare metal or LXC; VM passthrough and WSL2 receive a preflight warning ([WSL2](#wsl2)). | preflight policy |
@@ -263,9 +265,9 @@ reports a tested row on WSL2). If you try it:
   otherwise empty card. Serve on headless cards (`GPUS=`). For the 27B, `KV_BYTES=auto` is an unqualified attempt at a
   smaller pool. The launcher still asks for `--gpu-memory-utilization 0.96`, so a busy card may also need a lower value
   passed as an extra argument. Check the resulting pool before relying on it.
-- **Driver and toolkit.** Install the NVIDIA driver on Windows only, never a Linux driver inside WSL. The 0.32
+- **Driver and toolkit.** Install the NVIDIA driver on Windows only, never a Linux driver inside WSL. The 0.33
   environment carries its own CUDA 13.0 toolkit, so leave `CUDA_HOME` unset. An external toolkit must pass the
-  release's toolkit check ([install-0.32.md](../../release/install-0.32.md)): use the versioned, driver-free
+  release's toolkit check ([install-0.33.md](../../release/install-0.33.md)): use the versioned, driver-free
   `cuda-toolkit-13-0` package, not the unversioned `cuda-toolkit`, which tracks newer releases.
 - **nvidia-smi.** It has a limited feature set under WSL, and persistence mode cannot be changed, so skip the
   `nvidia-smi -pm 1` step. Set a power limit from Windows where the card and driver support it.
@@ -275,7 +277,7 @@ Reports from WSL2 runs are welcome ([Reporting a run](#reporting-a-run-the-commu
 ## Optional host upgrade: GPU unlock (GeForce GA102)
 
 Like P2P, this is an optional, platform-level change. It is not a Merlin component, and Merlin runs without it; the
-3.0.1 bench numbers are measured with it (last paragraph).
+bench numbers are measured with it (last paragraph).
 [Zagitta/gpu-unlock](https://github.com/Zagitta/gpu-unlock) is a third-party host kernel module (GPL-2). It loads
 before the NVIDIA driver binds the card and lifts the GeForce cap on FP16/BF16 tensor math with FP32 accumulate,
 which the W4A16 GEMMs and attention use during prefill.
@@ -396,7 +398,7 @@ A one-command bench, identity smoke, needle and pool-readout script for this doe
 ## Design constraints
 
 The quad stays TP2xPP2+EP, 25,23, seqs 8, fp8 KV, pin 4.1e9. No quant is lowered to make a platform fit, and nothing here uses NVMe
-(a host-RAM-only expert tier for 2 x 24 GB cards is not implemented).
+by default (the one opt-in is the experimental `--ple-store disk` for the PLE table; a host-RAM-only expert tier for 2 x 24 GB cards is not implemented).
 
 ## `merlin serve`: one front end for every checkpoint
 

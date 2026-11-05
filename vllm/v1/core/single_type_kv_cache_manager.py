@@ -18,6 +18,7 @@ from vllm.v1.core.kv_cache_utils import (
     BlockHashWithGroupId,
     KVCacheBlock,
     resolve_block_hashes,
+    trim_null_head,
 )
 from vllm.v1.hisparse.block_pool import SharedEventQueueBlockPool
 from vllm.v1.kv_cache_interface import (
@@ -652,7 +653,8 @@ class SingleTypeKVCacheManager(ABC):
         if not self.kv_cache_spec.prefix_cacheable:
             return
         num_cached_blocks = self.num_cached_block.get(request.request_id, 0)
-        num_full_blocks = num_tokens // self.block_size
+        num_hashed_tokens = len(request.block_hashes) * self.block_pool.hash_block_size
+        num_full_blocks = min(num_tokens, num_hashed_tokens) // self.block_size
 
         if num_cached_blocks >= num_full_blocks:
             return
@@ -663,6 +665,13 @@ class SingleTypeKVCacheManager(ABC):
         reachable_boundaries = [*replay_boundaries]
         if request.shared_prefix_boundary:
             reachable_boundaries.append(request.shared_prefix_boundary)
+            if self.use_eagle:
+                # A sibling that diverges right after the junction cannot use
+                # the block past it as the EAGLE peek, so its hit lands one
+                # block lower.
+                reachable_boundaries.append(
+                    request.shared_prefix_boundary - self.block_size
+                )
 
         block_mask = self.reachable_block_mask(
             start_block=num_cached_blocks,
@@ -732,7 +741,12 @@ class SingleTypeKVCacheManager(ABC):
             if self.use_eagle
             else request.num_prompt_tokens - 1
         )
-        boundary_tokens = token_limit // hash_block_size * hash_block_size
+        # Capped by the hashes computed so far (upstream: lookahead hashes lag
+        # the token count); with legacy hashes the cap never binds here.
+        boundary_tokens = (
+            min(token_limit // hash_block_size, len(request.block_hashes))
+            * hash_block_size
+        )
         if boundary_tokens == 0 or boundary_tokens > num_tokens:
             return
         if boundary_tokens % self.block_size == 0:
@@ -796,7 +810,8 @@ class SingleTypeKVCacheManager(ABC):
             request_id: The request ID.
 
         Returns:
-            The request's blocks in allocation order.
+            The request's blocks in allocation order, without the leading
+            null blocks (e.g. a sliding-window table's skipped prefix).
 
         """
         # Default to [] in case a request is freed (aborted) before alloc.
@@ -804,7 +819,7 @@ class SingleTypeKVCacheManager(ABC):
         self.num_cached_block.pop(request_id, None)
         self._partial_hit_reqs.pop(request_id, None)
         self.restored_private_tails.pop(request_id, None)
-        return req_blocks
+        return trim_null_head(req_blocks)
 
     def free(self, request_id: str) -> None:
         """Free the blocks for the request.
@@ -1927,6 +1942,9 @@ class MambaManager(SingleTypeKVCacheManager):
     ) -> None:
         super().__init__(kv_cache_spec, block_pool, **kwargs)
         self.mamba_cache_mode = kv_cache_spec.mamba_cache_mode
+        assert self.mamba_cache_mode == "align" or not self.enable_caching, (
+            "Mamba prefix caching requires mamba_cache_mode='align'"
+        )
         self.num_speculative_blocks: int = kv_cache_spec.num_speculative_blocks
         self.has_prefill_checkpoint_blocks = (
             self.mamba_cache_mode == "align"
@@ -2411,6 +2429,7 @@ class MambaManager(SingleTypeKVCacheManager):
                 num_tokens,
                 self.cache_hit_alignment_tokens,
                 self.drop_eagle_checkpoint_block,
+                num_hash_lookahead_tokens=self.block_pool.num_hash_lookahead_tokens,
             )
             if not self._needs_internal_checkpoint(
                 request_id,
@@ -2745,6 +2764,7 @@ class MambaManager(SingleTypeKVCacheManager):
                     request.num_prompt_tokens,
                     self.cache_hit_alignment_tokens,
                     self.drop_eagle_checkpoint_block,
+                    num_hash_lookahead_tokens=self.block_pool.num_hash_lookahead_tokens,
                 )
             )
             is_retained_checkpoint = False
@@ -2785,6 +2805,8 @@ class MambaManager(SingleTypeKVCacheManager):
             return None
         if num_tokens <= 0 or num_tokens % hash_block_size != 0:
             return None
+        # Prompt hash boundary keyed as upstream
+        # when block_size <= hash_block_size
         if self.block_size <= hash_block_size:
             # No `_block_aligned_prompt_tail` here, and the scheduler-block replay
             # mask can miss this boundary (DCP > 1): key it as upstream does.
@@ -2792,13 +2814,21 @@ class MambaManager(SingleTypeKVCacheManager):
                 request.num_prompt_tokens,
                 hash_block_size,
                 self.drop_eagle_checkpoint_block,
+                num_hash_lookahead_tokens=self.block_pool.num_hash_lookahead_tokens,
             )
         # Block-aligned tails are keyed by cache_blocks as full-block keys; the branch below returns for them.
         elif num_tokens % self.block_size == 0:
             return None
         else:
+            # With legacy hashes (lookahead 0,
+            # the Merlin default) the boundary is the prompt's last whole hash
+            # unit. Lookahead hashes (#61589) exist only once the
+            # L tokens after a unit do, so the tail key moves down to the
+            # last unit whose lookahead lies inside the prompt (upstream's
+            # proof limit ``num_prompt_tokens - L``).
+            lookahead = self.block_pool.num_hash_lookahead_tokens
             latest_prompt_hash_boundary = (
-                request.num_prompt_tokens // hash_block_size
+                (request.num_prompt_tokens - lookahead) // hash_block_size
             ) * hash_block_size
             if self.drop_eagle_checkpoint_block:
                 # Eagle groups match one hash unit past the candidate and drop
@@ -2828,10 +2858,8 @@ class MambaManager(SingleTypeKVCacheManager):
         source_block = blocks[block_idx]
         if source_block.is_null:
             return None
-        # Port of vllm#62841: a block
-        # already keyed here by a hit or an earlier step is not re-cached;
-        # re-caching would mark it cached this step and defer every sibling
-        # that hits it (the checkpoint path above has the same guard).
+        # Already keyed here by a hit or an earlier step; re-caching would
+        # mark it cached this step and defer every sibling that hits it.
         if source_block.block_hash_num_tokens == num_tokens:
             return None
 
@@ -3288,7 +3316,7 @@ class HiSparseResidentManager(_HiSparseAuxiliaryManager):
         blocks = self.get_residency_row(request_id)
         self.residency_changes.pop(request_id, None)
         super().pop_blocks_for_free(request_id)
-        return blocks
+        return trim_null_head(blocks)
 
     def adopt_resident_page(
         self, request_id: str, block_idx: int, block: KVCacheBlock

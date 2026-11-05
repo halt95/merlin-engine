@@ -15,65 +15,52 @@ Block state (``state``), derived on every query, never cached:
   (ref > 0), so it is not in the free queue and cannot be reclaimed.
 * ``CLEAN``: reclaim is free. The block is unhashed, its group is not stored
   by the tier, its content was reported masked (never valid), the content is
-  no restore dependency (``retains_fn``, below), or the host pool holds every
-  key the block carries (primary and aliases).
+  no restore dependency (``retains_fn``), or the host pool holds every key the
+  block carries (primary and aliases).
 * ``DIRTY``: hashed, stored by the tier, a restore dependency, and some key is
   not on the host. A reclaim destroys a restore point.
 
 Restore dependency: ``retains_fn`` (installed by the unit table when a
-sliding-window group exists, ``kv_host_tier_units.mount``) says whether a
-hashed page can still be read by a restore. A sliding-window page is one only
-inside the retained window of a boundary (a recorded unit, a superseded
-endpoint that is still keyed, or a running request's prospective finish-time
-boundary); the out-of-window pages a long prefill sheds are not, so the
-write-back walker does not copy them and the admission gate does not protect
-them. Without ``retains_fn`` (no sliding-window group: MTP lanes) every
-eligible page is a dependency, as before. A page the host holds under one of
-its keys in OTHER content (an older generation) stays a dependency whatever
-``retains_fn`` says (``_host_holds_foreign``): host completeness is checked
-by key, so the GPU generation must be copied over it rather than
-dropped.
+sliding-window group exists, ``kv_host_tier_units.mount``) says whether a hashed
+page can still be read by a restore. A sliding-window page is one only inside
+the retained window of a boundary (a recorded unit, a superseded endpoint that
+is still keyed, or a running request's prospective finish-time boundary); the
+out-of-window pages a long prefill sheds are not, so they are neither copied by
+the write-back walker nor protected by the admission gate. Without
+``retains_fn`` (no sliding-window group: MTP lanes) every eligible page is a
+dependency. A page the host holds under one of its keys in OTHER content (an
+older generation) stays a dependency whatever ``retains_fn`` says
+(``_host_holds_foreign``): the GPU generation must be copied over it.
 
-Backing is revalidated against the host directory on every query instead of
-being kept as a bit: a host unkey (LRU reuse, duplicate reclaim, a failed
-load's invalidation, a reset) makes the GPU copy DIRTY with no reverse
-transition to forget. Equal keys do NOT mean equal content (a recomputed
-generation of the same tokens has different bytes, and the restore bar is
-byte-identity with the GPU hit): a host block backs a GPU block only when it
-was copied from that very content. Every stamped GPU content has a content id
-(``ContentStamp.cid``): minted when the content is published, carried through
-a CoW hash move, and inherited by a restored destination from the host block
-it was read from (``publish_restored``). A host copy records the content id
-it read (``note_host_copy``, from the demotion ticket). ``host_backs`` needs
-the host block under every key to carry the GPU content's id
-(``h.src = (g.pool, g.block_id, g.cgen)``). A GPU block with no stamp has no
-identity to compare (content inserted without a producer, e.g. a cancelled
-restore's quiesced publication, whose bytes ARE the host copy's): it falls
-back to key equality and is counted ``backing_unproven``.
+Backing is revalidated against the host directory on every query, never kept as
+a bit: a host unkey (LRU reuse, duplicate reclaim, a failed load's invalidation,
+a reset) makes the GPU copy DIRTY. Equal keys do NOT mean equal content (a
+recomputed generation of the same tokens has different bytes), so a host block
+backs a GPU block only when it was copied from that very content: every stamped
+GPU content has a content id (``ContentStamp.cid``), minted when it is
+published, carried through a CoW hash move, and inherited by a restored
+destination (``publish_restored``); a host copy records the id it read
+(``note_host_copy``), and ``host_backs`` needs the host block under every key to
+carry the GPU content's id. A GPU block with no stamp (e.g. a cancelled
+restore's quiesced publication, whose bytes ARE the host copy's) falls back to
+key equality and is counted ``backing_unproven``.
 
-Readiness (``is_ready``) is a property of the content, not of the block id:
+Readiness (``is_ready``) is a property of the content, not of the block id, and
+is the lookup and publication predicate for both tiers (a demotion copies only
+ready sources). Every hashed content gets a ``ContentStamp`` when it is
+published (the scheduled step that writes it and the producing request), tied to
+the block's ``generation``; any un-hash or reuse bumps the generation and
+invalidates the stamp. A CoW hash move (``BlockPool.move_block_hashes``) carries
+the stamp to the destination and delays readiness to the move's step. Content is
+ready once the per-rank commit frontier (``set_acked_step``, the minimum over
+ranks of the contiguous retired step) has passed its step and its
+``(producer, produced_step)`` was not reported masked (``mark_masked``); until
+the rank-ack feed sets both, nothing is ready.
 
-* every hashed content gets a ``ContentStamp`` when it is published (the
-  scheduled step that writes it and the producing request), tied to the
-  block's ``generation``. Any un-hash or reuse bumps the generation, which
-  invalidates the stamp.
-* a CoW hash move (``BlockPool.move_block_hashes``) carries the stamp to the
-  destination with its producer, and delays readiness to the move's step (the
-  copy into the destination runs in that step).
-* content is ready once the per-rank commit frontier (``set_acked_step``, the
-  minimum over ranks of the contiguous retired step) has passed its step and
-  its ``(producer, produced_step)`` was not reported masked
-  (``mark_masked``). The rank-ack feed owns both inputs; until it sets them nothing is
-  ready.
-
-``is_ready`` is a lookup and publication predicate for both tiers: a demotion
-copies only ready sources, and a lookup that serves a GPU block may call it
-too.
-
-Step ids: ``advance_step(s)`` names the step being scheduled next. The
-offload manager calls it from ``build_connector_meta`` with its own
-``_sched_step + 1``, so a stamp's step is the ``_sched_step`` of the
-connector metadata that ships the forward writing the content.
+Step ids: ``advance_step(s)`` names the step being scheduled next. The offload
+manager calls it from ``build_connector_meta`` with its own ``_sched_step + 1``,
+so a stamp's step is the ``_sched_step`` of the connector metadata that ships the
+forward writing the content.
 """
 
 from __future__ import annotations

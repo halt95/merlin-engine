@@ -1,6 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright 2026 halt95 (Merlin modifications)
-"""Admission cap for restores in flight; host rows have no retention ledger."""
+"""The restore admission cap of the host KV tier.
+
+``RestoresInFlight`` counts the restores that are running and refuses a new one
+once the cap (``MERLIN_KV_HOST_TIER__N_RESTORE``) is reached. Host rows are not
+retained by a ledger, so this is the module's only content.
+"""
 
 from __future__ import annotations
 

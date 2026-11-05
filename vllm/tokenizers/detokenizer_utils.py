@@ -1,9 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by the Merlin project; see NOTICE.
 
 from __future__ import annotations
 
+import codecs
 import json
+import re
 
 from vllm.tokenizers import TokenizerLike
 
@@ -57,6 +60,81 @@ def _convert_tokens_to_string_with_added_encoders(
 # 5 is an arbitrary value that should work for all
 # tokenizers (bigger = more conservative).
 INITIAL_INCREMENTAL_DETOKENIZATION_OFFSET = 5
+# Bound undecodable runs; ordinary UTF-8 needs at most four byte tokens.
+MAX_PENDING_TOKENS = 16
+# Lossless flush: at the cap only text that no
+# later token can change is emitted: the window is split before at least
+# HELD_TOKENS held tokens (a UTF-8 decoder reads a byte with at most the 3 bytes
+# after it), at a point where the text so far, plus the held tokens decoded on
+# their own, is exactly the whole window's text. Valid UTF-8 (whose window only
+# stays open past the cap on literal U+FFFD characters) is never cut inside a
+# character. If no such point exists yet the run waits, up to twice the cap.
+HELD_TOKENS = 4
+# ByteFallback pieces. That decoder renders a whole run of byte pieces at once:
+# valid, or one U+FFFD per piece, so a run's text is only final once its bytes
+# are complete UTF-8 or can no longer become valid.
+_BYTE_PIECE = re.compile(r"<0x([0-9A-Fa-f]{2})>")
+
+
+def _byte_run_is_final(pieces: list) -> bool:
+    run = bytearray()
+    for piece in reversed(pieces):
+        m = _BYTE_PIECE.fullmatch(piece) if isinstance(piece, str) else None
+        if m is None:
+            break
+        run.append(int(m.group(1), 16))
+    if not run:
+        return True
+    run.reverse()
+    try:
+        bytes(run).decode("utf-8")
+        return True  # complete and valid
+    except UnicodeDecodeError:
+        pass
+    try:
+        codecs.getincrementaldecoder("utf-8")().decode(bytes(run), final=False)
+    except UnicodeDecodeError:
+        return True  # invalid whatever follows
+    return False  # an incomplete character later bytes may still complete
+
+
+def byte_runs_complete(pieces: list) -> bool:
+    """True when every run of ByteFallback byte pieces is complete, valid UTF-8,
+    so decoding the pieces on their own renders them as in a longer text."""
+    run = bytearray()
+    for piece in [*pieces, None]:
+        m = _BYTE_PIECE.fullmatch(piece) if isinstance(piece, str) else None
+        if m is not None:
+            run.append(int(m.group(1), 16))
+            continue
+        if run:
+            try:
+                bytes(run).decode("utf-8")
+            except UnicodeDecodeError:
+                return False
+            run.clear()
+    return True
+
+
+def settled_split(decode, seq, start: int, read: int, end: int, piece=None):
+    """``(j, text)``: emit ``text`` (the window's text from ``read`` to ``j``) and
+    hold ``seq[j:end]``; None when no split point is settled yet.
+    ``decode`` maps a slice of ``seq`` to its text; ``piece`` maps an item to
+    its token string (default: the items are token strings)."""
+    before = decode(seq[start:read])
+    full = decode(seq[start:end])
+    for j in range(end - HELD_TOKENS, read, -1):
+        settled = decode(seq[start:j])
+        if (
+            settled.startswith(before)
+            and full.startswith(settled)
+            and full[len(settled) :] == decode(seq[j:end])
+            and _byte_run_is_final(
+                [piece(x) if piece else x for x in seq[start:j]]
+            )
+        ):
+            return j, settled[len(before) :]
+    return None
 
 
 _CACHED_MARKER_KEY = "_vllm_space_marker_cache"
@@ -271,7 +349,35 @@ def detokenize_incrementally(
         # from byte fallback tokenization.
         # If it's in the middle, it's probably a real invalid id generated
         # by the model
-        return new_tokens, "", prefix_offset, read_offset
+        pending = output_token_count - read_offset
+        if pending < MAX_PENDING_TOKENS:
+            return new_tokens, "", prefix_offset, read_offset
+        # Emit only the settled text.
+        if tokenizer.is_fast or not tokenizer.get_added_vocab():
+            to_text = tokenizer.convert_tokens_to_string
+        else:
+
+            def to_text(tokens: list[str]) -> str:
+                return _convert_tokens_to_string_with_added_encoders(
+                    tokenizer,
+                    tokens,
+                    skip_special_tokens=skip_special_tokens,
+                    spaces_between_special_tokens=spaces_between_special_tokens,
+                )
+
+        split = settled_split(
+            to_text,
+            output_tokens,
+            prefix_offset - window_start,
+            read_offset - window_start,
+            len(output_tokens),
+        )
+        if split is not None:
+            j, text = split
+            return new_tokens, text, read_offset, j + window_start
+        if pending < 2 * MAX_PENDING_TOKENS:
+            return new_tokens, "", prefix_offset, read_offset
+        # Never settled: flush the whole run, bounding the work.
 
     new_text = new_text[len(prefix_text) :]
     return new_tokens, new_text, read_offset, output_token_count

@@ -29,6 +29,7 @@ from vllm.entrypoints.serve.engine.protocol import (
 )
 from vllm.entrypoints.serve.engine.serving import BaseServing
 from vllm.entrypoints.serve.utils.request_logger import RequestLogger
+from vllm.exceptions import GenerationError
 from vllm.inputs import EngineInput, tokens_input
 from vllm.logger import init_logger
 from vllm.sampling_params import SamplingParams
@@ -39,7 +40,6 @@ from vllm.utils.async_utils import make_async
 logger = init_logger(__name__)
 
 
-# The one token-budget check.
 def _check_scoring_tokens(total_tokens: int, max_tokens: int) -> None:
     if total_tokens > max_tokens:
         raise ValueError(
@@ -321,6 +321,8 @@ class ServingGenerativeScoring(BaseServing):
         except asyncio.CancelledError:
             return self.create_error_response("Client disconnected")
         except ValueError as e:
+            return self.create_error_response(e)
+        except GenerationError as e:
             return self.create_error_response(e)
         except Exception as e:
             logger.exception("Error during generation")

@@ -3,7 +3,7 @@
 # Modified by the Merlin project; see NOTICE.
 from collections.abc import Iterable, Mapping, Sequence
 from contextlib import AbstractContextManager, nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
@@ -19,7 +19,6 @@ from vllm.logger import init_logger
 from vllm.merlin.draft_workspace import share_workspace
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
-from vllm.multimodal.inputs import MultiModalFeatureSpec
 from vllm.platforms import current_platform
 from vllm.v1.attention.backend import (
     AttentionCGSupport,
@@ -150,6 +149,8 @@ def get_kv_cache_spec(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
         if spec := attn_module.get_kv_cache_spec(vllm_config):
             if isinstance(spec, AttentionSpec):
                 spec = customize_attention_spec(attn_module.get_attn_backend(), spec)
+            if attn_module.is_draft_layer:
+                spec = replace(spec, is_draft=True)
             kv_cache_spec[layer_name] = spec
     if vllm_config.attention_config.hisparse_config is not None:
         kv_cache_spec = resolve_hisparse_specs(vllm_config, kv_cache_spec, attn_layers)
@@ -583,27 +584,3 @@ def build_attn_metadata(
                 attn_metadata[layer_name] = metadata
         token_to_req_indices = common_attn_metadata._token_to_req_indices_cache
     return attn_metadata
-
-
-def compute_mm_prefix_ranges(
-    req_ids: list[str],
-    mm_features: dict[str, list[MultiModalFeatureSpec]],
-    sliding_window: int | None = None,
-) -> dict[int, list[tuple[int, int]]]:
-    """Compute PrefixLM bidirectional ranges for multimodal tokens.
-
-    Ranges exceeding sliding_window are skipped to prevent early tokens
-    from attending across the entire image span.
-    """
-    req_doc_ranges: dict[int, list[tuple[int, int]]] = {}
-    for req_idx, req_id in enumerate(req_ids):
-        image_doc_ranges = []
-        for mm_feature in mm_features.get(req_id, ()):
-            if mm_feature.modality not in ("image", "video"):
-                continue
-            for r in mm_feature.mm_position.extract_embeds_range():
-                if sliding_window is not None and (r[1] - r[0] + 1) > sliding_window:
-                    continue
-                image_doc_ranges.append(r)
-        req_doc_ranges[req_idx] = image_doc_ranges
-    return req_doc_ranges

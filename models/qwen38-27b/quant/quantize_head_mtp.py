@@ -49,8 +49,7 @@ HKEY = {"lm_head": ("lm_head@target", "lm_head@draft"), "mtp.fc": ("mtp.fc",),
         "mtp.layers.0.mlp.down_proj": ("mtp.layers.0.mlp.down_proj",)}
 # Runtime prefixes differ from checkpoint names for the TARGET head: Qwen3_5ForConditionalGeneration
 # builds its language model under "language_model.", so its head is "language_model.lm_head" at
-# quant-dispatch time (the first smoke boot failed with "no parameter named lm_head.weight_packed"
-# because only the checkpoint name was targeted). The drafter's head is "lm_head" (prefix "").
+# quant-dispatch time, so the checkpoint name alone is not targeted. The drafter's head is "lm_head" (prefix "").
 GROUP = {"format": "pack-quantized", "input_activations": None, "output_activations": None,
          "targets": list(TARGETS) + ["language_model.lm_head", "model.language_model.lm_head"],
          "weights": {"actorder": None, "block_structure": None, "dynamic": False, "group_size": GS,
@@ -138,7 +137,7 @@ def pack_ct(prefix, Q, S, Z, shape):
     # compressed-tensors convention (int type, 4 bits, symmetric OR asymmetric): codes live in
     # the SIGNED range [-8, 7] and so does the zero point; dequant = (q - zp) * scale.
     # pack_to_int32 adds 2^(bits-1) before packing, so unsigned 0..15 codes overflow the nibble.
-    # Handing it 0..15 produces garbage (acceptance 0.000, every answer at the length cap).
+    # Handing it 0..15 makes the packed nibbles overflow.
     # Our minmax codes/zp are 0..15 -> shift both by -8 (dequant unchanged).
     w_int = (Q.to(torch.int16) - 8).to(torch.int8)
     zp_int = (Z.to(torch.int16) - 8).to(torch.int8)

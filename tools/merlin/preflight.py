@@ -44,6 +44,7 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import gpu_unlock as U  # noqa: E402
+import ple_store as PS  # noqa: E402
 import registry as R  # noqa: E402
 
 GIB = 2**30
@@ -71,7 +72,7 @@ FN_PLE_TEST_GIB = {"bfloat16": 95.37, "int8_row": 48.28}  # launch.PLE_TEST_TABL
 # of the floor, per server; merlin serve --kv-ram-cache sets it per rank and launch.py passes it to the engine.
 KV_HOST_TIER_ENV = "MERLIN_KV_HOST_TIER_GIB"
 SHM_MIN_MIB = 1024
-BAR1_MIN_MIB = 1024  # a card below 1 GB BAR1 hangs NCCL warmup on any P2P pair that includes it
+BAR1_MIN_MIB = 1024  # a card below 1 GiB BAR1 hangs NCCL warmup on any P2P pair that includes it
 BUSY_MIB = 1024  # the KV pool is pinned in bytes and leaves ~1 GB per card
 KV_MIN_BYTES = 1 << 30  # the 27B / Super VL launcher refuses KV_BYTES under 1 GiB (launch.py); preflight refuses the same pin
 
@@ -80,6 +81,8 @@ def min_restore_unit_gib_per_rank(ranks: int, model: str | None = None, profile:
     """Whole GiB per rank needed for one 262K restore unit: from the profile's host row size when it is recorded
     (registry.restore_unit_min_gib_per_rank), else 4 GiB per server."""
     return R.restore_unit_min_gib_per_rank(model, profile, ranks)
+
+
 DRIVER_MIN_MAJOR = 580  # CUDA 13.0 driver: the 580 series or later
 
 
@@ -441,7 +444,6 @@ def _read(path: str) -> str | None:
         return None
 
 
-
 def _listdir(path: str) -> list[str] | None:
     try:
         return os.listdir(path)
@@ -462,7 +464,7 @@ def probe_interconnect(
     read: Callable[[str], str | None] = _read,
     listdir: Callable[[str], list[str] | None] = _listdir,
 ) -> None:
-    """Read diagnostic snapshots only; leave the legacy PCIe warning inputs unchanged."""
+    """Reads the per-card link and IOMMU snapshots for the report only."""
     for gpu in inv.gpus:
         link: dict[str, int | None] = {}
         base = f"/sys/bus/pci/devices/{sysfs_bus_id(gpu.bus_id)}/" if gpu.bus_id else None
@@ -599,11 +601,16 @@ def mem_available_mib(read: Callable[[str], str | None] = _read) -> int | None:
     return avail
 
 
+def ple_pin_text(ple_gib: float) -> str:
+    """How the RAM messages name the table: pinned in RAM, or on disk (``--ple-store disk``, ``ple_gib`` 0)."""
+    return f"pins a ~{ple_gib:.1f} GiB PLE table" if ple_gib else "reads its PLE table from disk"
+
+
 def ram_available_text(cards: int, avail_mib: int, tier_gib: int = 0, ple_gib: float = FN_PLE_TABLE_GIB) -> str:
     """serve's refusal (and doctor's FAIL) when the memory a host has left is under a Flash-Next server's floor (with
     the KV host tier, ``tier_gib`` per rank, when on)."""
     return (f"host memory available now is {_gib(avail_mib):.0f} GiB (MemAvailable, capped by what the cgroup has left); a "
-            f"{cards}-card Flash-Next server pins a ~{ple_gib:.1f} GiB PLE table and needs "
+            f"{cards}-card Flash-Next server {ple_pin_text(ple_gib)} and needs "
             f"~{ram_floor_gib(cards, tier_gib, ple_gib):.0f} GiB resident{ram_tier_text(cards, tier_gib)} "
             f"(another Merlin server or a large page cache user?)")
 
@@ -612,14 +619,18 @@ def ram_floor_gib(cards: int, tier_gib: int = 0, ple_gib: float = FN_PLE_TABLE_G
     """The resident host RAM one Flash-Next server needs: the measured four-worker floor plus one allowance per worker
     above four (a TP2xPP4 octo = 69 + 4 x 2 = 77 GiB), plus the KV host tier's arena, ``tier_gib`` per rank
     (``cards`` = TP x PP ranks; 0 = off adds nothing), with the FP8 table term swapped for ``ple_gib`` (INT6 g32:
-    69 - 47.68 + 38.74 = 60.06 GiB at four workers; an estimate, no capped-host boot record yet)."""
+    69 - 47.68 + 38.74 = 60.06 GiB at four workers; an estimate, no capped-host boot record yet; 0 under
+    --ple-store disk: 21.32 GiB)."""
     return RAM_FLOOR_GIB - FN_PLE_TABLE_GIB + ple_gib + max(0, cards - 4) * RAM_PER_EXTRA_WORKER_GIB + max(0, tier_gib) * cards
 
 
-def ple_table_gib_of(ckpt: str | None, default: float = FN_PLE_TABLE_GIB) -> float:
+def ple_table_gib_of(ckpt: str | None, default: float = FN_PLE_TABLE_GIB, store: str | None = None) -> float:
     """The host-RAM size of the PLE table the checkpoint in ``ckpt`` carries (text_config.ple_embedding_dtype, read the
     way the launcher reads it): the INT6 g32 opt-in table's or a test table's, else the FP8 one; ``default`` when there
-    is no readable config.json (a folder setup has not built yet: setup passes the table it will build)."""
+    is no readable config.json (a folder setup has not built yet: setup passes the table it will build). 0 under
+    ``store`` disk: no table in RAM, so every RAM gate takes the full credit."""
+    if store == "disk":
+        return 0.0
     if not ckpt:
         return default  # no folder: never the current directory's config.json
     try:
@@ -638,12 +649,12 @@ def ram_tier_text(cards: int, tier_gib: int) -> str:
 
 
 def dflash2_tier_conflicts(model: str | None, env: dict[str, str], saved: dict | None) -> list[str]:
-    """A KV RAM cache with DFlash2 on the Flash-Next family, which merlin serve refuses in 3.0.1: from the
+    """A KV RAM cache with DFlash2 on the Flash-Next family, which merlin serve refuses: from the
     environment (SPEC=dflash2 + MERLIN_KV_HOST_TIER_GIB) or from setup's saved answers (.merlin/setup.json)."""
     out = []
     if model == "flash-next" and (env.get("SPEC") or "").strip() == "dflash2" and kv_host_tier_gib(env) > 0:
         out.append(f"SPEC=dflash2 with {KV_HOST_TIER_ENV}={kv_host_tier_gib(env)}: the KV RAM cache is qualified with MTP "
-                   "only in 3.0.1; merlin serve refuses the pair. Unset SPEC (MTP) or set "
+                   "only; merlin serve refuses the pair. Unset SPEC (MTP) or set "
                    f"{KV_HOST_TIER_ENV}=0")
     saved = saved if isinstance(saved, dict) else {}
     models = saved.get("models") if isinstance(saved.get("models"), dict) else {}
@@ -653,7 +664,7 @@ def dflash2_tier_conflicts(model: str | None, env: dict[str, str], saved: dict |
     if (isinstance(block, dict) and block.get("spec") == "dflash2" and isinstance(gib, int)
             and not isinstance(gib, bool) and gib > 0):
         out.append(f"saved setup answers for {name} (.merlin/setup.json) pair --spec dflash2 with --kv-ram-cache {gib}g; "
-                   "merlin serve refuses the pair in 3.0.1. Run ./setup.sh --kv-ram-cache 0 or ./setup.sh --spec mtp")
+                   "merlin serve refuses the pair. Run ./setup.sh --kv-ram-cache 0 or ./setup.sh --spec mtp")
     return out
 
 
@@ -663,6 +674,8 @@ def saved_ple_table_gib(model: str | None, saved: dict | None) -> float:
     saved = saved if isinstance(saved, dict) else {}
     models = saved.get("models") if isinstance(saved.get("models"), dict) else {}
     block = models.get(saved.get("model")) if isinstance(saved.get("model"), str) else None
+    if model == "flash-next" and isinstance(block, dict) and block.get("ple_store") == "disk":
+        return 0.0
     if model == "flash-next" and isinstance(block, dict) and block.get("ple_table") == "int6":
         return FN_PLE_OPT_IN_GIB["int6_g32"]
     return FN_PLE_TABLE_GIB
@@ -942,21 +955,23 @@ def effective_p2p(inv: Inventory, forced: str, report: Report) -> str:
         if g.bar1_mib is not None and g.bar1_mib < BAR1_MIN_MIB
     ]
     driver = inv.p2p
-    if forced in ("on", "off"):
-        if forced == "on" and driver in ("off", "partial"):
+    # Ipc keeps NCCL off its P2P transport, but the
+    # PCIe-IPC all-reduce maps peer buffers, so it needs the same peer access as on.
+    if forced in ("on", "off", "ipc"):
+        if forced in ("on", "ipc") and driver in ("off", "partial"):
             report.add(
                 "FAIL",
                 "p2p",
-                f"--p2p on was requested but the driver reports P2P '{driver}' between the selected GPUs",
+                f"--p2p {forced} was requested but the driver reports P2P '{driver}' between the selected GPUs",
             )
-        if forced == "on" and small:
+        if forced in ("on", "ipc") and small:
             report.add(
                 "FAIL",
                 "bar1",
-                f"--p2p on was requested but GPU(s) {small} have BAR1 below 1 GiB: NCCL hangs at warmup on any "
+                f"--p2p {forced} was requested but GPU(s) {small} have BAR1 below 1 GiB: NCCL hangs at warmup on any "
                 "P2P pair that includes them",
             )
-        return forced
+        return "on" if forced == "ipc" else forced
     raw = inv.p2p_among([g.index for g in inv.gpus], driver_view=True)
     if small and raw != "off":
         report.add(
@@ -1111,6 +1126,13 @@ def no_p2p_hint(reg: dict[str, Any], model: str, arch: str, vclass: int | None, 
             return text + f"; the single-card row {tp1[0]['id']} does not fit these cards either: {why}"
     return text + (f"; the single-card row {tp1[0]['id']} runs without it: GPUS={gpus[0]} merlin serve {name} <dir> --tp 1 (one server), "
                    f"or merlin serve {name} <dir> --tp 1 --instances {len(gpus)} ({len(gpus)} servers, the measured best without P2P)")
+
+
+def ipc_refusal(reg: dict[str, Any], prof: dict[str, Any]) -> str:
+    rows = [q["id"] for q in reg["profiles"] if "ipc" in (q.get("interconnect") or {}).get("modes", {})]
+    return (f"P2P=ipc was requested but {prof['id']} has no ipc interconnect mode"
+            + (f" (rows with one: {', '.join(rows[:6])}{', ...' if len(rows) > 6 else ''})" if rows else
+               " (no row of this model has one)"))
 
 
 def _mode_for(p: dict[str, Any], p2p: str) -> str | None:
@@ -1335,7 +1357,6 @@ def evaluate(
     else:
         cands = _candidates(reg, model, n, arch, vclass, rep.effective_p2p)
         if cands:
-
             def keyf(p: dict[str, Any]) -> tuple[Any, ...]:
                 exact = 0 if p["match"]["p2p"] == rep.effective_p2p else 1
                 lat = 0 if (prefer_latency and p.get("latency")) else 1
@@ -1384,8 +1405,16 @@ def evaluate(
     status = prof["status"]
     if model == "flash-next":
         rep.p2p_mode = _mode_for(prof, rep.effective_p2p) if n >= 2 else None
+        # P2P=ipc is opt-in, only on rows that declare it
+        if p2p == "ipc" and n >= 2:
+            if "ipc" in prof["interconnect"]["modes"]:
+                rep.p2p_mode = "ipc"
+            else:
+                rep.add("FAIL", "p2p", ipc_refusal(reg, prof))
     else:
         rep.p2p_mode = rep.effective_p2p if n >= 2 else None
+        if p2p == "ipc":
+            rep.add("FAIL", "p2p", ipc_refusal(reg, prof))
     if status == "tested" and not _tested_name_ok(prof, inv):
         status = "untested"
         other = sorted({g.name for g in inv.gpus if not any(re.search(p, g.name) for p in prof["match"]["tested_gpu_names"])})
@@ -1408,6 +1437,23 @@ def evaluate(
             f"{prof['id']} ran on {', '.join(run_on)} only; {' + '.join(other)} "
             "resolves to the same row but is untested / community-validated",
         )
+    # a tested/testing row's evidence covers
+    # only the P2P modes in match.status_p2p_modes; the other mode of a two-mode row is
+    # untested (e.g. the CMP 170HX rows were measured P2P off only).
+    covered = prof["match"].get("status_p2p_modes")
+    if (
+        status in (R.LABEL_TESTED, R.LABEL_TESTING)
+        and covered
+        and rep.p2p_mode
+        and rep.p2p_mode not in covered
+    ):
+        status = R.LABEL_UNTESTED
+        rep.add(
+            "WARN",
+            "status-p2p",
+            f"{prof['id']} was measured with P2P {' / '.join(covered)} only; this host resolves "
+            f"P2P={rep.p2p_mode}, which runs the same row but is untested / community-validated",
+        )
     rep.status = status
     rep.label = R.label_text(reg, prof, status)
     rep.layout = prof.get("layout") or {"tp": prof["serve"]["tensor_parallel"], "pp": 1}
@@ -1429,7 +1475,7 @@ def evaluate(
             if prof.get("checkpoint") else "Qwen3.8-Flash-Next-W4A16-Merlin"
         )
         prefix = ""
-        if rep.p2p_mode and len(prof["interconnect"]["modes"]) > 1:
+        if rep.p2p_mode and (R.auto_p2p_switch(prof) or rep.p2p_mode == "ipc"):
             prefix = f"P2P={rep.p2p_mode} "
         # every launcher file is a shim for tools/merlin/launch.py; name the file that pins this profile
         if shared:
@@ -1447,8 +1493,8 @@ def evaluate(
         rep.differs = [] if shared else R.diff_vs_reference(reg, prof)
         if (
             rep.p2p_mode
-            and len(prof["interconnect"]["modes"]) > 1
-            and rep.p2p_mode != rep.effective_p2p
+            and R.auto_p2p_switch(prof)
+            and rep.p2p_mode not in (rep.effective_p2p, "ipc")
         ):
             rep.add(
                 "INFO",
@@ -1611,13 +1657,16 @@ def _host_checks(rep: Report, inv: Inventory, prof: dict[str, Any] | None) -> No
         tier = inv.kv_tier_gib
         floor = ram_floor_gib(n, tier, inv.ple_table_gib)
         warn = RAM_WARN_GIB + max(0, tier) * n  # the qualified allocation is for the tier off: the tier comes on top
+        if not inv.ple_table_gib:  # --ple-store disk: warn below the floor + the page cache allowance
+            warn = floor + PS.CACHE_WARN_GIB
         t = ram_tier_text(n, tier)
         if h.ram_mib is None:
             rep.add(
                 "WARN",
                 "ram",
-                f"host RAM unknown; Flash-Next needs ~{floor:.0f} GiB resident (~{inv.ple_table_gib:.1f} GiB pinned PLE table{t}) "
-                f"and {warn:.0f} GiB is qualified",
+                f"host RAM unknown; Flash-Next needs {'~' if inv.ple_table_gib else 'a computed ~'}{floor:.0f} GiB resident ("
+                + (f"~{inv.ple_table_gib:.1f} GiB pinned PLE table" if inv.ple_table_gib else "PLE table on disk") + f"{t}) "
+                + (f"and {warn:.0f} GiB is qualified" if inv.ple_table_gib else f"and {warn:.0f} GiB is the computed floor plus page cache"),
             )
         else:
             ram = _gib(h.ram_mib)
@@ -1633,13 +1682,16 @@ def _host_checks(rep: Report, inv: Inventory, prof: dict[str, Any] | None) -> No
                     "WARN",
                     "ram",
                     f"host RAM {ram:.0f} GiB is below the qualified {warn:.0f} GiB (floor ~{floor:.0f} GiB{t}; "
-                    "the boot peak is unmeasured)",
+                    "the boot peak is unmeasured)"
+                    if inv.ple_table_gib
+                    else f"host RAM {ram:.0f} GiB leaves under {PS.CACHE_WARN_GIB} GiB of page cache for the PLE table above "
+                    f"the ~{floor:.0f} GiB floor{t}; decode and prefill slow down",
                 )
             else:
                 rep.add(
                     "PASS",
                     "ram",
-                    f"host RAM {ram:.0f} GiB (>= {warn:.0f} GiB qualified{t})",
+                    f"host RAM {ram:.0f} GiB (>= {warn:.0f} GiB {'qualified' if inv.ple_table_gib else 'floor + page cache'}{t})",
                 )
     elif rep.model in ("27b", "ornith") and inv.kv_tier_gib > 0:
         # The 27B and Ornith have no measured resident floor; the KV host tier's arenas (GiB per rank, pinned)
@@ -1728,7 +1780,7 @@ def _host_checks(rep: Report, inv: Inventory, prof: dict[str, Any] | None) -> No
             "pcie",
             f"PCIe generation {inv.gpus[0].pcie_gen} on GPU(s) {low_gen}: ~6 GB/s class link",
         )
-    if rep.p2p_mode == "on":
+    if rep.p2p_mode in ("on", "ipc"):
         bars = [g.bar1_mib for g in inv.gpus if g.bar1_mib is not None]
         if bars:
             rep.add(
@@ -1766,7 +1818,8 @@ def render_text(rep: Report, reg: dict[str, Any]) -> str:
     else:
         out.append("  no NVIDIA GPU found")
     if len(inv.gpus) > 1:
-        out.append(f"  P2P: driver view '{inv.p2p}', effective '{rep.effective_p2p}'")
+        out.append(f"  P2P: driver view '{inv.p2p}', effective '{rep.effective_p2p}'"
+                   + (f", mode '{rep.p2p_mode}'" if rep.p2p_mode == "ipc" else ""))
     out.extend(interconnect_text(inv))
     h = inv.host
     ram = f"{_gib(h.ram_mib):.0f} GiB" if h.ram_mib else "unknown"
@@ -1978,9 +2031,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     ap.add_argument(
         "--p2p",
-        choices=("auto", "on", "off"),
+        choices=("auto", "on", "off", "ipc"),
         default="auto",
-        help="override the detected peer-to-peer state",
+        help="override the detected peer-to-peer state (ipc: NCCL without P2P transport + PCIe-IPC all-reduce)",
     )
     ap.add_argument(
         "--profile", help="force a profile id (checked against the hardware)"

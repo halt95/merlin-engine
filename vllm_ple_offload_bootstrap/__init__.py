@@ -174,8 +174,6 @@ def main() -> None:
         try:  # noqa: SIM105
             death_pipe.recv()
         except (EOFError, OSError):
-            # SIM105 declined: this module's contract is the docstring above --
-            # its import list is the audited surface of the pre-torch child.
             pass
         os._exit(1)
 

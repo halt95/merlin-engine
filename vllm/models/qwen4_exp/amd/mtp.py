@@ -35,7 +35,12 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from vllm.model_executor.model_loader.utils import configure_quant_config
-from vllm.model_executor.models.interfaces import LocalArgmaxMixin, SupportsPP
+# The MTP head keeps Merlin's local-argmax mixin
+from vllm.model_executor.models.interfaces import (
+    LocalArgmaxMixin,
+    SupportsHCSP,
+    SupportsPP,
+)
 from vllm.model_executor.models.qwen3_5 import Qwen3_5Model
 from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
@@ -46,8 +51,10 @@ from vllm.model_executor.models.utils import (
     maybe_fuse_shared_experts,
     maybe_prefix,
 )
+from vllm.models.common.ops.sequence_parallel import sp_all_gather, sp_shard
 from vllm.sequence import IntermediateTensors
 
+from ..common.hyperconnection import is_hc_sequence_parallel_enabled
 from .hyperconnection import GatedResidual, HyperConnectionConfig
 from .low_latency_gemm import enable_qwen4_exp_low_latency_gemm
 from .model import (
@@ -182,6 +189,8 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
         config: Qwen4ExpTextConfig = model_config.hf_text_config
 
         self.config = config
+        # MoE SP also enables HC SP, while HC SP can be enabled independently.
+        self.use_hc_sequence_parallel = is_hc_sequence_parallel_enabled(vllm_config)
         self.vocab_size = config.vocab_size
 
         self.mtp_start_layer_idx = config.num_hidden_layers
@@ -322,6 +331,9 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
             hidden_states = intermediate_tensors["hidden_states"]
 
         current_step_idx = spec_step_idx % self.num_mtp_layers
+        full_num_tokens = positions.shape[-1]
+        if self.use_hc_sequence_parallel:
+            hidden_states = sp_shard(hidden_states)
         layer = self.layers[current_step_idx]
         hidden_states, block_output, injection = layer(
             hidden_states=hidden_states,
@@ -349,6 +361,17 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
                 hidden_states, block_output, injection
             )
         )
+        if self.use_hc_sequence_parallel:
+            # Gather both outputs together, then restore their contiguous layouts.
+            packed_hidden_states = torch.cat(
+                [sample_hidden_states, multi_hidden], dim=-1
+            )
+            packed_hidden_states = sp_all_gather(packed_hidden_states)[:full_num_tokens]
+            sample_hidden_states, multi_hidden = packed_hidden_states.split(
+                [hidden_size, hc_count * hidden_size], dim=-1
+            )
+            sample_hidden_states = sample_hidden_states.contiguous()
+            multi_hidden = multi_hidden.contiguous()
         return sample_hidden_states, multi_hidden
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
@@ -378,8 +401,9 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
         "hidden_states": 0,
     }
 )
+# LocalArgmaxMixin first in the MRO
 class Qwen4ExpMTP(
-    LocalArgmaxMixin, nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts
+    LocalArgmaxMixin, nn.Module, SupportsHCSP, SupportsPP, Qwen4ExpMixtureOfExperts
 ):
     packed_modules_mapping = {
         "qkv_proj": ["q_proj", "k_proj", "v_proj"],

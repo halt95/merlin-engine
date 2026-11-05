@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by the Merlin project; see NOTICE.
 """DiffusionGemma model, ModelState, and Sampler for vLLM.
 
 Single Gemma4 backbone run in two modes (like YOCO):
@@ -286,6 +287,7 @@ class DiffusionGemmaForConditionalGeneration(
         Gemma4ForConditionalGeneration._parse_and_validate_multimodal_inputs
     )
     _encoder_chunk = staticmethod(Gemma4ForConditionalGeneration._encoder_chunk)
+    _get_max_soft_tokens = Gemma4ForConditionalGeneration._get_max_soft_tokens
     _process_image_input = Gemma4ForConditionalGeneration._process_image_input
     _process_video_input = Gemma4ForConditionalGeneration._process_video_input
     embed_multimodal = Gemma4ForConditionalGeneration.embed_multimodal
@@ -347,7 +349,7 @@ class DiffusionGemmaForConditionalGeneration(
     @classmethod
     def get_placeholder_str(cls, modality: str, i: int) -> str | None:
         if modality == "image":
-            return "<image_soft_token>"
+            return "<|image|>"
         if modality == "video":
             return "<|video|>"
         raise ValueError(f"Unsupported modality: {modality}")
@@ -1404,13 +1406,18 @@ class DiffusionSampler:
         # unaffected; only the canvas exploration is constrained. Applied
         # before canvas padding so phantom positions stay uniform.
         if num_decode > 0:
+            # Keeps the pre-0.33 reduction order; the upstream
+            # change alters sampled tokens.
             top_k, top_p = self.sampling_states.get_top_k_top_p(
                 decode_slots.repeat_interleave(
                     valid_canvas_len, output_size=int(valid_canvas_len_np.sum())
                 ),
                 decode_slots_np,
+                # apply_top_k_top_p takes no
+                # has_topp_only_rows shortcut.
             )
             if top_k is not None or top_p is not None:
+                # Every row takes the split top-p path.
                 logits = apply_top_k_top_p(logits.float(), top_k, top_p)
 
         # Where each decode request's rows start in the flat logits. Tiles

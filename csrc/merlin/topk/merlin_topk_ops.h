@@ -1,4 +1,5 @@
-// merlin-hook: csrc-topk-vendored
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright 2026 halt95 (Merlin modifications)
 // Host entry points of the vendored top-k (topk.cu in this directory).
 // Registrations: bindings.cpp in this directory.
 #pragma once

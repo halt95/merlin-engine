@@ -1,6 +1,6 @@
 # Reference
 
-> **Recipe 3.0.0 / Merlin 3.0.1:** vLLM **0.32.0**, FlashInfer **0.7.0.post1** with the ported tile,
+> **Recipe 3.0.0 / Merlin 3.0.2:** vLLM **0.33.0**, FlashInfer **0.7.2.post1** with the ported tile,
 > **FGPC ON**, RecoverSSM on every layout, pools **826,689 / 2,012,105 tokens** (TP2 / TP4),
 > and an **8 MP** release cap.
 > The [2026-11-02 card](../benchmarks/2026-11-02/BENCH-CARD.md) has the current 3.0.1 results; the [2026-10-20 card](../benchmarks/2026-10-20/BENCH-CARD.md) has the 3.0.0 results; the [2026-10-15 card](../benchmarks/2026-10-15/BENCH-CARD.md) records the 0.32 tile reclaim.
@@ -40,8 +40,9 @@ and drafter, FP8 E4M3 KV, MTP with **K=4** draft tokens per step, fp16 SSM state
   95 % Newcombe CI **[−5.89, +1.61] pp**, within CI and not significantly worse.
 - 27B TP2 serves images up to 8 MP. With the vision-peak option on (`VLLM_MERLIN_VISION_PEAK=1`, the TP2 launcher default), the 50-item TP2 stress sweep's worst minimum free was 806 MiB per card (2026-10-15), above the 524 MiB floor. A separate knob OFF/ON identity check matched tokens and logprobs on 6/6 prompts. Flash-Next (902 MiB) meets the target. 27B TP4 left 690 MiB free on the retired RecoverSSM-off pin; at the shipped chunk 4096 with RecoverSSM on, the 2026-10-20 bench card measured 862 MiB lowest free (one 8 MP image, two at once, and four in one prompt; 2 cards: 886 MiB), above the 524 MiB floor.
 
-The release engine is **Merlin 3.0.1 on vLLM 0.32.0**. The
-[2026-11-02 bench card](../benchmarks/2026-11-02/BENCH-CARD.md) holds the 3.0.1 results and the
+The release engine is **Merlin 3.0.2 on vLLM 0.33.0**. The
+[3.0.2 bench card](../benchmarks/2026-11-04/BENCH-CARD.md) holds the 3.0.2 results, the
+[2026-11-02 bench card](../benchmarks/2026-11-02/BENCH-CARD.md) the 3.0.1 results and the
 [2026-10-20 bench card](../benchmarks/2026-10-20/BENCH-CARD.md) the 3.0.0 release results; the
 [2026-10-15 card](../benchmarks/2026-10-15/BENCH-CARD.md) distinguishes the 0.32 candidate tile run from the final release assembly.
 The profiles are `models/qwen38-27b/serve.sh` and `models/qwen38-27b/serve-tp4.sh`.
@@ -60,13 +61,13 @@ checkpoint.
 
 Install the shared engine and patched FlashInfer using the repository-wide
 [release tooling](../../../release/README.md). The installer and tile patch are integrated.
-Use the complete 222-pin, SHA-256-hashed `release/requirements-0.32.lock`
+Use the complete 223-pin, SHA-256-hashed `release/requirements-0.33.lock`
 through that installer; historical 0.30 bundles do not install this release.
 
 | path | what |
 |---|---|
-| `release/install-env.sh` | integrated shared 0.32 installer; complete hash lock; a fresh install (2026-10-21) and a from-source build (2026-10-22) passed on the reference host |
-| `release/apply-flashinfer-patch.sh`, `check-tile-proof.sh` | applies the packaged 0.7.0.post1 tile and verifies current-boot planner selection per TP rank |
+| `release/install-env.sh` | integrated shared 0.33 installer; complete hash lock. On the 3.0.0 release (vLLM 0.32) a fresh install (2026-10-21) and a from-source build (2026-10-22) passed on the reference host; the 3.0.2 fresh install has not been done |
+| `release/apply-flashinfer-patch.sh`, `check-tile-proof.sh` | applies the packaged 0.7.2.post1 tile and verifies current-boot planner selection per TP rank |
 | `models/qwen38-27b/checkpoint.sha256` | checksums of the base checkpoint's 11 files |
 | `models/thinkingcap/checkpoint.sha256` | checksums of ThinkingCap's 11 files |
 | `models/qwen38-27b/serve.sh`, `models/qwen38-27b/serve-tp4.sh` | TP2 and TP4 launchers |
@@ -116,12 +117,14 @@ directory; export `HF_HUB_OFFLINE=0` to allow Hub lookups). The download step se
 | Engine defaults | on in every family | the engine switches that are on by default in every launch (vision chunking, prompt-logprob chunk, guard transport) are listed in the [Flash-Next reference](../../flash-next/docs/reference.md#engine-defaults) |
 | `KV_BYTES` | per-card pin: **14,756,413,440** (dual card, 883 blocks), **17,923,833,856** (quad card, 2,011 blocks of 1,024 tokens) | whole KV pool blocks at K=4 ([The KV budget](#the-kv-budget)); `auto` drops the pin (unqualified) |
 
-### vLLM 0.32 launcher settings
+### vLLM 0.33 launcher settings
+
+On vLLM 0.33, `--mamba-cache-mode` is deprecated and has no effect: Mamba prefix caching follows `--enable-prefix-caching`. The launchers still pass `align`, which logs one deprecation warning; `--enable-mamba-shared-prefix-checkpoint` is unchanged.
 
 Both TP profiles use `--attention-backend FLASHINFER`; `VLLM_ATTENTION_BACKEND` is removed.
 Prefix caching uses `--enable-prefix-caching --mamba-cache-mode align`,
 `--enable-mamba-shared-prefix-checkpoint` and `--prefix-match-unit 16`. The shared-prefix checkpoint flag is
-the 0.32 name for the former fine-grained Mamba prefix-cache flag; the 27B keeps that feature enabled on both profiles.
+the name (since 0.32) of the former fine-grained Mamba prefix-cache flag; the 27B keeps that feature enabled on both profiles.
 
 The four folded environment controls `VLLM_E2_PLE_PULL_TRANSPORT`, `VLLM_E2_SIDE_CACHE_LAYOUT`,
 `VLLM_E2_MAMBA_RETAIN_CHECKPOINT` and `VLLM_E2_GUARD_IDLE` are no longer registered or exported.
@@ -134,12 +137,12 @@ The historical v1.3.0 measurements used a 4 MP cap. The chunked vision encoder i
 
 ### Requirements
 
-Use the shared 0.32 environment for 3.0.0. The software versions and binary compatibility floor in the
+Use the shared 0.33 environment for 3.0.2. The software versions and binary compatibility floor in the
 following table describe the historical 0.30 install and reference host. Current installs use the complete
-222-pin hash lock, including the CUDA 13.0 CRT, nvcc, nvJitLink and NVVM wheels.
+223-pin hash lock, including the CUDA 13.0 CRT, nvcc, nvJitLink and NVVM wheels.
 
-Reference host: NVIDIA driver 610.43.02 (reports CUDA 13.3). The release lock selects a matched CUDA 13.0 toolkit (nvcc, crt, nvvm, nvJitLink 13.0.88, cccl 13.0.85, runtime 13.0.96, the pair torch 2.13.0 cu130 ships with); the release wheel is served on it by every recipe (2026-10-20). Other CUDA 13.x drivers (R580 or later) are expected to work through CUDA minor-version compatibility, but are untested.
-See the [CUDA driver requirements](../../../release/install-0.32.md). A fresh install (2026-10-21) and a from-source build (2026-10-22) passed on the reference host.
+Reference host: NVIDIA driver 610.43.02 (reports CUDA 13.3). The release lock selects a matched CUDA 13.0 toolkit (nvcc, crt, nvvm, nvJitLink 13.0.88, cccl 13.0.85, runtime 13.0.96, the pair torch 2.14.0 cu130 ships with); the 3.0.0 release wheel was served on it by every recipe (2026-10-20); the 3.0.2 wheel was served on it on 2026-11-04 by Flash-Next, Qwen3.8-27B (1, 2 and 4 GPUs), Nemotron 3.5 Super VL and Ornith 1.5, each with a 262K request. Other CUDA 13.x drivers (R580 or later) are expected to work through CUDA minor-version compatibility, but are untested.
+See the [CUDA driver requirements](../../../release/install-0.33.md). On the 3.0.0 release (vLLM 0.32) a fresh install (2026-10-21) and a from-source build (2026-10-22) passed on the reference host; the 3.0.2 fresh install has not been done.
 
 
 | | Required | Reference host |
@@ -147,7 +150,7 @@ See the [CUDA driver requirements](../../../release/install-0.32.md). A fresh in
 | GPUs | 2× (dual card) or 4× (quad card) 24 GB sm_86 cards, with no other process on them | RTX 3090 |
 | OS | Linux x86_64 with glibc 2.38 or newer (the compiled engine libraries need it) | Debian 13, glibc 2.41 |
 | NVIDIA driver | one that supports CUDA 13.0 | 610.43.02, P2P-enabled |
-| CUDA toolkit | none on 3.0.x: the 0.32 environment carries CUDA 13.0 (nvcc 13.0.88) for FlashInfer's JIT; an inherited `CUDA_HOME` must pass the release's toolkit check ([install-0.32.md](../../../release/install-0.32.md)). The 0.30 install needed a system `nvcc` | 13.3 (0.30 install) |
+| CUDA toolkit | none on 3.0.x: the 0.33 environment carries CUDA 13.0 (nvcc 13.0.88) for FlashInfer's JIT; an inherited `CUDA_HOME` must pass the release's toolkit check ([install-0.33.md](../../../release/install-0.33.md)). The 0.30 install needed a system `nvcc` | 13.3 (0.30 install) |
 | Python | 3.13, with `venv` | 3.13 |
 | Tools | git, `sha256sum`, GNU `patch`, `flock` (util-linux) | |
 | Disk | about 17 GB (15.9 GiB) for the checkpoint, plus the venv and the engine source tree (`.vllm-v2.5.2`) | |
@@ -239,9 +242,9 @@ with the rank's CUDA device (0 and 1 on two cards, 0 to 3 on four, counted withi
 [flashinfer-sm8x-tile] smallq=cta32 q_len=5 rows=30 cta_tile_q=32 device=1
 ```
 
-For the 0.7.0.post1 port, verify tile selection after an MTP generation on every rank. The port uses JIT suffix
-`_sm8x_smallq_070_v1`. The imported `release/check-tile-proof.sh` is still the 0.6.18 checker until the shared tooling
-is ported; the old line example alone does not establish that the installed 0.32 environment contains the port.
+For the 0.7.2.post1 port, verify tile selection after an MTP generation on every rank. The port uses JIT suffix
+`_sm8x_smallq_072_v1` (`_070_v1` on 0.7.0.post1). `release/check-tile-proof.sh` is ported to 0.7.2.post1 and keeps the proof-line protocol; the old line example
+alone does not establish that the installed 0.33 environment contains the port.
 
 The pool is pinned in bytes,
 so any KV number other than the one the release check records means the serve command, the checkpoint or the
@@ -266,8 +269,8 @@ the check.
 - The model load is killed by the kernel's OOM killer with nothing useful in the vLLM log: host RAM is below the
   [requirement](#requirements).
 - FlashInfer fails to compile on the first boot or the first request: `nvcc` was not found, or an inherited
-  `CUDA_HOME` points at a different toolkit. The 0.32 environment carries its own CUDA 13.0 `nvcc`; unset `CUDA_HOME`,
-  or point it at a toolkit that passes the release's check ([install-0.32.md](../../../release/install-0.32.md)).
+  `CUDA_HOME` points at a different toolkit. The 0.33 environment carries its own CUDA 13.0 `nvcc`; unset `CUDA_HOME`,
+  or point it at a toolkit that passes the release's check ([install-0.33.md](../../../release/install-0.33.md)).
 - The tile proof line is missing from the log: FlashInfer is not the patched build (re-run
   `release/apply-flashinfer-patch.sh` in the venv), or `FLASHINFER_SM8X_FP8_SMALLQ` is set to the empty string.
   Decode then runs on stock FlashInfer, correct but slower at depth.
@@ -434,12 +437,12 @@ variants never share a compile-cache entry. Freeing VRAM does not enlarge the po
 
 | piece | 3.0.0 release target |
 |---|---|
-| engine | Merlin 3.0.0, **vLLM 0.32.0** |
-| attention | FlashInfer **0.7.0.post1** plus the ported sm_86 FP8 small-query tile, `FLASHINFER_SM8X_FP8_SMALLQ=cta32` |
+| engine | Merlin 3.0.2, **vLLM 0.33.0** |
+| attention | FlashInfer **0.7.2.post1** plus the ported sm_86 FP8 small-query tile, `FLASHINFER_SM8X_FP8_SMALLQ=cta32` |
 | prefix caching | **FGPC ON**, `--mamba-cache-mode align --enable-mamba-shared-prefix-checkpoint` |
 | pools | TP2 **826,689**, TP4 **2,012,105 tokens** at K=4 (TP4 = RecoverSSM on) |
 | vision | 27B TP2 serves images up to 8 MP. With the vision-peak option on (`VLLM_MERLIN_VISION_PEAK=1`, the TP2 launcher default), the 50-item TP2 stress sweep's worst minimum free was 806 MiB per card (2026-10-15), above the 524 MiB floor. A separate knob OFF/ON identity check matched tokens and logprobs on 6/6 prompts. Flash-Next (902 MiB) meets the target. 27B TP4 left 690 MiB free on the retired RecoverSSM-off pin; at the shipped chunk 4096 with RecoverSSM on, the 2026-10-20 bench card measured 862 MiB lowest free (one 8 MP image, two at once, and four in one prompt; 2 cards: 886 MiB), above the 524 MiB floor. |
-| dependencies | humming-kernels **0.1.17**, instanttensor **≥0.2.2**; complete pins belong to shared release tooling |
+| dependencies | humming-kernels **0.1.19**, Pillow **13.0.0**, instanttensor **≥0.2.2**; complete pins belong to shared release tooling |
 
 The table below records the historical v1.3.0 stack. Its bundle, compiled-artifact and dependency versions do not install 3.0.0.
 
@@ -447,7 +450,7 @@ The table below records the historical v1.3.0 stack. Its bundle, compiled-artifa
 | piece | v1.3.0 |
 |---|---|
 | engine | Merlin engine v2.5.2 (Flash-Next v2.5.1, i.e. vLLM v0.30.0 + 97 fork commits, plus the guard fix) plus `patches/merlin-engine-v2.5.2/0001-0011`; Model Runner V2. `upstream/PIN`: tag v2.5.2, commit `de6e2c2fe9e0`, tree `05e6d1a583e1`, on vLLM base commit `ced6857afa0e`; bundle sha256 `ab70e1a39768…`; compiled-artifact tarball (v2.2.0) sha256 `cdca5ffcb300…` |
-| environment | Python 3.13, torch 2.13.0 (CUDA 13.0 build), flashinfer-python 0.6.18.post1 with the 32-row tile patch, **transformers 5.18.0**, tokenizers 0.23.2, triton 3.7.1, nvidia-nccl-cu13 2.29.7, historical hash-locked environment (pip 26.2.1); current installs use `release/requirements-0.32.lock` with its complete 222-pin SHA-256 hash closure |
+| environment | Python 3.13, torch 2.13.0 (CUDA 13.0 build), flashinfer-python 0.6.18.post1 with the 32-row tile patch, **transformers 5.18.0**, tokenizers 0.23.2, triton 3.7.1, nvidia-nccl-cu13 2.29.7, historical hash-locked environment (pip 26.2.1); current installs use `release/requirements-0.33.lock` with its complete 223-pin SHA-256 hash closure |
 | shape | dual card TP=2 or quad card TP=4, MTP K=4 probabilistic, FULL_AND_PIECEWISE cudagraphs (captures `[1,2,4,5,8,10,15,20,25,30,35,40]` at K=4), `--max-num-seqs 16` / `24` (dual / quad card; the quad card serves 32 with `merlin serve --swarm` in 3.0.1), `--max-num-batched-tokens 2048`, `--long-prefill-token-threshold 832`, prefix caching with `--prefix-match-unit 16` and shared prefix checkpoints (`--enable-mamba-shared-prefix-checkpoint` in vLLM 0.32), RecoverSSM (`--use-replayssm`) on dual card, custom all-reduce off, `--gpu-memory-utilization 0.96` with the KV pin |
 | KV | `fp8_e4m3` with the checkpoint's calibrated scales, fp16 Mamba SSM cache, FlashInfer attention with the 32-row verify tile |
 | front end | OpenAI-compatible; Qwen3 reasoning parser, `qwen3_coder` tool parser with auto tool choice, up to 64 images per prompt (no video), froggeric v22.5 chat template |
@@ -562,9 +565,9 @@ serve scripts. The release check measured the shipped K=4 profiles only; K=3 and
 
 - **GSM8K-200** (first 200 test items, as-served sampling, exact-number match): release check **196** on dual card and **194** on
   quad card (0 errors; 3 and 4 generations cut at the token cap); on identical questions dual card was right on 2 that quad
-  card missed and quad card on none (exact McNemar p = 0.5). Dual card with the tile off: 194. A separate run on the delta-audit tree under another protocol (thinking off, temperature
+  card missed and quad card on none (exact McNemar p = 0.5). Dual card with the tile off: 194. A separate run on tree 3 under another protocol (thinking off, temperature
   0, 5-shot) gave 193; the two protocols are not compared.
-- **Release head re-check** (2026-10-11, the shipped engine as released, its guard fix then in series 0012, shipped scripts, fresh caches; bench
+- **Tree 5 re-check** (2026-10-11, the shipped engine as released, its guard fix then in series 0012, shipped scripts, fresh caches; bench
   card section 11): GSM8K-200 195 on dual card and 196 on quad card; 262K needle passed on both (307 s, 181 s); 8-conversation
   load 222 and 488 requests with 0 errors and 0 preemptions (prefix-cache hit 90.6 % and 96.5 %); multi-turn replay median
   follow-up 2.79 s and 1.78 s; loop gate 0 genuine collapses in 72 generations on each; warm prefix, tool call, reasoning
@@ -583,7 +586,7 @@ serve scripts. The release check measured the shipped K=4 profiles only; K=3 and
   correct). Images: see [`MAX_PIXELS`](#knobs); text decode with distinct 4 MP images encoded back to back (3 streams, thinking
   off) fell from 172.5 to 47.9 tok/s on dual card and from 235.8 to 61.5 on quad card, and the engine stayed up. **JSON-schema
   structured output was not tested at the check.**
-- **Tokenizer:** on the delta-audit tree (clean install, shipped scripts, the checkpoint with the upstream `tokenizer.json`) the
+- **Tokenizer:** on tree 3 (clean install, shipped scripts, the checkpoint with the upstream `tokenizer.json`) the
   served tokenizer equals the upstream one on the frozen 153-item combining-mark set plus controls (9 sets). An earlier run of
   the same check on the previous engine found transformers 5.18.0 matching upstream on every item of that set while 5.17.0
   diverged on each combining-mark script.

@@ -28,14 +28,14 @@ if not isinstance(text, dict):
     sys.exit("config.json has no text_config object; this is not the Flash-Next checkpoint this script is for")
 if KEY in text and text[KEY] != VAL:
     sys.exit(f"text_config.{KEY}={text[KEY]!r} already present; refusing to overwrite")
-stale_top = KEY in cfg   # left by the pre-fix version of this script; the engine never read it
+stale_top = KEY in cfg   # a top-level copy of the key, which the engine never reads
 if text.get(KEY) == VAL and not stale_top:
     print("already set"); sys.exit(0)
 if os.stat(p).st_nlink > 1:
     print(f"note: config.json has {os.stat(p).st_nlink} hard links; writing a new file so the other links stay unchanged")
 s = raw.decode("utf-8")
 if stale_top:
-    # remove the top-level copy (the pre-fix script wrote it right after the opening brace): the first
+    # remove the top-level copy: the first
     # occurrence of the key line that sits before "text_config" is the top-level one
     tc = s.index('"text_config"')
     mm = None

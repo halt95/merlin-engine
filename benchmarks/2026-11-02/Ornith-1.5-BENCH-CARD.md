@@ -5,7 +5,7 @@
 > defaults, one fresh boot per layout; the 3.0.1 bench runs were measured 2026-11-01 to 2026-11-02 (UTC); this template has no effort levels, so thinking-on rows are its full thinking, as on the 3.0.0 card.
 > Streams are client-timed; drivers, raw streams and boot logs are not published.
 >
-> Checkpoint: [halt95/Ornith-1.5-122B-A10B-W4A16-Merlin](https://huggingface.co/halt95/Ornith-1.5-122B-A10B-W4A16-Merlin). The 3.0.0 column is the [3.0.0 card (run 2026-10-21, filed under 2026-10-20)](../2026-10-20/Ornith-1.5-BENCH-CARD.md).
+> Checkpoint: [halt95/Ornith-1.5-122B-A10B-W4A16-Merlin](https://huggingface.co/halt95/Ornith-1.5-122B-A10B-W4A16-Merlin). The 3.0.0 column is the [3.0.0 card (run 2026-10-21)](../2026-10-20/Ornith-1.5-BENCH-CARD.md).
 > Layout: four cards (`ornith-quad-3090`), MTP, FP8 KV; thinking on (this template has no effort levels; the driver's `medium` has no effect); boot 292 s; KV pool 894,618 tokens.
 > Ornith's 3.0.0 card was measured on the 3.0.0 release with the Ornith-specific engine changes listed on that card;
 > the comparison is against that build.

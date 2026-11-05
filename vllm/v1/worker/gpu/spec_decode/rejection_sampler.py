@@ -7,8 +7,10 @@ from typing import Any
 import numpy as np
 import torch
 
+from vllm import envs
 from vllm.config import SpeculativeConfig
 from vllm.config.model import PROCESSED_LOGPROBS_MODES
+from vllm.merlin.spec_verify_fast_paths import spec_verify_batch_flags
 from vllm.triton_utils import tl, triton
 from vllm.v1.outputs import LogprobsTensors
 from vllm.v1.spec_decode.utils import unconditional_to_conditional_rates
@@ -150,6 +152,11 @@ def gather_draft_sampled(
 
 
 class RejectionSampler:
+    # Host mirrors, resolved in
+    # __init__; None (both shortcuts off) for a sampler built without them.
+    _temperature_np: np.ndarray | None = None
+    _may_mask_logits: np.ndarray | None = None
+
     def __init__(
         self,
         sampler: Sampler,
@@ -166,6 +173,9 @@ class RejectionSampler:
         self.enable_adaptive_verification = spec_config.enable_adaptive_verification
         rejection_sample_method = spec_config.rejection_sample_method
         self.use_block_verification: bool = False
+        self.fly_window_size = 0
+        self.fly_entropy_threshold = spec_config.fly_entropy_threshold
+        self.fly_entropy_top_k = spec_config.fly_entropy_top_k
         self.synthetic_conditional_rates: torch.Tensor | None = None
         if rejection_sample_method == "synthetic":
             assert spec_config.synthetic_acceptance_rates is not None
@@ -178,6 +188,22 @@ class RejectionSampler:
             )
         elif rejection_sample_method == "block":
             self.use_block_verification = True
+        elif rejection_sample_method == "fly":
+            assert spec_config.fly_window_size is not None
+            self.fly_window_size = spec_config.fly_window_size
+        # The stable-residual switch is resolved once at init.
+        self.stable_residual = bool(envs.VLLM_SPEC_STABLE_RESIDUAL)
+        # The sampler's host
+        # mirrors once here, not per verify step. Both are allocated once and
+        # written in place (add_request), so the references stay current. A
+        # sampler without them (a custom or stub sampler) keeps the legacy
+        # launch: both shortcuts off.
+        self._temperature_np = getattr(
+            getattr(getattr(sampler, "sampling_states", None), "temperature", None),
+            "np",
+            None,
+        )
+        self._may_mask_logits = getattr(sampler, "may_mask_logits", None)
         # Step-keyed acceptance draws (block only). Static: read once
         # here, before any graph is captured.
         self.step_keyed_rng = resolve_step_keyed_rng(rejection_sample_method)
@@ -275,6 +301,11 @@ class RejectionSampler:
             expanded_local_pos,
             seq_lens_upper_bound_np,
         )
+        # Host flags for this chunk,
+        # derived from the mirrors resolved in __init__.
+        all_greedy, skip_masked_vocab_blocks = spec_verify_batch_flags(
+            self._temperature_np, self._may_mask_logits, idx_mapping_np
+        )
         sampled, num_sampled = rejection_sample(
             processed_logits,
             draft_logits,
@@ -290,6 +321,12 @@ class RejectionSampler:
             self.synthetic_conditional_rates,
             use_fp64=self.sampler.use_fp64_gumbel,
             use_block_verification=self.use_block_verification,
+            fly_window_size=self.fly_window_size,
+            all_greedy=all_greedy,
+            skip_masked_vocab_blocks=skip_masked_vocab_blocks,
+            fly_entropy_threshold=self.fly_entropy_threshold,
+            fly_entropy_top_k=self.fly_entropy_top_k,
+            stable_residual=self.stable_residual,
             step_keyed_rng=self.step_keyed_rng,
             **self._watermarking_kwargs(
                 draft_sampled, expanded_idx_mapping, expanded_local_pos

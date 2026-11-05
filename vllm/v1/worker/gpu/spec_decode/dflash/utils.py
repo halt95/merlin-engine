@@ -89,7 +89,6 @@ def load_dflash_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
         dflash_model.lm_head = target_lm_head
 
     return dflash_model
-# The DFlash2 checkpoint helpers follow.
 
 
 def _find_target_embed_tensor(model_dir: str) -> tuple[str, str]:

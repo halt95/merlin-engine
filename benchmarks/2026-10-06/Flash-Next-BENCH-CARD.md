@@ -192,14 +192,14 @@ from the images, 4/4.
 | v2.5.0 (control, block-aligned hits) | 20/20 | 20/20 | 20/20 | 4/4 |
 
 Greedy repeatability at depth was not re-run for v2.5.1 (the decode path is v2.5.0's); see
-[the v2.5.0 card, section 6](../2026-10-05/Flash-Next-BENCH-CARD_OLD.md#6-greedy-repeatability-at-depth-release-candidate).
+[the v2.5.0 card, section 6](https://github.com/halt95/merlin-engine/blob/merlin-v3.0.1/benchmarks/2026-10-05/Flash-Next-BENCH-CARD_OLD.md#6-greedy-repeatability-at-depth-release-candidate).
 
 ## 7. Fault containment and shutdown
 
 - Not re-run for v2.5.1: fault injection, the shipped-default-variables boot and the tool-call, reasoning-split and
   chat-template smoke (v2.5.1 changes the prefix cache and
   the scheduler only);
-  [the v2.5.0 card, section 7](../2026-10-05/Flash-Next-BENCH-CARD_OLD.md#7-fault-containment-and-shutdown-release-candidate),
+  [the v2.5.0 card, section 7](https://github.com/halt95/merlin-engine/blob/merlin-v3.0.1/benchmarks/2026-10-05/Flash-Next-BENCH-CARD_OLD.md#7-fault-containment-and-shutdown-release-candidate),
   has the release-candidate results.
 - Known issue, not reached by the shipped configuration: with pipeline parallelism, blocks whose release is deferred
   can make the shared-prefix shortcut over-report a common prefix; only cascade attention on the V1 runner consumes it,

@@ -11,6 +11,7 @@
 
 import torch
 
+from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.v1.worker import guard_telemetry
 
@@ -120,10 +121,8 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
             # read before this request's row (and before the tensor for
             # i_n == 0); a stale or too-large count reads past the row. The
             # state_idx <= 0 guard below rejects only non-positive values, so
-            # an out-of-range read returning a garbage positive int flowed into
-            # h0 + state_idx * stride_init_state_token and faulted the SM.
-            #
-            # This is the SAME defect as the decode-state guard, in the twin kernel.
+            # an out-of-range read must be masked here: a garbage positive int
+            # would otherwise become an offset into h0.
             idx_in_row = (i_t >= 0) & (i_t < stride_indices_seq)
             if (i_t < 0) or (i_t >= stride_indices_seq):
                 tl.atomic_add(guard_ctr, 1)
@@ -134,9 +133,9 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
                 mask=idx_in_row,
                 other=0,
             ).to(tl.int64)
-            # Skip invalid state indices without exposing uninitialized output.
-            # o is q.new_empty in the entry below, so the previous early return
-            # left this request's rows holding whatever the allocator returned.
+            # Skip invalid state indices without exposing uninitialized output:
+            # o is q.new_empty in the entry below, so a skipped request's rows
+            # are zeroed here.
             if state_idx <= 0:
                 zero = tl.zeros([BV], dtype=tl.float32).to(p_o.dtype.element_ty)
                 for _ in range(0, T):
@@ -312,6 +311,10 @@ def fused_recurrent_gated_delta_rule_packed_decode_kernel(
     SOFTPLUS_THRESHOLD: tl.constexpr,
     USE_QK_L2NORM_IN_KERNEL: tl.constexpr,
     SPLIT_BATCH_HEAD_GRID: tl.constexpr,
+    # vllm#65338: the
+    # reciprocal-square-root L2 norm of the spec-verify recurrences. Off keeps
+    # the stock divide-by-sqrt, bit for bit.
+    VERIFY_PARITY: tl.constexpr = False,
 ):
     if SPLIT_BATCH_HEAD_GRID:
         i_v, i_hv, i_n = tl.program_id(0), tl.program_id(1), tl.program_id(2)
@@ -348,8 +351,14 @@ def fused_recurrent_gated_delta_rule_packed_decode_kernel(
     b_v = tl.load(p_mixed + v_off, mask=mask_v, other=0).to(tl.float32)
 
     if USE_QK_L2NORM_IN_KERNEL:
-        b_q = b_q / tl.sqrt(tl.sum(b_q * b_q) + 1e-6)
-        b_k = b_k / tl.sqrt(tl.sum(b_k * b_k) + 1e-6)
+        # Rsqrt form under
+        # VERIFY_PARITY, as fused_sigmoid_gating and the RecoverSSM verify do.
+        if VERIFY_PARITY:
+            b_q = b_q * tl.rsqrt(tl.sum(b_q * b_q) + 1e-6)
+            b_k = b_k * tl.rsqrt(tl.sum(b_k * b_k) + 1e-6)
+        else:
+            b_q = b_q / tl.sqrt(tl.sum(b_q * b_q) + 1e-6)
+            b_k = b_k / tl.sqrt(tl.sum(b_k * b_k) + 1e-6)
     b_q = b_q * scale
 
     a_val = tl.load(a + i_n * stride_a_tok + i_hv).to(tl.float32)
@@ -384,7 +393,11 @@ def fused_recurrent_gated_delta_rule_packed_decode(
     out: torch.Tensor,
     ssm_state_indices: torch.Tensor,
     use_qk_l2norm_in_kernel: bool = False,
+    verify_parity: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    # verify_parity=True runs
+    # vllm#65338's numerics (rsqrt L2 norm, 4 warps), matching the recurrent
+    # kernels that verify speculative tokens; False keeps the stock kernel.
     if mixed_qkv.ndim != 2:
         raise ValueError(
             f"`mixed_qkv` must be a 2D tensor (got ndim={mixed_qkv.ndim})."
@@ -472,8 +485,21 @@ def fused_recurrent_gated_delta_rule_packed_decode(
             f"Packed decode kernel only supports NK=1 (got K={K}, BK={BK})."
         )
     BV = min(triton.next_power_of_2(V), 32)
+    if (
+        K == V == 128
+        and current_platform.is_cuda()
+        and current_platform.is_device_capability_family(100, device_id=dev.index)
+    ):
+        # Tuned on GB300; validated on GB200 and with 148 SMs.
+        # MRv2 decode warmup/graph capture compiles the reachable BV variants.
+        if B * HV <= 64:
+            BV = 4
+        elif initial_state.dtype == torch.float32:
+            BV = 8
     num_stages = 3
-    num_warps = 1
+    # 4 warps lay the tl.sum
+    # reductions out as the verify kernels do (both factors are needed).
+    num_warps = 4 if verify_parity else 1
 
     stride_mixed_qkv_tok = mixed_qkv.stride(0)
     stride_a_tok = a.stride(0)
@@ -512,6 +538,7 @@ def fused_recurrent_gated_delta_rule_packed_decode(
         SOFTPLUS_THRESHOLD=20.0,
         USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
         SPLIT_BATCH_HEAD_GRID=split_batch_head_grid,
+        VERIFY_PARITY=verify_parity,
         num_warps=num_warps,
         num_stages=num_stages,
     )

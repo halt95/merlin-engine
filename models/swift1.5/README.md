@@ -1,4 +1,4 @@
-# Swift 1.5 · Merlin 3.0.1
+# Swift 1.5 · Merlin 3.0.2
 
 The launcher serves Froggeric's fixed Qwen3.8 template,
 [`froggeric-qwen-v22.5.jinja`](../qwen38-27b/templates/froggeric-qwen-v22.5.jinja), the same template as the
@@ -7,7 +7,7 @@ The launcher serves Froggeric's fixed Qwen3.8 template,
 the first turn, so coding agents' per-turn notes stay in place on `/v1/messages` and the prefix cache keeps
 hitting. `CHAT_TEMPLATE=<path>` serves another template; `CHAT_TEMPLATE=` (empty) serves the checkpoint's own.
 
-Recipe version: [3.0.0](VERSION). The engine lives at the repository root and currently uses **vLLM 0.32.0** plus the Merlin changes. The weights stay on Hugging Face:
+Recipe version: [3.0.0](VERSION). The engine lives at the repository root and currently uses **vLLM 0.33.0** plus the Merlin changes. The weights stay on Hugging Face:
 
 [halt95/Swift1.5-Qwen3.8-Flash-Next-W4A16-Merlin](https://huggingface.co/halt95/Swift1.5-Qwen3.8-Flash-Next-W4A16-Merlin).
 
@@ -15,16 +15,20 @@ This is a W4A16 build of [UkisAI's Swift 1.5](https://huggingface.co/ukisai/Swif
 
 ## Qualification status
 
-The canonical [serve.sh](serve.sh) is generated from the checkpoint profile in `tools/merlin/profiles/flash-next.json` by `tools/merlin/preflight.py`; it starts this checkout directly. It passed its qualification run on 2026-10-16: boot 443 s, GSM8K-20 19/20, ITL 4K / 32K 18.78 / 18.84 ms, 27/27 T=0 outputs matched the Flash-Next quad's Swift 1.5 outputs (report-only because argv differs); the 2026-10-20 Merlin 3.0.0 release bench card then passed it: GSM8K-200 197/200, pool 924,993; needles 23/23 at 262K and 10/10 at 131K (needle panel from the 2026-10-17 pre-release build). It is tested on the reference host.
+The canonical [serve.sh](serve.sh) is generated from the checkpoint profile in `tools/merlin/profiles/flash-next.json` by `tools/merlin/preflight.py`; it starts this checkout directly. A boot-and-check run of the generated launcher on 2026-10-16 gave: boot 443 s, GSM8K-20 19/20, ITL 4K / 32K 18.78 / 18.84 ms, 27/27 T=0 outputs matched the Flash-Next quad's Swift 1.5 outputs (report-only because argv differs); the 2026-10-20 Merlin 3.0.0 release bench card then measured GSM8K-200 197/200, pool 924,993; needles 23/23 at 262K and 10/10 at 131K (needle panel from the 2026-10-17 pre-release build). It is tested on the reference host.
 
 | Evidence | Status |
 |---|---|
 | Swift vision at 8 MP (8,388,608 pixels per image) | Measured on 2026-10-15 on 4× RTX 3090 / 0.32: **stage-0 minimum free memory 902 MiB** (different served configuration). Generated launcher, 2026-10-16 8 MP burst after 8K prefill: **544 MiB**, 20 MiB above the 524 MiB floor |
-| Generated 0.32 launcher on the assembled release tree | the launcher qualification passed (2026-10-16); the 2026-10-20 release bench card passed: tested on the reference host |
+| Generated 0.32 launcher on the assembled release tree | a boot-and-check run of the generated launcher (2026-10-16) and the 2026-10-20 release bench card both ran clean: tested on the reference host |
 | KV pool and session residency | 924,993 tokens was measured on the generated launcher (2026-10-16); 3 × 262K and 6 × 131K sessions held at once on the 2026-10-20 bench card |
 | Decode, prefill, follow-up latency and quality | 2026-11-02 bench card (below): decode 176 / 186 / 186 tok/s at 4K / 131K / 262K, cold prefill 6,623 / 7,043 tok/s at 10K / 100K; agents (8 × 16K) 673 tok/s thinking on, 650 thinking off; GSM8K-200 199/200 at medium. The 2026-10-20 3.0.0 card (BF16 draft head): decode 177 / 180 / 177 tok/s, cold prefill 5,676 / 6,055 tok/s, agents 643 tok/s, GSM8K-200 197/200 thinking off. Historical, the 2026-10-17 pre-release bench run (INT8 draft head): agents aggregate 256 / 409 / 657 tok/s at n=2 / 4 / 8, GSM8K 198/200. The launcher qualification measured GSM8K-20 19/20 and ITL 18.78 / 18.84 ms at 4K / 32K; other earlier results are historical |
 
 [Swift1.5-Huihui](../swift1.5-huihui/README.md) inherits Swift's heavy results. Its generated launcher independently passed the 2026-10-16 8 MP check with 902 MiB minimum free.
+
+## Merlin 3.0.2
+
+This checkpoint was not benchmarked for 3.0.2. It was not run on the 3.0.2 wheel before release. The 3.0.1 bench card below is the latest measurement and was taken on vLLM 0.32. There is no 3.0.2 card.
 
 ## Merlin 3.0.1 bench card (2026-11-02)
 
@@ -42,9 +46,9 @@ Maintainer measurements on 4× RTX 3090 (220 W, PCIe Gen4) with P2P (the aikitor
 
 ## Quick start
 
-This checkout includes the generated 0.32 launcher. Build and install the engine from this checkout using the repository-wide [release instructions](../../release/README.md); installation and container qualification are separate release checks.
+This checkout includes the generated 0.33 launcher. Build and install the engine from this checkout using the repository-wide [release instructions](../../release/README.md); installation and container qualification are separate release checks.
 
-The shared 0.32 installer is integrated. The dependency lock is complete: 222 exact pins with artifact SHA-256 hashes, resolved with uv; a dry-run `--require-hashes` install resolves. From the repository root, with the Hugging Face CLI available:
+The shared 0.33 installer is integrated. The dependency lock is complete: 223 exact pins with artifact SHA-256 hashes, resolved with uv; a dry-run `--require-hashes` install resolves. From the repository root, with the Hugging Face CLI available:
 
 ```bash
 venv/bin/hf download halt95/Swift1.5-Qwen3.8-Flash-Next-W4A16-Merlin \
@@ -58,7 +62,7 @@ TREE="$PWD" VENV="$PWD/venv" CACHE_ROOT="$PWD/.vllm-cache" \
   bash models/swift1.5/serve.sh "$PWD/ckpt-swift"
 ```
 
-Set `VENV` to the environment in which this checkout was installed. Reference host: NVIDIA driver 610.43.02 (reports CUDA 13.3). The release lock selects a matched CUDA 13.0 toolkit (nvcc, crt, nvvm, nvJitLink 13.0.88, cccl 13.0.85, runtime 13.0.96, the pair torch 2.13.0 cu130 ships with); the release wheel is served on it by every recipe (2026-10-20). Other CUDA 13.x drivers (R580 or later) are expected to work through CUDA minor-version compatibility, but are untested. See the [driver requirements](../../release/install-0.32.md). The checksum list leaves out the HF card's `README.md`, so card edits do not affect verification.
+Set `VENV` to the environment in which this checkout was installed. Reference host: NVIDIA driver 610.43.02 (reports CUDA 13.3). The release lock selects a matched CUDA 13.0 toolkit (nvcc, crt, nvvm, nvJitLink 13.0.88, cccl 13.0.85, runtime 13.0.96, the pair torch 2.14.0 cu130 ships with); the 3.0.0 release wheel was served on it by every recipe (2026-10-20); the 3.0.2 wheel was served on it on 2026-11-04 by Flash-Next, Qwen3.8-27B (1, 2 and 4 GPUs), Nemotron 3.5 Super VL and Ornith 1.5, each with a 262K request. Other CUDA 13.x drivers (R580 or later) are expected to work through CUDA minor-version compatibility, but are untested. See the [driver requirements](../../release/install-0.33.md). The checksum list leaves out the HF card's `README.md`, so card edits do not affect verification.
 
 ## Launcher defaults
 
@@ -95,7 +99,7 @@ Requests may choose `reasoning_effort` or disable thinking through `chat_templat
 
 ## Known limitations
 
-The generated launcher passed its qualification run and the 3.0.0 bench card. The 544 MiB result (20 MiB above the floor) records the generated launcher's measured 8 MP stage-0 margin; it is not a guarantee for larger images, other layouts or other hardware. Legacy speed, quality and cache-reuse numbers remain in their dated records.
+The generated launcher ran clean in its 2026-10-16 boot-and-check run and in the 3.0.0 bench card. The 544 MiB result (20 MiB above the floor) records the generated launcher's measured 8 MP stage-0 margin; it is not a guarantee for larger images, other layouts or other hardware. Legacy speed, quality and cache-reuse numbers remain in their dated records.
 
 ## Credits
 

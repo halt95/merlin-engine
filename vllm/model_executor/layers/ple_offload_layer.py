@@ -173,8 +173,6 @@ class CpuGpuSemaphore:
         )
 
 
-
-
 def _ple_offload_wait_impl(
     sem_flag_tensor: torch.Tensor,
     gpu_output_buffer: torch.Tensor,
@@ -210,8 +208,6 @@ direct_register_custom_op(
     mutates_args=["gpu_output_buffer"],
     fake_impl=_ple_offload_wait_fake,
 )
-
-
 
 
 _PULL_LAYERS: dict[str, "PleOffloadLayer"] = {}

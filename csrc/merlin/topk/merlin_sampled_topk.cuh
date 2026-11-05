@@ -1,37 +1,15 @@
-// merlin-hook: csrc-topk-vendored
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+// Modified by the Merlin project; see NOTICE.
 // Sampled top-k for the vendored persistent top-k launcher (topk.cu in this
-// directory). Ported from upstream vLLM v0.32.0rc0 (fe341a53dd) so the Merlin
-// op merlin_persistent_topk has upstream 0.32's dispatch order:
+// directory), adapted from upstream vLLM's sampled top-k so that the Merlin op
+// merlin_persistent_topk keeps upstream's dispatch order:
 //   sampled (> 64 rows, long rows, >= 144 KiB smem) -> FilteredTopK -> persist.
 //
-// Provenance -- the two code blocks below are byte-for-byte upstream text;
-// only the namespace wrapper around them is ours:
-//   block A = csrc/persistent_topk.cuh:982-1282 @ v0.32.0rc0
-//             (vec_t, FilteredTopKTraits<float>, the FILTERED_TOPK_* constants,
-//              FilteredTopKStorage, filtered_topk_row -- the 0.32 refactor of
-//              FilteredTopKUnifiedKernel's body into a per-row device function
-//              with the CheckOverflow escape the sampled fallback needs)
-//   block B = csrc/sampled_topk.cuh:20-251 @ v0.32.0rc0 (the whole body of
-//             namespace vllm::sampled_topk)
-// FLASHINFER_CUDA_CALL (upstream :974-980) is left out: it is only used by the
-// host-side FilteredTopKRaggedTransform launcher, which is not ported here.
-//
-// Why a copy and not "#include persistent_topk.cuh" as upstream does: our
-// vendored persistent_topk.cuh is the 0.30 file, whose FilteredTopK kernel
-// predates the 0.32 refactor and has no filtered_topk_row/FilteredTopKStorage.
-// Changing that header would change the FilteredTopKUnifiedKernel source, and
-// the kernel-identity claim needs it (and the persistent kernel) unchanged. So
-// the 0.32 per-row FilteredTopK lives here, used ONLY by the sampled kernel.
-//
-// Symbols: the vendored top-k lives under namespace merlin (was vllm), so it
-// cannot collide with upstream's csrc/topk.cu, which is compiled again and
-// owns _C::persistent_topk (see csrc/merlin/merlin.cmake). This file uses
-// merlin::sampled_topk (kernel) and merlin::sampled_topk::filtered_topk
-// (block A) -- the latter nested so it cannot meet the 0.30
-// merlin::filtered_topk. Inside block B the unqualified `filtered_topk::`
-// resolves to the nested namespace and `topk_histogram_4096::` to
-// merlin::topk_histogram_4096 (the vendored copy). Normalising merlin -> vllm
-// gives upstream's own vllm::sampled_topk::sampled_topk_kernel<K> name.
+// The kernel and the per-row FilteredTopK it uses (the nested
+// merlin::sampled_topk::filtered_topk namespace) are upstream text under our
+// own namespace, so they cannot collide with upstream's csrc/topk.cu, which is
+// compiled again and owns _C::persistent_topk (see csrc/merlin/merlin.cmake).
 //
 // Reachability: the launcher gates this kernel exactly as upstream does
 // (num_rows > 64, max_seq_len >= kMinSampledLength<K>, opt-in smem per block
@@ -53,7 +31,6 @@ namespace filtered_topk {
 
 namespace hist4096 = topk_histogram_4096;
 
-// ---- block A: upstream v0.32.0rc0 csrc/persistent_topk.cuh:982-1282 ----
 #define FLASHINFER_INLINE inline __attribute__((always_inline)) __device__
 
 template <typename T, size_t N>
@@ -355,11 +332,9 @@ __device__ __forceinline__ bool filtered_topk_row(
   }
   return true;
 }
-// ---- end block A ----
 
 }  // namespace filtered_topk
 
-// ---- block B: upstream v0.32.0rc0 csrc/sampled_topk.cuh:20-251 ----
 constexpr int kThreads = 1024;
 // Conservative crossover bounds from the B300 batch/length sweep.
 template <int K>
@@ -592,7 +567,6 @@ __global__ void __launch_bounds__(kThreads)
     emit<false>(s, row, dst, length, exact_cutoff);
   }
 }
-// ---- end block B ----
 
 }  // namespace sampled_topk
 }  // namespace merlin

@@ -75,7 +75,7 @@ Other sources in the served checkpoint:
   - tokenizer.json: Qwen's upstream file from Qwen/Qwen3.8-Flash-Next (sha256
     0997f410c57a1f4e53b09e4be8f4a172d90edd9564368fb0847030937229b9f3, Qwen Community License 1.0), the file the Swift 1.5
     W4A16 checkpoint has shipped since 2026-10-06; shipped byte-identical.
-  - Serving engine: this repository's Merlin 3.0.0 engine (a modified vLLM, Apache License 2.0; see NOTICE), unchanged
+  - Serving engine: this repository's Merlin 3.0.2 engine (a modified vLLM, Apache License 2.0; see NOTICE), unchanged
     for this checkpoint.
 
 Changes made in this derivative (halt95, 2026). Every file below is modified or added relative to

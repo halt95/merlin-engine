@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+// Modified by the Merlin project; see NOTICE.
 // Persistent TopK kernel for DeepSeek V3 sparse attention indexer.
 // See persistent_topk.cuh for kernel implementation.
 
@@ -15,7 +18,7 @@
 
 #ifndef USE_ROCM
   #include "persistent_topk.cuh"
-  // The ported upstream 0.32 sampled branch is its own translation unit
+  // The sampled branch (ported from upstream) is its own translation unit
   // (sampled_topk.cu): only its launch interface is visible here.
   #include "merlin/topk/merlin_sampled_topk_launch.h"
 #endif
@@ -25,29 +28,25 @@ namespace {
 #ifndef USE_ROCM
 
 // ---------------------------------------------------------------------------
-// The persistent_topk policy switches are FOLDED to their shipped values:
-// MERLIN_TIE_DET=1, MERLIN_TIE_RECENT=1, MERLIN_TOPK_EXACT_MEDIUM=1,
-// MERLIN_TOPK_DET_LARGE=1, MERLIN_TOPK_SORTED_EMIT=1. No environment variable
-// is read. The host-side A/B control arms are gone; the kernel keeps its
-// runtime parameters and branches, so the device code is byte-identical to the
-// switchable build.
+// Persistent TopK policy. The tie, exact-restart and sorted-emission policies
+// are fixed at their shipped values: deterministic ties, most-recent-wins
+// direction, exact medium restart, deterministic large path, in-kernel sorted
+// emission. No environment variable is read; the kernel still takes each
+// policy as a runtime parameter.
 //
-// Our own policy rather than upstream's VLLM_BATCH_INVARIANT, which aborts
-// engine startup on GDN models (upstream #42960) and so can never reach this
-// kernel on Flash-Next.
+// This is Merlin's own policy rather than upstream's VLLM_BATCH_INVARIANT, which
+// aborts engine startup on GDN models (upstream #42960) and so can never reach
+// this kernel on Flash-Next.
 // ---------------------------------------------------------------------------
-// -------------------------------------------------------------------------
-// A READ-ONLY MIRROR of the
-// switches as this process CACHED them, for persistent_topk_toggle_state().
+// Read-only mirror of the cached policy values, for
+// persistent_topk_toggle_state().
 //
-// Each switch below is a function-local static filled once on first use. Its
-// initialiser also stores the value into the matching atomic here
-// (publish_cached), and nothing else ever writes these atomics, so a mirror
-// either says "not initialised yet" (-1) or holds exactly the cached value --
-// the toggle-state word reads exactly as it did in the served configuration
-// of the switchable build (2 before the first launch, the shipped value after).
-// The query only LOADS them: it never calls a getter. Host code only.
-// -------------------------------------------------------------------------
+// Each getter below caches its value in a function-local static filled once on
+// first use. The initialiser also stores the value into the matching atomic
+// here (publish_cached), and nothing else writes these atomics, so a mirror
+// holds either -1 (not initialised yet) or exactly the cached value. The query
+// only loads them and never calls a getter. Host code only.
+// ---------------------------------------------------------------------------
 std::atomic<int> g_cached_tie_recent{-1};
 std::atomic<int> g_cached_tie_det{-1};
 std::atomic<int> g_cached_exact_medium{-1};
@@ -60,9 +59,7 @@ bool publish_cached(std::atomic<int>& mirror, bool value) {
   return value;
 }
 
-// Tie DIRECTION (was MERLIN_TIE_RECENT): most-recent-wins. Measured at 12k
-// tokens: oldest-wins costs -7.9 % decode,
-// most-recent-wins is +1.5 %. Both deterministic. Also the direction
+// Tie direction: most-recent-wins, deterministic. It is also the direction
 // medium_exact_restart() implements, so the medium path agrees with itself on
 // overflowing rows.
 bool tie_recent_enabled() {
@@ -70,29 +67,29 @@ bool tie_recent_enabled() {
   return enabled;
 }
 
-// Deterministic tie-break at the k-th cutoff (was MERLIN_TIE_DET).
+// Deterministic tie-break at the k-th cutoff.
 bool det_ties_enabled() {
   static const bool enabled = publish_cached(g_cached_tie_det, true);
   return enabled;
 }
 
-// Medium-path exact restart (was MERLIN_TOPK_EXACT_MEDIUM, default ON).
+// Medium-path exact restart.
 bool exact_medium_enabled() {
   static const bool enabled = publish_cached(g_cached_exact_medium, true);
   return enabled;
 }
 
-// Large-path deterministic emission (was MERLIN_TOPK_DET_LARGE, default ON).
-// The kernel keeps the v2.0.1 `radix_topk` tail behind `if (det_large)`; with
-// det ties on, a launch whose ctas_per_group overflows the staging row
-// (det_large_fits in launch_persistent_topk) takes exact_rows_topk_kernel
-// instead, so the tail only runs with det ties off.
+// Large-path deterministic emission. The kernel keeps the baseline
+// `radix_topk` tail behind `if (det_large)`; with det ties on, a launch whose
+// ctas_per_group overflows the staging row (det_large_fits in
+// launch_persistent_topk) takes exact_rows_topk_kernel instead, so the tail
+// only runs with det ties off.
 bool det_large_enabled() {
   static const bool enabled = publish_cached(g_cached_det_large, true);
   return enabled;
 }
 
-// Decode-path exact restart: ON. A decode row whose buffered candidates
+// Decode-path exact restart. A decode row whose buffered candidates
 // overflow DBUF takes the medium path's exact restart instead of ranking a
 // truncated set, which could drop a true winner. Counter [10] still counts
 // every overflowing decode row.
@@ -102,13 +99,12 @@ bool exact_decode_enabled() {
 }
 
 // ---------------------------------------------------------------------------
-// Sorted emission (was MERLIN_TOPK_SORTED_EMIT): every persistent_topk row
-// leaves the op in the canonical order the Python MERLIN_QSA_SORT imposes
-// (ascending index, padding last as -1), so qsa_indexer.py can drop that sort.
-// See sorted_emit_row() in persistent_topk.cuh for the contract; the selected
-// SET is never touched. qsa_indexer.py asks THIS cache, through
-// toggle-state field 6, after its first launch -- so the Python sort is
-// skipped only when the kernel that ran says it sorted.
+// Sorted emission: every persistent_topk row leaves the op in canonical order
+// (ascending index, padding last as -1), so qsa_indexer.py can skip its own
+// sort. See sorted_emit_row() in persistent_topk.cuh for the contract; the
+// selected SET is never touched. qsa_indexer.py asks this cache, through
+// toggle-state field 6, after its first launch, so it skips its sort only when
+// the kernel that ran says it sorted.
 // ---------------------------------------------------------------------------
 bool sorted_emit_enabled() {
   static const bool enabled = publish_cached(g_cached_sorted_emit, true);
@@ -116,21 +112,12 @@ bool sorted_emit_enabled() {
 }
 
 // ---------------------------------------------------------------------------
-// Say the effective tie policy out loud, once.
+// Report the effective tie policy once per process.
 //
-// The tie flags alone do not show what each of the three paths
-// applies.  One stderr line at the first
-// launch of the process naming the policy the kernel will actually apply on
-// EVERY path.  It is a plain fprintf on the host: no CUDA call, so it is safe
-// from a capturing thread, and the `static` initialiser makes it exactly once
-// per process regardless of how many workers share the log.
-//
-// The line covers all FIVE paths and the host fallbacks.  The large
-// path is no longer a fixed rule: `radix_emit_deterministic` takes the same
-// `effective_tie_recent()` value as the medium restart, so `large=` reports
-// the real direction when MERLIN_TOPK_DET_LARGE is on and the inherited
-// v2.0.1 atomic-arrival race when it is off.  The flags printed are the folded
-// values above.
+// One stderr line at the first launch names the policy the kernel applies on
+// every path. It is a plain fprintf on the host with no CUDA call, so it is safe
+// from a capturing thread, and the `static` initialiser makes it fire exactly
+// once per process regardless of how many workers share the log.
 // ---------------------------------------------------------------------------
 void report_tie_policy_once() {
   static const bool reported = [] {
@@ -165,10 +152,10 @@ void report_tie_policy_once() {
 }
 
 #if MERLIN_TOPK_DIAG_ANY
-// DIAGNOSTIC BUILD ONLY (persistent_topk.cuh, "DIAGNOSTIC BUILDS ONLY").  Say
-// so once per process, on stderr, before the first launch: the diagnostic-build tests
-// key on this line to prove which build they ran against, and a
-// startup-warning scan must reject any process that prints it.
+// DIAGNOSTIC BUILD ONLY (persistent_topk.cuh, "DIAGNOSTIC BUILDS ONLY"). Say
+// so once per process, on stderr, before the first launch, so a diagnostic build
+// is recognisable in the log; a startup-warning scan must reject any process
+// that prints it.
 void report_diag_build_once() {
   static const bool reported = [] {
     std::fprintf(stderr,
@@ -323,9 +310,9 @@ void launch_persistent_topk(const torch::stable::Tensor& logits,
     max_smem_per_block = device_prop->sharedMemPerBlockOptin;
   }
 
-  // MERLIN_TOPK_SORTED_EMIT on the two fallbacks that bypass
-  // persistent_topk_kernel: re-emit every row ascending on the same stream.
-  // A plain launch with a fixed configuration, so it is capture-safe.
+  // Re-emit every row ascending, on the same stream, for the two fallbacks
+  // that bypass persistent_topk_kernel. A plain launch with a fixed
+  // configuration, so it is capture-safe.
   const auto sorted_emit_fallback_rows = [&]() {
     if (!sorted_emit_enabled()) return;
     report_tie_policy_once();
@@ -336,24 +323,16 @@ void launch_persistent_topk(const torch::stable::Tensor& logits,
             static_cast<uint32_t>(num_rows));
   };
 
-  // Upstream v0.32.0rc0 csrc/topk.cu:40-54, ported here:
-  // the sampled branch runs ahead of FilteredTopK,
-  // with upstream's three gates unchanged. sm_86 / sm_89 (99 KiB opt-in smem)
-  // fail the smem gate, so the served path below is untouched there. Ours
-  // differs from upstream in three places: the kernel and its constants
-  // come from merlin::sampled_topk (symbol isolation), the rows are
-  // re-emitted ascending afterwards, as on the FilteredTopK branch, because
-  // qsa_indexer.py skips its own sort when toggle-state field 6 says the
-  // kernel sorted, and the gate below closes the branch under the deterministic
-  // tie policy.
-  // merlin-hook: det-ties-fallback-gate. The atomic fallbacks (sampled_topk
-  // and FilteredTopK here, top_k_per_row_decode / FilteredTopK when the
-  // cooperative launch does not fit) settle ties by atomic arrival order, so
-  // they are closed whenever the deterministic tie policy is on (the default).
-  // Those requests take persistent_topk_kernel, or exact_rows_topk_kernel where
-  // it cannot run deterministically. sm_86 / sm_89 report 99 KiB of opt-in
-  // smem, so gate_open() (>= 144 KiB) and the FilteredTopK test (>= 128 KiB)
-  // are already false there.
+  // Fallbacks that settle ties by atomic arrival order: the sampled branch
+  // (sampled_topk) and FilteredTopK here, and top_k_per_row_decode /
+  // FilteredTopK when the cooperative launch does not fit. Their rows are
+  // re-emitted ascending afterwards, because qsa_indexer.py skips its own sort
+  // when toggle-state field 6 says the kernel sorted. sm_86 / sm_89 report
+  // 99 KiB of opt-in smem, so gate_open() (>= 144 KiB) and the FilteredTopK
+  // test (>= 128 KiB) are already false there.
+  // The fallbacks are closed whenever the deterministic tie policy is on (the
+  // default). Those requests take persistent_topk_kernel, or
+  // exact_rows_topk_kernel where it cannot run deterministically.
   const bool allow_atomic_fallbacks = !det_ties_enabled();
   if (allow_atomic_fallbacks &&
       merlin::sampled_topk::gate_open<TopK>(num_rows, max_seq_len,
@@ -469,8 +448,8 @@ void launch_persistent_topk(const torch::stable::Tensor& logits,
     // Under det ties, a launch whose cooperative group would not be co-resident,
     // or whose groups overflow the det_large staging row (4 * ctas_per_group
     // <= RADIX, see params.det_large), takes the exact one-CTA-per-row kernel.
-    // The widest QSA row served is 65,536 columns (262,144 tokens at compress
-    // 4): at most 16 CTAs per group, so served launches never get here.
+    // Both conditions are checked at run time; ordinary long-context shapes
+    // need only a few CTAs per group, so this is a safety net.
     const bool overflows_residency = total_ctas > hw_resident_cap;
     const bool det_large_fits =
         4u * ctas_per_group <= static_cast<uint32_t>(P::RADIX);
@@ -528,30 +507,20 @@ void launch_persistent_topk(const torch::stable::Tensor& logits,
     STD_TORCH_CHECK(workspace.size(0) >= static_cast<int64_t>(state_bytes),
                     "workspace too small, need ", state_bytes, " bytes");
 
-    // Zero the per-group RadixRowState region before launch.
+    // Zero the per-group RadixRowState region before every launch.
     //
-    // Issued UNCONDITIONALLY so the memset is captured as its own node in
-    // the cudagraph (a separate cudaMemsetAsync node, sequenced before the
-    // persistent_topk_kernel launch on the same stream). The previous
-    // host-side guard `if (needs_cooperative)` was evaluated at capture time;
-    // when capture-time max_seq_len <= RADIX_THRESHOLD (always true under
-    // FULL_DECODE_ONLY with max_model_len < 32 K) the memset would NOT be
-    // captured, leaving the workspace state to accumulate across replays.
-    // That's a latent correctness bug if the runtime data ever takes the
-    // radix path, and removes one variable while debugging hangs in the
-    // decode/medium paths.
+    // Issued unconditionally so the memset is captured as its own node in the
+    // cudagraph, stream-ordered before the persistent_topk_kernel launch. A
+    // capture-time host guard on needs_cooperative would leave the memset out of
+    // graphs captured with a short max_seq_len, and the workspace state would
+    // then accumulate across replays.
     //
-    // Cost is sub-microsecond: state_bytes = num_groups * sizeof(RadixRowState)
-    // is ~3 KB per group, ~100 KB for the largest grids on this hardware.
-    //
-    // Why the memset is required (regardless of which path the kernel takes):
-    //   1. arrival_counter accumulates within a launch and is never reset,
-    //      so a prior call leaves it at a large positive value. Without this
-    //      reset, the very first wait_ge in the next call sees counter >>
-    //      target and returns instantly, breaking the barrier.
-    //   2. The previous in-kernel init only ran in CTA-0 with intra-CTA
-    //      __syncthreads(), so it had no happens-before edge to CTA-1+'s
-    //      first red_release. cudaMemsetAsync is stream-ordered: the zero
+    // The reset is required whichever path the kernel takes:
+    //   1. arrival_counter accumulates within a launch and is never reset, so
+    //      a stale value would satisfy the next call's first wait_ge at once
+    //      and break the barrier.
+    //   2. An in-kernel init by CTA 0 has no happens-before edge to the other
+    //      CTAs' first red_release. cudaMemsetAsync is stream-ordered: the zero
     //      is globally visible before any CTA runs.
     {
       cudaError_t mz_err = cudaMemsetAsync(
@@ -573,22 +542,17 @@ void launch_persistent_topk(const torch::stable::Tensor& logits,
     params.ctas_per_group = ctas_per_group;
     params.max_seq_len = static_cast<uint32_t>(max_seq_len);
     params.exact_medium = exact_medium_enabled();
-    // The per-CTA selected / pivot-equal counts are staged in ONE
-    // 256-slot RadixRowState histogram row (the slot round 3 has just finished
-    // reading).  Two more per-CTA regions were added for the
-    // group-uniform fault verdicts, so the row now holds 4 * ctas_per_group
-    // uint32s.  That is still the whole reason the workspace contract is
-    // unchanged, and it is also the only
-    // limit: above 64 CTAs per group the deterministic path cannot be
-    // expressed there.  Unreachable at any shape this kernel serves
-    // (ctas_per_group is 2-3 across the 135K-262K band and <= 16 at the
-    // smallest chunk size); with det ties on such a launch took
-    // exact_rows_topk_kernel above, and with them off it degrades to the
-    // v2.0.1 tail and says so once.
+    // The per-CTA selected / pivot-equal counts are staged in one 256-slot
+    // RadixRowState histogram row (the slot round 3 has just finished reading),
+    // 4 * ctas_per_group uint32s. That is why the workspace contract is
+    // unchanged, and it is also the only limit: above 64 CTAs per group the
+    // deterministic path cannot be expressed there. With det ties on such a
+    // launch takes exact_rows_topk_kernel above; with them off it degrades to
+    // the baseline tail and says so once.
     params.det_large = det_large_enabled() && det_large_fits;
-    // The served kernel never injects a fault and keeps __trap() armed. The
-    // kernel's fault predicates are unchanged; the MERLIN_TOPK_DIAG_FORCE_FAULT
-    // diagnostic build exercises them.
+    // The served kernel never injects a fault and keeps __trap() armed; the
+    // MERLIN_TOPK_DIAG_FORCE_FAULT diagnostic build exercises the fault
+    // predicates.
     params.fault_inject_cta = -1;
     params.fault_inject_emit = false;
     if (det_large_enabled() && !det_large_fits) {
@@ -617,10 +581,9 @@ void launch_persistent_topk(const torch::stable::Tensor& logits,
     params.exact_counters = stream_is_capturing(stream)
                                 ? get_exact_counters(device_index)
                                 : ensure_exact_counters(device_index, stream);
-    // Note: this check is UNCONDITIONAL -- eager as well as
-    // capturing, and in both arms.  An eager launch with nullptr would have the
-    // reader report [0,0,0,0,1]: an unavailable instrument encoded as healthy
-    // zero counts, which is the exact failure the counters exist to prevent.
+    // Unconditional, eager as well as capturing: an unavailable instrument must
+    // raise rather than read as healthy zero counts, which is the failure the
+    // counters exist to prevent.
     STD_TORCH_CHECK(
         params.exact_counters != nullptr,
         "persistent_topk: the medium-path exact-restart counters are unavailable on "
@@ -716,9 +679,9 @@ void persistent_topk(const torch::stable::Tensor& logits,
 // Read (and, on first call, allocate) the exact-restart counters; also the
 // pre-capture init path, so call it once per device before any cudagraph
 // capture, never during one. `out` is an int64 CUDA tensor of exactly
-// kNumTopKExactCounters (11) elements (64-bit counters cannot wrap); any other
-// dtype or length is rejected. `sync != 0` synchronizes before and after the
-// copy/reset; `reset` requires `sync`.
+// persistent_topk_exact_counters_slots() elements (64-bit counters cannot
+// wrap); any other dtype or length is rejected. `sync != 0` synchronizes before
+// and after the copy/reset; `reset` requires `sync`.
 //
 // Slots:
 //   [0] medium-path rows entered           (denominator)
@@ -729,8 +692,8 @@ void persistent_topk(const torch::stable::Tensor& logits,
 //   [5] large-path rows whose pivot-equal group was cut at the k-th value
 //   [6] large-path pivot-equal elements discarded by those cuts
 //   [7] large-path invariant violations (must stay 0)
-//   [8] 1 if MERLIN_TOPK_EXACT_MEDIUM is on, else 0   (host-written)
-//   [9] 1 if MERLIN_TOPK_DET_LARGE is on, else 0      (host-written)
+//   [8] 1 if the exact medium restart is on, else 0   (host-written)
+//   [9] 1 if the deterministic large path is on, else 0 (host-written)
 //   [10] decode rows whose buffered candidates exceeded DBUF (3,708)
 void persistent_topk_exact_counters(torch::stable::Tensor& out, int64_t reset,
                                     int64_t sync) {
@@ -743,22 +706,18 @@ void persistent_topk_exact_counters(torch::stable::Tensor& out, int64_t reset,
       "from half of each counter. Allocate "
       "torch.zeros(persistent_topk_exact_counters_slots(), dtype=torch.int64)."
       " (int32 was protocol version 1 and is deliberately rejected.)");
-  // Element count alone is not enough.  A CUDA scalar expanded
-  // to ten elements (stride 0) satisfies numel but owns one element's storage,
-  // and the raw int64 writes below would run past it; an ordinary strided view
-  // would receive the values in the wrong slots.  Require a contiguous 1-D
-  // buffer before taking the pointer.
+  // Element count alone is not enough. A CUDA scalar expanded to the slot count
+  // (stride 0) satisfies numel but owns one element's storage, and the raw int64
+  // writes below would run past it; an ordinary strided view would receive the
+  // values in the wrong slots. Require a contiguous 1-D buffer before taking the
+  // pointer.
   STD_TORCH_CHECK(out.dim() == 1, "out must be 1-D");
   STD_TORCH_CHECK(out.is_contiguous(),
                   "out must be contiguous (expanded or strided views would be "
                   "written out of bounds or into the wrong elements)");
-  // EXACTLY the build's slot count, not "at least".  `>=` accepted an
-  // 11-element buffer on the ten-slot large-path build and quietly left the extra
-  // element reading 0 -- a caller compiled against one layout got a plausible
-  // answer from a build with another, which is the failure mode the
-  // self-describing `..._slots` op exists to prevent.  Ask the build, size the
-  // buffer to what it says, and a mismatch is an error rather than a wrong
-  // number.
+  // Exactly the build's slot count, not "at least": a caller compiled against
+  // another layout must get an error rather than a plausible answer. Ask
+  // persistent_topk_exact_counters_slots() and size the buffer to what it says.
   STD_TORCH_CHECK(out.numel() == merlin::persistent::kNumTopKExactCounters,
                   "out must hold exactly ",
                   merlin::persistent::kNumTopKExactCounters,
@@ -783,9 +742,8 @@ void persistent_topk_exact_counters(torch::stable::Tensor& out, int64_t reset,
   unsigned long long* src =
       ensure_exact_counters(static_cast<int>(out.get_device_index()), stream);
 
-  // An unavailable buffer must not read as four zeros plus "enabled" (an
-  // instrument failure indistinguishable from "no medium work and no
-  // faults"), so it fails instead.
+  // An unavailable buffer must raise: it must not read as healthy zero counts,
+  // which would be indistinguishable from no medium work and no faults.
   STD_TORCH_CHECK(src != nullptr,
                   "persistent_topk_exact_counters: the counter buffer could "
                   "not be allocated on this device; the instrument is "
@@ -809,12 +767,12 @@ void persistent_topk_exact_counters(torch::stable::Tensor& out, int64_t reset,
   }
 
   // Static storage: the source of an async H2D copy must outlive the copy.
-  // Written AFTER the device copy, which has already zeroed both slots: they
-  // are slots [8] and [9] INSIDE the array and the device never touches them.
-  // The large flag reports the folded switch, not the per-launch effective
-  // value: a launch whose ctas_per_group overflowed the staging row still
-  // reports 1 here and leaves counter [4] at 0.  kSlotSwitchLarge == kSlotSwitchMedium + 1, so one copy does
-  // both.
+  // Written after the device copy, which has already zeroed both slots: they
+  // are slots [8] and [9] inside the array and the device never touches them.
+  // The large flag reports the compiled policy value (det_large_enabled()), not
+  // the per-launch effective value: a launch whose ctas_per_group overflowed the staging row still
+  // reports 1 here and leaves counter [4] at 0. The two flags are adjacent, so
+  // one copy writes both.
   static_assert(merlin::persistent::kSlotSwitchLarge ==
                     merlin::persistent::kSlotSwitchMedium + 1,
                 "the two host-written flags must stay adjacent for this copy");
@@ -827,10 +785,9 @@ void persistent_topk_exact_counters(torch::stable::Tensor& out, int64_t reset,
       "exact counter flag write failed");
 
   if (sync != 0) {
-    // The leading synchronize alone left the copy and the reset
-    // merely ENQUEUED, so the caller could return and immediately race the
-    // outstanding reset from another stream.  Complete the handoff before
-    // returning.
+    // The leading synchronize leaves the copy and the reset merely enqueued;
+    // complete the handoff before returning so the caller cannot race the
+    // outstanding reset from another stream.
     STD_TORCH_CHECK(cudaDeviceSynchronize() == cudaSuccess,
                     "exact counter completion synchronize failed");
   }
@@ -839,14 +796,11 @@ void persistent_topk_exact_counters(torch::stable::Tensor& out, int64_t reset,
 #endif
 }
 
-// How many 64-bit slots THIS build's counter array carries.
+// How many 64-bit slots this build's counter array carries.
 //
-// A Python reader must not guess from MERLIN_TOPK_COUNTER_SLOTS (default 5)
-// and name the slots by that length. The decode restart makes the array 11 and the large path makes
-// it 10, so a guess is now wrong on at least one branch, and a reader that
-// allocates the wrong length is rejected by the length check above -- the
-// instrument goes dark exactly when it starts mattering. Ask the build
-// instead. No CUDA call, no allocation, safe from anywhere.
+// Readers must size their buffer from this value: a buffer of any other length
+// is rejected by the length check above. No CUDA call, no allocation, safe from
+// anywhere.
 int64_t persistent_topk_exact_counters_slots() {
 #ifndef USE_ROCM
   return static_cast<int64_t>(merlin::persistent::kNumTopKExactCounters);
@@ -855,27 +809,25 @@ int64_t persistent_topk_exact_counters_slots() {
 #endif
 }
 
-// The persistent_topk
-// switches AS THIS PROCESS CACHED THEM -- the values every launch of this
-// process uses -- read from the mirrors above. Tensor-free, no CUDA call, no
-// allocation, never initialises a cache (see publish_cached), so it is safe
-// from anywhere and asking changes nothing.
+// The persistent_topk policy switches as this process cached them -- the values
+// every launch of this process uses -- read from the mirrors above. Tensor-free,
+// no CUDA call, no allocation, never initialises a cache (see publish_cached),
+// so it is safe from anywhere and asking changes nothing.
 //
 // Packed into one int64 so the op needs no tensor and no dispatch key.
 // 2 bits per field, field i at bits [2i, 2i+1]: 0 = off, 1 = on,
 // 2 = the static has not been initialised in this process yet.
-//   field 0  MERLIN_TIE_DET                       (det_ties_enabled)
-//   field 1  MERLIN_TIE_RECENT as parsed          (tie_recent_enabled)
+//   field 0  deterministic ties                  (det_ties_enabled)
+//   field 1  tie direction as configured         (tie_recent_enabled)
 //   field 2  effective direction, 1 = most-recent (effective_tie_recent)
-//   field 3  MERLIN_TOPK_EXACT_MEDIUM             (exact_medium_enabled)
-//   field 4  MERLIN_TOPK_EXACT_DECODE             (exact_decode_enabled)
-//   field 5  MERLIN_TOPK_DET_LARGE                (det_large_enabled)
-//   field 6  MERLIN_TOPK_SORTED_EMIT              (sorted_emit_enabled)
+//   field 3  exact medium restart                (exact_medium_enabled)
+//   field 4  exact decode restart                (exact_decode_enabled)
+//   field 5  deterministic large path            (det_large_enabled)
+//   field 6  sorted emission                     (sorted_emit_enabled)
 // bits [48, 55] = field count (7), bits [56, 62] = layout version (2). A
-// reader must check both and refuse any other layout rather than guess.
-// Layout 2 = layout 1 plus field 6; fields 0-5 are unchanged, so
-// a reader that knows both can decode either.  Field 6 is what
-// qsa_indexer.py reads to decide whether its Python sort may be skipped.
+// reader must check both and refuse any other layout rather than guess. Field 6
+// is what qsa_indexer.py reads to decide whether its Python sort may be
+// skipped.
 int64_t persistent_topk_toggle_state() {
 #ifndef USE_ROCM
   const auto field = [](int cached) -> int64_t {

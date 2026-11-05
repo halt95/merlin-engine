@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1280" height="452" viewBox="0 0 1280 452" role="img" aria-labelledby="ttl dsc">
-<title id="ttl">Merlin 3.0.1</title>
-<desc id="dsc">Open models at their full 262K context on consumer GPUs. A vLLM 0.32.0 fork tuned for Ampere and Ada  ·  one install  ·  one command Host RAM token embedding tables; 197 tok/s decode at 262K; 7,064 tok/s prefill; One command merlin serve &lt;checkpoint&gt;</desc>
+<title id="ttl">Merlin 3.0.2</title>
+<desc id="dsc">Open models at their full 262K context on consumer GPUs. A vLLM 0.33.0 fork tuned for Ampere and Ada  ·  one install  ·  one command Host RAM token embedding tables; 207 tok/s decode at 262K; 6,994 tok/s prefill; One command merlin serve &lt;checkpoint&gt;</desc>
 <defs>
 <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#0a0f24"/><stop offset="0.55" stop-color="#121638"/><stop offset="1" stop-color="#1d1145"/></linearGradient>
 <radialGradient id="glowA" cx="0.82" cy="0.18" r="0.55"><stop offset="0" stop-color="#5b6cff" stop-opacity="0.38"/><stop offset="1" stop-color="#5b6cff" stop-opacity="0"/></radialGradient>
@@ -19,19 +19,19 @@
 
 <text x="72" y="152" font-size="84" font-weight="700" fill="#ffffff" letter-spacing="-1.5">Merlin</text>
 <rect x="366.9" y="104" width="118.4" height="30" rx="15" fill="#a78bfa" fill-opacity="0.16" stroke="#a78bfa" stroke-opacity="0.45"/>
-<text x="426.1" y="124" font-size="15" font-weight="600" fill="#d9ccff" text-anchor="middle">engine 3.0.1</text>
+<text x="426.1" y="124" font-size="15" font-weight="600" fill="#d9ccff" text-anchor="middle">engine 3.0.2</text>
 <text x="72" y="214" font-size="30" font-weight="600" fill="#eef1fb">Open models at their full 262K context on consumer GPUs.</text>
-<text x="72" y="254" font-size="20" fill="#9aa4bf">A vLLM 0.32.0 fork tuned for Ampere and Ada  ·  one install  ·  one command</text>
+<text x="72" y="254" font-size="20" fill="#9aa4bf">A vLLM 0.33.0 fork tuned for Ampere and Ada  ·  one install  ·  one command</text>
 <rect x="72.0" y="292" width="269.0" height="116" rx="14" fill="#ffffff" fill-opacity="0.045" stroke="#ffffff" stroke-opacity="0.10"/>
 <text x="94.0" y="336" font-size="40.0" font-weight="700" fill="#ffffff">Host RAM</text>
 <text x="94.0" y="366" font-size="17" font-weight="600" fill="#c9d1e6">token embedding tables</text>
 <text x="94.0" y="388" font-size="12.5" fill="#8a93ad">Frees VRAM, no speed loss.</text>
 <rect x="361.0" y="292" width="269.0" height="116" rx="14" fill="#ffffff" fill-opacity="0.045" stroke="#ffffff" stroke-opacity="0.10"/>
-<text x="383.0" y="336" font-size="40.0" font-weight="700" fill="#ffffff">197 tok/s</text>
+<text x="383.0" y="336" font-size="40.0" font-weight="700" fill="#ffffff">207 tok/s</text>
 <text x="383.0" y="366" font-size="17" font-weight="600" fill="#c9d1e6">decode at 262K</text>
 <text x="383.0" y="388" font-size="12.3" fill="#8a93ad">Flash-Next, one stream, 4× RTX 3090</text>
 <rect x="650.0" y="292" width="269.0" height="116" rx="14" fill="#ffffff" fill-opacity="0.045" stroke="#ffffff" stroke-opacity="0.10"/>
-<text x="672.0" y="336" font-size="38.5" font-weight="700" fill="#ffffff">7,064 tok/s</text>
+<text x="672.0" y="336" font-size="38.5" font-weight="700" fill="#ffffff">6,994 tok/s</text>
 <text x="672.0" y="366" font-size="17" font-weight="600" fill="#c9d1e6">prefill</text>
 <text x="672.0" y="388" font-size="15.0" fill="#8a93ad">Flash-Next, 100K prompt, cold</text>
 <rect x="939.0" y="292" width="269.0" height="116" rx="14" fill="#ffffff" fill-opacity="0.045" stroke="#ffffff" stroke-opacity="0.10"/>

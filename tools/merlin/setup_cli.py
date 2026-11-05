@@ -39,11 +39,14 @@ from typing import Any, Callable
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import launch as L  # noqa: E402
 import ple_pack as PP  # noqa: E402
+import ple_store as PS  # noqa: E402
 import preflight as pf  # noqa: E402
 import registry as R  # noqa: E402
 import serve_cli as S  # noqa: E402
 
 REPO = Path(__file__).resolve().parents[2]
+# The release dependency lock install-env.sh installs (release/install-env.sh REQ).
+RELEASE_LOCK = "requirements-0.33.lock"
 # Checkpoints the launcher serves that setup cannot install or verify yet: no checkpoint.sha256 in the engine (it is written
 # when the checkpoint is staged for publication). `merlin serve <name> <dir>` still serves a local copy.
 SETUP_WITHHELD: dict[str, str] = {}  # none in this release
@@ -90,8 +93,8 @@ class PleTable:
 # unless the engine has its loader (ple_formats.py, booted by launch.py as PLE_OPT_IN_TABLES, not a test table) and
 # the family's INT6 PLE pack is recorded (release/download-sizes.json ple_packs.int6 +
 # models/flash-next/ple-int6-pack.sha256). There is no second checkpoint per model: setup lays the one pack over the
-# user's verified FP8 checkpoint (ple_pack.py). No INT4, no table reads from disk or page cache. INT6 g32 measured no
-# quality loss vs FP8 and is the route for smaller hosts.
+# user's verified FP8 checkpoint (ple_pack.py). No INT4. INT6 g32 measured no quality loss vs FP8 and is the route for
+# smaller hosts. Where the table lives is separate: --ple-store ram|disk, asked after the Models folder.
 PLE_TABLES = {
     "fp8": PleTable("fp8", "float8_e4m3fn", pf.FN_PLE_TABLE_GIB, "FP8 (the shipped table)"),
     "int6": PleTable("int6", "int6_g32", 38.74, "INT6 g32 (same quality and speed as FP8 in a side-by-side comparison)"),
@@ -216,7 +219,7 @@ def wheel_urls(repo: Path = REPO) -> list[str]:
 
 
 def lock_hash(repo: Path = REPO) -> str:
-    return sha256_file(repo / "release" / "requirements-0.32.lock")
+    return sha256_file(repo / "release" / RELEASE_LOCK)
 
 
 def sizes_table(repo: Path = REPO) -> dict[str, Any]:
@@ -469,7 +472,7 @@ def uv_cache_dir() -> Path:
 # --------------------------------------------------------------------------------------------
 # Arguments and saved answers (per model)
 # --------------------------------------------------------------------------------------------
-PER_MODEL = ("models_dir", "port", "tp", "instances", "ple_table", "kv_ram_cache_gib", "spec", "swarm")
+PER_MODEL = ("models_dir", "port", "tp", "instances", "ple_table", "ple_store", "kv_ram_cache_gib", "spec", "swarm", "context")
 
 
 @dataclass
@@ -485,9 +488,12 @@ class Answers:
     cc: str | None = None
     cxx: str | None = None
     ple_table: str | None = None  # Flash-Next family: fp8, or int6 with --ple int6 (None elsewhere)
+    ple_store: str | None = None  # Flash-Next family: ram, or disk with --ple-store disk (None elsewhere)
     kv_ram_cache_gib: int | None = None  # Flash-Next, 27B, Ornith: --kv-ram-cache, GiB per server, 0 = off (else None)
     spec: str | None = None  # Flash-Next family: the drafter, mtp / dflash2 (None elsewhere: their MTP head)
     swarm: bool | None = None  # Flash-Next, 27B: --swarm, the row's tested high-concurrency cap (False = the default cap; else None)
+
+    context: int | None = None  # tokens; None keeps the native/default context
 
     def base_dir(self) -> Path:
         """The FP8 checkpoint folder (--models-dir, else ~/models/<model>), with --ple int6 too: the overlay is built
@@ -511,9 +517,10 @@ def normalize_fn(a: Answers) -> Answers:
     unless a flag (or a saved flag) says otherwise, never asked; nothing elsewhere."""
     if fn_family(a.model):
         a.ple_table = a.ple_table or PLE_DEFAULT
+        a.ple_store = a.ple_store or "ram"
         a.spec = a.spec or SPEC_DEFAULT
     else:
-        a.ple_table = a.spec = None
+        a.ple_table = a.ple_store = a.spec = None
     a.kv_ram_cache_gib = (a.kv_ram_cache_gib or 0) if tier_family(a.model) else None
     a.swarm = bool(a.swarm) if swarm_family(a.model) else None
     return a
@@ -537,9 +544,14 @@ def build_parser() -> argparse.ArgumentParser:
                     help=f"Flash-Next: the PLE table in host RAM, fp8 ({PLE_TABLES['fp8'].gib} GiB, the default) or int6 "
                     f"(INT6 g32, {PLE_TABLES['int6'].gib} GiB): one pack for the family, downloaded once beside the FP8 checkpoint, "
                     "which stays untouched; the served folder is <checkpoint>-int6 (links + a generated config.json and index)")
-    ap.add_argument("--kv-ram-cache", metavar="SIZE", help="Flash-Next (experimental in 3.0.1, MTP only), 27B (experimental in 3.0.1) and Ornith 1.5 (untested): a host-RAM cache for prefix KV blocks the GPU pool "
+    ap.add_argument("--ple-store", choices=PS.STORES, default=None,
+                    help="Flash-Next: where the PLE table lives, ram (the default) or disk (experimental: read from the checkpoint's own files, "
+                    "which frees the table's host RAM, but first reads are much slower). Asked after the models folder when it is on local NVMe")
+    ap.add_argument("--kv-ram-cache", metavar="SIZE", help="Flash-Next (experimental, MTP only), 27B (experimental) and Ornith 1.5 (untested): a host-RAM cache for prefix KV blocks the GPU pool "
                     "evicts (restored instead of recomputed; adds no context and does not change the session cap (--swarm does); RAM only, never disk; ~66K tokens/GiB on Flash-Next TP2xPP2; needs memlock: LimitMEMLOCK=infinity or ulimit -l unlimited). SIZE = "
                     "host RAM per server (24g, 24gib or 24 = GiB; 0 = off, the default), split over its TP x PP ranks (rounded down to whole GiB per rank)")
+    ap.add_argument("--context", type=L.C.parse_size, metavar="SIZE",
+                    help="tokens or binary k/m (512k = 524288); default native, auto-YaRN past native")
     ap.add_argument("--swarm", action=argparse.BooleanOptionalAction, default=None,
                     help="the row's tested high-concurrency cap instead of its default (experimental): the Flash-Next 4 x 3090 profiles 24 "
                     "sessions (default 8), the 27B 4 x 3090 (TP4) profiles 32 (default 24). Needs the KV RAM cache at the size that cap was "
@@ -578,6 +590,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                          f"{args.model} uses its MTP head", 2)
     if args.model and not fn_family(args.model) and is_variant(args.ple):
         raise SetupError(f"--ple int6 applies to the Flash-Next family only, not {args.model}", 2)
+    if args.model and not fn_family(args.model) and args.ple_store == "disk":
+        raise SetupError(f"--ple-store disk applies to the Flash-Next family only, not {args.model}", 2)
     if args.model and not tier_family(args.model) and args.kv_ram_cache_gib:
         raise SetupError(f"--kv-ram-cache applies to the Flash-Next family, the 27B and Ornith 1.5 only, not {args.model}", 2)
     if args.swarm:
@@ -587,7 +601,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
             raise SetupError("--swarm needs the KV RAM cache (it is sized for the swarm cap when --kv-ram-cache is not given); "
                              "--kv-ram-cache 0 turns it off", 2)
         if args.spec == "dflash2":
-            raise SetupError("--swarm with --spec dflash2: the KV RAM cache --swarm needs is qualified with MTP only in 3.0.1", 2)
+            raise SetupError("--swarm with --spec dflash2: the KV RAM cache --swarm needs is qualified with MTP only", 2)
     return args
 
 
@@ -613,12 +627,14 @@ def _valid_saved(saved: dict[str, Any] | None) -> dict[str, Any]:
                 b: dict[str, Any] = {}
                 if isinstance(block.get("models_dir"), str) and block["models_dir"]:
                     b["models_dir"] = block["models_dir"]
-                for k in ("port", "tp", "instances"):
+                for k in ("port", "tp", "instances", "context"):
                     v = block.get(k)
                     if isinstance(v, int) and not isinstance(v, bool) and v >= 1 and (k != "port" or v <= 65535):
                         b[k] = v
                 if fn_family(m) and isinstance(block.get("ple_table"), str) and block["ple_table"] in PLE_TABLES:
                     b["ple_table"] = block["ple_table"]
+                if fn_family(m) and block.get("ple_store") in PS.STORES:
+                    b["ple_store"] = block["ple_store"]
                 if fn_family(m) and block.get("spec") in S.SPEC_CHOICES:
                     b["spec"] = block["spec"]
                 v = block.get("kv_ram_cache_gib")
@@ -640,7 +656,7 @@ def merge_answers(saved: dict[str, Any] | None, args: argparse.Namespace, key: s
     a.api_key = key
     for k in PER_MODEL:
         setattr(a, k, block.get(k))
-    for k in ("models_dir", "host", "api_key", "port", "tp", "instances", "ple_table", "kv_ram_cache_gib", "spec", "swarm"):
+    for k in ("models_dir", "host", "api_key", "port", "tp", "instances", "ple_table", "ple_store", "kv_ram_cache_gib", "spec", "swarm", "context"):
         v = getattr(args, k)
         if v is not None:
             setattr(a, k, v)
@@ -792,35 +808,37 @@ def ram_budget(inv: pf.Inventory, avail: Callable[[], int | None] | None = None)
     return total, "host RAM (MemTotal or the cgroup memory.max)"
 
 
-def fn_ram_need_gib(ple: str | None, tier_gib: int | None, sizes: list[int]) -> float:
+def fn_ram_need_gib(ple: str | None, tier_gib: int | None, sizes: list[int], store: str | None = None) -> float:
     """Resident host RAM of Flash-Next servers with ``sizes`` workers each (TP x PP; one entry per --instances
-    server): per server the measured floor with the FP8 table swapped for ``ple``'s, plus the KV tier's arena of
-    ``tier_gib`` per rank. The floor is preflight's (69 GiB at four workers, +2 GiB per worker above four)."""
-    delta = PLE_TABLES[ple or PLE_DEFAULT].gib - PLE_TABLES[PLE_DEFAULT].gib
+    server): per server the measured floor with the FP8 table swapped for ``ple``'s (none under ``store`` disk, the full
+    credit), plus the KV tier's arena of ``tier_gib`` per rank. The floor is preflight's (69 GiB at four
+    workers, +2 GiB per worker above four)."""
+    delta = (0.0 if store == "disk" else PLE_TABLES[ple or PLE_DEFAULT].gib) - PLE_TABLES[PLE_DEFAULT].gib
     return sum(pf.ram_floor_gib(n, tier_gib or 0) + delta for n in sizes)  # the floor serve's gates use, tier included
 
 
-def fn_ram_parts(ple: str | None, tier_gib: int | None, sizes: list[int]) -> str:
+def fn_ram_parts(ple: str | None, tier_gib: int | None, sizes: list[int], store: str | None = None) -> str:
     t = PLE_TABLES[ple or PLE_DEFAULT]
     per = f"{len(sizes)} servers x " if len(sizes) > 1 else ""
-    parts = f"{per}{t.key.upper()} PLE table {t.gib:.1f} GiB + the rest of the server ~{fn_ram_need_gib(PLE_DEFAULT, 0, sizes) / len(sizes) - PLE_TABLES[PLE_DEFAULT].gib:.0f} GiB"
+    table = f"{t.key.upper()} PLE table on disk" if store == "disk" else f"{t.key.upper()} PLE table {t.gib:.1f} GiB"
+    parts = f"{per}{table} + the rest of the server ~{fn_ram_need_gib(PLE_DEFAULT, 0, sizes) / len(sizes) - PLE_TABLES[PLE_DEFAULT].gib:.0f} GiB"
     if tier_gib:
         parts += f", KV host tier {tier_gib * sizes[0]} GiB per server ({tier_gib} GiB x {sizes[0]} ranks)"
     return parts
 
 
-def max_kv_ram_cache_gib(ple: str | None, sizes: list[int], have: float | None) -> int | None:
+def max_kv_ram_cache_gib(ple: str | None, sizes: list[int], have: float | None, store: str | None = None) -> int | None:
     """The largest --kv-ram-cache (GiB per server, a whole number of GiB per rank) that fits ``have`` beside the servers;
     None when RAM is unknown."""
     if have is None:
         return None
-    per_rank = max(0, int((have - fn_ram_need_gib(ple, 0, sizes)) // max(1, sum(sizes))))
+    per_rank = max(0, int((have - fn_ram_need_gib(ple, 0, sizes, store)) // max(1, sum(sizes))))
     return per_rank * (sizes[0] if sizes else 4)
 
 
 def ram_problem(model: str, inv: pf.Inventory, cards: int, ple: str | None = None, tier_gib: int | None = None,
                 sizes: list[int] | None = None, budget: tuple[float | None, str] | None = None,
-                int6_why: str | None = "not checked") -> Problem | None:
+                int6_why: str | None = "not checked", store: str | None = None, disk_why: str | None = "not checked") -> Problem | None:
     """The host-RAM check of the chosen flags (nothing is picked here). Flash-Next: the servers' resident need for the
     PLE table (FP8, or INT6 with --ple int6) and the KV tier (``tier_gib`` = GiB per rank, from --kv-ram-cache) against
     ``ram_budget`` (FAIL when it cannot fit, with what would); other models: a warning below 32 GiB."""
@@ -842,18 +860,25 @@ def ram_problem(model: str, inv: pf.Inventory, cards: int, ple: str | None = Non
     ple, tier_gib = ple or PLE_DEFAULT, tier_gib or 0
     have, what = budget or ram_budget(inv)
     if have is None:
-        return Problem("WARN", "ram", f"host RAM unknown; Flash-Next needs ~{fn_ram_need_gib(ple, tier_gib, sizes):.0f} GiB resident here")
-    need = fn_ram_need_gib(ple, tier_gib, sizes)
+        return Problem("WARN", "ram", f"host RAM unknown; Flash-Next needs ~{fn_ram_need_gib(ple, tier_gib, sizes, store):.0f} GiB resident here")
+    need = fn_ram_need_gib(ple, tier_gib, sizes, store)
     if have < need:
         fixes = []
         if tier_gib:
-            top = max_kv_ram_cache_gib(ple, sizes, have)
+            top = max_kv_ram_cache_gib(ple, sizes, have, store)
             fixes.append(f"a smaller KV host tier (--kv-ram-cache {top}g or less)" if top else "the KV host tier off (--kv-ram-cache 0)")
         if ple == "fp8" and int6_why is None and have >= fn_ram_need_gib("int6", tier_gib, sizes):
             fixes.append(f"the INT6 g32 PLE table (--ple int6, ~{fn_ram_need_gib('int6', tier_gib, sizes):.0f} GiB)")
+        if store != "disk" and disk_why is None and have >= fn_ram_need_gib(ple, tier_gib, sizes, "disk"):
+            fixes.append(f"the PLE table on NVMe (--ple-store disk, ~{fn_ram_need_gib(ple, tier_gib, sizes, 'disk'):.0f} GiB; first reads are much slower)")
         fixes += ["add RAM (or raise the container's memory limit)", "choose 27b (--model 27b), which needs no PLE table"]
         return Problem("FAIL", "ram", f"{what} {have:.0f} GiB is below the ~{need:.0f} GiB Flash-Next needs resident here "
-                       f"({fn_ram_parts(ple, tier_gib, sizes)}): the load would be OOM-killed", "; or ".join(fixes))
+                       f"({fn_ram_parts(ple, tier_gib, sizes, store)}): the load would be OOM-killed", "; or ".join(fixes))
+    if store == "disk":  # the full credit, with a warning below floor + 16 GiB of page cache
+        if have < need + PS.CACHE_WARN_GIB:
+            return Problem("WARN", "ram", f"{what} {have:.0f} GiB leaves under {PS.CACHE_WARN_GIB} GiB of page cache for the PLE table above the "
+                           f"~{need:.0f} GiB {fn_ram_parts(ple, tier_gib, sizes, store)} need: decode and prefill slow down")
+        return None
     if ple == PLE_DEFAULT and not tier_gib:
         if have < pf.RAM_WARN_GIB:
             return Problem("WARN", "ram", f"{what} {have:.0f} GiB is below the qualified {pf.RAM_WARN_GIB:.0f} GiB "
@@ -976,16 +1001,30 @@ def layouts(model: str, inv: pf.Inventory, repo: Path = REPO) -> list[Layout]:
 
 def serve_plan(a: Answers, inv: pf.Inventory, repo: Path = REPO) -> list[S.Plan]:
     env = serve_env(a)
+    if a.context is not None:
+        env.pop("MAXLEN", None)  # explicit --context replaces the inherited limit
     if fn_family(a.model):  # the table the served folder will carry (an INT6 overlay may not be built yet)
-        inv = replace(inv, ple_table_gib=PLE_TABLES[a.ple_table or PLE_DEFAULT].gib)
+        inv = replace(inv, ple_table_gib=0.0 if a.ple_store == "disk" else PLE_TABLES[a.ple_table or PLE_DEFAULT].gib)
     # the layout is resolved with the KV host tier off: ram_problem counts the tier (and the table) itself and names the
     # fixes, which serve's tier-aware RAM gates would otherwise pre-empt with a bare layout refusal
     env.pop(KV_TIER_ENV, None)
     for k in L.FN_KV_HOST_TIER_NEEDS_ON:  # refused with the tier off; serve checks them against the real size
         env.pop(k, None)
     if a.instances and a.instances > 1:
-        return S.plan_instances(a.model, str(a.checkpoint_dir()), None, inv, [], a.instances, repo, env, tp=a.tp)
-    return [S.resolve(a.model, str(a.checkpoint_dir()), None, inv, [], repo, env, tp=a.tp)]
+        plans = S.plan_instances(a.model, str(a.checkpoint_dir()), None, inv, [], a.instances, repo, env, tp=a.tp)
+    else:
+        plans = [S.resolve(a.model, str(a.checkpoint_dir()), None, inv, [], repo, env, tp=a.tp)]
+    # Setup may not have downloaded config.json.
+    if a.context is not None:
+        for plan in plans:
+            if plan.vllm is not None:
+                try:
+                    flags = L._flag_values(plan.vllm.args + plan.vllm.extra)
+                    plan.notes.append(L.C.pool_note(plan.vllm, a.context, flags))
+                except ValueError as e:
+                    raise SetupError(str(e), 2) from None
+                plan.notes.append("context: YaRN recipe resolves from config.json at serve time")
+    return plans
 
 
 def serve_env(a: Answers) -> dict[str, str]:
@@ -999,6 +1038,7 @@ def serve_env(a: Answers) -> dict[str, str]:
         env.pop(KV_TIER_ENV, None)
         env.pop(L.SWARM_ENV, None)  # so does the swarm cap (serve's --swarm)
     if fn_family(a.model):
+        env["PLE_STORE"] = a.ple_store or "ram"  # the answer, never a stale export
         env["SPEC"] = a.spec or SPEC_DEFAULT  # the resolved choice wins over an ambient SPEC (serve_plan resolves from this env)
         if a.spec == "dflash2":
             env["DFLASH2_MODEL"] = str(drafter_dir())  # the copy setup downloaded and verified
@@ -1014,8 +1054,12 @@ def serve_argv(a: Answers, repo: Path = REPO) -> list[str]:
         argv += ["--instances", str(a.instances)]
     if fn_family(a.model) and is_variant(a.ple_table):
         argv += ["--ple", a.ple_table]
+    if fn_family(a.model) and a.ple_store == "disk":
+        argv += ["--ple-store", "disk"]
     if tier_family(a.model) and a.kv_ram_cache_gib:
         argv += ["--kv-ram-cache", f"{a.kv_ram_cache_gib}g"]
+    if a.context is not None:
+        argv += ["--context", str(a.context)]
     if swarm_family(a.model) and a.swarm:
         argv += ["--swarm"]
     if fn_family(a.model):
@@ -1254,9 +1298,9 @@ def pull_pack(repo: Path, a: Answers, env: dict[str, str], table: dict[str, Any]
             raise SetupError("the INT6 PLE pack has no pinned revision (record it in release/download-sizes.json); nothing downloaded")
         hf = hf_tool(repo, env, runner)
         d.mkdir(parents=True, exist_ok=True)
-        rc = runner([str(hf), "download", e["repo"], "--revision", rev, "--local-dir", str(d)], env={**env, "HF_HUB_DISABLE_TELEMETRY": "1"})
+        rc = hf_download(hf, e["repo"], rev, d, env, runner)
         if rc != 0:
-            raise SetupError(f"hf download of the INT6 PLE pack failed (rc {rc}); run again to resume")
+            raise SetupError(f"hf download of the INT6 PLE pack failed (rc {rc}); run again: finished files stay, partial ones start over")
     ok, bad = verify_checkpoint(d, lst, model=PP.PACK_MARKER_MODEL, rehash=rehash)
     if not ok:
         raise SetupError(f"INT6 PLE pack verification failed in {d}:\n  " + "\n  ".join(bad)
@@ -1374,7 +1418,7 @@ def checkpoint_item(model: str, ckpt_dir: Path, repo: Path, table: dict[str, Any
     else:
         note = f"{n_files} files, {gib(n_bytes)} in all, size from {src}"
     if len(missing) < len(sums):
-        note += f"; {len(missing)} of {len(sums)} listed files still missing in {ckpt_dir} (the download resumes)"
+        note += f"; {len(missing)} of {len(sums)} listed files still missing in {ckpt_dir} (the download fetches them; finished files stay)"
     cmd = f"hf download {ck['repo']}" + (f" --revision {rev}" if rev else " (no pinned revision yet)") + f" -> {ckpt_dir}"
     return Download(what, cmd, remaining, "models", note), True, rev, remaining
 
@@ -1404,7 +1448,7 @@ def download_plan(a: Answers, repo: Path, state: dict[str, Any] | None, commit: 
             else:
                 plan.items.append(Download("engine wheel", wheel_urls(repo)[0], table["wheel"]["bytes"], "repo"))
                 plan.disk.append(DiskNeed(repo / ".merlin" / "downloads", table["wheel"]["bytes"], "the wheel download"))
-        plan.items.append(Download(f"Python packages ({pk['count']} from release/requirements-0.32.lock)", "PyPI via uv (cached after the first install)",
+        plan.items.append(Download(f"Python packages ({pk['count']} from release/{RELEASE_LOCK})", "PyPI via uv (cached after the first install)",
                                    pk["bytes"], "repo", f"about {gib(pk['bytes'] * factor)} installed"))
         plan.disk.append(DiskNeed(uv_cache_dir(), pk["bytes"], "uv's package cache (up to; less when it already holds them)"))
         plan.disk.append(DiskNeed(venv, pk["bytes"] * factor, "the new venv"))
@@ -1464,10 +1508,9 @@ def pull_drafter(repo: Path, a: Answers, env: dict[str, str], table: dict[str, A
     if checkpoint_missing(d, lst):
         hf = hf_tool(repo, env, runner)
         d.mkdir(parents=True, exist_ok=True)
-        rc = runner([str(hf), "download", ck["repo"], "--revision", ck["revision"], "--local-dir", str(d)],
-                    env={**env, "HF_HUB_DISABLE_TELEMETRY": "1"})
+        rc = hf_download(hf, ck["repo"], ck["revision"], d, env, runner)
         if rc != 0:
-            raise SetupError(f"hf download of the DFlash2 drafter failed (rc {rc}); run again to resume")
+            raise SetupError(f"hf download of the DFlash2 drafter failed (rc {rc}); run again: finished files stay, partial ones start over")
     ok, bad = verify_checkpoint(d, lst, model="dflash2-drafter", rehash=rehash)
     if not ok:
         raise SetupError(f"DFlash2 drafter verification failed in {d}:\n  " + "\n  ".join(bad)
@@ -1705,7 +1748,7 @@ def hf_tool(repo: Path, env: dict[str, str], runner: Callable[..., int] = sh) ->
     if which("uv", env) is None:
         raise SetupError("no `hf` (install the engine first, or run through ./setup.sh so uv is on PATH)")
     pins = {}
-    for line in (repo / "release" / "requirements-0.32.lock").read_text(encoding="utf-8").splitlines():
+    for line in (repo / "release" / RELEASE_LOCK).read_text(encoding="utf-8").splitlines():
         m = re.match(r"^([A-Za-z0-9_.-]+)(?:\[[^\]]*\])?==([^\s\\;]+)", line)
         if m:
             pins[m[1]] = m[2]
@@ -1718,6 +1761,57 @@ def hf_tool(repo: Path, env: dict[str, str], runner: Callable[..., int] = sh) ->
                f"huggingface-hub=={pins['huggingface-hub']}"], env=env) != 0:
         raise SetupError("installing huggingface-hub for the hf tool failed")
     return hf
+
+
+def clear_partial_downloads(dest: Path) -> int:
+    """Delete the ``*.incomplete`` files an interrupted ``hf download --local-dir dest`` left under
+    ``dest/.cache/huggingface/download``; returns how many. huggingface-hub 1.x writes each attempt to a name of its
+    own and never resumes an earlier one, so a leftover is dead weight that the next run neither reuses nor removes."""
+    cache, n, size = dest / ".cache" / "huggingface" / "download", 0, 0
+    leftovers = sorted(cache.rglob("*.incomplete")) if cache.is_dir() else []
+    for f in leftovers:
+        try:
+            st = f.stat()
+            f.unlink()
+        except OSError:
+            continue
+        n, size = n + 1, size + st.st_size
+    if n:
+        print(f"setup: removed {n} partial download{'s' if n != 1 else ''} ({gib(size)}) left in {cache} by an "
+              "interrupted run; hf download starts those files again", flush=True)
+    return n
+
+
+def hf_download(hf: Path, repo_id: str, revision: str, dest: Path, env: dict[str, str],
+                runner: Callable[..., int] = sh) -> int:
+    """``hf download repo_id --revision revision --local-dir dest``, with the partial files of an interrupted earlier
+    attempt removed before it and, if it fails, after it. ``.merlin-download.lock`` in hf's cache folder serializes
+    downloads into one folder for the whole download and its cleanup, so no setup can delete another's partial files:
+    a second one fails fast. Where the lock can't be created (a read-only cache folder) nothing is cleaned."""
+    cache = dest / ".cache" / "huggingface" / "download"
+    fd = None
+    mine = False
+    try:
+        cache.mkdir(parents=True, exist_ok=True)
+        fd = os.open(cache / ".merlin-download.lock", os.O_RDWR | os.O_CREAT, 0o600)
+        mine = _try_lock(fd)
+    except OSError:
+        pass
+    else:
+        if not mine:
+            os.close(fd)
+            raise SetupError(f"another ./setup.sh is downloading into {dest}; wait for it to finish, then run ./setup.sh again", 1)
+    try:
+        if mine:
+            clear_partial_downloads(dest)
+        rc = runner([str(hf), "download", repo_id, "--revision", revision, "--local-dir", str(dest)],
+                    env={**env, "HF_HUB_DISABLE_TELEMETRY": "1"})
+        if mine and rc != 0:
+            clear_partial_downloads(dest)
+        return rc
+    finally:
+        if fd is not None:
+            os.close(fd)  # closing the descriptor releases the lock
 
 
 def pull_checkpoint(repo: Path, a: Answers, env: dict[str, str], revision: str | None, rehash: bool = False,
@@ -1742,10 +1836,9 @@ def pull_checkpoint(repo: Path, a: Answers, env: dict[str, str], revision: str |
                              "repository is published); nothing downloaded")
         hf = hf_tool(repo, env, runner)
         ckpt_dir.mkdir(parents=True, exist_ok=True)
-        env = {**env, "HF_HUB_DISABLE_TELEMETRY": "1"}
-        rc = runner([str(hf), "download", hf_repo(a.model, repo), "--revision", revision, "--local-dir", str(ckpt_dir)], env=env)
+        rc = hf_download(hf, hf_repo(a.model, repo), revision, ckpt_dir, env, runner)
         if rc != 0:
-            raise SetupError(f"hf download failed (rc {rc}); run again to resume")
+            raise SetupError(f"hf download failed (rc {rc}); run again: finished files stay, partial ones start over")
     ok, bad = verify_checkpoint(ckpt_dir, list_path, model=a.model, rehash=rehash)
     if not ok:
         raise SetupError(f"checkpoint verification failed in {ckpt_dir}:\n  " + "\n  ".join(bad)
@@ -1867,6 +1960,8 @@ def ask_questions(a: Answers, inv: pf.Inventory, ui: Asker, args: argparse.Names
         a.models_dir = ui.ask("Models folder (an existing download is reused)", a.models_dir or default_dir(a.model))
     if want("folder") and not ui.yes:  # --yes: the folder is in the answers block below
         ui.say(f"  checkpoint -> {a.checkpoint_dir()}")
+    if want("folder"):
+        a = _ask_ple_store(a, inv, ui, args, repo)
     if want("access"):
         a = _ask_access(a, ui, args, key_path)
     if want("port") and args.port is None:
@@ -1874,8 +1969,90 @@ def ask_questions(a: Answers, inv: pf.Inventory, ui: Asker, args: argparse.Names
         if not (p.isascii() and p.isdigit() and len(p) <= 5) or not 1 <= int(p) <= 65535:
             raise SetupError(f"port {p!r}: 1..65535", 2)
         a.port = int(p)
+    if want("context"):
+        a = _ask_context(a, inv, ui, args, repo)
     if ui.yes:
         answers_block(a, inv, ui, "Answers", repo=repo)
+    return a
+
+
+def ple_store_reason(a: Answers) -> str | None:
+    """Why setup does not offer NVMe for the table these answers read; None when it does. INT6 reads the pack, which
+    MERLIN_PLE_PACK_DIR can put on another disk, whether or not the overlay is built yet."""
+    return PS.offer_reason(a.pack_dir() if is_variant(a.ple_table) else a.checkpoint_dir())
+
+
+def reconcile_ple_store(a: Answers, args: argparse.Namespace, ui: Asker) -> Answers:
+    """A saved disk answer stays only while the table is still on NVMe (every run, questions or not); a flag always stays."""
+    if fn_family(a.model) and args.ple_store is None and a.ple_store == "disk":
+        why = ple_store_reason(a)
+        if why is not None:
+            ui.say(f"  PLE store: RAM; {why}")
+            a.ple_store = "ram"
+    return a
+
+
+def _nvme_only_fits(a: Answers, inv: pf.Inventory, args: argparse.Namespace, repo: Path) -> bool:
+    """Whether these flags fail with the table in RAM and fit with it on disk: said in the question, never its default."""
+    def fails(store: str) -> bool:
+        b = replace(a, ple_store=store)
+        try:
+            plans = serve_plan(b, inv, repo)
+        except (S.CliError, R.ProfileError):
+            return True  # no layout under this RAM gate
+        sizes = [len(p.cards) for p in plans]
+        per_rank = kv_ram_cache_per_rank(effective_answers(b, plans, sizes, args), sizes)
+        p = ram_problem(a.model, inv, sizes[0], a.ple_table, per_rank, sizes, store=store)
+        return p is not None and p.level == "FAIL"
+
+    return fails("ram") and not fails("disk")
+
+
+def _ask_ple_store(a: Answers, inv: pf.Inventory, ui: Asker, args: argparse.Namespace, repo: Path) -> Answers:
+    """The PLE store question: Flash-Next family only, after the folder (the answer depends on where the table is); NVMe
+    only (``merlin serve`` warns and runs elsewhere); never with --ple-store; never under --yes, where a saved disk answer
+    stays while the table still qualifies, else RAM. Enter means RAM."""
+    if not fn_family(a.model) or args.ple_store is not None:
+        return a
+    why = ple_store_reason(a)
+    if why is not None:
+        if a.ple_store == "disk" or not ui.yes:
+            ui.say(f"  PLE store: RAM; {why}")
+        a.ple_store = "ram"
+        return a
+    if ui.yes:
+        return a
+    t = PLE_TABLES[a.ple_table or PLE_DEFAULT]
+    ui.section("PLE table", "(Enter = RAM)")
+    ui.para(f"RAM holds the table in host memory (~{t.gib:.1f} GiB). NVMe (experimental) reads its rows from the model files and frees "
+            "that memory, for about 2 % slower decode once the table is cached; text it has not read yet is slower (decode 9-11 %, "
+            "and a cold 262K prompt takes 7-53 % longer to its first token).", "  ")
+    if _nvme_only_fits(a, inv, args, repo):
+        ui.para("These flags would not fit with the table in RAM, and would fit with it on NVMe.", "  ")
+    answer = ui.ask("PLE table: RAM or NVMe? (ram/nvme)", "ram", ["ram", "nvme"])
+    a.ple_store = "disk" if answer == "nvme" else "ram"
+    return a
+
+
+def _ask_context(a: Answers, inv: pf.Inventory, ui: Asker, args: argparse.Namespace, repo: Path) -> Answers:
+    if args.context is not None or ui.yes or not swarm_family(a.model):
+        return a
+    ui.section("Context", "(Enter = native; pool fit checked before download)")
+    try:
+        plans = serve_plan(replace(a, context=None), inv, repo)
+        profile = plans[0].profile_id
+    except (S.CliError, SetupError):
+        profile = ""  # the normal pre-download report explains a layout refusal
+    ui.say("  native: 262K (262,144), no YaRN")
+    for size, factor in ((393216, 1.5), (524288, 2.0), (1048576, 4.0)):
+        label = L.C.qualification(a.model, profile, a.spec or "mtp", factor)
+        ui.say(f"  {size}: YaRN {factor:g}, {label}")
+    ui.say("  1M needs a pool that fits it; current Flash-Next 4x3090 pins do not.")
+    value = ui.ask("Context (native, tokens, or binary k/m)", str(a.context) if a.context else "native")
+    try:
+        a.context = None if value == "native" else L.C.parse_size(value)
+    except ValueError as e:
+        raise SetupError(str(e), 2) from None
     return a
 
 
@@ -1936,7 +2113,8 @@ def _ask_swarm(a: Answers, inv: pf.Inventory, ui: Asker, args: argparse.Namespac
 def flag_rows(a: Answers, inv: pf.Inventory, repo: Path = REPO) -> list[tuple[str, str, str]]:
     """The Flash-Next answers set by flags (or the Drafter question): (name, value, the flag that changes it); for the
     27B and Ornith 1.5 only the KV RAM cache, and only when it is on (untested)."""
-    swarm_rows = [("Swarm", "on (experimental)", "--no-swarm for the default session cap")] if swarm_family(a.model) and a.swarm else []
+    context_rows = [("Context", f"{a.context:,} tokens", "--context SIZE")] if a.context else []
+    swarm_rows = context_rows + [("Swarm", "on (experimental)", "--no-swarm for the default session cap")] if swarm_family(a.model) and a.swarm else context_rows
     if not fn_family(a.model):
         rows = []
         if tier_family(a.model) and a.kv_ram_cache_gib:
@@ -1955,11 +2133,13 @@ def flag_rows(a: Answers, inv: pf.Inventory, repo: Path = REPO) -> list[tuple[st
     elif a.swarm:
         cache, cache_hint = "sized by --swarm", "--kv-ram-cache SIZE to set another size"
     else:
-        # The cache is qualified with MTP only in 3.0.1: no hint to turn it on beside DFlash2.
+        # The cache is qualified with MTP only: no hint to turn it on beside DFlash2.
         cache, cache_hint = "off", "" if a.spec == "dflash2" else "--kv-ram-cache 24g to keep evicted prefixes in RAM"
     ple = "INT6 g32" if is_variant(a.ple_table) else "FP8"
+    store = ("NVMe (experimental)", "--ple-store ram") if a.ple_store == "disk" else ("RAM", "--ple-store disk")
     return [("Drafter", spec, spec_hint), ("KV RAM cache", cache, cache_hint), *swarm_rows,
-            ("PLE table", ple, "--ple fp8 for the FP8 table" if is_variant(a.ple_table) else "")]
+            ("PLE table", ple, "--ple fp8 for the FP8 table" if is_variant(a.ple_table) else ""),
+            ("PLE store", *store)]
 
 
 def say_flag_rows(a: Answers, inv: pf.Inventory, ui: Asker, repo: Path = REPO) -> None:
@@ -2092,9 +2272,9 @@ def review_answers(a: Answers, inv: pf.Inventory, ui: Asker, args: argparse.Name
         before = a.model
         a = ask_questions(a, inv, ui, args, repo, table, saved, key_path, only={pick})
         if pick == "model" and a.model != before:
-            a = ask_questions(a, inv, ui, args, repo, table, saved, key_path, only={"layout", "drafter", "swarm", "folder", "port"})
+            a = ask_questions(a, inv, ui, args, repo, table, saved, key_path, only={"layout", "drafter", "swarm", "context", "folder", "port"})
         elif pick == "layout":
-            a = ask_questions(a, inv, ui, args, repo, table, saved, key_path, only={"drafter", "swarm"})  # the row may have changed
+            a = ask_questions(a, inv, ui, args, repo, table, saved, key_path, only={"drafter", "swarm", "context"})  # the row may have changed
 
 
 def kv_ram_cache_per_rank(a: Answers, sizes: list[int], rows: list[str] | None = None) -> int:
@@ -2126,18 +2306,19 @@ DFLASH2_TIER_FIX = "--kv-ram-cache 0 (off; it also drops a saved size), or --spe
 
 
 def dflash2_tier_text(a: Answers, args: argparse.Namespace | None = None) -> str:
-    """Why a KV RAM cache with --spec dflash2 is refused: 3.0.1 qualifies the cache with MTP only, and
+    """Why a KV RAM cache with --spec dflash2 is refused: the cache is qualified with MTP only, and
     merlin serve refuses the pair, so setup says so before anything downloads."""
     saved = " (saved)" if args is None or getattr(args, "kv_ram_cache_gib", None) is None else ""
     return (f"--kv-ram-cache {a.kv_ram_cache_gib}g{saved} with --spec dflash2: the KV RAM cache is qualified with MTP "
-            "only in 3.0.1; merlin serve refuses the pair")
+            "only; merlin serve refuses the pair")
 
 
 def ple_tier_problems(a: Answers, args: argparse.Namespace, repo: Path, table: dict[str, Any], sizes: list[int],
                       rows: list[str] | None = None) -> list[Problem]:
     """--ple int6 / --kv-ram-cache (given now or saved) refused before anything downloads: INT6 where this build cannot serve
     it (int6_reason), a tier too small for one 262K restore unit over ``sizes`` (TP x PP of each server), and
-    either flag on a model outside the Flash-Next family."""
+    --ple int6 on a model outside the Flash-Next family, or --kv-ram-cache on one outside the Flash-Next, 27B and Ornith
+    families."""
     out = []
     if not fn_family(a.model):
         if is_variant(args.ple) or (args.kv_ram_cache_gib and not tier_family(a.model)):
@@ -2212,7 +2393,7 @@ def swarm_problems(a: Answers, plans: list[S.Plan], sizes: list[int], args: argp
             return [Problem("FAIL", "swarm", L.swarm_not_qualified(pr["id"]), "--no-swarm (the default session cap), or a layout whose row has a swarm cap")]
     out = []
     if a.spec == "dflash2":
-        out.append(Problem("FAIL", "swarm", "--swarm with --spec dflash2: the KV RAM cache --swarm needs is qualified with MTP only in 3.0.1",
+        out.append(Problem("FAIL", "swarm", "--swarm with --spec dflash2: the KV RAM cache --swarm needs is qualified with MTP only",
                            "--no-swarm, or --spec mtp (the default)"))
     if a.kv_ram_cache_gib and profs and len(set(sizes)) == 1:
         need = int(L.swarm_gate(profs[0])["min_gib_per_rank"])
@@ -2264,7 +2445,7 @@ def main(argv: list[str] | None = None, inp: Any = None, out: Any = None, run: C
         print(f"setup: {e}", file=sys.stderr)
         return e.code
     except KeyboardInterrupt:
-        print("\nsetup: interrupted; ./setup.sh again continues (downloads resume)", file=sys.stderr)
+        print("\nsetup: interrupted; ./setup.sh again continues (finished downloads stay)", file=sys.stderr)
         return 130
 
 
@@ -2296,6 +2477,7 @@ def _main(argv: list[str], inp: Any, out: Any, run: Callable[[list[str]], str | 
     if a.cc and not os.environ.get("CC"):
         ui.row("  compiler", f"{a.cc} / {a.cxx} (remembered in .merlin/setup.json)", 10)
 
+    a = reconcile_ple_store(a, args, ui)
     # Questions (a complete saved set for this model is reused unless --reconfigure).
     asked = False
     if not answers_complete(a, saved) or args.reconfigure:
@@ -2323,7 +2505,8 @@ def _main(argv: list[str], inp: Any, out: Any, run: Callable[[list[str]], str | 
     flag_problems = ple_tier_problems(a, args, repo, table, sizes, [p.profile_id for p in plans]) + swarm_probs
     per_rank = kv_ram_cache_per_rank(a_run, sizes, [p.profile_id for p in plans])
     ram = ram_problem(a.model, inv, cards, a.ple_table, per_rank, sizes,
-                      int6_why=int6_reason(a.model, repo, table) if fn_family(a.model) else None)
+                      int6_why=int6_reason(a.model, repo, table) if fn_family(a.model) else None,
+                      store=a.ple_store, disk_why=ple_store_reason(a) if fn_family(a.model) else None)
     if ram is not None and ram.level == "FAIL" and a.swarm and not a.kv_ram_cache_gib:
         ram = replace(ram, fix=SWARM_RAM_FIX)  # the cache is the one --swarm sized: a smaller one would not serve the swarm cap
     # which session cap applies and why (default / --swarm), as the launcher says it at boot

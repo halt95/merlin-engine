@@ -105,13 +105,15 @@ class GDNRecoverSSMMetadata(GDNAttentionMetadata, RecoverSSMMetadata):
             block_size=c.block_size,
         )
 
-    def snapshot_for_deferred_commit(self) -> "GDNRecoverSSMMetadata":
+    def snapshot_for_deferred_commit(
+        self, copy: Any = None
+    ) -> "GDNRecoverSSMMetadata":
         c = self.recoverssm_commit
         if c is None:
             return self
         return replace(
             self,
-            recoverssm_commit=clone_commit_tensors(c, self.num_spec_decodes),
+            recoverssm_commit=clone_commit_tensors(c, self.num_spec_decodes, copy),
         )
 
 

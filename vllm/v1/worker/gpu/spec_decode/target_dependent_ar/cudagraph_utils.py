@@ -6,7 +6,6 @@ from dataclasses import dataclass, replace
 
 import torch
 
-from vllm import envs
 from vllm.config.compilation import CUDAGraphMode
 from vllm.merlin.flashinfer_smallq import (
     plan_identity,
@@ -119,8 +118,7 @@ class SpeculatorCudaGraphManager(CudaGraphManager):
                 **forward_kwargs,
             )
             if (
-                envs.MERLIN_FLASHINFER_WORKLOAD_TILE
-                and desc.cg_mode == CUDAGraphMode.FULL
+                self._workload_tile and desc.cg_mode == CUDAGraphMode.FULL
             ):
                 run._merlin_flashinfer_smallq = plan_identity(attn_metadata)
             return run

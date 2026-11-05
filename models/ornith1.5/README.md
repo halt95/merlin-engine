@@ -11,7 +11,7 @@ The model's own chat template and sampling are served as shipped: T 0.6, top_p 0
 is `qwen3` and the tool-call parser `qwen3_coder`.
 
 > **Status: tested on the reference host** (registry profile `ornith-quad-3090`, 4 × RTX 3090 with P2P), and on a
-> 4 × RTX 3090 host without P2P (`ornith-quad-3090-nop2p`). The full 3.0.0 bench card ran on the reference host on 2026-10-21; the 3.0.1 card re-measured decode, prefill, agents and GSM8K (2026-11-02).
+> 4 × RTX 3090 host without P2P (`ornith-quad-3090-nop2p`). The full 3.0.0 bench card ran on the reference host on 2026-10-21; the 3.0.1 card re-measured decode, prefill, agents and GSM8K (2026-11-02); the 3.0.2 card re-measured them on vLLM 0.33.
 
 ```bash
 MODEL=/path/to/Ornith-1.5-122B-A10B-W4A16-Merlin PORT=8000 bash models/ornith1.5/serve.sh
@@ -30,7 +30,7 @@ Extra arguments go to `vllm serve` after the launcher's own flags; later flags w
 | `VENV` | `<repo>/venv` |
 | `TREE` | unset (optional engine tree, put first on `PYTHONPATH`) |
 | `CACHE_ROOT` | `<repo>/.vllm-cache` |
-| `P2P` | the row's: `on` for `ornith-quad-3090`, `off` for `ornith-quad-3090-nop2p` (a mismatch is refused) |
+| `P2P` | unset: `serve.sh` reads the cards' peer access (`nvidia-smi topo -p2p r`) and serves `ornith-quad-3090` with P2P or `ornith-quad-3090-nop2p` without (unreadable: refused, set `P2P`); `on` / `off` picks that row. `launch.py --profile <row>` refuses a mismatch |
 | `KV_BYTES` | `3556769792` (P2P row) / `3892314112` (no-P2P row) |
 | `CHUNK` | `1024` |
 | `SEQS` | `8` |
@@ -40,6 +40,20 @@ Extra arguments go to `vllm serve` after the launcher's own flags; later flags w
 | `PP_PARTITION` | `25,23` (two counts summing to 48; empty = the engine's even split) |
 | `MAX_PIXELS` | `8388608` (at least 8,388,608) |
 | `UV` | `1` (uniform verify on; `0` = off) |
+
+## Merlin 3.0.2 bench card (2026-11-04)
+
+Maintainer measurements on 4× RTX 3090 (220 W, PCIe Gen4) with P2P (the aikitoria patched driver) and the Zagitta [gpu-unlock](https://github.com/Zagitta/gpu-unlock) kernel module, on vLLM 0.33.0, one fresh `merlin serve` boot per configuration, 2026-11-04; method and every cell in the [bench card](benchmarks/2026-11-04/BENCH-CARD.md). Decode is one stream with thinking on (this template has no effort levels) (tok/s after the first streamed token); prefill is one cold request. With thinking on, a 512-token agent follow-up may end inside the reasoning, and reasoning tokens count. Rows marked (3.0.1 run) were not re-run for 3.0.2 and are on the 3.0.1 card below.
+
+| Measurement | Ornith 1.5 |
+|---|---|
+| Decode, 4K / 131K / 262K prompt | 145 / 122 / 111 tok/s |
+| Cold prefill, 10K / 100K / 262K prompt | 6,385 / 4,068 / 2,288 tok/s |
+| Agents at once (8 × 16K conversations), total, thinking on / off | 528 / 486 tok/s (3.0.1 run) |
+| GSM8K-200 (5-shot), correct of 200, thinking on / thinking off | 196 / 190 (3.0.1 run) |
+| Prompts sent at once (not a residency test) | Not re-measured on 3.0.2. 3.0.0 run: 3 × ~262K needle prompts (259,261-261,565 tokens) sent at once, every needle found. |
+| KV pool | 894,618 tokens |
+| Against 3.0.1 | Within run-to-run spread: decode 0 % / +6 % / +6 % at 4K / 131K / 262K, 262K prefill +1 %. |
 
 ## Merlin 3.0.1 bench card (2026-11-02)
 
@@ -66,7 +80,7 @@ Maintainer measurements on 4× RTX 3090 (220 W, PCIe Gen4) with P2P (the aikitor
 | State space | RecoverSSM: `--use-replayssm --mamba-backend triton`, Model Runner V2; SSM state fp32 | |
 | Speculation | MTP, 3 draft tokens, probabilistic drafting | the model's own MTP head; its routed experts are INT4 (acceptance equal to BF16: 2.943 vs 2.947) |
 | Uniform verify | `MERLIN_MOE_UNIFORM_VERIFY=1` (`UV`) | runs the verify batch through one MoE graph; bitwise identical to UV off at 1 session on one compile cache (same answers at 6 sessions and 258K) |
-| Prefix cache | `--enable-prefix-caching --mamba-cache-mode align`, `--block-size 4608 --prefix-match-unit 64` | the engine needs ≥ 4,512 at fp32 SSM state |
+| Prefix cache | `--enable-prefix-caching --mamba-cache-mode align`, `--block-size 4608 --prefix-match-unit 64` | the engine needs ≥ 4,512 at fp32 SSM state; `--mamba-cache-mode` is deprecated on vLLM 0.33 and has no effect |
 | Chunk | `--max-num-batched-tokens 1024` | 2048 fits but measured no gain |
 | KV | FP8 with the checkpoint's calibrated scales. `--kv-cache-memory-bytes 3556769792` with P2P, `3892314112` without | byte-pinned, never a utilisation fraction; 3 × 262K by engine fit on both rows. Each pin was verified at 8 MP + 262K with uniform verify off; the UV full card then held 262K needles and answered 3 × ~262K needle prompts sent at once |
 | Interconnect | with P2P: `NCCL_P2P_LEVEL=SYS NCCL_PROTO=Simple VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC=1`; without: `NCCL_P2P_DISABLE=1`; custom all-reduce off on both | |
@@ -82,6 +96,11 @@ Maintainer measurements on 4× RTX 3090 (220 W, PCIe Gen4) with P2P (the aikitor
 - The no-P2P host's 262K identity requests failed (prompt plus output over 262,144 tokens) and give no identity evidence. The
   RecoverSSM check on the no-P2P host matched at 6 sessions; at 1 session the outputs differed on 9 of 12 prompts (temperature-0
   drift).
+- Quoted control markers can re-encode differently when replayed. If a user message spells a marker such as
+  `<|im_end|>` next to punctuation or code, the sanitized prompt can tokenize differently from a plain encode of the same
+  text, so a replayed conversation can differ from the first pass (4 of 6 quoted-marker cases in the CPU check, 2026-11-03).
+  This is upstream behaviour (transformers#49891). The check is kept as a monitor, and nothing in
+  the engine works around it.
 
 ## Host-RAM KV cache
 
@@ -97,6 +116,15 @@ whether that holds one 262K restore unit on Ornith is not yet verified. It is un
 Besides the reference argv, the launcher sets `VLLM_CACHE_ROOT` / `TRITON_CACHE_DIR` under `CACHE_ROOT`, per-port
 `MASTER_PORT` / `VLLM_PORT`, `VLLM_NO_USAGE_STATS=1` / `DO_NOT_TRACK=1`, `HF_HUB_OFFLINE=1`, `VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=0` and the
 venv-toolkit `CUDA_HOME` default, and it puts `TREE` first on `PYTHONPATH` while keeping an inherited `PYTHONPATH` behind it.
+
+Merlin 3.0.2 changes for Ornith: the launcher sets `VLLM_MERLIN_EXTRA_CONTROL_TOKENS` to the six FIM tokens
+(`<|fim_prefix|>`, `<|fim_middle|>`, `<|fim_suffix|>`, `<|fim_pad|>`, `<|repo_name|>`, `<|file_sep|>`), so the control-token
+sanitizer encodes them as text when they appear in chat content (`--sanitize-control-tokens`, on by default). It acts only on
+the sanitize path and is empty on the other recipes. `serve.sh` runs `launch.py --profile ornith-quad-3090 --p2p-probe`: `P2P=on`
+or `P2P=off` picks the row without probing, otherwise the cards' peer access decides (`ornith-quad-3090` when every pair has it,
+`ornith-quad-3090-nop2p` otherwise), and an unreadable probe stops the launch with "set P2P=on or P2P=off". Before it sets its
+own values the launcher clears an inherited `NCCL_P2P_DISABLE`, `NCCL_P2P_LEVEL`, `NCCL_PROTO`, `NCCL_ALGO` and
+`VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC`.
 
 ## Checkpoint
 

@@ -8,7 +8,7 @@
 > *File names in this record (`serve/serve.sh`, `scripts/...`, `release/...`, `patches/...`) are from the measurement time; current locations are in [models/README.md](../../../README.md).*
 
 Checkpoint: [halt95/Swift1.5-Huihui-Qwen3.8-Flash-Next-W4A16-Merlin](https://huggingface.co/halt95/Swift1.5-Huihui-Qwen3.8-Flash-Next-W4A16-Merlin),
-served by `scripts/serve-huihui.sh`. The engine's own card for v2.5.2 is [`BENCH-CARD.md`](https://github.com/halt95/merlin-engine/blob/v2.5.3/benchmarks/2026-10-12/BENCH-CARD.md) (tag `v2.5.3`).
+served by `scripts/serve-huihui.sh`. The engine's own card for v2.5.3 is [`BENCH-CARD.md`](https://github.com/halt95/merlin-engine/blob/v2.5.3/benchmarks/2026-10-12/BENCH-CARD.md) (tag `v2.5.3`).
 
 > **Provenance.** These are the maintainer's measurements on the reference host: 4× RTX 3090 at 220 W, PCIe Gen4 x16 with
 > peer-to-peer, no NVLink, 152 GiB host RAM. Engine: the reference host's v2.5.1 tree, which is vLLM 0.30.0 plus the
@@ -94,7 +94,7 @@ parking; the engine's own release check), all four cards sit in P8 at 22-32 W af
 ## Install and serve, as a user
 
 Same host, 2026-10-12, both routes a user can take to this checkpoint, on the release checkpoint files
-(`release/checkpoint-huihui.sha256` verified every file):
+(`models/swift1.5-huihui/checkpoint.sha256` verified every file):
 
 - **This repository**, built from the v2.5.2 bundle with `scripts/build-v2.5.sh`, served with `scripts/serve-huihui.sh`:
   ready in 480 s, serving `flash-next-swift-huihui` and

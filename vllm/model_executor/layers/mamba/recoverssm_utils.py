@@ -25,7 +25,8 @@ def uses_recoverssm(cache_config, num_speculative_tokens: int) -> bool:
     """True when this model instance runs RecoverSSM for its recurrent states.
 
     VllmConfig sets ``cache_config.use_recoverssm`` for every model whose recurrent
-    states support it (Kimi-K3 KDA, Qwen GDN/PLE). Without speculative tokens there is
+    states support it (Kimi-K3 KDA, Qwen GDN/PLE, NemotronH Mamba-2). Without
+    speculative tokens there is
     nothing to recover, so the stock path runs."""
     return (
         bool(getattr(cache_config, "use_recoverssm", False))

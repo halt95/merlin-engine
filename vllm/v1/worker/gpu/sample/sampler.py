@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by the Merlin project; see NOTICE.
 
 from collections.abc import Sequence
 
@@ -9,6 +10,7 @@ import torch
 import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.config.model import PROCESSED_LOGPROBS_MODES, LogprobsMode
+from vllm.merlin.spec_verify_fast_paths import sampling_may_mask_logits
 from vllm.sampling_params import SamplingParams
 from vllm.v1.sample.ops.topk_topp_sampler import (
     apply_top_k_top_p,
@@ -83,6 +85,7 @@ class Sampler:
             TraceReplayState(req_states) if enable_trace_replay else None
         )
         self.needs_logits_processing = np.zeros(max_num_reqs, dtype=bool)
+        self.may_mask_logits = np.zeros(max_num_reqs, dtype=bool)
         self.num_speculative_tokens = num_speculative_tokens
         self.return_sampling_mask = return_sampling_mask
         self.use_flashinfer = (
@@ -95,12 +98,20 @@ class Sampler:
 
     def add_request(self, req_idx: int, sampling_params: SamplingParams) -> None:
         needs_processing = self.sampling_states.add_request(req_idx, sampling_params)
-        needs_processing |= self.thinking_budget_state.add_request(
-            req_idx, sampling_params
+        states = self.sampling_states
+        may_mask = sampling_may_mask_logits(
+            states.temperature.np[req_idx],
+            states.min_p.np[req_idx],
+            states.top_k.np[req_idx],
+            states.top_p.np[req_idx],
+            states.vocab_size,
         )
+        # Thinking budget may mask.
+        may_mask |= self.thinking_budget_state.add_request(req_idx, sampling_params)
         for processor in self.logits_processors:
-            needs_processing |= processor.add_request(req_idx, sampling_params)
-        self.needs_logits_processing[req_idx] = needs_processing
+            may_mask |= processor.add_request(req_idx, sampling_params)
+        self.needs_logits_processing[req_idx] = needs_processing or may_mask
+        self.may_mask_logits[req_idx] = may_mask
 
         self.logprob_token_ids_state.add_request(req_idx, sampling_params)
         if self.trace_replay_state is not None:

@@ -8,8 +8,7 @@ cuModuleLoadData, cuModuleGetFunction, cuFuncGetAttribute/SetAttribute) only
 at the first real launch, from ``launch_metadata``. That first launch can come
 in the middle of a forward pass. Under CUDA lazy module loading it then runs
 while device work is pending, such as the PLE host-mapped pull's host-flag
-wait, and hang the worker (both PP0 ranks stopped in ``load_binary`` under
-``qsa_sparse_paged_attention``). Loading every warmed specialization while
+wait, and can hang the worker. Loading every warmed specialization while
 the boot warm-up still owns an idle device removes that first-launch load.
 
 Loading only creates the module and function handles and sets the function's
@@ -20,10 +19,10 @@ Also here: the boot launch of the Mamba-hybrid accepted-count kernels, which
 no warm-up reached (``warm_num_accepted_kernels``), and the post-warm-up
 kernel-load monitor (``install_kernel_load_monitor``).
 
-This is general: ``preload_boot_kernels`` loads
-every specialization any boot compile left in a JITFunction cache: the
-functions in Triton's registry plus those a ``jit_post_compile_hook``
-recorder saw (``install_compile_recorder``, from ``Worker.load_model``).
+``preload_boot_kernels`` is general: it loads every specialization any boot
+compile left in a JITFunction cache: the functions in Triton's registry plus
+those a ``jit_post_compile_hook`` recorder saw (``install_compile_recorder``,
+from ``Worker.load_model``).
 A specialization first compiled while serving (one no warm-up produced)
 still compiles and loads in the forward that needs it; the recorder logs it
 (once per specialization, every rank) and nothing is written to disk.
@@ -83,7 +82,7 @@ def _compiled_kernels(jit_fn: Any, device: Any) -> list[Any]:
     # ``.get``: ``device_caches`` is a defaultdict; indexing would add a key.
     entry = caches.get(device)
     # (kernel_cache, kernel_key_cache, target, backend, binder) in Triton
-    # 3.4+ (3.7.1 jit.py:671-682); the kernel cache is the first element.
+    # 3.4+ (3.8.0 jit.py:689-700); the kernel cache is the first element.
     kernel_cache = entry[0] if isinstance(entry, tuple) else None
     return list(kernel_cache.values()) if isinstance(kernel_cache, dict) else []
 
@@ -96,9 +95,8 @@ def preload_triton_kernels(
     is a no-op).
 
     A specialization that fails to load is logged and left to load at its
-    first launch, as it would without the preload; boot does not fail for
-    it. A
-    shortfall (any failure, or fewer loaded than ``expected``, the number the
+    first launch, as it would without the preload; boot does not fail for it.
+    A shortfall (any failure, or fewer loaded than ``expected``, the number the
     warm-up compiled) is a WARNING with the counts, so a serving log shows when
     the preload did not take effect.
     """
@@ -175,18 +173,20 @@ def _preload(
                     continue
                 if getattr(kernel, "module", None) is not None:
                     # Already loaded: never re-enter _init_handles for a
-                    # resident key (Triton keeps that module for good).
+                    # resident key. Triton keeps the module while the kernel
+                    # cache holds the CompiledKernel (3.8.0 compiler.py:439
+                    # unloads it only when the kernel object is freed).
                     loaded += 1
                     continue
                 init_handles()
                 if new_names is not None:
                     new_names.append(str(getattr(kernel, "name", jit_fn)))
             except Exception:
-                # Triton sets ``_run`` before ``load_binary`` (3.7.1
-                # compiler.py:455/:468): when the load itself failed (module
+                # Triton sets ``_run`` before ``load_binary`` (3.8.0
+                # compiler.py:464/:479): when the load itself failed (module
                 # still None) clear it, so the first launch rebuilds the
                 # handles and retries. A failure after the module is set (the
-                # thread-count check, a kernel_load_end_hook: :471-474) keeps
+                # thread-count check, a kernel_load_end_hook: :482-485) keeps
                 # ``_run``: the launch then skips _init_handles and must still
                 # have its launcher.
                 if kernel is not None and getattr(kernel, "module", None) is None:
@@ -230,6 +230,9 @@ def warm_num_accepted_kernels(runner: Any) -> bool:
     specializes the int 1 on its own), and the scatter's sampled counts are
     int32 (sampler / rejection sampler).
     """
+    # The GDN in_proj_ba split-K kernel has the same boot gap (see below); the
+    # worker calls this function once, after every warm-up and capture.
+    warm_gdn_ba_splitk_kernels(runner)
     state = getattr(runner, "model_state", None)
     accepted = getattr(state, "num_accepted_tokens_gpu", None)
     if accepted is None:
@@ -249,12 +252,71 @@ def warm_num_accepted_kernels(runner: Any) -> bool:
     return True
 
 
+def warm_gdn_ba_splitk_kernels(runner: Any) -> int:
+    """Compile and load every GDN in_proj_ba split-K specialization at boot.
+
+    ``gdn_ba_splitk`` runs ``_ba_splitk_kernel`` only for ``M <= SPLITK_MAX_M``
+    (16) tokens, and Triton specializes the int ``M`` (``M == 1``,
+    ``M % 16 == 0``, other). The profile run (``M`` = max batched tokens) takes
+    ``F.linear``, and CUDA-graph capture only reaches the configured capture
+    sizes, so a specialization whose ``M`` is not among them (``M == 16`` when
+    16 is not a capture size) is first reached by an eager forward, such as a
+    short prefill, and would otherwise compile while serving. Launching
+    the production function once per ``M`` in 1..16 on each distinct
+    (weight shape, dtype, device) compiles every specialization the dispatch can
+    reach; ``preload_boot_kernels`` then loads them. The launches write only
+    their own temporary output, so serving state and numerics are unchanged
+    (same kernel, same arguments as a serving call of that ``M``).
+
+    Returns the number of distinct projections warmed."""
+    get_model = getattr(runner, "get_model", None)
+    model = None
+    with contextlib.suppress(Exception):
+        model = get_model() if callable(get_model) else getattr(runner, "model", None)
+    if model is None or not hasattr(model, "modules"):
+        return 0
+    import torch
+
+    from vllm.model_executor.layers.mamba.gdn import ba_splitk
+    from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
+        ba_splitk_applies,
+    )
+
+    seen: set[tuple] = set()
+    for module in model.modules():
+        proj = getattr(module, "in_proj_ba", None)
+        if proj is None or not hasattr(module, "use_ba_splitk"):
+            continue
+        if getattr(module, "use_ba_aux_stream", False):
+            continue  # the aux-stream path never calls split-K
+        if not ba_splitk_applies(module.use_ba_splitk, proj):
+            continue
+        weight = proj.weight
+        key = (tuple(weight.shape), weight.dtype, weight.device)
+        if key in seen:
+            continue
+        seen.add(key)
+        with torch.inference_mode():
+            for m in range(1, ba_splitk.SPLITK_MAX_M + 1):
+                x = torch.zeros(
+                    (m, weight.shape[1]), dtype=weight.dtype, device=weight.device
+                )
+                ba_splitk.gdn_ba_splitk(x, weight)
+        torch.cuda.synchronize(weight.device)
+    if seen:
+        logger.info(
+            "Warmed GDN in_proj_ba split-K kernels at boot: %d projection "
+            "shape(s), M=1..%d.", len(seen), ba_splitk.SPLITK_MAX_M,
+        )
+    return len(seen)
+
+
 # --- Every boot compile loaded at boot -------------------------------------
 
 
 def _jit_function_registry() -> dict[str, Any]:
     """Triton's own map of every JITFunction constructed, keyed
-    ``module:qualname`` (3.7.1 jit.py ``JITFunction.__init__``)."""
+    ``module:qualname`` (3.8.0 jit.py:799, ``JITFunction.__init__``)."""
     try:
         from triton.runtime import jit as triton_jit
     except Exception:
@@ -265,7 +327,7 @@ def _jit_function_registry() -> dict[str, Any]:
 
 def _guard_specialization_serializer(jit_module: Any = None) -> None:
     """With any post-compile hook set, Triton serializes each compile's
-    specialization (3.7.1 jit.py:636) and a non-JSON constexpr raises out of
+    specialization (3.8.0 jit.py:654) and a non-JSON constexpr raises out of
     the compile. Same guard as ``vllm.utils.jit_monitor`` (whose marker it
     sets, so neither wraps twice), needed earlier: the recorder runs during
     warm-up, before the JIT monitor."""
@@ -447,7 +509,7 @@ def _on_kernel_load(*args: Any, **kwargs: Any) -> None:
 def install_kernel_load_monitor(knobs: Any = None, *, warn: bool = True) -> bool:
     """Log every Triton kernel binary load from now on (call once warm-up and
     graph capture are done), once per (name, hash). Uses
-    ``knobs.runtime.kernel_load_start_hook`` (Triton 3.7.1: a HookChain fired
+    ``knobs.runtime.kernel_load_start_hook`` (Triton 3.8.0: a HookChain fired
     in ``CompiledKernel._init_handles`` before ``load_binary``). ``warn``
     False (JIT warm-up disabled, so lazy first loads are expected) logs at
     INFO; the monitor stays installed either way. Returns False when this
@@ -481,7 +543,7 @@ def install_kernel_load_monitor(knobs: Any = None, *, warn: bool = True) -> bool
 
 
 def _chain_load_start_hook(runtime: Any, fn: Any) -> None:
-    """Add ``fn`` to ``runtime.kernel_load_start_hook``: a 3.7.1 HookChain
+    """Add ``fn`` to ``runtime.kernel_load_start_hook``: a 3.8.0 HookChain
     (``add``), else become the hook or wrap the existing one, so the monitor
     and the quiesce hook both run whichever is installed first."""
     hook = runtime.kernel_load_start_hook
@@ -518,7 +580,7 @@ def _gpu_sync_allowed() -> Any:
 
 def _quiesce_before_load(*args: Any, **kwargs: Any) -> None:
     """``kernel_load_start_hook``: runs on the loading thread just before
-    ``load_binary`` (3.7.1 compiler.py:465-468). Once serving has started,
+    ``load_binary`` (3.8.0 compiler.py:476-479). Once serving has started,
     drain this thread's current stream first, so no PLE host-flag wait (or
     other host-dependent work) is pending on it while the module loads (a
     wait cycle). ``Stream.synchronize`` releases the GIL

@@ -109,7 +109,9 @@ class Mamba2RecoverSSMMetadata(Mamba2AttentionMetadata, RecoverSSMMetadata):
             block_size=c.block_size,
         )
 
-    def snapshot_for_deferred_commit(self) -> "Mamba2RecoverSSMMetadata":
+    def snapshot_for_deferred_commit(
+        self, copy: Any = None
+    ) -> "Mamba2RecoverSSMMetadata":
         """The commit inputs cloned (trimmed to the real decode rows), so the
         builds between this step and its PP-deferred commit cannot overwrite
         them: the state indices may be the builder's persistent graph buffer and
@@ -119,7 +121,7 @@ class Mamba2RecoverSSMMetadata(Mamba2AttentionMetadata, RecoverSSMMetadata):
         if c is None:
             return self
         return replace(
-            self, recoverssm_commit=clone_commit_tensors(c, self.num_spec_decodes)
+            self, recoverssm_commit=clone_commit_tensors(c, self.num_spec_decodes, copy)
         )
 
 

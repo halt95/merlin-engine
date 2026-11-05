@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Modified by the Merlin project; see NOTICE.
 
+from functools import lru_cache
+
 import torch
 
 from vllm.distributed import (
@@ -21,6 +23,16 @@ def _custom_collective(name: str, x: torch.Tensor) -> torch.Tensor | None:
         return None
     collective = getattr(device_communicator, name, None)
     return None if collective is None else collective(x)
+
+
+@lru_cache
+def is_sequence_parallel_active(is_enabled: bool, num_tokens: int) -> bool:
+    """Whether a batch of ``num_tokens`` shards the stream along the sequence.
+
+    Below one token per rank the shards are mostly padding, so the batch
+    stays replicated.
+    """
+    return is_enabled and num_tokens >= get_tensor_model_parallel_world_size()
 
 
 def sp_all_gather(x: torch.Tensor) -> torch.Tensor:

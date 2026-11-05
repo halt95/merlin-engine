@@ -4,8 +4,8 @@
 
 Opt-in with MERLIN_SHARE_DRAFT_WORKSPACE=1. The drafter and the target issue attention
 serially on one compute stream, and the float buffer is scratch that each run rewrites
-before reading, so one buffer serves both. ``share_workspace`` is also the upstream
-within-model sharing loop: with ``shared=None`` it behaves exactly as that loop did.
+before reading, so one buffer serves both. With ``shared=None``,
+``share_workspace`` only shares one workspace across a model's own builders.
 """
 
 import logging

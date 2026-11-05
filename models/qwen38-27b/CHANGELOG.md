@@ -7,6 +7,17 @@ Release notes, newest first. To install and run the current release, see the [RE
 (scripts, serve-script variables and knobs, capacity, known behaviours, measurement method) is in
 [docs/reference.md](docs/reference.md); v1.0.0 and its numbers are in [docs/history.md](docs/history.md).
 
+## Merlin 3.0.2
+
+See the [engine changelog](../../docs/CHANGELOG.md#merlin-302) for the full release: the recipe now runs on **vLLM 0.33.0** with
+FlashInfer 0.7.2.post1 and its re-ported sm_86 FP8 verify tile (`FLASHINFER_SM8X_FP8_SMALLQ=cta32` stays the TP1, TP2 and TP4
+default; the workload plan mode stays opt-in). This recipe's results are in the
+[2026-11-04 bench card](benchmarks/2026-11-04/BENCH-CARD.md); the 2026-11-02 card stays as the 3.0.1
+comparator. The launchers still pass the deprecated `--mamba-cache-mode align`, which has no effect on 0.33. Pillow 13 changes the
+image path: the 8 MP floor and an image A/B against 3.0.1 are not yet re-measured on Pillow 13. The 27B launcher clears an
+inherited `NCCL_PROTO`, `NCCL_ALGO` and `VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC` before it sets its P2P row, so IPC all-reduce
+can no longer be switched on from the shell on TP4.
+
 ## Merlin 3.0.1
 
 See the [engine changelog](../../docs/CHANGELOG.md) for the full release. This recipe's results, measured with P2P and the
@@ -156,7 +167,7 @@ To run it: [Quick start](README.md#quick-start), or [Build and serve](docs/refer
 - New ThinkingCap-Qwen3.8-27B checkpoint profile (`halt95/ThinkingCap-Qwen3.8-27B-W4A16-Merlin`, weights under the PolyForm
   Small Business License 1.0.0 plus BottleCap AI's personal-use permission): served via `serve/serve-thinkingcap.sh` (TP=2)
   and `serve/serve-thinkingcap-tp4.sh` (TP=4), `xhigh` reasoning effort by default; checkpoint list
-  `release/checkpoint-thinkingcap.sha256`, licence copies in `licenses/`, bench card `benchmarks/2026-10-12/ThinkingCap-BENCH-CARD.md`.
+  `models/thinkingcap/checkpoint.sha256`, licence copies in `licenses/`, bench card `benchmarks/2026-10-12/ThinkingCap-BENCH-CARD.md`.
   ThinkingCap has no version of its own: it is the ThinkingCap profile of v1.3.0.
 
 ### Upgrading from v1.0.0

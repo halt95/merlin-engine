@@ -25,7 +25,7 @@ class PendingRecv:
 
     event: torch.cuda.Event
 
-    sampled_tokens: torch.Tensor  # [num_reqs, max_sample_len]
+    sampled_tokens: torch.Tensor  # [num_reqs, sample_len]
     num_sampled: torch.Tensor  # [num_reqs]
     num_rejected: torch.Tensor  # [num_reqs]
     idx_mapping: torch.Tensor  # [num_reqs]
@@ -40,6 +40,10 @@ class PendingRecv:
     # arrive (RecoverSSM: the snapshot of the step's deferred commits).
     deferred_state: object | None = None
     commit_ack: DeferredCommitAck | None = None
+    # Recorded after the token and count
+    # broadcasts, before the draft broadcast (`event` covers all three). None:
+    # one event (no drafts received, or VLLM_RECOVERSSM_PP_SPLIT_RECV off).
+    counts_event: torch.cuda.Event | None = None
 
 
 def compute_need_sampled_mask(input_batch: InputBatch) -> np.ndarray | None:
@@ -101,10 +105,18 @@ class PPHandler:
         self.broadcast_group = get_pp_group().make_sibling_device_group(
             group_desc="pp_broadcast"
         )
+        # Whether sampled tokens were broadcast this step.
+        self.sampled_tokens_broadcast = False
+        # Read once, before any step.
+        self.split_recv_events = bool(envs.VLLM_RECOVERSSM_PP_SPLIT_RECV)
         self.aux_hidden_state_relay_keys: tuple[str, ...] = ()
 
     def on_req_idx_freed(self, req_idx: int) -> None:
         self.req_idx_gen_np[req_idx] += 1
+
+    def _sample_len(self, input_batch: InputBatch) -> int:
+        # Width of the sampled-token broadcast. Must be the same on all ranks.
+        return self.max_sample_len if input_batch.num_draft_tokens > 0 else 1
 
     def configure_aux_hidden_state_relay(self, model: torch.nn.Module) -> None:
         from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
@@ -129,9 +141,7 @@ class PPHandler:
             }
         )
 
-    def get_prev_sampled_outputs(
-        self, draft_tokens_to_update: torch.Tensor | None = None
-    ) -> dict[str, torch.Tensor] | None:
+    def get_prev_sampled_outputs(self) -> dict[str, torch.Tensor | None] | None:
         """Consume the entry from pp_size steps ago and wait for its recv event,
         then filter out entries whose request was freed since `receive`.
         """
@@ -151,6 +161,11 @@ class PPHandler:
         if slot.commit_ack is not None:
             slot.commit_ack.mask(freed & slot.need_sampled_mask)
         idx_mapping = slot.idx_mapping
+        # With a counts event the main stream
+        # waits here only for the tokens and counts; the caller waits on
+        # `drafts_event` before anything that reads the drafts (post_update).
+        first_event = slot.event if slot.counts_event is None else slot.counts_event
+        drafts_event = None if slot.counts_event is None else slot.event
         if exclude_mask.any():
             if exclude_mask.all():
                 # No states require update anymore.
@@ -163,26 +178,18 @@ class PPHandler:
             idx_mapping_np = np.where(exclude_mask, -1, slot.idx_mapping_np)
             idx_mapping = async_tensor_h2d(idx_mapping_np, device=self.device)
 
-        self.main_stream.wait_event(slot.event)
-        if slot.draft_tokens is not None and draft_tokens_to_update is not None:
-            draft_tokens = slot.draft_tokens
-            draft_idx_mapping = slot.idx_mapping
-            if exclude_mask.any():
-                keep = ~exclude_mask
-                keep_t = torch.as_tensor(keep, device=self.device)
-                draft_tokens = draft_tokens[keep_t]
-                draft_idx_mapping = async_tensor_h2d(
-                    slot.idx_mapping_np[keep], device=self.device
-                )
-            draft_tokens_to_update[draft_idx_mapping] = draft_tokens
-
+        # Wait on the first (counts) event when
+        # receives are split
+        self.main_stream.wait_event(first_event)
         return dict(
             sampled_tokens=slot.sampled_tokens,
             num_sampled=slot.num_sampled,
             num_rejected=slot.num_rejected,
             idx_mapping=idx_mapping,
+            draft_tokens=slot.draft_tokens,
             deferred_state=slot.deferred_state,
             commit_ack=slot.commit_ack,
+            drafts_event=drafts_event,
         )
 
     def attach_deferred_state(self, state: object | None) -> None:
@@ -210,28 +217,21 @@ class PPHandler:
                 dropped += 1
         return dropped
 
-    def broadcast_drafts(
-        self, draft_tokens: torch.Tensor, input_batch: InputBatch
-    ) -> None:
+    def broadcast_drafts(self, draft_tokens: torch.Tensor) -> None:
         """Broadcast draft proposals so non-last ranks can embed real token ids."""
         assert self.is_last_rank
-        if compute_need_sampled_mask(input_batch) is None:
-            return
-        # Port of vllm#64458: gather on the main stream,
-        # ordered with the draft writes; the main stream could otherwise
-        # overwrite draft_tokens before the broadcast stream reads them.
-        send = draft_tokens[input_batch.idx_mapping].contiguous()
-        with torch.cuda.stream(self.broadcast_stream):
-            self.broadcast_stream.wait_stream(self.main_stream)
-            # The payload is a main-stream tensor.
-            send.record_stream(self.broadcast_stream)
-            torch.distributed.broadcast(
-                send, src=self.last_rank, group=self.broadcast_group
-            )
+        if self.sampled_tokens_broadcast:
+            with torch.cuda.stream(self.broadcast_stream):
+                self.broadcast_stream.wait_stream(self.main_stream)
+                torch.distributed.broadcast(
+                    draft_tokens, src=self.last_rank, group=self.broadcast_group
+                )
+                draft_tokens.record_stream(self.broadcast_stream)
 
-    def receive(self, input_batch: InputBatch) -> bool:
+    def receive(self, input_batch: InputBatch, recv_drafts: bool) -> bool:
         """Returns True iff sampled tokens need to be gathered from *all*
-        requests in the batch."""
+        requests in the batch. `recv_drafts` must match whether the last rank
+        calls `broadcast_drafts` for this step."""
         assert not self.is_last_rank
         need_sampled_mask = compute_need_sampled_mask(input_batch)
         if need_sampled_mask is None:
@@ -245,8 +245,9 @@ class PPHandler:
         num_reqs = input_batch.num_reqs
         with torch.cuda.stream(self.broadcast_stream):
             self.broadcast_stream.wait_stream(self.main_stream)
+            sample_len = self._sample_len(input_batch)
             sampled_tokens = torch.empty(
-                num_reqs, self.max_sample_len, dtype=torch.int64, device=self.device
+                num_reqs, sample_len, dtype=torch.int64, device=self.device
             )
             combined = torch.empty(2, num_reqs, dtype=torch.int32, device=self.device)
             torch.distributed.broadcast(
@@ -256,12 +257,16 @@ class PPHandler:
                 combined, src=self.last_rank, group=self.broadcast_group
             )
             draft_tokens = None
-            if self.num_speculative_steps > 0:
-                draft_tokens = torch.empty(
-                    num_reqs,
-                    self.num_speculative_steps,
-                    dtype=torch.int64,
-                    device=self.device,
+            # counts-only receive event (None unless
+            # split receives are on)
+            counts_event = None
+            if recv_drafts:
+                # Record the counts event before the
+                # draft receive
+                if self.split_recv_events:
+                    counts_event = self.broadcast_stream.record_event()
+                draft_tokens = sampled_tokens.new_empty(
+                    num_reqs, self.num_speculative_steps
                 )
                 torch.distributed.broadcast(
                     draft_tokens, src=self.last_rank, group=self.broadcast_group
@@ -284,6 +289,7 @@ class PPHandler:
             need_sampled_mask,
             gen_at_receive_np,
             draft_tokens,
+            counts_event=counts_event,
         )
         return bool(need_sampled_mask.all())
 
@@ -297,21 +303,21 @@ class PPHandler:
         assert self.is_last_rank
         if compute_need_sampled_mask(input_batch) is None:
             # No request needs sampled outputs for a subsequent decode step.
+            self.sampled_tokens_broadcast = False
             return
 
         assert sampled_token_ids.dtype == torch.int64
+        self.sampled_tokens_broadcast = True
 
         if current_platform.is_xpu():
             self.main_stream.synchronize()
 
         with torch.cuda.stream(self.broadcast_stream):
             self.broadcast_stream.wait_stream(self.main_stream)
-            send_tokens = torch.nn.functional.pad(
-                sampled_token_ids,
-                (0, self.max_sample_len - sampled_token_ids.shape[-1]),
-            )
+            # receive() allocates the same width on the other ranks.
+            assert sampled_token_ids.shape[-1] == self._sample_len(input_batch)
             torch.distributed.broadcast(
-                send_tokens.contiguous(),
+                sampled_token_ids.contiguous(),
                 src=self.last_rank,
                 group=self.broadcast_group,
             )

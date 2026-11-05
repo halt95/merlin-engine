@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by the Merlin project; see NOTICE.
 
 
 import math
@@ -456,6 +457,40 @@ def _marlin_gemm(
 ) -> torch.Tensor:
     if workspace is None:
         workspace = get_marlin_workspace(a.device)
+    # a matched rule launches its pinned
+    # tile; OFF and unmatched calls fall through to the direct call below. The
+    # table is parsed once per process and the device limits are read once per
+    # device (env_rules / device_limits), not on every GEMM.
+    from vllm.merlin.marlin_dense_cfg import device_limits, env_rules, select_override
+
+    rules = env_rules()
+    if rules and (
+        a.device.type == "cuda"
+        and a.dtype == torch.bfloat16
+        and b_q_type_id == scalar_types.uint8b128.id
+        and b_scales.ndim == 2 and b_scales.shape[0] == 1
+        and b_bias is None
+        and (b_zeros is None or b_zeros.numel() == 0)
+        and not use_atomic_add and use_fp32_reduce and not is_zp_float
+    ):
+        sm, sms, max_shared_mem = device_limits(a.device.index)
+        cfg = select_override(
+            rules, sm=sm, sms=sms,
+            m=size_m, n=size_n, k=size_k,
+            max_shared_mem=max_shared_mem,
+        )
+        if cfg is not None:
+            logger.warning_once(
+                "MERLIN_MARLIN_DENSE_CFG: M/N/K=%s/%s/%s tile=%s; ack=bitwise "
+                "records a bitwise-equality qualification, it does not prove it",
+                size_m, size_n, size_k, cfg,
+            )
+            return torch.ops._C.marlin_gemm(
+                a, None, b_q_weight, b_bias, b_scales, a_scales, global_scale,
+                b_zeros, workspace, b_q_type_id, size_m, size_n, size_k,
+                use_atomic_add, use_fp32_reduce, is_zp_float,
+                thread_k_override=cfg[0], thread_n_override=cfg[1],
+            )
     return torch.ops._C.marlin_gemm(
         a,
         None,

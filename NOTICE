@@ -1,4 +1,4 @@
-NOTICE — Merlin 3.0.1
+NOTICE — Merlin 3.0.2
 Copyright 2026 halt95 (Merlin modifications)
 
 Upstream attribution
@@ -8,8 +8,8 @@ This distribution contains a modified version of vLLM:
   Copyright (c) the vLLM project contributors.
   Licensed under the Apache License, Version 2.0; see LICENSE.
 
-Upstream base: vLLM v0.32.0, commit 5df63a7203.
-Upstream README: https://github.com/vllm-project/vllm/blob/v0.32.0/README.md
+Upstream base: vLLM v0.33.0, commit 4ba787ec99.
+Upstream README: https://github.com/vllm-project/vllm/blob/v0.33.0/README.md
 Upstream documentation: https://docs.vllm.ai/
 Original copyright, patent, trademark and attribution notices in upstream and
 vendored sources remain applicable. This NOTICE is informational and does not
@@ -17,7 +17,7 @@ change any licence or imply endorsement by upstream projects.
 
 Modified-files statement (Apache-2.0 section 4(b))
 -------------------------------------------------
-Merlin changes files relative to vLLM v0.32.0. Those changes are by the Merlin
+Merlin changes files relative to vLLM v0.33.0. Those changes are by the Merlin
 project, not the upstream vLLM authors. The fork adds or changes engine code for
 FP8 QSA on sm_86, host-memory PLE offload, RecoverSSM, prefix-cache retention,
 persistent top-k, prompt-logprob workspace bounds, compatibility checks,
@@ -70,11 +70,11 @@ change scope; they are not an exhaustive per-release inventory. For the complete
 added, modified, deleted and renamed file record of a checkout, fetch the upstream
 base and compare:
 
-  git fetch https://github.com/vllm-project/vllm.git v0.32.0
-  git diff --name-status --no-renames 5df63a7203 HEAD
-  git diff 5df63a7203 HEAD -- <path>
+  git fetch https://github.com/vllm-project/vllm.git v0.33.0
+  git diff --name-status --no-renames 4ba787ec99 HEAD
+  git diff 4ba787ec99 HEAD -- <path>
 
-For the published release, use the merlin-v3.0.1 tag in place of HEAD. Source
+For the published release, use the merlin-v3.0.2 tag in place of HEAD. Source
 files retain their applicable notices. Each modified upstream file, including
 CMakeLists.txt and the modified csrc/ files, carries the line "Modified by the Merlin
 project; see NOTICE." This central record supplements those notices.
@@ -106,15 +106,16 @@ proposal and its first measurements on Merlin);
 incoai (the Qwen3.8-Flash-Next-DFlash2 drafter, Apache-2.0, downloaded by setup at a pinned revision and not shipped);
 the club-3090 community (an sm_80 FP8 KV decoder port shared in github.com/noonghunna/club-3090 discussion #1735,
 which informed the sm_80 FP8 KV opt-in; Merlin serves it through its own sm_86 byte-decoder path); DominikBucko (MTP INT4 packing
-recipe); Neiko2002, Yarikdevcom, noonghunna/club-3090 and tfriedel (independent work on the same hardware class); Intel (AutoRound experts); RadixArk (FP8 PLE table); Qwen, UkisAI,
+recipe); Neiko2002, Yarikdevcom, noonghunna and tfriedel (independent work on the same hardware class); Intel (AutoRound experts); RadixArk (FP8 PLE table); Qwen, UkisAI,
 huihui-ai, philbert, BottleCap AI, NVIDIA and ornith-ai (source models and checkpoints).
 
 FlashInfer and templates
 ------------------------
 FlashInfer (https://github.com/flashinfer-ai/flashinfer), Apache-2.0, is an
-external dependency. The 27B serving configuration uses FlashInfer 0.7.0.post1
+external dependency. The 27B serving configuration uses FlashInfer 0.7.2.post1
 with the Merlin sm_86 FP8 small-q verify-tile patch distributed under
-release/patches/flashinfer-0.7.0.post1/. Applying that patch modifies the
+release/patches/flashinfer-0.7.2.post1/ (the 0.7.0.post1 series under
+release/patches/flashinfer-0.7.0.post1/ is kept for history). Applying that patch modifies the
 installed FlashInfer files named by its diff headers; retain their original
 copyright and licence notices.
 

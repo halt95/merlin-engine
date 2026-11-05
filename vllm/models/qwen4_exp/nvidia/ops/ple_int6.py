@@ -2,8 +2,7 @@
 # SPDX-FileCopyrightText: Copyright 2026 halt95 (Merlin modifications)
 """INT6 g32 PLE table rows (``ple_embedding_dtype == "int6_g32"``).
 
-Fork module. The table
-method that uses it is ``Qwen4ExpPLEInt6G32EmbeddingMethod`` in
+Fork module. The table method that uses it is ``Qwen4ExpPLEInt6G32EmbeddingMethod`` in
 ``nvidia/ple_formats.py``; the pull transport wiring is in ``nvidia/ple_pull.py``.
 
 One PLE table row is 160 values = 5 groups of 32. A group is stored as 32

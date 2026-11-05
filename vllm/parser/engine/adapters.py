@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by the Merlin project; see NOTICE.
 """Adapters that expose :class:`ParserEngine` through the legacy
 :class:`ReasoningParser` and :class:`ToolParser` interfaces.
 
@@ -14,6 +15,7 @@ from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from typing import TYPE_CHECKING
 
+from vllm.merlin.tool_none import copy_mode
 from vllm.parser.engine.parser_engine_config import ParserState
 from vllm.reasoning.abs_reasoning_parsers import ReasoningParser
 from vllm.tool_parsers.abstract_tool_parser import ToolParser
@@ -62,11 +64,27 @@ class ParserEngineReasoningAdapter(ReasoningParser):
         finally:
             self._parser_engine.skip_tool_parsing = saved
 
+    @contextmanager
+    def token_aligned(self, token_ids: Sequence[int]) -> Iterator[None]:
+        """Parse the next non-streaming call with the output's token ids."""
+        engine = self._parser_engine
+        saved = engine._token_ids_for_parse
+        engine._token_ids_for_parse = tuple(token_ids)
+        try:
+            yield
+        finally:
+            engine._token_ids_for_parse = saved
+
     def is_reasoning_end(self, input_ids: Sequence[int]) -> bool:
         return self._parser_engine.is_reasoning_end(list(input_ids))
 
     def find_reasoning_end(self, token_ids: Sequence[int]) -> ReasoningEnd | None:
         return self._parser_engine.find_reasoning_end(token_ids)
+
+    def set_prompt_token_ids(self, prompt_token_ids: Sequence[int]) -> None:
+        self._parser_engine.set_prompt_token_ids(prompt_token_ids)
+        if self._counting_parser_engine is not None:
+            self._counting_parser_engine.set_prompt_token_ids(prompt_token_ids)
 
     def adjust_initial_state_from_prompt(self, prompt_token_ids: Sequence[int]) -> None:
         self._parser_engine.adjust_initial_state_from_prompt(prompt_token_ids)
@@ -115,6 +133,10 @@ class ParserEngineReasoningAdapter(ReasoningParser):
     def reasoning_end_token_ids(self) -> frozenset[int]:
         return self._parser_engine.reasoning_end_token_ids
 
+    @property
+    def implicit_reasoning_end_token_ids(self) -> frozenset[int]:
+        return self._parser_engine.implicit_reasoning_end_token_ids
+
     def adjust_request(
         self,
         request: ChatCompletionRequest | ResponsesRequest,
@@ -144,6 +166,11 @@ class ParserEngineReasoningAdapter(ReasoningParser):
             self._counting_parser_engine = self._parser_engine_cls(
                 self.model_tokenizer, **self._parser_engine_kwargs
             )  # type: ignore[call-arg]
+            self._counting_parser_engine._prompt_closes_reasoning = (
+                self._parser_engine._prompt_closes_reasoning
+            )
+        # Count what parse() returned.
+        copy_mode(self._parser_engine._engine, self._counting_parser_engine._engine)
         self._counting_parser_engine._single_pass_parse(
             self.model_tokenizer.decode(token_ids), token_ids
         )
@@ -181,6 +208,17 @@ class ParserEngineToolAdapter(ToolParser):
     ) -> None:
         super().__init__(tokenizer, tools)
         self._parser_engine = self._parser_engine_cls(tokenizer, tools, **kwargs)  # type: ignore[call-arg]
+
+    @contextmanager
+    def token_aligned(self, token_ids: Sequence[int]) -> Iterator[None]:
+        """Parse the next non-streaming call with the content's token ids."""
+        engine = self._parser_engine
+        saved = engine._token_ids_for_parse
+        engine._token_ids_for_parse = tuple(token_ids)
+        try:
+            yield
+        finally:
+            engine._token_ids_for_parse = saved
 
     @property
     def skip_reasoning_parsing(self) -> bool:

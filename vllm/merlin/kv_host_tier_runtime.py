@@ -350,9 +350,9 @@ class TierRuntime:
         self, req_id: str, num_external_tokens: int, *, hit_tokens: int | None = None
     ) -> None:
         """``hit_tokens``: the external tokens actually handed off to a restore
-        (default: all of them). A plan whose hand-off was refused books no hit
-        tokens, only miss tokens, as ``hit_tokens`` in the tier log line does; its load state is still tracked from
-        ``num_external_tokens``."""
+        (default: all of them). A plan whose hand-off was refused books miss
+        tokens only, as ``hit_tokens`` in the tier log line does; its load
+        state is still tracked from ``num_external_tokens``."""
         queried = self._queried.pop(req_id, 0)
         booked = num_external_tokens if hit_tokens is None else hit_tokens
         hit = min(booked, queried) if queried else booked
@@ -433,7 +433,7 @@ class TierRuntime:
                 history_capacity(self.hash_block_size, cache_tokens),
             )
             logger.info(
-                "SimpleCPU tier history: capacity=%d hashes per basis "
+                "SimpleCPU tier history: capacity=%d shared hashes "
                 "hash_block_size=%d", self.history.capacity, self.hash_block_size,
             )
 
@@ -447,8 +447,8 @@ class TierRuntime:
         gpu_pool: "BlockPool", gpu_block_ids: list[int], req_id: str
     ) -> None:
         """Every restore target is private to the loader and not servable by
-        the prefix cache (comment 4166, load side). Called before the tier's
-        own touch, so the request's block table holds the only reference."""
+        the prefix cache (load side). Called before the tier's own touch, so
+        the request's block table holds the only reference."""
         for bid in gpu_block_ids:
             block = gpu_pool.blocks[bid]
             if block.ref_cnt != 1 or block.block_hash is not None:

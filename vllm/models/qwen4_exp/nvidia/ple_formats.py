@@ -65,8 +65,11 @@ class PackedShardPairer:
         if part not in ("codes", "scales"):
             raise ValueError(f"packed PLE shard {shard_key}: unknown part .{part}")
         if not (shard_key.isdigit() and str(int(shard_key)) == shard_key):
-            # canonical shard numbers only: shard_00 and shard_0 would both land in row block 0
-            raise ValueError(f"packed PLE shard {shard_key!r}: not a canonical shard number")
+            # canonical shard numbers only: shard_00 and shard_0 would both land
+            # in row block 0
+            raise ValueError(
+                f"packed PLE shard {shard_key!r}: not a canonical shard number"
+            )
         if shard_key in self._done:
             # a second copy of a completed shard would add its rows twice and
             # could mask a missing one in the row count

@@ -339,8 +339,8 @@ def overlay_conflict(out: Path) -> str | None:
 
 @contextlib.contextmanager
 def _build_lock(out: Path):
-    """One builder per overlay folder at a time (``.<name>.lock`` beside it; flock where the platform has it: on Windows,
-    where these tools are only developed and tested, there is no lock and concurrent setups are not supported)."""
+    """One builder per overlay folder at a time (``.<name>.lock`` beside it; flock where the platform has it: where fcntl is
+    missing (Windows), there is no lock and concurrent setups are not supported)."""
     out.parent.mkdir(parents=True, exist_ok=True)
     fd = os.open(out.with_name(f".{out.name}.lock"), os.O_CREAT | os.O_RDWR, 0o644)
     try:
@@ -396,7 +396,7 @@ def _build_overlay(out: Path, src: Sources) -> str:
             os.replace(stage, out)
         except BaseException:
             if old is not None and old.exists() and not out.exists():
-                os.replace(old, out)  # never no overlay where there was one
+                os.replace(old, out)  # never leave the output missing when a previous overlay existed
             raise
     except BaseException:
         shutil.rmtree(stage, ignore_errors=True)

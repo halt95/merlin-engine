@@ -34,6 +34,8 @@ discriminator; release launchers use `cta32`.
 
 ## Opt-in: workload-aware tile (default off)
 
+This section describes the 0.7.0.post1 series kept for history; the 0.7.2.post1 installer refuses this wheel pin, and the current series is under [`../flashinfer-0.7.2.post1/`](../flashinfer-0.7.2.post1/README.md).
+
 [0002-workload-smallq-plan-mode.patch](0002-workload-smallq-plan-mode.patch) applies
 on top of 0001 and lets the 27B V2 builder choose the tile per plan: cta32 for a
 proven pure verify batch, stock beside prefill. **The default install does not

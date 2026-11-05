@@ -34,22 +34,21 @@
 #include <torch/headeronly/util/Exception.h>
 
 #include "torch_utils.h"
-#include <atomic>  // merlin-hook: marlin-full-k
+#include <atomic>
 #include <cstdlib>
 
 namespace {
 // -------------------------------------------------------------------------
-// MERLIN_FULL_K: the CUDA half of the unmerged upstream PR #46639
-// (`use_full_k`), which makes the Marlin MoE split-K reduction order
-// independent of how many blocks the launch was split across.
+// Full-K: the CUDA half of upstream PR #46639 (`use_full_k`), which makes the
+// Marlin MoE split-K reduction order independent of how many blocks the launch
+// was split across.
 //
-// Our own toggle rather than upstream's VLLM_BATCH_INVARIANT, because that
+// Our own policy rather than upstream's VLLM_BATCH_INVARIANT, because that
 // one aborts engine startup on GDN models (upstream #42960) and so can never
 // reach this kernel on Flash-Next.
 //
-// FOLDED ON: no environment variable is read; every served config ran
-// MERLIN_FULL_K=1. use_full_k stays a runtime kernel argument, so the Marlin
-// kernels are unchanged. The first launch publishes 1 into g_cached_full_k
+// Full-K is always on and no environment variable is read. use_full_k stays a
+// runtime kernel argument. The first launch publishes 1 into g_cached_full_k
 // (-1 = no Marlin MoE launch yet in this process; nothing else writes it) and
 // marlin_moe_full_k_state() below only LOADS it. Host code only.
 // -------------------------------------------------------------------------
@@ -63,9 +62,8 @@ bool merlin_full_k() {
   return enabled;
 }
 
-// MERLIN_FULL_K as this process cached it: -1 = not initialised yet (no Marlin
-// MoE launch has happened in this process), 0 = off, 1 = on. Tensor-free, no
-// CUDA call.
+// Full-K as this process cached it: -1 = not initialised yet (no Marlin MoE
+// launch has happened in this process), 1 = on. Tensor-free, no CUDA call.
 int64_t marlin_moe_full_k_state() {
   return static_cast<int64_t>(g_cached_full_k.load(std::memory_order_acquire));
 }
@@ -220,7 +218,6 @@ exec_config_t determine_exec_config(
     const vllm::ScalarType& c_type, const vllm::ScalarType& s_type, int prob_m,
     int prob_n, int prob_k, int num_experts, int top_k, int thread_m_blocks,
     bool m_block_size_8, int num_bits, int group_size, bool has_zp,
-    // merlin-hook: marlin-full-k
     bool is_zp_float, bool is_a_8bit, int stages, int max_shared_mem, int sms,
     bool use_full_k) {
   exec_config_t exec_cfg = exec_config_t{1, thread_config_t{-1, -1, -1}};
@@ -267,7 +264,7 @@ exec_config_t determine_exec_config(
     else
       allow_count = max(min(allow_count, 2), 1);
 
-    if (!use_full_k &&  // merlin-hook: marlin-full-k
+    if (!use_full_k &&
         prob_n / th_config.thread_n * prob_m * top_k * 4 < sms * allow_count) {
       allow_count =
           max(prob_n / th_config.thread_n * prob_m * top_k * 4 / sms, 1);
@@ -294,7 +291,7 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
                int group_size, int dev, cudaStream_t stream, int thread_k,
                int thread_n, int sms, int blocks_per_sm, bool use_atomic_add,
                bool use_fp32_reduce, bool is_zp_float) {
-  const bool use_full_k = merlin_full_k();  // merlin-hook: marlin-full-k
+  const bool use_full_k = merlin_full_k();
   int thread_m_blocks = div_ceil(moe_block_size, 16);
   bool m_block_size_8 = moe_block_size == 8;
   bool is_a_8bit = a_type.size_bits() == 8;
@@ -372,7 +369,6 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
     exec_cfg = determine_exec_config(
         a_type, b_type, c_type, s_type, prob_m, prob_n, prob_k, num_experts,
         top_k, thread_m_blocks, m_block_size_8, num_bits, group_size, has_zp,
-        // merlin-hook: marlin-full-k
         is_zp_float, is_a_8bit, stages, max_shared_mem, sms, use_full_k);
     thread_tfg = exec_cfg.tb_cfg;
   }
@@ -425,7 +421,6 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
       A_ptr, B_ptr, C_ptr, C_tmp_ptr, bias_ptr, a_s_ptr, b_s_ptr, g_s_ptr, zp_ptr,
       sorted_token_ids_ptr, expert_ids_ptr, num_tokens_past_padded_ptr,
       topk_weights_ptr, top_k, mul_topk_weights, prob_m, prob_n, prob_k, locks,
-      // merlin-hook: marlin-full-k
       has_bias, use_atomic_add, use_fp32_reduce, use_full_k);
   // clang-format on
 }
@@ -747,7 +742,6 @@ torch::stable::Tensor moe_wna16_marlin_gemm(
 STABLE_TORCH_LIBRARY_IMPL(_moe_C, CUDA, m) {
   m.impl("moe_wna16_marlin_gemm", TORCH_BOX(&moe_wna16_marlin_gemm));
 }
-// merlin-hook: marlin-full-k
 // Registered in this TU so the query exists exactly when its static does.
 // Tensor-free: CompositeExplicitAutograd, since CUDA dispatch needs a tensor.
 STABLE_TORCH_LIBRARY_FRAGMENT(_moe_C, m) {

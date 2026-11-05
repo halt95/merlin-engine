@@ -50,7 +50,7 @@ from vllm.distributed.parallel_state import (
     ensure_model_parallel_initialized,
     init_distributed_environment,
 )
-from vllm.logger import init_logger
+from vllm.logger import _configure_vllm_root_logger, init_logger
 from vllm.model_executor.layers.ple_offload_layer import (
     PleOffloadLayer,
     mark_as_offload_worker,
@@ -219,10 +219,9 @@ def _prepare_cuda_free_process() -> None:
        runner calls ``aux_stream()`` -> ``torch.cuda.Stream()``, whose C++
        constructor creates the primary context without calling
        ``torch.cuda._lazy_init`` (``torch.cuda.is_initialized()`` stays False).
-       This is the context a startup check caught (stack dumped inside
-       ``Stream.__new__``). This process never runs an MoE layer, so it never
-       needs the stream. vLLM reads the variable when the layer is built; this
-       process does not enable vLLM's env cache.
+       This process never runs an MoE layer, so it never needs the stream.
+       vLLM reads the variable when the layer is built; this process does not
+       enable vLLM's env cache.
     1b. ``VLLM_GDN_BA_AUX_STREAM=0``: the same for the GDN layers. With the
        parent's flag at 1 the meta-model construction would call
        ``aux_stream()`` per GDN layer, which the guard refuses; this process
@@ -241,10 +240,9 @@ def _prepare_cuda_free_process() -> None:
 def _install_cuda_guard() -> None:
     """Make torch-level CUDA initialization raise in the PLE offload process.
 
-    An offload-startup check found the host-mapped pull still got a 322 MiB context
-    on its home card: importing the Qwen4Exp model imports the vendored FLA
-    ops, whose utils call triton's ``get_current_target()`` at import time,
-    i.e. ``torch.cuda.current_device()`` -> lazy init. FLA catches
+    Importing the Qwen4Exp model imports the vendored FLA ops, whose utils call
+    triton's ``get_current_target()`` at import time, i.e.
+    ``torch.cuda.current_device()`` -> lazy init. FLA catches
     ``RuntimeError`` and falls back to "cpu" (and then skips its Hopper
     probe), so raising here keeps this process context-free. Any other call
     site fails loudly at offload startup with its stack logged, instead of
@@ -428,6 +426,7 @@ def _send_framed_payload(fd: int, payload: bytes, deadline: float) -> None:
 
 
 _PLE_READY_MAX_PAYLOAD_BYTES = 1 << 20
+
 
 class _BoundedStartupResponseWriter:
     """Preflight startup responses against the parent receiver's frame cap."""
@@ -820,6 +819,10 @@ class PleOffloadWorker:
         ready_pipe: Connection,
     ) -> None:
         """Load PLE weights, accept registrations, and run the request loop."""
+        # A spawned child starts with no handlers: without this every INFO line
+        # here is dropped. Not configure_logging: its platform warnings call
+        # NVML, and the parent has already logged them.
+        _configure_vllm_root_logger(vllm_config.logging_config)
         decorate_logs("PleOffloadWorker")
         ready_writer = _BoundedStartupResponseWriter(ready_pipe)
         shutdown_event = threading.Event()
@@ -884,6 +887,8 @@ class PleOffloadWorker:
             ready_writer.close()
             ready_writer = None  # type: ignore[assignment]
 
+            if envs.VLLM_E2_PLE_STORE == "disk":
+                runner.start_ple_store_warm(shutdown_event)
             runner.busy_loop(pull_socket, shutdown_event)
         except _PleShutdownRequested:
             logger.debug("PLE offload shutdown requested")
@@ -945,6 +950,16 @@ class PleOffloadRunner:
     def layer_names(self) -> list[str]:
         """Return PleOffloadLayer names in model traversal order."""
         return list(self._layers)
+
+    def start_ple_store_warm(self, shutdown_event: threading.Event) -> None:
+        """``--ple-store disk``: warm each file-backed table after READY."""
+        from vllm.merlin.kv_host_tier import _ranks_on_this_host
+
+        ranks = _ranks_on_this_host(self.vllm_config.parallel_config)
+        for layer in self._layers.values():
+            table = layer.__dict__.get("_ple_file_table")
+            if table is not None:
+                table.start_warm(shutdown_event, envs.MERLIN_KV_HOST_TIER_GIB, ranks)
 
     def _load_weights(self) -> None:
         """Load only :class:`PleOffloadLayer` subtrees into CPU memory.
@@ -1023,8 +1038,7 @@ class PleOffloadRunner:
                 "Initializing dummy weights for %d PleOffloadLayer(s) ...",
                 len(offload_layers),
             )
-            # 0.32 removed `initialize_dummy_weights(model, model_config)`; its
-            # body was exactly this loop with the same defaults.
+            # Same loop as upstream's dummy-weight initialization, same defaults.
             for layer in offload_layers.values():
                 for param in layer.state_dict().values():
                     initialize_single_dummy_weight(param)

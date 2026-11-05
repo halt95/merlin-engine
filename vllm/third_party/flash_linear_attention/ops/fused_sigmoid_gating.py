@@ -16,7 +16,6 @@ from vllm.v1.worker import guard_telemetry
 _GUARD_BIAS = tl.constexpr(guard_telemetry.GUARD_BIAS)
 
 
-
 @triton.heuristics(
     {
         "USE_INITIAL_STATE": lambda args: args["h0"] is not None,
@@ -113,13 +112,9 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
             else:
                 i_t = 0
             # PR #50021: i_t is num_accepted_tokens - 1 and is otherwise
-            # unbounded against a stride_indices_seq-column tensor. A zero
-            # accepted count gives i_t == -1, a read before this request's row
-            # (and before the tensor for i_n == 0); a stale or too-large count
-            # reads past the row. The state_idx <= 0 guard below rejects only
-            # non-positive values, so an out-of-range read returning a garbage
-            # positive int flowed into h0 + state_idx * stride_init_state_token
-            # and faulted the SM.
+            # unbounded against a stride_indices_seq-column tensor. The same
+            # guard as in fused_recurrent_gated_delta_rule_fwd_kernel
+            # (fused_recurrent.py) masks the read; see the explanation there.
             idx_in_row = (i_t >= 0) & (i_t < stride_indices_seq)
             if (i_t < 0) or (i_t >= stride_indices_seq):
                 tl.atomic_add(guard_ctr, 1)
@@ -130,9 +125,9 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
                 mask=idx_in_row,
                 other=0,
             ).to(tl.int64)
-            # Skip invalid state indices without exposing uninitialized output.
-            # o is q.new_empty in the entry below, so the previous early return
-            # left this request's rows holding whatever the allocator returned.
+            # Skip invalid state indices without exposing uninitialized output:
+            # o is q.new_empty in the entry below, so a skipped request's rows
+            # are zeroed here.
             if state_idx <= 0:
                 zero = tl.zeros([BV], dtype=tl.float32).to(p_o.dtype.element_ty)
                 for _ in range(0, T):

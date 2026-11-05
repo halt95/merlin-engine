@@ -2,9 +2,9 @@
 # SPDX-FileCopyrightText: Copyright 2026 halt95 (Merlin modifications)
 """Hook slot for the test-only PLE fault injector.
 
-The injector package ``vllm_ple_test_fault`` lives under
-``tests/v1/ple_offload/`` and is not shipped. Every injection site in the
-product reads ``_FAULT`` from here and short-circuits on ``_FAULT is None``.
+The injector package ``vllm_ple_test_fault`` belongs to the test suite and is
+not shipped. Every injection site in the product reads ``_FAULT`` from here and
+short-circuits on ``_FAULT is None``.
 ``_FAULT`` stays None unless ``VLLM_PLE_TEST_FAULT`` is set, and only then is
 the injector imported (a test harness that sets it puts the package on
 ``PYTHONPATH``). The PLE offload bootstrap applies the same gate.

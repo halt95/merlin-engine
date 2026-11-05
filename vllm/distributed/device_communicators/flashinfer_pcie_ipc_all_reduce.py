@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by the Merlin project; see NOTICE.
 """FlashInfer PCIe CUDA-IPC all-reduce integration.
 
 This backend targets small tensor-parallel all-reduces on a single PCIe-only
@@ -17,8 +18,11 @@ import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
+# vllm#65192
+from vllm.distributed.device_communicators.custom_all_reduce import _all_ranks_true
 from vllm.distributed.parallel_state import in_the_same_node_as
 from vllm.logger import init_logger
+from vllm.merlin import pcie_ipc_tune_cache
 from vllm.platforms import current_platform
 
 if TYPE_CHECKING:
@@ -36,6 +40,30 @@ try:
 except ImportError:
     flashinfer_comm = None  # type: ignore[assignment]
     _pcie_ipc_available = False
+
+
+# vllm#65192
+def _reaches_every_peer(group: ProcessGroup, device: torch.device) -> bool:
+    """Whether this rank's GPU has CUDA peer access to every other rank's GPU.
+
+    The IPC workspace maps every peer's buffer, so every ordered pair counts.
+    Each rank checks its own outgoing edges against the devices the group
+    actually runs on (gathered over ``group``, a CPU group); the caller's MIN
+    over the group then covers all pairs. Unlike ``_can_p2p``, this never
+    stops at the first peer and never assumes group rank == device index.
+    """
+    mine = device.index if device.index is not None else torch.cuda.current_device()
+    devices: list[Any] = [None] * dist.get_world_size(group)
+    dist.all_gather_object(devices, int(mine), group=group)
+    try:
+        return all(
+            torch.cuda.can_device_access_peer(mine, peer)
+            for peer in devices
+            if peer != mine
+        )
+    except Exception as error:  # noqa: BLE001 -- a failed probe is "no access"
+        logger.warning("CUDA peer-access probe failed: %s", error)
+        return False
 
 
 class FlashInferPcieIpcAllReduce:
@@ -83,6 +111,19 @@ class FlashInferPcieIpcAllReduce:
                 "group to be on one node."
             )
             return
+        # vllm#65192: the IPC
+        # workspace maps every peer's buffer, so one rank without CUDA peer
+        # access breaks it. Every rank takes the same branch: the verdict is
+        # a MIN over the CPU (tune) group, so a partial-P2P layout falls back
+        # to the existing all-reduce backends on all ranks together.
+        peer_ok = _reaches_every_peer(tune_group, self.device)
+        if not _all_ranks_true(tune_group, peer_ok):
+            logger.warning_once(
+                "FlashInfer PCIe IPC all-reduce requires CUDA peer access "
+                "between every pair of TP ranks, but at least one rank "
+                "lacks it; falling back to another all-reduce backend."
+            )
+            return
 
         # Setup is deferred until kernel_warmup, where the model hidden size and
         # exact CUDA Graph buckets are known. Until then dispatch falls through.
@@ -124,6 +165,15 @@ class FlashInferPcieIpcAllReduce:
         self.hidden_dim = int(hidden_dim)
         self.dtype = dtype
         max_numel = batches[-1] * self.hidden_dim
+        # One load decision per TP
+        # group, and a hardware-named cache a mixed-model group can reload.
+        tune_cache, _, mixed_group = pcie_ipc_tune_cache.prepare(
+            Path(tune_cache),
+            self.rank,
+            pcie_ipc_tune_cache.device_identity(self._device_index()),
+            self._gather_tune_group,
+            self._barrier_tune_group,
+        )
         workspace = flashinfer_comm.PcieIpcAllReduceWorkspace(
             group=self.group,
             max_numel=max_numel,
@@ -143,6 +193,9 @@ class FlashInferPcieIpcAllReduce:
             dtype=dtype,
             tune_group=self.tune_group,
         )
+        pcie_ipc_tune_cache.finish(
+            Path(tune_cache), self.rank, mixed_group, self._barrier_tune_group
+        )
         workspace.prepare([(batch, self.hidden_dim) for batch in batches], dtype=dtype)
         torch.accelerator.synchronize(self.device)
         workspace.rebind_stream()
@@ -154,6 +207,19 @@ class FlashInferPcieIpcAllReduce:
             dtype,
             batches[-1],
         )
+
+    # CPU-group collectives
+    def _device_index(self) -> int:
+        index = self.device.index
+        return torch.cuda.current_device() if index is None else index
+
+    def _gather_tune_group(self, obj: Any) -> list[Any]:
+        out: list[Any] = [None] * self.world_size
+        dist.all_gather_object(out, obj, group=self.tune_group)
+        return out
+
+    def _barrier_tune_group(self) -> None:
+        dist.barrier(group=self.tune_group)
 
     def should_use(self, inp: torch.Tensor) -> bool:
         workspace = self.workspace

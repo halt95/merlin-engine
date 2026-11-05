@@ -1,4 +1,4 @@
-# Swift1.5-Huihui · Merlin 3.0.1
+# Swift1.5-Huihui · Merlin 3.0.2
 
 The launcher serves Froggeric's fixed Qwen3.8 template,
 [`froggeric-qwen-v22.5.jinja`](../qwen38-27b/templates/froggeric-qwen-v22.5.jinja), the same template as the
@@ -7,17 +7,21 @@ The launcher serves Froggeric's fixed Qwen3.8 template,
 the first turn, so coding agents' per-turn notes stay in place on `/v1/messages` and the prefix cache keeps
 hitting. `CHAT_TEMPLATE=<path>` serves another template; `CHAT_TEMPLATE=` (empty) serves the checkpoint's own.
 
-Recipe version: [3.0.0](VERSION). This is the abliterated Swift 1.5 W4A16 checkpoint, served by the engine at the repository root (currently vLLM 0.32.0 plus Merlin changes). The weights stay on Hugging Face:
+Recipe version: [3.0.0](VERSION). This is the abliterated Swift 1.5 W4A16 checkpoint, served by the engine at the repository root (currently vLLM 0.33.0 plus Merlin changes). The weights stay on Hugging Face:
 
 [halt95/Swift1.5-Huihui-Qwen3.8-Flash-Next-W4A16-Merlin](https://huggingface.co/halt95/Swift1.5-Huihui-Qwen3.8-Flash-Next-W4A16-Merlin).
 
 ## Qualification status
 
-The canonical [serve.sh](serve.sh) is generated from `tools/merlin/profiles/flash-next.json` by `tools/merlin/preflight.py`, using profile `fn-swift1.5-huihui-quad-3090`. It starts this checkout directly. It passed its qualification run on 2026-10-16: boot 398 s, GSM8K-20 20/20, ITL 4K / 32K 18.78 / 18.87 ms, and the Merlin 3.0.0 release bench card on the release wheel (2026-10-20): the Huihui quad is tested on the reference host.
+The canonical [serve.sh](serve.sh) is generated from `tools/merlin/profiles/flash-next.json` by `tools/merlin/preflight.py`, using profile `fn-swift1.5-huihui-quad-3090`. It starts this checkout directly. A boot-and-check run of the generated launcher on 2026-10-16 gave: boot 398 s, GSM8K-20 20/20, ITL 4K / 32K 18.78 / 18.87 ms, and the Merlin 3.0.0 release bench card on the release wheel (2026-10-20): the Huihui quad is tested on the reference host.
 
 Huihui has its own [3.0.1 bench card](benchmarks/2026-11-02/BENCH-CARD.md) (below) and its own [3.0.0 bench card](benchmarks/2026-10-20/BENCH-CARD.md) (2026-10-20: decode, prefill, residency, 8 MP image, 2-agent, GSM8K-200 and needles, the needle panel from a 2026-10-17 pre-release build; its 8 agents were re-run on the released install, 2026-10-21); the remaining heavy results are **inherited from Swift**. Swift at 8 MP (8,388,608 pixels per image) on 4× RTX 3090 / 0.32 measured **stage-0 minimum free memory 902 MiB** on 2026-10-15. Huihui's generated launcher independently passed the 2026-10-16 8 MP check with 902 MiB minimum free; broader heavy results remain inherited from Swift. See [Swift's qualification status](../swift1.5/README.md#qualification-status).
 
 The 924,993-token KV pool was measured on this generated launcher (2026-10-16). Earlier quality and speed numbers are recorded in the [2026-10-12 bench card](benchmarks/2026-10-12/Huihui-BENCH-CARD.md); those vLLM 0.30 results do not qualify Merlin 3.0.0.
+
+## Merlin 3.0.2
+
+This checkpoint was not benchmarked for 3.0.2. It was not run on the 3.0.2 wheel before release. The 3.0.1 bench card below is the latest measurement and was taken on vLLM 0.32. There is no 3.0.2 card.
 
 ## Merlin 3.0.1 bench card (2026-11-02)
 
@@ -47,7 +51,7 @@ The checkpoint is intended to reduce refusals. The historical [bench card](bench
 
 ## Quick start
 
-The generated 0.32 recipe and shared installer are integrated in this checkout. Build and install the engine using the repository-wide [release instructions](../../release/README.md). The dependency lock is complete: 222 exact pins with artifact SHA-256 hashes, resolved with uv; a dry-run `--require-hashes` install resolves. From the repository root:
+The generated 0.33 recipe and shared installer are integrated in this checkout. Build and install the engine using the repository-wide [release instructions](../../release/README.md). The dependency lock is complete: 223 exact pins with artifact SHA-256 hashes, resolved with uv; a dry-run `--require-hashes` install resolves. From the repository root:
 
 ```bash
 venv/bin/hf download halt95/Swift1.5-Huihui-Qwen3.8-Flash-Next-W4A16-Merlin \
@@ -61,7 +65,7 @@ TREE="$PWD" VENV="$PWD/venv" CACHE_ROOT="$PWD/.vllm-cache" \
   bash models/swift1.5-huihui/serve.sh "$PWD/ckpt-swift-huihui"
 ```
 
-Set `VENV` to the environment in which this checkout was installed. Reference host: NVIDIA driver 610.43.02 (reports CUDA 13.3). The release lock selects a matched CUDA 13.0 toolkit (nvcc, crt, nvvm, nvJitLink 13.0.88, cccl 13.0.85, runtime 13.0.96, the pair torch 2.13.0 cu130 ships with); the release wheel is served on it by every recipe (2026-10-20). Other CUDA 13.x drivers (R580 or later) are expected to work through CUDA minor-version compatibility, but are untested. See the [driver requirements](../../release/install-0.32.md). The launcher requires `EDITED_TENSORS.txt` in the checkpoint directory. Requests use `flash-next-swift-huihui` or `flash-next-abliterated`; `MODEL_NAME` overrides those names.
+Set `VENV` to the environment in which this checkout was installed. Reference host: NVIDIA driver 610.43.02 (reports CUDA 13.3). The release lock selects a matched CUDA 13.0 toolkit (nvcc, crt, nvvm, nvJitLink 13.0.88, cccl 13.0.85, runtime 13.0.96, the pair torch 2.14.0 cu130 ships with); the 3.0.0 release wheel was served on it by every recipe (2026-10-20); the 3.0.2 wheel was served on it on 2026-11-04 by Flash-Next, Qwen3.8-27B (1, 2 and 4 GPUs), Nemotron 3.5 Super VL and Ornith 1.5, each with a 262K request. Other CUDA 13.x drivers (R580 or later) are expected to work through CUDA minor-version compatibility, but are untested. See the [driver requirements](../../release/install-0.33.md). The launcher requires `EDITED_TENSORS.txt` in the checkpoint directory. Requests use `flash-next-swift-huihui` or `flash-next-abliterated`; `MODEL_NAME` overrides those names.
 
 ## Launcher defaults
 
@@ -71,7 +75,7 @@ Huihui uses its own [dense-recalibrated scale sidecar](scales/qsa_kv_scales_swif
 
 ## Known limitations
 
-A qualification run validated this generated launcher, and the Merlin 3.0.0 release bench card tested it on the release wheel. Swift's measured 8 MP margin and inherited heavy results do not establish Huihui-specific quality, refusal, cache, MTP or capacity results on this release. Other hardware and no-P2P operation need separate qualification; the Huihui profile is a P2P-on 4 x RTX 3090 row and preflight refuses it on hosts without P2P (see the [hardware matrix](../../docs/merlin/hardware-matrix.md)). The repository-wide [container route](../../container/README.md) and LXC serving with this recipe are untested here.
+A boot-and-check run (2026-10-16) and the Merlin 3.0.0 release bench card (2026-10-20) ran this generated launcher on the release wheel. Swift's measured 8 MP margin and inherited heavy results do not establish Huihui-specific quality, refusal, cache, MTP or capacity results on this release. Other hardware and no-P2P operation need separate qualification; the Huihui profile is a P2P-on 4 x RTX 3090 row and preflight refuses it on hosts without P2P (see the [hardware matrix](../../docs/merlin/hardware-matrix.md)). The repository-wide [container route](../../container/README.md) and LXC serving with this recipe are untested here.
 
 ## Credits
 

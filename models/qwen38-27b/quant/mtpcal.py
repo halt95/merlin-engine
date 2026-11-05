@@ -19,7 +19,7 @@ Hard requirement, asserted at boot: --enforce-eager (Python hooks do not run ins
 CUDA graph). TP=2 is fine: column-parallel inputs are replicated on both ranks, and for the
 row-parallel modules (o_proj, down_proj), whose input arrives already sliced per rank, the hook
 all-gathers the slices along the feature dim first (both ranks execute the hook symmetrically),
-so the Hessian is the FULL-input Hessian GPTQ needs. TP=1 was tried first and OOMs on a 24 GB
+so the Hessian is the FULL-input Hessian GPTQ needs. TP=1 OOMs on a 24 GB
 card (19 GB target + 2.37 GiB draft head at construction). Only TP rank 0 flushes.
 Hessians accumulate in fp32 on the GPU (~2.1 GB total: down_proj's 17408^2 dominates) and are
 flushed to MTPCAL_OUT/hessians.pt every MTPCAL_FLUSH forwards and at exit, with the row count

@@ -13,6 +13,7 @@ commit receipts.
 
 from collections import Counter, OrderedDict, deque
 from dataclasses import dataclass
+from itertools import islice
 
 from vllm.logger import init_logger
 from vllm.merlin.kv_host_tier import RESTORE_UNIT_TOKENS
@@ -810,8 +811,8 @@ FLAT_PENDING_KEYS = (
 )
 
 
-# The request history is sized in the hash unit the server really uses
-# (``--prefix-match-unit``: 16 tokens on 27B, 64 on FN; never the page size).
+# The request history is sized in the hash unit the server uses
+# (``--prefix-match-unit``), never the page size.
 # It holds at least HISTORY_MIN_CHAINS distinct 262K-token chains and
 # HISTORY_CACHE_MARGIN x what the GPU and host tiers can hold together.
 HISTORY_DEFAULT_CAPACITY = 1 << 17
@@ -821,8 +822,7 @@ HISTORY_CACHE_MARGIN = 4
 
 
 def history_capacity(hash_block_size: int, cache_tokens: int = 0) -> int:
-    """Hashes per basis for this geometry (~241 B per hash over both bases,
-    measured with 32-byte keys: 27B ~250 MiB, FN ~63 MiB at the floor)."""
+    """Distinct hashes in the shared prompt/full history for this geometry."""
     tokens = max(HISTORY_MIN_CHAINS * HISTORY_CHAIN_TOKENS,
                  HISTORY_CACHE_MARGIN * max(0, cache_tokens))
     return max(HISTORY_DEFAULT_CAPACITY, tokens // max(1, hash_block_size))
@@ -836,25 +836,28 @@ class HistoryIndex:
     ``num_tokens - 1`` (the last token is always recomputed). Hash chains are
     parent-dependent, so one hash present means its whole prefix was computed.
 
-    Two bases: ``prompt`` (hashes inside the finished request's PROMPT; the
-    conservative lower bound: RecoverSSM + PP publishes no decode checkpoint)
-    and ``full`` (prompt + generated tokens; the upper bound). Bounded by
-    ``capacity`` hashes per basis (LRU on re-add). Memory bound: one dict
-    entry per hash per basis (the hash bytes objects are shared with the
-    requests and between the bases). The default capacity is only the floor;
-    ``TierRuntime.bind_geometry`` sizes it with ``history_capacity``: one hash
-    per ``--prefix-match-unit`` tokens, so a 262K chain is 16,384 hashes on 27B
-    and 4,096 on FN. ``evicted_prompt`` / ``evicted_full``
-    count what the bound dropped: a dropped hash can only DEFLATE the
+    One insertion-ordered dict holds at most ``capacity`` distinct hashes,
+    refreshed on re-add. Its boolean value records whether a hash was inside
+    any finished request's PROMPT (the conservative lower bound: RecoverSSM +
+    PP publishes no decode checkpoint). All keys form the ``full`` basis
+    (prompt + generated tokens; the upper bound). Re-adding a hash as decode
+    cannot erase its prompt flag.
+
+    ``TierRuntime.bind_geometry`` sizes the shared capacity with
+    ``history_capacity``: one hash per ``--prefix-match-unit`` tokens, so a
+    262K chain is 16,384 hashes on 27B and 4,096 on FN. Every eviction counts
+    toward ``evicted_full``; evicting a flagged hash also counts toward
+    ``evicted_prompt``. Decode can therefore displace prompt history sooner
+    than with separate limits. A dropped prompt hash can only DEFLATE the
     denominator, so once the PROMPT basis truncated, every rho_bar / T* / E /
     E_tier claim from here on is invalid (``efficiency`` returns them None and
-    ``ceiling_valid`` False) rather than flattered; ``evicted`` is the total.
+    ``ceiling_valid`` False) rather than flattered; ``evicted`` is the total
+    number of basis entries lost.
     """
 
     def __init__(self, capacity: int = HISTORY_DEFAULT_CAPACITY) -> None:
         self.capacity = capacity
-        self._prompt: OrderedDict = OrderedDict()
-        self._full: OrderedDict = OrderedDict()
+        self._hashes: dict[bytes, bool] = {}
         self.evicted_prompt = 0
         self.evicted_full = 0
         self.finished = 0
@@ -863,33 +866,30 @@ class HistoryIndex:
     def evicted(self) -> int:
         return self.evicted_prompt + self.evicted_full
 
-    def _add(self, index: OrderedDict, hashes) -> int:
-        for h in hashes:
-            if h in index:
-                index.move_to_end(h)
-            else:
-                index[h] = None
-        dropped = 0
-        while len(index) > self.capacity:
-            index.popitem(last=False)
-            dropped += 1
-        return dropped
-
     def note_finished(self, block_hashes, hash_block_size: int,
                       prompt_tokens: int, computed_tokens: int) -> None:
         """A request finished having computed ``computed_tokens`` tokens."""
         size = max(1, hash_block_size)
         full = min(len(block_hashes), max(0, computed_tokens) // size)
         prompt = min(full, max(0, prompt_tokens) // size)
-        self.evicted_prompt += self._add(self._prompt, block_hashes[:prompt])
-        self.evicted_full += self._add(self._full, block_hashes[:full])
+        index = self._hashes
+        for i in range(full):
+            h = block_hashes[i]
+            in_prompt = index.pop(h, False) or i < prompt
+            index[h] = in_prompt
+        dropped = max(0, len(index) - self.capacity)
+        # Collect the oldest keys in one pass before mutating the dict.
+        # Repeated next(iter(index)) would rescan deleted slots for each key.
+        for h in list(islice(index, dropped)):
+            self.evicted_prompt += index.pop(h)
+        self.evicted_full += dropped
         self.finished += 1
 
     def matched_blocks(self, block_hashes, basis: str = "prompt") -> int:
-        index = self._prompt if basis == "prompt" else self._full
+        index = self._hashes
         n = 0
         for h in block_hashes:
-            if h not in index:
+            if (not index.get(h, False) if basis == "prompt" else h not in index):
                 break
             n += 1
         return n
@@ -1323,13 +1323,11 @@ class RestoreProgressDetector:
 
 class HostFlushDetector:
     """Fires when the cached host rows fall by >= ``frac`` of capacity between
-    two samples: whole-component eviction, not per-unit expiry (for example
-    1,798 -> 157 rows, 91 %, in one interval to admit one unit).
+    two samples: whole-component eviction, not per-unit expiry (for example a
+    large share of the rows dropping in one interval to admit one unit).
 
-    Fixed at 50 % of the host rows, independent of unit size. So on a
-    small tier one 262K admission that evicts most of the host fires too (27B
-    12 GiB: a 277-row unit in a 385-row host is a 72 % drop); the older
-    1.25 x largest-unit lift left 50-89 % flushes silent at 12-16 GiB.
+    Fixed at 50 % of the host rows, independent of unit size. So on a small
+    tier one long-context admission that evicts most of the host fires too.
 
     ``rearm`` forgets the previous sample: a coordinated prefix-cache reset
     un-keys every row on purpose and must not read as a flush."""

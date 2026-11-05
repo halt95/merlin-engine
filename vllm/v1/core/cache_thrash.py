@@ -304,8 +304,8 @@ class SessionYield:
             self._needed_sets.pop(request_id, None)
 
     def follow_cow(self, source_block: KVCacheBlock, cow_block: KVCacheBlock) -> None:
-        # a grace / waiter pin moved to
-        # the CoW copy: the copy scheduler's pin census is stale.
+        # A grace / waiter pin moved to the CoW copy, so the copy scheduler's pin
+        # census is stale.
         copyq = self._copy_scheduler()
         if copyq is not None:
             copyq.note_pins_changed()
@@ -445,7 +445,7 @@ class SessionYield:
             if kind == "grace":
                 blocks = manager.grace_pinned_blocks(request_id)
                 # ``release_grace_pin`` (reason "yield") tells the copy
-                # scheduler before the blocks are freed (kv-host-tier).
+                # scheduler before the blocks are freed (KV host tier).
                 released += manager.release_grace_pin(request_id)
             else:
                 blocks = manager.pinned_hit_blocks(request_id)
@@ -510,7 +510,7 @@ class SessionYield:
         ]
         return grace_units + waiter_units
 
-    # -- host-aware yield (kv-host-tier) ------------------------------
+    # -- host-aware yield (KV host tier) ------------------------------
     def _copy_scheduler(self):
         """The host tier's copy scheduler (``kv_host_tier_copyq.CopyQueue``)
         when the tier is on and bound to this manager; None otherwise, and
@@ -591,8 +591,7 @@ class SessionYield:
         Returns the number of blocks the released holders held (0: nothing
         released; ``last_best_single_yield`` says how close the best single
         session came)."""
-        # No shortfall (a demotion
-        # wait) releases nothing.
+        # No shortfall (a demotion wait) releases nothing.
         if shortfall <= 0:
             self.last_best_single_yield = 0
             return 0
@@ -601,10 +600,10 @@ class SessionYield:
         )
         units = [(unit, self._freeable(unit, hit_ids)) for unit in self._units(keep)]
         self.last_best_single_yield = max((f for _, f in units), default=0)
-        # host-aware yield: prefer a
-        # host-complete session (its break demotes, nothing is lost); hold
-        # back briefly for one whose grace copy is in flight; else yield as
-        # before and let the copy scheduler count ``yield_incomplete``.
+        # Host-aware yield: prefer a host-complete session (its break demotes,
+        # nothing is lost); hold back briefly for one whose grace copy is in
+        # flight; else yield by need and let the copy scheduler count
+        # ``yield_incomplete``.
         copyq = self._copy_scheduler()
         if copyq is not None:
             return self._yield_host_aware(copyq, units, shortfall, hit_ids)

@@ -174,8 +174,8 @@ def autotune_off_sm8x(**autotune_kwargs):
     winners per compile cache, and the block sizes and num_warps of the GDN
     chunked-prefill kernels change their accumulation order. An autotuned
     launch therefore made the temp-0 output depend on which cache an engine
-    booted from. Each fixed config (num_stages included) is one the v2.5.1
-    reference caches ran. Other archs keep the upstream autotune spaces.
+    booted from. Each fixed config (num_stages included) is one the reference
+    caches ran. Other archs keep the upstream autotune spaces.
     """
     if is_nvidia_sm8x:
         return lambda fn: fn

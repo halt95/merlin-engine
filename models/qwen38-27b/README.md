@@ -6,14 +6,14 @@ Flash-Next recipes. It accepts system messages after the first turn, so coding a
 place on `/v1/messages` and the prefix cache keeps hitting. `CHAT_TEMPLATE=<path>` serves another template;
 `CHAT_TEMPLATE=` (empty) serves the checkpoint's own.
 
-**Recipe 3.0.0 targets the Merlin engine on vLLM 0.32.0**, with full 262K context, vision, tools,
+**Recipe 3.0.0 targets the Merlin engine on vLLM 0.33.0**, with full 262K context, vision, tools,
 FP8 E4M3 KV and MTP K=4. ThinkingCap is the [checkpoint profile](../thinkingcap/README.md), served at `medium`
 reasoning effort by default; Qwen3.8-27B defaults to `medium`.
 
 [![GPU](https://img.shields.io/badge/GPU-2x_or_4x_RTX_3090-76B900?logo=nvidia&logoColor=white)](docs/reference.md#hardware)
 [![Context](https://img.shields.io/badge/context-262K_per_request-ffb000)](docs/reference.md#the-kv-budget)
 [![KV pool](https://img.shields.io/badge/KV_pool-826%2C689_%2F_2%2C012%2C105_tokens-0969da)](docs/reference.md#the-kv-budget)
-[![Engine](https://img.shields.io/badge/vLLM-0.32.0-6f42c1)](docs/reference.md#stack)
+[![Engine](https://img.shields.io/badge/vLLM-0.33.0-6f42c1)](docs/reference.md#stack)
 
 The two W4A16 checkpoints are
 [halt95/Qwen3.8-27B-W4A16-Merlin](https://huggingface.co/halt95/Qwen3.8-27B-W4A16-Merlin) (Apache-2.0) and
@@ -32,6 +32,21 @@ not published, reviewed or endorsed by BottleCap AI or Qwen. Bare metal, sm_86 (
 Both checkpoints share the engine, port 8100, served name `qwen38-27b` and profile settings.
 The wrappers select the ThinkingCap checkpoint and forward the other variables; both checkpoints default to reasoning effort `medium`.
 
+## Merlin 3.0.2 bench card (2026-11-04)
+
+Maintainer measurements on 4× RTX 3090 (220 W, PCIe Gen4) with P2P (the aikitoria patched driver) and the Zagitta [gpu-unlock](https://github.com/Zagitta/gpu-unlock) kernel module, on vLLM 0.33.0 with FlashInfer 0.7.2.post1, one fresh `merlin serve` boot per configuration, 2026-11-04; method and every cell in the [bench card](benchmarks/2026-11-04/BENCH-CARD.md). Decode is one stream with thinking on at reasoning effort medium, the server default (tok/s after the first streamed token); prefill is one cold request. With thinking on, a 512-token agent follow-up may end inside the reasoning, and reasoning tokens count. GSM8K-200 and the thinking-off agent figures are from the 3.0.1 run. Rows marked (3.0.1 run) were not re-run for 3.0.2 and are on the 3.0.1 card below.
+
+| Measurement | 2× RTX 3090 (TP2) | 4× RTX 3090 (TP4) | 1× RTX 3090 |
+|---|---|---|---|
+| Decode, 4K / 131K / 262K prompt | 211 / 184 / 146 tok/s | 258 / 255 / 250 tok/s | 131 / 100 / 77 tok/s |
+| Cold prefill, 10K / 100K / 262K prompt | 2,331 / 1,677 / 1,112 tok/s | 3,904 / 3,015 / 2,111 tok/s | 1,219 / 884 / 586 tok/s |
+| Agents at once (8 × 16K conversations), total, thinking on / off | 682 tok/s / 615 tok/s (the off figure is a 3.0.1 run) | 940 tok/s / 854 tok/s (the off figure is a 3.0.1 run) | n/a |
+| GSM8K-200 (5-shot), correct of 200, thinking on at medium / thinking off | – / 194 (3.0.1 run) | 198 / 197 (3.0.1 run) | – / 195 (3.0.1 run) |
+| Sessions held at once | Not re-measured on 3.0.2. 3.0.0 run: 3 × 262K and 6 × 131K, every session resident (re-sent prompts ≥ 99.98 % cached), 0 preemptions. | Not re-measured on 3.0.2. 3.0.0 run: 7 × 262K and 14 × 131K, every session resident (re-sent prompts ≥ 99.98 % cached), 0 preemptions. | Not re-measured on 3.0.2. 3.0.0 run: 1 × 262K and 2 × 131K, every session resident, 0 preemptions. |
+| 8 MP image (Pillow 13 path) | Not re-measured on 3.0.2 (Pillow 13). 3.0.0 run, Pillow 12: one, two at once and four in one prompt (32,842 tokens) correct; lowest free memory 886 MiB on any card. | Not re-measured on 3.0.2 (Pillow 13). 3.0.0 run, Pillow 12: one, two at once and four in one prompt (32,842 tokens) correct; lowest free memory 862 MiB on any card. | Not re-measured on 3.0.2 (Pillow 13). 3.0.0 run, Pillow 12: 8 MP: out of memory on one card. One card takes 4 MP instead: one and two at once correct with the single-card memory settings, lowest free memory 558-563 MiB (2026-10-21). |
+| KV pool | 826,689 tokens | 2,012,105 tokens | 271,506 tokens |
+| Against 3.0.1 (within run-to-run spread) | decode 0 % / +1 % / +2 % at 4K / 131K / 262K; 262K prefill 0 %; 8 agents -3 % | decode +3 % / +5 % / +5 % at 4K / 131K / 262K; 262K prefill 0 %; 8 agents -1 % | decode +5 % / +5 % / +8 % at 4K / 131K / 262K; 262K prefill +1 % |
+
 ## Merlin 3.0.1 bench card (2026-11-02)
 
 Maintainer measurements on 4× RTX 3090 (220 W, PCIe Gen4) with P2P (the aikitoria patched driver) and the Zagitta [gpu-unlock](https://github.com/Zagitta/gpu-unlock) kernel module, one fresh `merlin serve` boot per configuration, 2026-11-01 to 2026-11-02; method and every cell in the [bench card](benchmarks/2026-11-02/BENCH-CARD.md). Decode is one stream with thinking on at reasoning effort medium, the server default (tok/s after the first streamed token); prefill is one cold request. With thinking on, a 512-token agent follow-up may end inside the reasoning, and reasoning tokens count. GSM8K at medium ran on four cards. Thinking-off GSM8K is from the 3.0.0 runs (two-card and one-card: a 2026-10-17 pre-release build). The agent overlap windows on four cards and the two-card thinking-on window are under 5 s: read those totals loosely. Rows marked (3.0.0 run) were not re-run for 3.0.1; they and the rest of the 3.0.0 figures are on the [3.0.0 bench card](benchmarks/2026-10-20/BENCH-CARD.md).
@@ -46,7 +61,7 @@ Maintainer measurements on 4× RTX 3090 (220 W, PCIe Gen4) with P2P (the aikitor
 | 8 MP image (3.0.0 run) | one, two at once and four in one prompt (32,842 tokens) correct; lowest free memory 886 MiB on any card | one, two at once and four in one prompt (32,842 tokens) correct; lowest free memory 862 MiB on any card | 8 MP: out of memory on one card. One card takes 4 MP instead: one and two at once correct with the single-card memory settings, lowest free memory 558-563 MiB (2026-10-21) |
 
 The [2026-10-15 bench card](benchmarks/2026-10-15/BENCH-CARD.md) records the 0.32 tile reclaim.
-With patched **FlashInfer 0.7.0.post1** and `FLASHINFER_SM8X_FP8_SMALLQ=cta32`, the median decode-step
+With patched **FlashInfer 0.7.0.post1** and `FLASHINFER_SM8X_FP8_SMALLQ=cta32` (0.32 era; 3.0.2 carries the port to FlashInfer 0.7.2.post1, whose figures are in the 3.0.2 bench card), the median decode-step
 interval (ITL) at 4K / 32K / 131K is:
 
 | Profile | 4K | 32K | 131K |
@@ -71,7 +86,7 @@ tok/s, token savings and quality figures are not new 3.0.0 results.
 
 ## What you need
 
-Two or four 24 GB RTX 3090s, Linux x86_64, and the shared 0.32 environment described in
+Two or four 24 GB RTX 3090s, Linux x86_64, and the shared 0.33 environment described in
 [release/README.md](../../release/README.md); it carries its own CUDA 13.0 toolkit for FlashInfer JIT, so no system
 toolkit is needed. The tested numbers use GPU peer-to-peer (P2P). Without it, `merlin serve 27b <dir> --tp 2` picks the
 no-P2P row, or run `P2P=off bash models/qwen38-27b/serve.sh`; RTX 3090s without P2P are untested on this release (⚫); the four-card
@@ -97,9 +112,9 @@ The [reference](docs/reference.md#requirements) describes the measured host and 
 
 ## Quick start
 
-Use the repository-wide [release install route](../../release/README.md) for this checkout and vLLM **0.32.0**.
-The shared installer and FlashInfer 0.7.0.post1 tile tooling are integrated.
-The dependency lock is complete: 222 exact pins with artifact SHA-256 hashes, resolved with uv; a dry-run `--require-hashes` install resolves.
+Use the repository-wide [release install route](../../release/README.md) for this checkout and vLLM **0.33.0**.
+The shared installer and FlashInfer 0.7.2.post1 tile tooling are integrated.
+The dependency lock is complete: 223 exact pins with artifact SHA-256 hashes, resolved with uv; a dry-run `--require-hashes` install resolves.
 The installer applies the tile; the environment knob alone has no effect on unpatched FlashInfer.
 The archived v1.3.x engine bundle and separate 27B series describe the historical 0.30 route.
 
@@ -156,6 +171,11 @@ print(reply.choices[0].message.content)
 - Tools use the standard `tools` field (`qwen3_coder` parser, auto tool choice); images go in `image_url` content parts,
   up to 64 per prompt, each downscaled to the 8 MP cap (`MAX_PIXELS=8388608`).
 - Every response reports `usage.prompt_tokens_details.cached_tokens`, the prompt tokens served from the prefix cache.
+- Multi-turn and the prefix cache: send each assistant turn back as it was returned, with its `reasoning` (or
+  `reasoning_content`) and `tool_calls`. Keep `reasoning_effort`, `enable_thinking` and the `tools` list the same for
+  the whole conversation and leave `preserve_thinking` on: all of them are rendered at the top of the prompt or into
+  every past turn, so a change re-reads the history instead of reusing the cache. For exact reuse, send
+  `/v1/completions` with token-ID prompts: the previous prompt's ids plus the returned ids (`"return_token_ids": true`).
 - Do not use `/v1/models` as a health check: it keeps answering 200 after the engine has died. A one-token generation
   is the check.
 
@@ -167,10 +187,11 @@ The launchers default to **8,388,608 pixels (8 MP)**; the examples select that v
 The cap is a served default, not an enforced limit: a client that raises it per request
 (`mm_processor_kwargs`) goes past the measured headroom and can run the engine out of memory.
 Keep client harnesses at or below the cap.
+On vLLM 0.33 `--mamba-cache-mode` is deprecated and has no effect (prefix caching follows `--enable-prefix-caching`); the launchers still pass it and the server logs one warning.
 The folded environment controls and the old attention environment variable are removed;
-see [0.32 launcher settings](docs/reference.md#vllm-032-launcher-settings).
-The shared installer, FlashInfer 0.7.0.post1 tile patch and 8 MP launcher default are integrated;
-a fresh install (2026-10-21) and a from-source build (2026-10-22) passed on the reference host.
+see [0.33 launcher settings](docs/reference.md#vllm-033-launcher-settings).
+The shared installer, FlashInfer 0.7.2.post1 tile patch (0.7.0.post1 in 3.0.0 and 3.0.1) and 8 MP launcher default are integrated;
+on the 3.0.0 release (vLLM 0.32) a fresh install (2026-10-21) and a from-source build (2026-10-22) passed on the reference host; the 3.0.2 fresh install has not been done.
 
 ## What's new in v1.3.0
 

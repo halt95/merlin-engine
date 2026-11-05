@@ -4,7 +4,7 @@
 
 Guard: ``Qwen4ExpPLEEmbeddingMethod.from_quant_config`` picks the table
 format from config alone (``ple_embedding_dtype`` and the quantization config).
-In 0.32 a mis-resolution is silent: an FP8 E4M3 table whose prefix the quant
+A mis-resolution would otherwise be silent: an FP8 E4M3 table whose prefix the quant
 config ignores resolves to the unquantized method, and the loader then copies
 FP8 bytes into a BF16 parameter without the scale. This compares what the
 checkpoint actually stores with what the resolved method expects, at table
@@ -15,6 +15,7 @@ import torch
 
 from vllm.models.qwen4_exp.common.ngram_embedding import (
     Qwen4ExpPLEFp8EmbeddingMethod,
+    Qwen4ExpPLENvFp4EmbeddingMethod,
     Qwen4ExpPLEUnquantizedEmbeddingMethod,
 )
 from vllm.models.qwen4_exp.nvidia.ple_formats import (
@@ -27,9 +28,14 @@ from vllm.models.qwen4_exp.nvidia.ple_formats import (
 #: The packed tables (INT6 g32, INT8 row) are checked on their interleaved
 #: U8 rows, after ``Qwen4ExpNGramEmbeddingPull.load_weights`` paired each shard's
 #: ``.codes`` / ``.scales`` (whose own dtypes and shapes the interleave checks).
+#: Upstream's NVFP4 PLE (0.33, vllm#56273) stores packed E2M1 rows as U8 in
+#: ``.weight``; its block scales (``.weight_scale``, FP8) are not ``.weight``
+#: names, and its global scale is checked by
+#: ``Qwen4ExpPLENvFp4EmbeddingMethod.process_weights_after_loading``.
 _VALID: tuple[tuple[type, frozenset[torch.dtype]], ...] = (
     (Qwen4ExpPLEUnquantizedEmbeddingMethod, frozenset({torch.bfloat16, torch.float16})),
     (Qwen4ExpPLEFp8EmbeddingMethod, frozenset({torch.float8_e4m3fn})),
+    (Qwen4ExpPLENvFp4EmbeddingMethod, frozenset({torch.uint8})),
     (Qwen4ExpPLEInt6G32EmbeddingMethod, frozenset({torch.uint8})),
     (Qwen4ExpPLEInt8RowEmbeddingMethod, frozenset({torch.uint8})),
 )

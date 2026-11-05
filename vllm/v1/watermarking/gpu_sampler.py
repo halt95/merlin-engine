@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by the Merlin project; see NOTICE.
 
 from typing import Literal
 
@@ -108,11 +109,14 @@ class GPUWatermarkSampler(Sampler):
         )
         sampled = output.token_ids
         output_logits = output.logits
-        sampled = torch.where(
-            temperatures == 0,
-            processed_logits.argmax(dim=-1),
-            sampled,
-        )
+        # Expanded rows each copy a request's temperature, so checking the
+        # request temperatures covers all expanded rows
+        if self.sampling_states.any_greedy(idx_mapping_np):
+            sampled = torch.where(
+                temperatures == 0,
+                processed_logits.argmax(dim=-1),
+                sampled,
+            )
         return sampled, output_logits
 
     def _get_repeated_contexts(

@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by the Merlin project; see NOTICE.
 import contextlib
 import copy
 import queue
@@ -8,12 +9,14 @@ from typing import TypeAlias, TypeVar
 
 from transformers import AutoTokenizer, PythonBackend, TokenizersBackend
 
+from vllm.logger import init_logger
 from vllm.transformers_utils.config import get_sentence_transformer_tokenizer_config
 
 from .protocol import TokenizerLike
 
 HfTokenizer: TypeAlias = PythonBackend | TokenizersBackend
 _T = TypeVar("_T", bound=TokenizerLike)
+logger = init_logger(__name__)
 
 
 class ThreadSafeHFTokenizerMixin:
@@ -161,6 +164,11 @@ def get_cached_tokenizer(tokenizer: HfTokenizer) -> HfTokenizer:
             return get_cached_tokenizer, (tokenizer,)
 
     CachedTokenizer.__name__ = f"Cached{tokenizer.__class__.__name__}"
+    # The configured extra
+    # added tokens join Transformers' sanitize_control_tokens control set.
+    from vllm.merlin.control_tokens import install as _install_extra_control_tokens
+
+    _install_extra_control_tokens(CachedTokenizer)
 
     cached_tokenizer.__class__ = CachedTokenizer
     return cached_tokenizer

@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright 2026 halt95 (Merlin modifications)
 # Provision a Debian 13 LXC created by lxc/pve-create.sh. Run inside it as root.
-# Builds the Merlin checkout (vLLM 0.32.0) with release/install-env.sh.
+# Builds the Merlin checkout (vLLM 0.33.0) with release/install-env.sh.
 # Prepare uv and the Rust toolchain selected by rust-toolchain.toml first.
-# The release dependency hash lock is complete (222 exact pins with SHA-256 hashes).
+# The release dependency hash lock is complete (223 exact pins with SHA-256 hashes).
 # The installer rejects a modified lock containing unresolved markers. No legacy engine bundle or compiled-artifact download is used.
 # Re-runs verify an existing installation; failed/partial venvs require a fresh
 # venv before retrying. Needs network for apt, source and build dependencies.
@@ -14,7 +16,7 @@
 # --no-kernel-module; peer-to-peer support remains a host-driver property.
 set -euo pipefail
 REPO_URL="${REPO_URL:-https://github.com/halt95/merlin-engine.git}"
-REPO_REF="${REPO_REF:-merlin-v3.0.1}"
+REPO_REF="${REPO_REF:-merlin-v3.0.2}"
 APP="${APP:-/opt/flash-next}"
 VENV="${VENV:-/opt/venv}"
 [ "$(id -u)" = 0 ] || { echo "run provision.sh as root" >&2; exit 1; }
@@ -33,7 +35,7 @@ nvidia-smi -L || { echo "check the container GPU device mappings and the host dr
 # Reference host: NVIDIA driver 610.43.02 (reports CUDA 13.3). The release lock selects a matched CUDA 13.0 toolkit (nvcc, crt, nvvm, nvJitLink 13.0.88, cccl 13.0.85, runtime 13.0.96, the pair torch 2.13.0 cu130 ships with); the release wheel is served on it by every recipe (2026-10-20).
 # Other CUDA 13.x drivers (R580 or later) are expected to work through CUDA minor-version
 # compatibility, but are untested.
-# Require the CUDA 13.x floor; see release/install-0.32.md.
+# Require the CUDA 13.x floor; see release/install-0.33.md.
 cuda_release="$(nvidia-smi 2>/dev/null | sed -n 's/.*CUDA \(UMD \)\{0,1\}Version: *\([0-9][0-9]*\.[0-9][0-9]*\).*/\2/p' | head -n 1 || true)"
 if [ -n "$cuda_release" ] && [ "$(printf '%s\n%s\n' 13.0 "$cuda_release" | sort -V | tail -n 1)" != "$cuda_release" ]; then
   echo "the host driver supports CUDA $cuda_release; the locked CUDA wheels require CUDA 13.0 or later (R580 or later)" >&2
@@ -53,8 +55,8 @@ want="$(git rev-parse --verify "$REPO_REF^{commit}")"
 [ -z "$(git status --porcelain --untracked-files=no)" ] || {
   echo "$APP has modified tracked files; review them before provisioning" >&2; exit 1;
 }
-[ -f release/requirements-0.32.lock ] || {
-  echo "this checkout lacks the 0.32 dependency lock required by release/install-env.sh" >&2; exit 1;
+[ -f release/requirements-0.33.lock ] || {
+  echo "this checkout lacks the 0.33 dependency lock required by release/install-env.sh" >&2; exit 1;
 }
 if [ ! -e "$VENV" ] && [ ! -L "$VENV" ]; then
   for tool in uv cargo rustc; do

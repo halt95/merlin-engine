@@ -15,12 +15,12 @@ run artifacts are not published. Measured 2026-10-08 to 2026-10-12 (UTC); where 
 
 - **2026-10-08 gate** (sections 1-2 and the gate rows of 4-6): dual card, the base profile's `serve/serve.sh` with its `medium`
   default (each harness sets its own per-request effort), the build directory's earlier `tokenizer.json`; 2026-10-08
-  21:05-22:52 UTC. The section 1 thinking-token run ran on the renamed tree of the Qwen3.8-27B card's section 7.
+  21:05-22:52 UTC. The section 1 thinking-token run ran on tree 2 of the Qwen3.8-27B card's section 7.
 - **2026-10-09** (section 7 and the quad rows of sections 4-5): dual and quad card with the `xhigh` default, on an earlier tree (before the final patch revision), the upstream `tokenizer.json` staged.
-- **2026-10-11** (sections 3 and 8, and the 2026-10-11 column of section 5): the release head's engine, patches and `serve/serve.sh` with
+- **2026-10-11** (sections 3 and 8, and the 2026-10-11 column of section 5): tree 5's engine, patches and `serve/serve.sh` with
   `THINKING` at the `xhigh` default (what the wrappers set), dual card only.
 - **2026-10-12** (the quad card rows of sections 3, 4 and 8, and section 9): this release's tree (Merlin engine v2.5.2) freshly installed with
-  `release/install-env.sh`, the checkpoint as published (`release/checkpoint-thinkingcap.sha256` 11 of 11, upstream
+  `release/install-env.sh`, the checkpoint as published (`models/thinkingcap/checkpoint.sha256` 11 of 11, upstream
   `tokenizer.json`), served through `serve/serve-thinkingcap-tp4.sh` and `serve/serve-thinkingcap.sh` with no `THINKING` set.
 
 ## 1. Thinking tokens against the base checkpoint
@@ -89,7 +89,7 @@ than the base's. n = 3 per row.
 
 ## 3. Decode on the shipped engine (dual card 2026-10-11, quad card 2026-10-12)
 
-One fresh-cache boot per profile at the `xhigh` default (dual: the release head's `serve/serve.sh` with `THINKING` set; quad:
+One fresh-cache boot per profile at the `xhigh` default (dual: tree 5's `serve/serve.sh` with `THINKING` set; quad:
 `serve/serve-thinkingcap-tp4.sh`):
 
 | | dual card (TP=2) | quad card (TP=4) |
@@ -162,7 +162,7 @@ the long-thought check.
 | patch proof lines (embed / plan cache / split-K / seq-lens), RecoverSSM proof lines | 2 / 100 / 2 / 2, 32 | 2 / 100 / 2 / 2, 32 |
 | boot errors | 0 | 0 |
 
-A dual card boot of the renamed tree (the Qwen3.8-27B card, section 7) with this checkpoint printed the tile proof line on 2 of 2 ranks with the same
+A dual card boot of tree 2 (the Qwen3.8-27B card, section 7) with this checkpoint printed the tile proof line on 2 of 2 ranks with the same
 pool and answered its first generation.
 
 ## 7. Smokes, tokenizer, images and quad card (2026-10-09, earlier tree, `xhigh` default)
@@ -178,7 +178,7 @@ pool and answered its first generation.
 
 A dash means no row was recorded for that profile in this run.
 
-## 8. Release head boot (dual card, 2026-10-11, `xhigh` default)
+## 8. Tree 5 boot (dual card, 2026-10-11, `xhigh` default)
 
 Fresh compile cache, on one card pair while the base checkpoint ran the Qwen3.8-27B card's section 11 on the other: pool 826,689 tokens (block 960, as
 frozen), boot to ready 438 s, tile proof once on each of devices 0-1, patch proof lines 2 / 100 / 2 / 2 / 32 (embed / plan

@@ -2,76 +2,55 @@
 # SPDX-FileCopyrightText: Copyright 2026 halt95 (Merlin modifications)
 """Per-rank determinism-toggle line (log-only; changes no behaviour).
 
-Why this exists: the effective state of the
-four determinism toggles and the three persistent_topk switches must be
-attributable to a RANK and a PID. The kernel's own stderr line
-(``[merlin] persistent_topk tie policy: ...``, topk.cu report_tie_policy_once)
-is printed once per process with no tag, and FULL_K / QSA_SORT have no log
-producer at all. Every GPU worker therefore logs exactly one line::
+The effective state of the four determinism toggles and the three persistent_topk
+switches must be attributable to a RANK and a PID. The kernel's own stderr line
+(``[merlin] persistent_topk tie policy: ...``) is printed once per process with
+no tag, and FULL_K / QSA_SORT have no log producer at all. Every GPU worker
+therefore logs exactly one line::
 
     e2-toggles[PP<p>_TP<t>]: pid=<pid> MERLIN_FULL_K=<raw> MERLIN_QSA_SORT=<raw>
-    MERLIN_TIE_DET=<raw> MERLIN_TIE_RECENT=<raw> MERLIN_TOPK_EXACT_MEDIUM=<raw>
-    MERLIN_TOPK_EXACT_DECODE=<raw> MERLIN_TOPK_DET_LARGE=<raw>
-    MERLIN_TOPK_SORTED_EMIT=<raw>
-    effective: full_k=<0|1> qsa_sort=<0|1|invalid> tie_det=<0|1> tie_recent=<0|1>
-    tie_recent_effective=<0|1> exact_medium=<0|1> exact_decode=<0|1>
-    det_large=<0|1> sorted_emit=<0|1> source=<libc-getenv|os-environ>
-    cpp-cache: <full_k=... tie_det=... tie_recent=... tie_recent_effective=...
-    exact_medium=... exact_decode=... det_large=... sorted_emit=...
-    source=cpp-cache | n-a reason=<why>>
+    ... (the other raw names)
+    effective: full_k=<0|1> qsa_sort=<0|1|invalid> tie_det=<0|1> ...
+    cpp-cache: <full_k=... tie_det=... | n-a reason=<why>>
     python: qsa_sort=<0|1|n-a> sorted_emit_skip=<0|1|n-a>
-    source=qsa_indexer._QSA_SORT
-    device: switch=<0|1|n-a> switch_large=<0|1|n-a> source=counter-slots-8-9
+    device: switch=<0|1|n-a> switch_large=<0|1|n-a>
 
-(one line in the log). ``<raw>`` is ``unset``, a plain token, or a double-quoted
-string with every byte outside ``[!-~]`` (and ``"`` / ``\\``) hex-escaped, so
-the line always splits on whitespace.
+``<raw>`` is ``unset``, a plain token, or a double-quoted string with every byte
+outside ``[!-~]`` (and ``"`` / ``\\``) hex-escaped, so the line always splits on
+whitespace.
 
-WHAT EACH SECTION IS
+Sections:
 * ``effective:`` -- what each switch resolves to. The seven C++ switches are
-  folded in csrc (topk.cu, marlin_moe_wna16/ops.cu: no ``getenv`` remains), so
-  they report the compiled value whatever the environment says; the raw
-  section still shows a set variable, which the kernel ignores. QSA_SORT is
-  the vllm/merlin/envs.py reader's result (``invalid`` where that reader
-  raises). The raw C++ names are read through libc ``getenv``, not
-  ``os.environ``, which can diverge from it after an ``os.putenv``. Nothing
-  may branch on this section: this module decides nothing.
-* ``cpp-cache:`` -- the kernel's switches as the C++ statics cached them, from
-  ``torch.ops._C.merlin_persistent_topk_toggle_state`` and
-  ``torch.ops._moe_C.marlin_moe_full_k_state`` (query ops that only LOAD a
-  mirror the static initialisers publish; they never fill a cache). ``n-a``
-  with a reason on a build without those ops --
-  older extension builds have none.
-* ``python:`` -- ``qsa_indexer._QSA_SORT``, the module constant the QSA sort
-  actually branches on (looked up in ``sys.modules``, never imported here;
-  ``n-a`` if the module was never loaded in this process), and
-  ``sorted_emit_skip`` -- ``qsa_indexer._kernel_sorted_emit_state``, i.e.
-  whether the Python sort is being SKIPPED because the kernel reported
-  MERLIN_TOPK_SORTED_EMIT through ``persistent_topk_toggle_state`` field 6
-  (``n-a`` until the first QSA top-k has run and latched it).
-* ``device:`` -- counter slots [8]/[9], which the counter op fills from the
-  C++ ``exact_medium_enabled()`` / ``det_large_enabled()`` statics
-  (topk.cu persistent_topk_exact_counters).
+  folded in csrc, so they report the compiled value whatever the environment
+  says; the raw section still shows a set variable, which the kernel ignores.
+  QSA_SORT is the vllm/merlin/envs.py reader's result (``invalid`` where that
+  reader raises). Nothing may branch on this section.
+* ``cpp-cache:`` -- the kernel's switches as the C++ statics cached them, read
+  through ``torch.ops._C.merlin_persistent_topk_toggle_state`` and
+  ``torch.ops._moe_C.marlin_moe_full_k_state`` (query ops that only load a
+  mirror the static initialisers publish). ``n-a`` with a reason on a build
+  without those ops.
+* ``python:`` -- ``qsa_indexer._QSA_SORT``, the constant the QSA sort branches
+  on (looked up in ``sys.modules``, never imported here; ``n-a`` if the module
+  was never loaded), and ``sorted_emit_skip``, whether the Python sort is skipped
+  because the kernel reported MERLIN_TOPK_SORTED_EMIT (``n-a`` until the first
+  QSA top-k has run).
+* ``device:`` -- counter slots [8]/[9], filled from the C++
+  ``exact_medium_enabled()`` / ``det_large_enabled()`` statics.
 
-WHEN. Once per worker, after ``compile_or_warm_up_model`` has run the MRV2
-kernel warmup and cudagraph capture (``arm()``), i.e. after this process's
-first persistent_topk and Marlin MoE launches -- NOT at the counter reader's
-first read: the first ``maybe_log`` runs at the head of the warmup's first
-execute step, before that step's forward. When the cpp-cache ops exist and a
+When: once per worker, after ``compile_or_warm_up_model`` has run the kernel
+warmup and cudagraph capture (``arm()``), so after this process's first
+persistent_topk and Marlin MoE launches. When the cpp-cache ops exist and a
 static is still uninitialised at ``arm()``, the line is deferred to the head of
 the first execute step where every static is filled, and forced out at shutdown
 otherwise (with ``uninit`` values, which readers must treat as a failure). It
-does not depend on ``MERLIN_TOPK_EXACT_COUNTERS_LOG``: it fires with the counter
-log off.
+does not depend on ``MERLIN_TOPK_EXACT_COUNTERS_LOG``.
 
-WHAT THIS DOES NOT PROVE. Without the cpp-cache ops the C++ state is not
-read: ``effective:`` then states the compiled constants of this source tree,
-and the only C++-derived evidence is ``device:`` (EXACT_MEDIUM and DET_LARGE)
-plus the untagged stderr policy line. A stale extension built from an older
-tree (one that still read the variables) would not show up there. With the
-cpp-cache ops that gap closes for every C++ name. Even then the line proves the
+Limits: without the cpp-cache ops the C++ state is not read, so ``effective:``
+states the compiled constants of this source tree, and a stale extension built
+from an older tree would not show up. Even with them the line proves the
 CONFIGURATION each rank ran, not that a switch changed any output: that is the
-job of an output-equality run (identical sends -> one distinct output).
+job of an output-equality run.
 """
 
 from __future__ import annotations
@@ -127,7 +106,7 @@ _QSA_MODULE = "vllm.models.qwen4_exp.nvidia.ops.qsa_indexer"
 def qsa_sort_value(raw: str | None) -> str:
     """The vllm/merlin/envs.py MERLIN_QSA_SORT reader, read once at import by
     qsa_indexer.py (``_QSA_SORT``): unset is on, ``"0"``/``"1"`` as written,
-    any other value goes through ``int()`` (the 3.0.0 legacy reading), which
+    any other value goes through ``int()`` (the legacy reading), which
     raises on ``"true"`` and ``""``. A raising value -- that engine would not
     have booted -- is reported as ``invalid`` rather than guessed."""
     if raw is None:
@@ -139,7 +118,7 @@ def qsa_sort_value(raw: str | None) -> str:
 
 
 def effective_tie_recent(det_ties: bool, tie_recent: bool) -> bool:
-    """csrc/merlin/topk/persistent_topk.cuh:65-68: ``det_ties ? tie_recent
+    """persistent_topk.cuh ``effective_tie_recent``: ``det_ties ? tie_recent
     : true`` -- with TIE_DET off the restart paths keep most-recent-wins."""
     return tie_recent if det_ties else True
 

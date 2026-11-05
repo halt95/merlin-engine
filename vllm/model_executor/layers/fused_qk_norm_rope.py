@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by the Merlin project; see NOTICE.
 """Fused QK-RMSNorm + (partial) RoPE + gate copy Triton kernel.
 
 Currently used by the Qwen3.5 attention path (``attn_output_gate`` with
@@ -47,7 +48,8 @@ def _fused_qk_rmsnorm_rope_gate_kernel(
     MROPE_SECTION_H: tl.constexpr,
     MROPE_SECTION_W: tl.constexpr,
 ):
-    token = tl.program_id(0)
+    # Widen before stride products.
+    token = tl.program_id(0).to(tl.int64)
     head = tl.program_id(1)
     is_k = head >= num_q_heads
     local_head = tl.where(is_k, head - num_q_heads, head)

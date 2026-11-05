@@ -4,13 +4,12 @@
 
 Declarations (TYPE_CHECKING), the fork parsers, the fork getters
 (MERLIN_ENV), the fork's runtime-only names (MERLIN_IGNORED) and the
-draft-vocab compile factor. vllm/envs.py merges them with three hook lines:
+derived compile factors. vllm/envs.py merges them with three hook lines:
 ``environment_variables.update(MERLIN_ENV)``, ``ignored_factors |=
-MERLIN_IGNORED`` and ``add_merlin_compile_factors(factors)``. The getters
-began as the bodies that stood in vllm/envs.py; the Python 0/1 switches now
-share one parser (``_e2_strict_switch``) and the determinism toggles default
-to ``SHIPPED_KERNEL_TOGGLE_DEFAULTS``. Imports nothing but the standard
-library at module level, so vllm.envs can import it first.
+MERLIN_IGNORED`` and ``add_merlin_compile_factors(factors)``. The Python 0/1
+switches share one parser (``_e2_strict_switch``) and the determinism toggles
+default to ``SHIPPED_KERNEL_TOGGLE_DEFAULTS``. Imports nothing but the
+standard library at module level, so vllm.envs can import it first.
 """
 
 import os
@@ -30,6 +29,11 @@ if TYPE_CHECKING:
     # API server: /health answers 503 after this many seconds without an
     # EngineCore step while requests are in flight; 0 = off.
     VLLM_MERLIN_HEALTH_STALL_S: int = 120
+    # API-server chat rendering: comma-separated added
+    # tokens that sanitize_control_tokens also encodes as text in client content,
+    # on top of Transformers' own control set. Empty = Transformers' set only.
+    # The Ornith launcher sets the six FIM tokens. AOT: no. CAPTURE: no.
+    VLLM_MERLIN_EXTRA_CONTROL_TOKENS: str = ""
     VLLM_MERLIN_PROMPT_LOGPROBS_TENSOR_BUDGET_MIB: int = 384
     # AOT: no -- eager tower dispatch, outside compiled decoder regions.
     # CAPTURE: no -- metadata-only encoder graphs keep the plain path.
@@ -45,6 +49,29 @@ if TYPE_CHECKING:
     # CAPTURE: no -- scheduler-side admission order and yield policy only.
     VLLM_E2_SCHED_MISS_DEFER_S: int = 120
     VLLM_E2_SCHED_COHERENT_YIELD: bool = True
+    # V2 runner + PP + async scheduling: cap the decode rows of one step
+    # at ceil(decoding requests / pp_size), deferring the rest by one step, so
+    # the pp_size decode microbatches stay balanced instead of keeping the split
+    # admission gave them (e.g. 7/1). Strict "0"/"1", default off. AOT: no.
+    # CAPTURE: no -- scheduler-side step composition only.
+    VLLM_MERLIN_PP_DECODE_BALANCE: bool = False
+    # Decode-first step budget: running decoders' tokens are
+    # reserved before prefill chunks are sized, so a decoder behind a long
+    # prefill still gets its step. Strict "0"/"1", default off. AOT: no.
+    # CAPTURE: no -- scheduler-side step composition only.
+    VLLM_MERLIN_DECODE_FIRST: bool = False
+    # Compile-cache fault guard, default on; exactly "0" disables. After
+    # a sticky CUDA fault the run's compile cache dirs are marked, and the next
+    # boot moves a marked dir to .merlin-quarantine/ and recompiles; AOT
+    # artifacts carry a sha256 sidecar. AOT: no (never a cache-key factor).
+    # CAPTURE: no.
+    VLLM_MERLIN_COMPILE_CACHE_GUARD: bool = True
+    # QSA indexer selection scratch in the memory-profile run (a port
+    # of vllm#60490): off (default) | reserve (one transient
+    # allocation of the bound) | workspace (the logits + top-k part lives in
+    # the shared MRV2 workspace, which serving then slices). KV capacity moves;
+    # outputs do not. AOT: no. CAPTURE: no (never used inside graph capture).
+    VLLM_MERLIN_QSA_SCRATCH: str = "off"
     # Drafter MoE profile forwards at startup (exactly "0" skips them; any
     # other value runs them). Host-side dummy forwards in the memory-profiling
     # window only: AOT: no. CAPTURE: no. Runtime-only (MERLIN_IGNORED).
@@ -76,6 +103,10 @@ if TYPE_CHECKING:
     # only). Runtime-only: scheduler-side copy issue.
     MERLIN_KV_HOST_TIER__COPY_CREDITS_D: int = 32
     MERLIN_KV_HOST_TIER__COPY_BYTES_D_MIB: int = 0
+    MERLIN_KV_HOST_TIER__MAX_PENDING_STORE_BLOCKS: int = 0
+    # Keep a published successor's predecessor as its fallback restore
+    # point (host eviction order only; 0/unset = off). Runtime-only.
+    MERLIN_KV_HOST_TIER__FALLBACK_BOUNDARY: bool = False
     # DEBUG ONLY: the tier census (unit directory, proofs, histograms and the
     # per-request "tier return" lines a test run reads); 0/unset = off. The
     # per-rank store-copy timings behind the copy-cost metric
@@ -91,9 +122,8 @@ if TYPE_CHECKING:
     # (0/unset = off). Requires the host tier on. Runtime-only: AOT: no.
     # CAPTURE: no.
     MERLIN_KV_HOST_TIER_FAIL_STORES: int = 0
-    # --- 27B series knobs -------------------
-    # Moved verbatim from the 27B series' vllm/envs.py registration (same
-    # defaults). Hashed unless listed in MERLIN_IGNORED below.
+    # --- 27B lane knobs -------------------
+    # Hashed unless listed in MERLIN_IGNORED below.
     VLLM_FLASHINFER_PLAN_CACHE: bool = True
     # Opt-in workload-selected FlashInfer verify tile (default off). Needs
     # the 0001+0002 FlashInfer series (release/install-env.sh with this knob at 1).
@@ -118,6 +148,13 @@ if TYPE_CHECKING:
     # the compiled forward. CAPTURE: no -- not inside any captured graph.
     # Ignored factor, so an A/B flip reuses one AOT cache.
     VLLM_RECOVERSSM_COMMIT_AFTER_PROPOSE: bool = False
+    # RecoverSSM + PP, non-last ranks: record a second receive event after the
+    # sampled-token/count broadcasts so the deferred commit waits only for the
+    # counts, not for the drafts (post_update still waits for everything).
+    # Same kernels and arguments; reordered only across data-disjoint writers.
+    # AOT: no -- eager Python/stream order after sampling. CAPTURE: no.
+    # Ignored factor. Default off.
+    VLLM_RECOVERSSM_PP_SPLIT_RECV: bool = False
     # RecoverSSM post-sampling commit execution mode
     # (vllm/v1/worker/gpu/model_states/recoverssm_commit_graph.py): "eager"/"0"/unset
     # = the unchanged launch chain, "staged" = staged inputs + eager chain (control
@@ -166,6 +203,8 @@ if TYPE_CHECKING:
     # persistent current_draft_step, seeds) are device buffers, so replay needs
     # no host RNG. Frozen at init, graphs never persisted.
     VLLM_SPEC_STEP_KEYED_RNG: bool = False
+    # Default-off numerical repair.
+    VLLM_SPEC_STABLE_RESIDUAL: bool = False
     # --- Flash-Next knobs ---------------------------------------------
     # Registered so compile_factors() hashes them; the read sites still parse
     # and fail closed themselves. Each entry states two identities: AOT (does it
@@ -185,11 +224,10 @@ if TYPE_CHECKING:
     # graph at capture (csrc/merlin/topk/persistent_topk.cuh,
     # PersistentTopKParams::exact_medium).
     # AOT: not established. Hashed conservatively.
-    # NOT A PYTHON READ SITE: exact_medium_enabled() in
-    # csrc/merlin/topk/topk.cu is folded on and reads no variable. This entry
-    # is a raw passthrough kept for the hash; do not use
-    # envs.MERLIN_TOPK_EXACT_MEDIUM to decide behaviour. Registered with the
-    # medium-path exact restart so the cache-factor contract is complete.
+    # Raw passthrough kept for the compile-cache hash: no behaviour reads it
+    # (vllm/v1/worker/e2_toggles.py only logs the raw value), and the
+    # medium-path exact restart is fixed on in csrc/merlin/topk/topk.cu. Do
+    # not use envs.MERLIN_TOPK_EXACT_MEDIUM to decide behaviour.
     MERLIN_TOPK_EXACT_MEDIUM: str | None = None
     #
     # RUNTIME-ONLY (registered for validate_environ + a single cached read):
@@ -227,12 +265,20 @@ if TYPE_CHECKING:
     # changes. Read once at import by vllm/v1/worker/gpu/model_runner.py.
     # AOT: no. CAPTURE: no. Strict "0"/"1", default off.
     VLLM_E2_PLE_EARLY_REQUEST: bool = False
+    # PLE offload process only: where the table lives, "ram" (default) or "disk"
+    # (read from the checkpoint's safetensors files); whether a disk table
+    # is warmed after READY; and the threads that take its page faults. Read once
+    # at import by vllm/models/qwen4_exp/nvidia/ple_pull.py. AOT: no. CAPTURE: no --
+    # the offload process has no CUDA context, and the rows are the same bytes.
+    VLLM_E2_PLE_STORE: str = "ram"
+    VLLM_E2_PLE_WARM: bool = True
+    VLLM_E2_PLE_DISK_THREADS: int = 32
     #
     # The tie-determinism toggles are registered and classified in the
     # "determinism toggles" block below.
     MERLIN_TOPK_EXACT_COUNTERS_LOG: int = 0
-    # Pre-tie-determinism fallback for the counter reader's slot count; runtime-only
-    # (ignored factor), never consulted on this build. See the dict entry.
+    # Raw passthrough; runtime-only (ignored factor) and never consulted:
+    # readers take the slot count from the build (persistent_topk_exact_counters_slots).
     MERLIN_TOPK_COUNTER_SLOTS: str | None = None
     # Flash-Next family-name aliases, "alias=canonical[,alias=canonical...]"
     # (vllm/flashnext_family.py). Default unset/"" (the resolved name sets are
@@ -249,32 +295,20 @@ if TYPE_CHECKING:
     # (SHIPPED_KERNEL_TOGGLE_DEFAULTS is the single source; vllm/env_override.py
     # puts it into the environment at import). All are hashed (none is in
     # ignored_factors) because each reaches a capture. Only MERLIN_QSA_SORT is
-    # still read; FULL_K / TIE_DET / TIE_RECENT are folded on in C++ and these
+    # still read; FULL_K / TIE_DET / TIE_RECENT are fixed on in C++ and these
     # entries are raw passthroughs for the hash, never a behaviour switch.
     #
-    # Marlin MoE split-K reduction order; the CUDA half of unmerged upstream
-    # PR #46639 (`use_full_k`).
+    # Marlin MoE split-K reduction order; the CUDA half of upstream PR #46639
+    # (`use_full_k`).
     MERLIN_FULL_K: str | None = "1"
     # persistent_topk tie-break at the k-th cutoff, and its direction.
     MERLIN_TIE_DET: str | None = "1"
     MERLIN_TIE_RECENT: str | None = "1"
     #
-    # A REAL Python read site, unlike the three above: parsed here and read
+    # Unlike the three above, a Python read site: parsed here and read
     # once at import by models/qwen4_exp/nvidia/ops/qsa_indexer.py, which adds
     # a torch.sort + two torch.where ops to the QSA selection path.
     MERLIN_QSA_SORT: bool = True
-    # Reduced MTP draft vocabulary: path to a 1-D int ids table
-    # (models/qwen4_exp/nvidia/draft_head.py). CAPTURE: yes (the FULL draft
-    # graphs record an N-row head GEMM plus the full-vocab scatter); AOT: no
-    # (compute_logits is outside the compiled submodule). Hashed conservatively:
-    # compile_factors() keys the path AND a fingerprint of the table's content
-    # (N + sha256 of the ids), so a different table at the same path is a
-    # different identity. Default unset (OFF).
-    VLLM_DRAFT_VOCAB_FILE: str | None = None
-    # Optional sha256 (64 hex) of the VLLM_DRAFT_VOCAB_FILE bytes; when set the
-    # load refuses a file that does not match. Integrity check only: not a
-    # compile factor (ignored_factors). Default unset (no check).
-    VLLM_DRAFT_VOCAB_SHA256: str | None = None
     # GDN in_proj_ba GEMM on the shared aux stream, overlapped with
     # in_proj_qkvz. Read at layer build by
     # model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py; CUDA only, and
@@ -283,13 +317,23 @@ if TYPE_CHECKING:
     # fork/join to the captured graph); default OFF, hashed by
     # compile_factors (not in ignored_factors).
     VLLM_GDN_BA_AUX_STREAM: bool = False
+    # Packed GDN decode (VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE) with the
+    # numerics of the kernels that verify speculative tokens (vllm#65338:
+    # rsqrt L2 norm, 4 warps), so plain decode matches the verify recurrence.
+    # Changes plain-decode bits; RecoverSSM lanes never run the packed kernel.
+    # Read at layer build by
+    # model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py. AOT: no -- the
+    # kernel runs inside the opaque qwen_gdn_attention_core op. CAPTURE: yes,
+    # in-process only (graphs capture the selected launch). Ignored factor,
+    # so an A/B flip reuses one AOT cache. Default OFF.
+    VLLM_FLA_PACKED_DECODE_VERIFY_PARITY: bool = False
     #
     # --- persistent_topk kernel switches ------------------------------
     # Same classification as the three raw passthroughs above and registered
     # for the same single reason: compile_factors() is a deny-list, so a name
     # it does not know cannot be hashed, and a Ray deployment that propagates
     # registered variables can otherwise drop an explicitly-disabled switch
-    # and leave a worker on the default. Each is folded in
+    # and leave a worker on the default. Each policy is fixed in
     # csrc/merlin/topk/topk.cu (its *_enabled() getter returns a constant and
     # reads no variable); the value reaches the GPU as a kernel launch
     # argument, so a cudagraph bakes it in.
@@ -298,31 +342,28 @@ if TYPE_CHECKING:
     # anyway, same rule as above. None is in ignored_factors.
     #
     # Raw passthroughs, so "unset" reads as None here; the kernel ignores the
-    # variable either way. Read the getter in topk.cu for the shipped
-    # behaviour (EXACT_MEDIUM, EXACT_DECODE and DET_LARGE on).
+    # variable either way (EXACT_MEDIUM, EXACT_DECODE and DET_LARGE are on).
     #
     # Take the exact restart on an overflowing MEDIUM row:
-    # MERLIN_TOPK_EXACT_MEDIUM. Declared ONCE, in the cross-change knob
-    # block above (same raw passthrough, same hashing), so it is not repeated
-    # here.
+    # MERLIN_TOPK_EXACT_MEDIUM, declared once in the cross-change knob block
+    # above (same raw passthrough, same hashing).
     # The same restart on an overflowing DECODE row.
     MERLIN_TOPK_EXACT_DECODE: str | None = None
-    # Deterministic placement and tie membership on the LARGE path.
-    # Always on: det_large_enabled() in
-    # csrc/merlin/topk/topk.cu is folded on (no variable read), and the value
-    # reaches the large-path radix_topk as a launch argument, so a cudagraph
-    # bakes it in. CAPTURE: yes. AOT: not established (built into the
-    # extension, not by the AOT compiler); hashed conservatively like the
-    # switches above.
+    # Deterministic placement and tie membership on the LARGE path. Always on:
+    # det_large_enabled() in csrc/merlin/topk/topk.cu returns a constant (no
+    # variable is read), and the value reaches the large-path radix_topk as a
+    # launch argument, so a cudagraph bakes it in. CAPTURE: yes. AOT: not
+    # established (built into the extension, not by the AOT compiler); hashed
+    # conservatively like the switches above.
     MERLIN_TOPK_DET_LARGE: str | None = None
     #
-    # MERLIN_TOPK_SORTED_EMIT -- persistent_topk
-    # emits every row in the canonical order MERLIN_QSA_SORT imposes
-    # (ascending index, padding last as -1), and qsa_indexer.py then skips its
-    # Python sort. Same classification as the kernel switches above: folded on
-    # in csrc/merlin/topk/topk.cu (sorted_emit_enabled reads no variable), and
-    # the value reaches the GPU as a kernel launch argument AND removes three torch
-    # ops from the captured sequence, so a cudagraph bakes it in. CAPTURE: yes.
+    # MERLIN_TOPK_SORTED_EMIT -- persistent_topk emits every row in the
+    # canonical order MERLIN_QSA_SORT imposes (ascending index, padding last as
+    # -1), and qsa_indexer.py then skips its Python sort. Same classification
+    # as the kernel switches above: sorted_emit_enabled() in
+    # csrc/merlin/topk/topk.cu returns a constant, and the value reaches the
+    # GPU as a kernel launch argument AND removes three torch ops from the
+    # captured sequence, so a cudagraph bakes it in. CAPTURE: yes.
     # AOT: not established for the kernel half; hashed conservatively (a fork
     # env knob must be a compile factor: an os.environ knob that is not
     # registered is not in the cache key). Raw passthrough: Python never parses
@@ -337,6 +378,8 @@ if TYPE_CHECKING:
     # parser; this entry is a passthrough). Syntax and the exactness classes are
     # documented there. IGNORED as a compile factor, see MERLIN_IGNORED.
     MERLIN_MARLIN_MOE_CFG: str | None = None
+    # Exact-shape W8A16 tiles; default OFF.
+    MERLIN_MARLIN_DENSE_CFG: str | None = None
     #
     # NOT REGISTERED: MERLIN_TOPK_EXACT_TRAP is a build-time -D define in
     # persistent_topk.cuh, not an environment variable.
@@ -344,20 +387,33 @@ if TYPE_CHECKING:
     # --- UNAUDITED: host-side knobs with no read site in this tree ----------
     # Names only, one per line, inside the fence; a knob leaves the fence when
     # its AOT and capture identity are written down against its read site.
-    # The fence is empty in this release: every host-side knob has its
-    # identity written down.
+    # The fence is empty: every host-side knob has its identity written
+    # down.
     # --8<-- [start:unaudited-host-side-knobs]
     # --8<-- [end:unaudited-host-side-knobs]
 
 
-# Compat flag for the 0/1 switch family. False (this release): a value outside
-# {"0", "1"} logs one warning naming the knob and the value, then keeps the
+# Compat flag for the 0/1 switch family. False: a value outside {"0", "1"}
+# logs one warning naming the knob and the value, then keeps the
 # interpretation that knob had before the helper existed, so no served
-# behaviour changes. A later release flips this to True to make every
-# out-of-set value a boot error.
+# behaviour changes. True makes every out-of-set value a boot error.
 STRICT_SWITCH_ENFORCE = False
 
 _switch_warned: set[tuple[str, str]] = set()
+
+
+def _ple_store_value() -> str:
+    value = os.getenv("VLLM_E2_PLE_STORE", "ram")
+    if value not in ("ram", "disk"):
+        raise ValueError(f"VLLM_E2_PLE_STORE must be ram or disk, got {value!r}")
+    return value
+
+
+def _ple_disk_threads() -> int:
+    raw = os.getenv("VLLM_E2_PLE_DISK_THREADS", "32")
+    if not (raw.isascii() and raw.isdigit()) or int(raw) < 1:
+        raise ValueError(f"VLLM_E2_PLE_DISK_THREADS must be a whole number >= 1, got {raw!r}")
+    return int(raw)
 
 
 def _e2_strict_switch(
@@ -406,6 +462,16 @@ def _e2_strict_switch(
         except ValueError:
             raise ValueError(msg) from None
     raise ValueError(msg)
+
+
+def _qsa_scratch_mode() -> str:
+    raw = os.getenv("VLLM_MERLIN_QSA_SCRATCH", "off").strip().lower()
+    if raw not in ("off", "reserve", "workspace"):
+        raise ValueError(
+            "VLLM_MERLIN_QSA_SCRATCH must be off, reserve or workspace, "
+            f"got {raw!r}"
+        )
+    return raw
 
 
 def _e2_nonneg_int(name: str, default: int = 0) -> int:
@@ -459,10 +525,6 @@ def _e2_positive_int(name: str, default: int) -> int:
     if value == 0:
         raise ValueError(f"{name} must be a positive integer")
     return value
-
-
-# compile_factors() key holding the draft-vocab table fingerprint (N + content hash).
-DRAFT_VOCAB_TABLE_FACTOR = "VLLM_DRAFT_VOCAB_FILE:table"
 
 
 # Architectures whose embedding tables may be kept in pinned host memory
@@ -524,6 +586,9 @@ MERLIN_ENV: dict[str, Callable[[], Any]] = {
     "VLLM_MERLIN_HEALTH_STALL_S": lambda: _e2_nonneg_int(
         "VLLM_MERLIN_HEALTH_STALL_S", 120
     ),
+    "VLLM_MERLIN_EXTRA_CONTROL_TOKENS": lambda: os.environ.get(
+        "VLLM_MERLIN_EXTRA_CONTROL_TOKENS", ""
+    ),
     # 0 disables chunking; negative/malformed values fail closed.
     "VLLM_MERLIN_VISION_CHUNK_ROWS": lambda: _e2_nonneg_int(
         "VLLM_MERLIN_VISION_CHUNK_ROWS", default=8192
@@ -539,8 +604,7 @@ MERLIN_ENV: dict[str, Callable[[], Any]] = {
     "VLLM_E2_QSA_LOGITS_GRANULE_MB": lambda: _e2_nonneg_int(
         "VLLM_E2_QSA_LOGITS_GRANULE_MB"
     ),
-    # --- 27B series knobs; getters moved
-    # verbatim from the series' vllm/envs.py. ---
+    # --- 27B lane knobs ---
     # --- FlashInfer decode-plan cache (fa2/sm_86) ---
     # Single-entry cache that skips fast_decode_plan when the schedule cannot have
     # changed. On by default; VLLM_FLASHINFER_PLAN_CACHE=0 disables it. Registered here
@@ -605,6 +669,10 @@ MERLIN_ENV: dict[str, Callable[[], Any]] = {
     "VLLM_RECOVERSSM_COMMIT_AFTER_PROPOSE": lambda: _e2_strict_switch(
         "VLLM_RECOVERSSM_COMMIT_AFTER_PROPOSE", default=False, legacy="int"
     ),
+    # See its declaration. Default off.
+    "VLLM_RECOVERSSM_PP_SPLIT_RECV": lambda: _e2_strict_switch(
+        "VLLM_RECOVERSSM_PP_SPLIT_RECV", default=False
+    ),
     # --- GDN metadata host trims (see their declaration). Default off. ---
     # VLLM_GDN_SHARED_ALIGN_INDEX=1: the align-mode state-index gather index is
     # computed once per batch and reused by every GDN group (update_block_table)
@@ -627,7 +695,7 @@ MERLIN_ENV: dict[str, Callable[[], Any]] = {
     "VLLM_RECOVERSSM_CHECK_OWNERSHIP": lambda: _e2_strict_switch(
         "VLLM_RECOVERSSM_CHECK_OWNERSHIP", default=False, legacy="int"
     ),
-    # --- end of the 27B series knobs ---
+    # --- end of the 27B lane knobs ---
     # --- Opt-in Qwen3.5 MoE / single-card memory knobs (off by default) ---
     "MERLIN_MOE_UNIFORM_VERIFY": lambda: _e2_strict_switch("MERLIN_MOE_UNIFORM_VERIFY"),
     "MERLIN_SHARE_DRAFT_WORKSPACE": lambda: _e2_strict_switch(
@@ -647,11 +715,15 @@ MERLIN_ENV: dict[str, Callable[[], Any]] = {
     "VLLM_SPEC_STEP_KEYED_RNG": lambda: _e2_strict_switch(
         "VLLM_SPEC_STEP_KEYED_RNG", default=False
     ),
+    # Reject misspelled boolean values.
+    "VLLM_SPEC_STABLE_RESIDUAL": lambda: _e2_strict_switch(
+        "VLLM_SPEC_STABLE_RESIDUAL", default=False
+    ),
     # --- Flash-Next fork knobs; see the TYPE_CHECKING block for
     # which of these are compile/capture factors and which are ignored.
     # Compile/capture factors.
     "VLLM_QSA_KV_CLIP_COUNT": lambda: os.getenv("VLLM_QSA_KV_CLIP_COUNT", "").strip(),
-    # Capture-configuration factor, folded in C++; raw passthrough for the hash.
+    # Capture-configuration factor, fixed in C++; raw passthrough for the hash.
     "MERLIN_TOPK_EXACT_MEDIUM": lambda: os.getenv("MERLIN_TOPK_EXACT_MEDIUM", None),
     # Runtime only; all of the following are in compile_factors.ignored_factors.
     "VLLM_QSA_KV_SCALES": lambda: os.getenv("VLLM_QSA_KV_SCALES", "").strip(),
@@ -678,6 +750,10 @@ MERLIN_ENV: dict[str, Callable[[], Any]] = {
     "VLLM_E2_PLE_EARLY_REQUEST": lambda: _e2_strict_switch(
         "VLLM_E2_PLE_EARLY_REQUEST", default=False
     ),
+    # PLE offload process: where the table lives. Strict ram|disk.
+    "VLLM_E2_PLE_STORE": lambda: _ple_store_value(),
+    "VLLM_E2_PLE_WARM": lambda: _e2_strict_switch("VLLM_E2_PLE_WARM", default=True),
+    "VLLM_E2_PLE_DISK_THREADS": lambda: _ple_disk_threads(),
     # Seconds between `topk-exact-counters` lines from each GPU worker
     # (0, the default, disables the reader entirely). The line reports the
     # medium-path exact-restart counters; see
@@ -710,15 +786,16 @@ MERLIN_ENV: dict[str, Callable[[], Any]] = {
     "MERLIN_QSA_SORT": lambda: _e2_strict_switch(
         "MERLIN_QSA_SORT", default=True, legacy="int"
     ),
-    # Reduced draft vocabulary; empty reads as unset, like draft_head.py.
-    "VLLM_DRAFT_VOCAB_FILE": lambda: os.getenv("VLLM_DRAFT_VOCAB_FILE") or None,
-    "VLLM_DRAFT_VOCAB_SHA256": lambda: os.getenv("VLLM_DRAFT_VOCAB_SHA256") or None,
     # GDN in_proj_ba on the aux stream; see the declaration block above.
     "VLLM_GDN_BA_AUX_STREAM": lambda: _e2_strict_switch(
         "VLLM_GDN_BA_AUX_STREAM", default=False
     ),
+    # See the declaration.
+    "VLLM_FLA_PACKED_DECODE_VERIFY_PARITY": lambda: _e2_strict_switch(
+        "VLLM_FLA_PACKED_DECODE_VERIFY_PARITY", default=False
+    ),
     # persistent_topk kernel switches. Raw passthroughs kept for the hash
-    # (the C++ is folded and reads none of them); see the declaration block.
+    # (the C++ policy is fixed and reads none of them); see the declaration block.
     # MERLIN_TOPK_EXACT_MEDIUM is registered once, earlier in this dict.
     "MERLIN_TOPK_EXACT_DECODE": lambda: os.getenv("MERLIN_TOPK_EXACT_DECODE", None),
     "MERLIN_TOPK_DET_LARGE": lambda: os.getenv("MERLIN_TOPK_DET_LARGE", None),
@@ -731,6 +808,8 @@ MERLIN_ENV: dict[str, Callable[[], Any]] = {
     # Marlin MoE per-shape block size / thread config. Raw
     # passthrough; marlin_moe_cfg.py parses it.
     "MERLIN_MARLIN_MOE_CFG": lambda: os.getenv("MERLIN_MARLIN_MOE_CFG", None),
+    # Blank/unset is preserved as OFF.
+    "MERLIN_MARLIN_DENSE_CFG": lambda: os.getenv("MERLIN_MARLIN_DENSE_CFG", None),
     # Prefix-cache thrash fixes (default ON). Read in cache_thrash.py.
     "VLLM_E2_SCHED_MISS_DEFER_S": lambda: _e2_nonneg_int(
         "VLLM_E2_SCHED_MISS_DEFER_S", default=120
@@ -738,6 +817,23 @@ MERLIN_ENV: dict[str, Callable[[], Any]] = {
     "VLLM_E2_SCHED_COHERENT_YIELD": lambda: _e2_strict_switch(
         "VLLM_E2_SCHED_COHERENT_YIELD", default=True
     ),
+    # Balanced PP decode microbatches, default off. Read in
+    # async_scheduler.py.
+    "VLLM_MERLIN_PP_DECODE_BALANCE": lambda: _e2_strict_switch(
+        "VLLM_MERLIN_PP_DECODE_BALANCE", default=False
+    ),
+    # Decode-first step budget, default off. Read in
+    # vllm/merlin/decode_first.py.
+    "VLLM_MERLIN_DECODE_FIRST": lambda: _e2_strict_switch(
+        "VLLM_MERLIN_DECODE_FIRST", default=False
+    ),
+    # Compile-cache fault guard, default on. Read in
+    # vllm/merlin/compile_cache_guard.py.
+    "VLLM_MERLIN_COMPILE_CACHE_GUARD": lambda: _e2_strict_switch(
+        "VLLM_MERLIN_COMPILE_CACHE_GUARD", default=True
+    ),
+    # QSA profile reserve mode; parsed here, by _qsa_scratch_mode.
+    "VLLM_MERLIN_QSA_SCRATCH": lambda: _qsa_scratch_mode(),
     # Same semantics as the former os.environ read: only "0" disables.
     "VLLM_SPEC_PROFILE_SHAPES": lambda: (
         os.getenv("VLLM_SPEC_PROFILE_SHAPES", "1") != "0"
@@ -780,6 +876,12 @@ MERLIN_ENV: dict[str, Callable[[], Any]] = {
     "MERLIN_KV_HOST_TIER__COPY_BYTES_D_MIB": lambda: _e2_nonneg_int(
         "MERLIN_KV_HOST_TIER__COPY_BYTES_D_MIB", 0
     ),
+    "MERLIN_KV_HOST_TIER__MAX_PENDING_STORE_BLOCKS": lambda: _e2_nonneg_int(
+        "MERLIN_KV_HOST_TIER__MAX_PENDING_STORE_BLOCKS", 0
+    ),
+    "MERLIN_KV_HOST_TIER__FALLBACK_BOUNDARY": lambda: _e2_strict_switch(
+        "MERLIN_KV_HOST_TIER__FALLBACK_BOUNDARY", default=False
+    ),
 }
 
 
@@ -792,6 +894,9 @@ MERLIN_IGNORED: frozenset[str] = frozenset(
     "VLLM_MERLIN_PROMPT_LOGPROBS_CHUNK_SIZE",
     # API-server /health watchdog; no compiled or captured operations.
     "VLLM_MERLIN_HEALTH_STALL_S",
+    # API-server chat rendering only (sanitize_control_tokens); no compiled or
+    # captured operations.
+    "VLLM_MERLIN_EXTRA_CONTROL_TOKENS",
     "VLLM_MERLIN_PROMPT_LOGPROBS_TENSOR_BUDGET_MIB",
     # AOT: no -- row slicing is eager, outside compiled decoder regions.
     # CAPTURE: no -- encoder graphs omit the grid and keep plain execution.
@@ -826,9 +931,6 @@ MERLIN_IGNORED: frozenset[str] = frozenset(
     # after load and before capture; the kernel reads them with
     # tl.load(k_scale_ptr), never as a constexpr.
     "VLLM_QSA_KV_SCALES",
-    # Boot-time integrity check on the draft vocab file; the table content
-    # is already keyed through DRAFT_VOCAB_TABLE_FACTOR.
-    "VLLM_DRAFT_VOCAB_SHA256",
     # Guard telemetry: counter() returns a real [3] int64 view in every
     # mode, so the Triton arguments and the captured graph are identical;
     # the mode only gates the side reader thread and the check_pending
@@ -848,6 +950,19 @@ MERLIN_IGNORED: frozenset[str] = frozenset(
     # flip reuses one AOT cache.
     "VLLM_E2_SCHED_MISS_DEFER_S",
     "VLLM_E2_SCHED_COHERENT_YIELD",
+    # Balanced PP decode microbatches: which decode rows a step
+    # schedules; shapes stay within the captured batch sizes either way.
+    "VLLM_MERLIN_PP_DECODE_BALANCE",
+    # Decode-first step budget: how many tokens a prefill chunk takes
+    # this step; shapes stay within the captured batch sizes either way.
+    "VLLM_MERLIN_DECODE_FIRST",
+    # Compile-cache fault guard: where the cache lives and whether it is
+    # trusted, never what is compiled; must not move the AOT cache key.
+    "VLLM_MERLIN_COMPILE_CACHE_GUARD",
+    # QSA profile reserve: eager allocations in the dummy run and the
+    # eager selection op; same kernels, shapes and strides; never used while a
+    # graph is captured.
+    "VLLM_MERLIN_QSA_SCRATCH",
     # Startup profiling only: extra dummy forwards before KV sizing, and the
     # severity of a post-profiling teardown check; neither touches a compiled
     # or captured artifact.
@@ -871,6 +986,9 @@ MERLIN_IGNORED: frozenset[str] = frozenset(
     "MERLIN_KV_HOST_TIER__MAX_ASSEMBLING",
     "MERLIN_KV_HOST_TIER__COPY_CREDITS_D",
     "MERLIN_KV_HOST_TIER__COPY_BYTES_D_MIB",
+    "MERLIN_KV_HOST_TIER__MAX_PENDING_STORE_BLOCKS",
+    # Scheduler-side host eviction order only.
+    "MERLIN_KV_HOST_TIER__FALLBACK_BOUNDARY",
     # Placement only: rewrites CUDA_VISIBLE_DEVICES for the PLE offload
     # child, and CUDA_VISIBLE_DEVICES is already ignored above.
     "VLLM_PLE_OFFLOAD_HOME_DEVICE",
@@ -889,6 +1007,11 @@ MERLIN_IGNORED: frozenset[str] = frozenset(
     # dummy forwards keep the late issue, so the compiled artifact and
     # every captured graph are the same with it on or off.
     "VLLM_E2_PLE_EARLY_REQUEST",
+    # PLE offload process only: where its table bytes come from, never what
+    # any kernel or graph runs.
+    "VLLM_E2_PLE_STORE",
+    "VLLM_E2_PLE_WARM",
+    "VLLM_E2_PLE_DISK_THREADS",
     # Eager allocation size of the QSA prefill logits (rounded up, reused
     # across chunks). The op runs outside capture, the view handed to the
     # kernel has the same shape, strides and dtype, so no compiled artifact
@@ -901,6 +1024,9 @@ MERLIN_IGNORED: frozenset[str] = frozenset(
     # no cross-process artifact depends on it; hashing it would force an AOT
     # miss on every configuration for an RNG-keying A/B.
     "VLLM_SPEC_STEP_KEYED_RNG",
+    # Init-frozen Triton constexpr, like RNG.
+    # JIT specialization keys it; graphs are not persisted and AOT is unaffected.
+    "VLLM_SPEC_STABLE_RESIDUAL",
     # Logging cadence for an already-compiled kernel's counters: it gates a
     # host-side timer and a snapshot op, and is read by no compiled code, so
     # hashing it would invalidate every compile cache for a log interval.
@@ -920,11 +1046,17 @@ MERLIN_IGNORED: frozenset[str] = frozenset(
     # release AOT cache key (even when unset) for no protection. Same argument
     # as VLLM_SPEC_STEP_KEYED_RNG above.
     "MERLIN_MARLIN_MOE_CFG",
-    # --- 27B series knobs: the same ignored
-    # set the series' compile_factors() listed, with its reasons. ---
+    # Read inside opaque marlin_gemm;
+    # only native launch parameters change, not persisted compiled code.
+    # CUDA graphs are process-local; changing the table requires a restart.
+    "MERLIN_MARLIN_DENSE_CFG",
+    # --- 27B lane knobs: ignored factors and their reasons. ---
     # RecoverSSM commit order (after vs before the MTP proposal): eager Python
     # call order after sampling; nothing compiled or captured depends on it.
     "VLLM_RECOVERSSM_COMMIT_AFTER_PROPOSE",
+    # PP receive event split: stream order
+    # after sampling; nothing compiled or captured depends on it.
+    "VLLM_RECOVERSSM_PP_SPLIT_RECV",
     # RecoverSSM commit execution mode: read only after sampling, outside the
     # compiled forward and its capture; the commit graphs it selects are
     # in-process and bit-identical to the eager chain (see its declaration).
@@ -936,6 +1068,10 @@ MERLIN_IGNORED: frozenset[str] = frozenset(
     # inside the compiled forward or a captured graph reads the flags.
     "VLLM_GDN_SHARED_ALIGN_INDEX",
     "VLLM_GDN_DECODE_FASTPATH",
+    # Selects a Triton launch
+    # inside the opaque qwen_gdn_attention_core op; no compiled artefact
+    # contains it, and registering it must not move the release AOT cache key.
+    "VLLM_FLA_PACKED_DECODE_VERIFY_PARITY",
     # MTP draft bounded plan: decides on the host whether a draft build plans
     # FlashInfer from CPU bounds (and writes the page table with a Triton kernel
     # outside capture); nothing compiled or captured reads either flag, and
@@ -960,16 +1096,6 @@ def add_merlin_compile_factors(factors: dict[str, object]) -> None:
     # Workload tile: a conservative capture factor only when on.
     if MERLIN_ENV["MERLIN_FLASHINFER_WORKLOAD_TILE"]():
         factors["MERLIN_FLASHINFER_WORKLOAD_TILE"] = True
-    # Draft vocab: the path alone does not identify the table (it can be replaced in
-    # place), so key its content too. The fingerprint is the one recorded when
-    # the table was loaded, else it is read from the file now.
-    draft_vocab_file = factors.get("VLLM_DRAFT_VOCAB_FILE")
-    if draft_vocab_file:
-        from vllm.models.qwen4_exp.nvidia.draft_head import draft_vocab_table_factor
-
-        factors[DRAFT_VOCAB_TABLE_FACTOR] = draft_vocab_table_factor(
-            str(draft_vocab_file)
-        )
 
 
 # Retired MERLIN_* knobs a published release read and this one ignores

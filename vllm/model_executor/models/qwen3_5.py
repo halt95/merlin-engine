@@ -223,6 +223,11 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
     }
 )
 class Qwen3_5Model(Qwen3NextModel):
+    # vllm#61180: PP stages relay the
+    # aux hidden-state taps (Qwen3NextModel.forward packs and collects them),
+    # so a DFlash/DFlash2 drafter runs on a PP layout (Ornith TP2xPP2).
+    supports_aux_hidden_states_over_pp = True
+
     # Qwen3.5 ships the GDN in_proj checkpoints separately (qwen3-next
     # pre-fuses them); fuse them on top of the qwen3-next QKV/gate_up mapping.
     hf_to_vllm_mapper = Qwen3NextModel.hf_to_vllm_mapper | WeightsMapper(
@@ -366,7 +371,9 @@ class Qwen3_5ForCausalLMBase(
         return self.model.embed_input_ids(input_ids)
 
     def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
-        self.model.aux_hidden_state_layers = layers
+        # Through the mixin so the taps are
+        # sorted and the PP slot layout (base, upstream total) is cached.
+        self.model._set_aux_hidden_state_layers(layers)
 
     def get_eagle3_aux_hidden_state_layers(self) -> tuple[int, ...]:
         num_layers = len(self.model.layers)

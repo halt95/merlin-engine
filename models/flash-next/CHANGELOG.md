@@ -3,6 +3,26 @@
 Release notes of the Flash-Next recipe, newest first. See the [README](README.md) for current serving status
 and [reference](docs/reference.md) for configuration and evidence boundaries.
 
+## Merlin 3.0.2
+
+The Flash-Next recipe is **built on vLLM 0.33.0**; the recipe version stays 3.0.0 (the VERSION file is unchanged). See the
+[engine changelog](../../docs/CHANGELOG.md#merlin-302) for the full release. This recipe's results are in the
+[2026-11-04 bench card](benchmarks/2026-11-04/BENCH-CARD.md); the 2026-11-02 card stays as the 3.0.1 comparator.
+
+- **`--ple-store disk` (experimental):** reads the PLE table's rows from the checkpoint's files on NVMe instead of holding
+  the table in host RAM (47.7–47.8 GiB freed with FP8, 38.8–38.9 GiB with `--ple int6`). Measured on the 0.32 tree; the 0.33 re-run has not been done for 3.0.2. See the [3.0.2 options](docs/reference.md#merlin-302-options).
+- **`--context SIZE` (experimental):** YaRN past 262K built from the checkpoint's config; see
+  [Context size](docs/reference.md#context-size-302).
+- **Pipeline-parallel decode:** commit kernels warmed on every PP rank at boot, a persistent snapshot ring that reuses its storage instead of allocating it each step, one align-postprocess launch per distinct input set, and two optional off-by-default switches
+  (`VLLM_RECOVERSSM_PP_SPLIT_RECV`, `VLLM_MERLIN_PP_DECODE_BALANCE`). Tokens unchanged by construction; the on-versus-off comparison has not been done for 3.0.2.
+- **Decode-first budget (experimental, off by default):** `VLLM_MERLIN_DECODE_FIRST=1`; see the [3.0.2 options](docs/reference.md#merlin-302-options). Reported by Sudzpel.
+- **Registry:** the CMP 170HX and RTX 4090 rows, whose evidence is P2P-off only, report "untested" when the resolved P2P mode is on
+  (`match.status_p2p_modes`).
+- **Variant scales:** a Swift1.5 or Swift1.5-Huihui name on a directory that has the right `config.json` but neither the release
+  scales file nor the verified marker is refused; pass `SCALES=<the recipe's scales file>` or run `merlin pull`.
+- **Held back from 0.33:** lookahead block hashes, DFlash/DSpark trailing-block drop, small-batch split top-p, step-keyed RNG
+  default. See the engine changelog.
+
 ## Merlin 3.0.1
 
 - **DFlash2, opt-in:** `--spec dflash2` on `merlin serve` or `./setup.sh`; `SPEC=dflash2` for a direct
@@ -108,7 +128,7 @@ finished answering (10.4 %, one judged run; 35 cut off). Quality check against S
 GSM8K 96.29 % vs 95.98 %, agent-turn tokens 0.86× (95 % CI includes parity). It ships Qwen's upstream `tokenizer.json`
 (the check ran with Swift 1.5's earlier file; smoke-tested since). New files:
 `scripts/serve-huihui.sh` (serve-v2.5.sh with this checkpoint's KV-scale sidecar, served names and `xhigh` default),
-`scales/qsa_kv_scales_swift_huihui_dense.json`, `release/checkpoint-huihui.sha256`, `licenses/Huihui-LICENSE` and
+`scales/qsa_kv_scales_swift_huihui_dense.json`, `models/swift1.5-huihui/checkpoint.sha256`, `licenses/Huihui-LICENSE` and
 `licenses/Huihui-NOTICE`, and its bench card
 [`Huihui-BENCH-CARD.md`](../swift1.5-huihui/benchmarks/2026-10-12/Huihui-BENCH-CARD.md). In this tree the Huihui files live in
 [`models/swift1.5-huihui/`](../swift1.5-huihui/README.md).

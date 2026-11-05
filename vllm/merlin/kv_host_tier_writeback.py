@@ -12,8 +12,9 @@ reset needs no reverse transition here. This module decides and issues copies:
 
 * Walker (``WriteBack.select``). Once per scheduler step it reads the next
   reclaims in the allocator's own pop order (``iter_pool_reclaims``:
-  junction priority and ``EvictGroups`` expansion included) over a window of the running headroom plus the admission gate's
-  ``demand_hint``. The first dirty member of a restore unit schedules the
+  junction priority and ``EvictGroups`` expansion included) over a window of
+  the running headroom plus the admission gate's ``demand_hint``. The first
+  dirty member of a restore unit schedules the
   whole unit (``UnitTable.gpu_members``, endpoints last); members it cannot
   issue this step wait in a backlog and go first next step. Only ready
   content is copied (``BlockTierState.is_ready``: every rank retired its
@@ -64,20 +65,20 @@ reset needs no reverse transition here. This module decides and issues copies:
   Running requests never wait: other dirty reclaims are
   ``demote_missed_running``.
 
-Accounts. There is no retention account: admitted restores are
-bounded by a restores-in-flight cap in the planner, and the tier's minimum
-size is one max-length restore unit (the math, ``kv_host_tier``).
+Accounts. There is no retention account: admitted restores are bounded by a
+restores-in-flight cap in the planner, and the tier's minimum size is one
+max-length restore unit (the math, ``kv_host_tier``).
 Quarantine (``account_quarantine``): stale-epoch demotions still in flight
 plus abandoned loads' destinations. ``H_run`` (``account_running``): the exact
 block need of the running requests' next step, computed by the scheduler hook
 after allocation and consumed by the next walk; ``select`` falls back to the R
 estimate only when no hook ran (the walker driven directly).
-DMA credits (``P``) are issued, not completed copies
-in both directions: the walker only issues demotions into credits that
-in-flight restores leave free. Restores never wait on credits here, and their
-reservations (host hit pins, GPU destinations) take
-none, so a restore larger than ``P`` is never deadlocked by the cap. Pinned
-restore sources are reported as ``promote_pins``.
+DMA credits (``P``) are issued, not completed copies, in both directions: the
+walker only issues demotions into credits that in-flight restores leave free.
+Restores never wait on credits here, and their reservations (host hit pins,
+GPU destinations) take none, so a restore larger than ``P`` is never
+deadlocked by the cap. Pinned restore sources are reported as
+``promote_pins``.
 """
 
 import time
@@ -102,7 +103,7 @@ logger = init_logger(__name__)
 
 # Gate tuning envs, documented under "KV RAM cache tuning knobs" in
 # models/flash-next/docs/reference.md; refused with the tier off
-# (kv_host_tier.post_init). Starting values, to be finalised from census data.
+# (kv_host_tier.post_init).
 CREDITS_ENV = "MERLIN_KV_HOST_TIER__COPY_CREDITS"
 ESCAPE_ENV = "MERLIN_KV_HOST_TIER__ESCAPE_STEPS"
 DEFAULT_COPY_CREDITS = 32
@@ -115,24 +116,28 @@ IDLE_BREAK_STEPS = 2
 TINY_FA_PAGES = 2
 # Units assembling at once (their landed rows are held until publish);
 # a new unit waits while this many are in progress, so held halves never fill
-# the host. MERLIN_KV_HOST_TIER__MAX_ASSEMBLING overrides it (27B assembly
-# waited under 24 agents).
+# the host. MERLIN_KV_HOST_TIER__MAX_ASSEMBLING overrides it.
 MAX_ASSEMBLING = 2
 ASSEMBLING_ENV = "MERLIN_KV_HOST_TIER__MAX_ASSEMBLING"
 N_RESTORE_ENV = "MERLIN_KV_HOST_TIER__N_RESTORE"
 DEFAULT_N_RESTORE = 2
-# Per-direction DMA credits. The demotion
-# direction (D) has its own row cap and an optional byte cap per rank; the
-# restore direction (R) keeps ``COPY_CREDITS`` (``credits_cap``, read by the
-# plans tick). With one shared pool, 32 block credits x multi-step acks at
-# ~1.2 s steps capped copy issue at ~6-8 % of the stream rate on the 27B.
+# Per-direction DMA credits. The demotion direction (D) has its own row cap and
+# an optional byte cap per rank; the restore direction (R) keeps
+# ``COPY_CREDITS`` (``credits_cap``, read by the plans tick). One shared credit
+# pool would throttle write-back to a fraction of the stream rate when acks
+# take several steps.
 CREDITS_D_ENV = "MERLIN_KV_HOST_TIER__COPY_CREDITS_D"
 BYTES_D_ENV = "MERLIN_KV_HOST_TIER__COPY_BYTES_D_MIB"
+# Optional total write-back source-reference cap (0 = off).
+STORE_PINS_ENV = "MERLIN_KV_HOST_TIER__MAX_PENDING_STORE_BLOCKS"
+# Keep a published successor's predecessor as its fallback restore point
+# (``kv_host_tier_units``); 0/unset = off.
+FALLBACK_ENV = "MERLIN_KV_HOST_TIER__FALLBACK_BOUNDARY"
 # The D default equals COPY_CREDITS (32 rows); COPY_CREDITS_D sets another.
 DEFAULT_COPY_CREDITS_D = DEFAULT_COPY_CREDITS
 GATE_ENVS = (
     CREDITS_ENV, ESCAPE_ENV, N_RESTORE_ENV, ASSEMBLING_ENV,
-    CREDITS_D_ENV, BYTES_D_ENV,
+    CREDITS_D_ENV, BYTES_D_ENV, STORE_PINS_ENV, FALLBACK_ENV,
 )
 
 
@@ -159,6 +164,21 @@ def copy_bytes_d() -> int:
     from vllm.merlin.envs import _e2_nonneg_int
 
     return _e2_nonneg_int(BYTES_D_ENV, default=0) << 20
+
+
+def fallback_boundary() -> bool:
+    """Whether a published successor keeps its predecessor as its
+    fallback restore point (exactly 0 or 1; unset = off)."""
+    from vllm.merlin.envs import _e2_strict_switch
+
+    return bool(_e2_strict_switch(FALLBACK_ENV, default=False))
+
+
+def max_pending_store_blocks() -> int:
+    """Maximum distinct write-back source blocks, or zero for no cap."""
+    from vllm.merlin.envs import _e2_nonneg_int
+
+    return _e2_nonneg_int(STORE_PINS_ENV, default=0)
 
 
 def escape_steps() -> int:
@@ -368,6 +388,7 @@ class WriteBack:
             copy_credits_d() if credits_cap is None else None
         )
         self._bytes_d = copy_bytes_d() if credits_cap is None else 0
+        self.max_store_pins = max_pending_store_blocks()
         # Host row bytes per rank (set by the runtime; 0 = rows only).
         self._row_bytes = 0
         # True once the restore direction keeps its own credit account
@@ -555,7 +576,42 @@ class WriteBack:
         units = list(self.units.unit_of_block(block))
         return bool(units) and all(self.units.fa_pages(u.uid) < TINY_FA_PAGES for u in units)
 
-    def _hold(self, blocks, gpu_free: int, headroom: int, pending: list) -> int:
+    def _store_pins_fit(self, blocks, picked_ids=()) -> bool:
+        """Count distinct store sources, including held, staged and issued.
+
+        Count referenced sources too: their request can release
+        them while the tier still owns a reference. Restore pins are separate.
+        """
+        cap = self.max_store_pins
+        if not cap:
+            return True
+        # Bounded by the cap, not by the pin count: the union is built
+        # source by source and the check fails as soon as it passes the
+        # cap. Each source adds at most cap + 1 new ids before that and
+        # repeats at most cap ids already seen, so one call is O(cap) however
+        # many pins are held (the walk calls it per candidate block).
+        seen: set[int] = set()
+
+        def over(ids) -> bool:
+            for bid in ids:
+                if bid not in seen:
+                    seen.add(bid)
+                    if len(seen) > cap:
+                        return True
+            return False
+
+        return not (
+            over(self._held_gpu)
+            or over(self.in_flight)
+            or over(picked_ids)
+            or over(t.block.block_id for t in self._staged)
+            or over(b.block_id for b in blocks)
+        )
+
+    def _hold(
+        self, blocks, gpu_free: int, headroom: int, pending: list,
+        picked_ids=(),
+    ) -> int:
         """Pin unit members that wait for a copy. A block already
         referenced costs no free block; a free one is pinned only while the
         free pool stays above the running headroom. Returns the free count.
@@ -572,6 +628,8 @@ class WriteBack:
             if b.block_id in self._held_gpu or b.block_id in self.in_flight:
                 continue
             if not tier.is_dirty(b) or not self._in_unit(b):
+                continue
+            if not self._store_pins_fit([b], picked_ids):
                 continue
             if b.ref_cnt == 0:
                 if gpu_free - 1 < headroom:
@@ -971,8 +1029,8 @@ class WriteBack:
         Reached when ``_sweep_reserved`` drops a reservation whose unit
         survives: a CoW hash move (``BlockPool.move_block_hashes``) carried
         its last reserved member's key to a block the running request keeps,
-        outside the reactive window. Before, nothing timed it out: its staged
-        rows and its MAX_ASSEMBLING slot stayed while that block was held."""
+        outside the reactive window. The timeout frees its staged rows and its
+        MAX_ASSEMBLING slot while that block is held."""
         units = self.units
         live = set(units.assembling_uids())
         for uid, since in list(self._unit_progress.items()):
@@ -1298,12 +1356,10 @@ class WriteBack:
 
     def _breaker_progress(self, block_id: int) -> bool:
         """A copy of ``block_id`` keeps the idle breaker from firing: it is
-        gate-relevant (``_gate_relevant``) and not a re-copy. A
-        re-copy is a copy of content whose earlier reactive / repair copy
-        already landed and was displaced while the source stayed on the GPU:
-        it frees nothing the head can use that the first landing did not
-        (the residue round robin re-copied 14 rows into 8 for 13K steps
-        with nothing running, and kept ``gate_idle`` from firing).
+        gate-relevant (``_gate_relevant``) and not a re-copy. A re-copy is a
+        copy of content whose earlier reactive / repair copy already landed and
+        was displaced while the source stayed on the GPU: it frees nothing the
+        head can use that the first landing did not, so it is not progress.
         Only a landing in the head's waiting episode counts
         (``_note_episode``), and only when it covered every key the block
         carries now (a copy that lands a new alias publishes a prefix the
@@ -1548,7 +1604,7 @@ class WriteBack:
             if not tier.is_ready(block):
                 c.demote_not_ready += 1
                 return True
-            if budget <= 0:
+            if budget <= 0 or not self._store_pins_fit([block], picked_ids):
                 return False
             reserved = bid in self._res_members
             unitless = self.units is not None and not self.units.unit_of_block(block)
@@ -1839,7 +1895,7 @@ class WriteBack:
                 rest = [m for m in fresh if m.block_id not in picked_ids]
                 if rest:
                     self.backlog.extend(rest)
-                    gpu_free = self._hold(rest, gpu_free, headroom, pins)
+                    gpu_free = self._hold(rest, gpu_free, headroom, pins, picked_ids)
 
         # The copy scheduler's lanes (PREEMPT, GRACE,
         # REPAIR, RUNNING) after the reactive victims, within what is left of
@@ -1922,6 +1978,9 @@ class WriteBack:
                         m for m in members if m.block_id not in self._res_members
                     ]
                     if fresh:
+                        if not self._store_pins_fit(fresh, picked_ids):
+                            c.copyq_offer_skipped += 1
+                            continue
                         # Assembly ledger (unique rows): every unit in
                         # progress plus this one fits the host cache.
                         extra = 0 if unit.uid in active else len(fresh)
@@ -1971,7 +2030,7 @@ class WriteBack:
                         self.backlog.extend(
                             m for m in rest if m.block_id not in queued
                         )
-                        gpu_free = self._hold(rest, gpu_free, headroom, pins)
+                        gpu_free = self._hold(rest, gpu_free, headroom, pins, picked_ids)
                     continue
                 # Non-atomic (REPAIR, RUNNING) or a unit no longer recorded:
                 # idle rows or running-twin duplicates only, never published
@@ -2422,9 +2481,9 @@ class WriteBack:
     def can_progress(self) -> bool:
         """A demotion is in flight or can be issued (credits come back as
         restores complete); False only when nothing will free a victim.
-        Any demotion in flight counts, copy-queue lanes included: its landing can release a host row for a
-        refused unit-less victim even when the host is full. Known limit:
-        a slow copy-queue copy is not breaker progress, so
+        Any demotion in flight counts, copy-queue lanes included: its landing
+        can release a host row for a refused unit-less victim even when the host
+        is full. Known limit: a slow copy-queue copy is not breaker progress, so
         the idle breaker can still release a refused victim before it lands."""
         if self.promote_dma or self.in_flight:
             return True
@@ -2448,7 +2507,8 @@ class WriteBack:
         waiting head's need, unless the unit issues whole this walk
         ``_issues_whole``; or exceed the hold cap),
         ``stalled`` (it gave up its start and a copy is still in flight).
-        ``whole``: the head floor was waived for this unit (        ``_issues_whole``), so the walk's ``take`` skips it for these pins;
+        ``whole``: the head floor was waived for this unit (
+        ``_issues_whole``), so the walk's ``take`` skips it for these pins;
         False whenever the floor does not bind."""
         tier = self.tier
         units = self.units
@@ -2488,6 +2548,9 @@ class WriteBack:
             ):
                 return "assembly", start
         if fresh:
+            # Refuse before reserving any rows: no partially pinned unit.
+            if not self._store_pins_fit(fresh, picked_ids):
+                return "held_capped", start
             free_members = sum(
                 1 for m in fresh
                 if m.ref_cnt == 0 and m.block_id not in self._held_gpu
@@ -2513,37 +2576,34 @@ class WriteBack:
         return None, start
 
     def _issues_whole(self, fresh, need: int, budget: int, *, node_units=()) -> bool:
-        """Every fresh member of the unit issues its copy in
-        this walk (all ready, and the credits cover every copy the unit
-        needs), so its pins are transfer refs that return to the front of the
-        free queue CLEAN when the copies land, never holds left to later
-        walks. The waiting head's need is then not a reason to refuse the
-        start: that head is the admission about to reclaim these very
-        members, so the floor made the walker refuse them, the gate's mirror
-        count nothing to protect, and the admission destroy them uncopied.
-        The running headroom (``gpu_tight``), the hold cap, ``_hold``'s floor
-        for members left to later walks and the lone-block floor
-        are unchanged. Walker and gate mirror share it through
-        ``_start_verdict``; the walk's ``take`` skips the head
-        floor for exactly these members.
+        """Whether every fresh member of the unit issues its copy in this walk
+        (all ready, and the credits cover every copy the unit needs), so its
+        pins are transfer refs that return to the front of the free queue CLEAN
+        when the copies land, never holds left to later walks. The waiting
+        head's need is then not a reason to refuse the start: that head is the
+        admission about to reclaim these very members, so the floor would make
+        the walker refuse them, leave the gate's mirror nothing to protect, and
+        let the admission destroy them uncopied. The running headroom
+        (``gpu_tight``), the hold cap, ``_hold``'s floor for members left to
+        later walks and the lone-block floor are unchanged. Walker and gate
+        mirror share it through ``_start_verdict``; the walk's ``take`` skips
+        the head floor for exactly these members.
 
-        Not when the unit's host rows would come
-        from evicting a unit whose free GPU twin (ref 0) loses its last host
-        copy. Un-keying it turns the twin DIRTY again, so the copy only moves
-        a dirty block into the head's reclaims; with staggered acks the walk
-        re-pinned unit after unit and the head was never admitted (80
-        passes). The caller asks only when the head floor binds, i.e. when
-        ``gpu_free < headroom + head_need + free members``: the head's path
-        is then the whole free queue, so every free twin is in it.
-        A twin counts only when EVERY host row holding one of its
-        keys is a row the plan frees; a row shared with a surviving unit
-        keeps it CLEAN, and refusing then reopened that loss (the
-        ``_backs_free_twin`` does not flag a unit victim's re-dirtied twins,
-        so it is not reused here). A twin already DIRTY (e.g. the
-        same tokens recomputed into a new generation under the same keys)
-        loses nothing and is skipped, and only host rows holding the twin's
-        own content (``host_src == content_id``) count as its backing, so a
-        foreign copy under the same key neither vetoes nor masks.
+        Not when the unit's host rows would come from evicting a unit whose free
+        GPU twin (ref 0) loses its last host copy. Un-keying it turns the twin
+        DIRTY again, so the copy only moves a dirty block into the head's
+        reclaims. The caller asks only when the head floor binds, i.e. when
+        ``gpu_free < headroom + head_need + free members``: the head's path is
+        then the whole free queue, so every free twin is in it. A twin counts
+        only when EVERY host row holding one of its keys is a row the plan
+        frees; a row shared with a surviving unit keeps it CLEAN, and refusing
+        in that case would reopen a lost-copy case. ``_backs_free_twin`` is not
+        reused for this check: it does not flag a unit victim's re-dirtied
+        twins. A twin already DIRTY (e.g. the same tokens
+        recomputed into a new generation under the same keys) loses nothing and
+        is skipped, and only host rows holding the twin's own content
+        (``host_src == content_id``) count as its backing, so a foreign copy
+        under the same key neither vetoes nor masks.
 
         A member that is a live write frontier
         (``BlockTierState.is_frontier``: on ``live_ids`` and referenced, its
@@ -2557,14 +2617,13 @@ class WriteBack:
         (unacked or masked content, a ref-0 block in a stale set included)
         still refuses the waiver.
 
-        Known limits (accepted for 3.0.1):
+        Known limits:
         * The gate's mirror judges ``need <= budget`` against the full
           ``_d_budget()``, while the walk spends credits on the backlog and
           earlier victims first, so it may refuse a unit the mirror counted.
-          The head then waits on a copy that is not issued until the
-          escape count (ESCAPE_STEPS consecutive waits without progress)
-          releases it; the unit is lost (charged as an escape, not a
-          running miss).
+          The head then waits on a copy that is not issued until the escape
+          count (ESCAPE_STEPS consecutive waits without progress) releases it;
+          the unit is lost (charged as an escape, not a running miss).
         * A whole unit's copy that never lands keeps its sources
           transfer-pinned, so a head with no other free room stays short of
           blocks for as long as the DMA is outstanding (as for any copy in
@@ -2573,14 +2632,12 @@ class WriteBack:
           picks counted but not yet allocated; the mirror cannot see those,
           so on a full host a walk whose lone picks take the last idle rows
           may evict where this probe saw idle rows (rare).
-        * Head size: a plain-mode head (``note_head``)
-          registers its full-sequence need, a coherent one (``admit``) only
-          the chunk's fresh blocks, so a long plain head charges a larger
-          floor and ``_shed_holds`` releases more holds. Measured on the real
-          Scheduler (40-block head, 256-token chunks, 20 free, a started
-          6-member unit holding 4): plain charges 40 and sheds 4, coherent 16
-          and sheds 2. Not a starvation (the full sequence is the plain head's
-          real admission requirement); more missed copies for that head."""
+        * Head size: a plain-mode head (``note_head``) registers its
+          full-sequence need, a coherent one (``admit``) only the chunk's fresh
+          blocks, so a long plain head charges a larger floor and
+          ``_shed_holds`` releases more holds. This is not starvation (the full
+          sequence is the plain head's real admission requirement), but that
+          head misses more copies."""
         tier = self.tier
         if not (need <= budget and all(
             tier.is_ready(m) or tier.is_frontier(m) for m in fresh
@@ -2705,6 +2762,8 @@ class WriteBack:
                     self.units.lone_victims(prev)
             if ctx is None:
                 ctx = self._gate_context()
+            if not self._store_pins_fit([block]):
+                return []
             if ctx["budget"] <= 0:
                 # The walk stops: no credits. (A copyable victim is then
                 # admitted silently, a running miss: pre-existing.)
@@ -2812,17 +2871,15 @@ class WriteBack:
     def note_head(
         self, request: "Request", num_new_blocks: int, shortfall: int
     ) -> None:
-        """A WAITING / PREEMPTED admission refused before
-        the gate (``allocate_slots``' non-coherent full-sequence check). Its
-        need sets the next walk's head floor, as ``admit`` does, and a
-        shortfall the in-flight copy sources cover is a shortfall wait counted as
-        ``admit``'s real-shortfall branch counts it in coherent mode, so the
-        refusal does not break the head's run of consecutive waits
-        (plain mode: seed 248 waited 76 passes for the backstop). No new
-        state: every walk resets ``_head_need`` and the next admission
-        overwrites it. The idle breaker is checked first, as in ``admit``.
-        The need registered is the full sequence's (see ``_issues_whole``'s
-        known limits, head size)."""
+        """A WAITING / PREEMPTED admission refused before the gate
+        (``allocate_slots``' non-coherent full-sequence check). Its need sets
+        the next walk's head floor, as ``admit`` does, and a shortfall the
+        in-flight copy sources cover is a shortfall wait counted as ``admit``'s
+        real-shortfall branch counts it in coherent mode, so the refusal does
+        not break the head's run of consecutive waits. No new state: every walk
+        resets ``_head_need`` and the next admission overwrites it. The idle
+        breaker is checked first, as in ``admit``. The need registered is the
+        full sequence's (see ``_issues_whole``'s known limits, head size)."""
         if self.gpu_pool is None or num_new_blocks <= 0:
             return
         self._head_need = num_new_blocks

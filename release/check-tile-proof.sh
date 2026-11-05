@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
-# Release smoke for the FlashInfer 0.7.0.post1 sm_86 FP8 32-row verify tile.
-# Patch: release/patches/flashinfer-0.7.0.post1/0001-sm8x-fp8-smallq-verify-tile-070.patch.
-# JIT suffix: _sm8x_smallq_070_v1. The proof-line protocol is unchanged by the 0.7.0 port.
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright 2026 halt95 (Merlin modifications)
+# Release smoke for the FlashInfer 0.7.2.post1 sm_86 FP8 32-row verify tile.
+# Patch: release/patches/flashinfer-0.7.2.post1/0001-sm8x-fp8-smallq-verify-tile-072.patch.
+# JIT suffix: _sm8x_smallq_072_v1. The proof-line protocol is unchanged by the 0.7.0 and 0.7.2 ports.
 # Run release/apply-flashinfer-patch.sh <venv> to verify the installed version and patched hashes;
 # this log check alone does not attest the FlashInfer version or JIT artifact identity.
 #

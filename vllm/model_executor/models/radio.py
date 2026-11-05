@@ -10,9 +10,8 @@
 # license agreement from NVIDIA CORPORATION is strictly prohibited.
 
 import math
-from collections.abc import Iterable
 from dataclasses import dataclass
-from itertools import accumulate, repeat
+from itertools import accumulate
 from typing import TypeAlias
 
 import torch
@@ -30,23 +29,6 @@ from vllm.model_executor.models.intern_vit import (
 )
 
 input_dim_t: TypeAlias = int | tuple[int, int]
-norm_t: TypeAlias = tuple[float, float, float] | torch.Tensor
-
-
-def _ntuple(n):
-    def parse(x):
-        if isinstance(x, Iterable) and not isinstance(x, str):
-            return tuple(x)
-        return tuple(repeat(x, n))
-
-    return parse
-
-
-to_1tuple = _ntuple(1)
-to_2tuple = _ntuple(2)
-to_3tuple = _ntuple(3)
-to_4tuple = _ntuple(4)
-to_ntuple = _ntuple
 
 
 def calc_seq_len(size: tuple[int, int], patch_size: int) -> int:
@@ -78,8 +60,8 @@ def _bilinear_square_window(
     F.interpolate(pos_embed.float(), (side, side), mode="bilinear",
     align_corners=False).to(pos_embed.dtype) for a (1, C, H, W) table.
 
-    While the square is small (side^2 <= 2 * H * W) it is resampled exactly as
-    before. Beyond that (elongated images) only the window is computed, from
+    While the square is small (side^2 <= 2 * H * W) it is resampled in full with
+    F.interpolate. Beyond that (elongated images) only the window is computed, from
     the same taps and float32 lambdas as upsample_bilinear2d, combined in its
     order h0 * (w0 * x00 + w1 * x01) + h1 * (w0 * x10 + w1 * x11): memory
     ~ rows * cols instead of side^2, results equal to the square path up to
@@ -88,8 +70,8 @@ def _bilinear_square_window(
     rows, cols = window
     _, channels, in_h, in_w = pos_embed.shape
     if side * side <= 2 * in_h * in_w:
-        # The square is at most twice the table: resample it as before
-        # (bit-identical to the old path; cheaper than gathering taps).
+        # The square is at most twice the table: resample it in full (cheaper
+        # than gathering taps).
         square = F.interpolate(
             pos_embed.float(), size=(side, side), align_corners=False, mode="bilinear"
         ).to(pos_embed.dtype)

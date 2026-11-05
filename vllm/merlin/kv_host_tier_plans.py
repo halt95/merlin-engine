@@ -58,25 +58,23 @@ GPU_ONLY = 1
 # One re-resolution after a lease failed validation (key, generation or epoch
 # moved between resolve and lease); a second failure is a cold lookup.
 MAX_RESOLVE_ATTEMPTS = 2
-# A valid host plan
-# that finds the restore cap (``RestoresInFlight``) full WAITS, holding no
-# lease, for as long as any cap holder makes real progress (a credit batch
-# resolves on every rank, or a load retires): each holder's retirement frees a
-# slot, FCFS, so no holder's progress is unrelated to a waiter.
-# It falls back to the
-# GPU-only plan (the miss cause ``restore_cap_wait``) only when no restore has
-# progressed for a stall timeout derived from the observed restore latency,
-# on BOTH clocks: scheduler steps, RESTORE_STALL_FACTOR
-# x the EWMA of issue -> commit steps per batch (never less than
+# A valid host plan that finds the restore cap (``RestoresInFlight``) full WAITS,
+# holding no lease, for as long as any cap holder makes real progress (a credit
+# batch resolves on every rank, or a load retires): each holder's retirement
+# frees a slot, FCFS, so no holder's progress is unrelated to a waiter.
+# It falls back to the GPU-only plan (the miss cause ``restore_cap_wait``) only
+# when no restore has progressed for a stall timeout derived from the observed
+# restore latency, on BOTH clocks: scheduler steps, RESTORE_STALL_FACTOR x the
+# EWMA of issue -> commit steps per batch (never less than
 # RESTORE_STALL_MIN_STEPS), AND wall time, RESTORE_STALL_FACTOR x the EWMA of
 # issue -> commit seconds per batch (never less than RESTORE_STALL_MIN_S). The
-# engine loop steps continuously (32 passes in 0.1-1.6 s) while one 262K
-# restore takes ~1.8 s on the reference host, so steps alone would call a progressing
-# batch stalled before its DMA could land; the step clock stays so a rig that
-# drives steps without real time still works. Never a pass count: a long
-# restore that keeps landing batches never turns a restorable prefix into a
-# recompute. A genuine transfer failure retires the load (progress) and frees
-# its slot, so the waiter is admitted on the next pass.
+# engine loop steps continuously while a long-context restore takes seconds, so
+# steps alone would call a progressing batch stalled before its DMA could land;
+# the step clock stays so a rig that drives steps without real time still
+# works. Never a pass count: a long restore that keeps landing batches never
+# turns a restorable prefix into a recompute. A genuine transfer failure
+# retires the load (progress) and frees its slot, so the waiter is admitted on
+# the next pass.
 RESTORE_STALL_MIN_STEPS = 8
 RESTORE_STALL_MIN_S = 2.0
 RESTORE_STALL_FACTOR = 4
@@ -85,10 +83,9 @@ RESTORE_STALL_FACTOR = 4
 RESTORE_LATENCY_PRIOR_STEPS = 2.0
 RESTORE_LATENCY_EWMA = 0.5
 # Wall-clock prior: the physical cost of the last batch issued, row_bytes x
-# batch rows / a conservative pinned host->GPU rate (a 27B 262K restore moved 4.3 GiB
-# in 1.81 s, ~2.4 GiB/s end to end; 2 GiB/s leaves margin), or a flat
-# RESTORE_LATENCY_PRIOR_S when no batch was issued yet / row_bytes is not
-# visible (x RESTORE_STALL_FACTOR = the RESTORE_STALL_MIN_S floor).
+# batch rows / a conservative pinned host->GPU rate (RESTORE_H2D_BYTES_PER_S),
+# or a flat RESTORE_LATENCY_PRIOR_S when no batch was issued yet / row_bytes is
+# not visible (x RESTORE_STALL_FACTOR = the RESTORE_STALL_MIN_S floor).
 RESTORE_LATENCY_PRIOR_S = 0.5
 RESTORE_H2D_BYTES_PER_S = 2 * (1 << 30)
 
@@ -128,6 +125,7 @@ class PlanCounters:
     touch_skipped_offchain: int = 0
     # Once-per-admission outcomes handed to the metrics sink.
     admission_outcomes: int = 0
+
 
 @dataclass
 class PlanHit:

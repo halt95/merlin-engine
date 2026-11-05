@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by the Merlin project; see NOTICE.
 """Fused post-conv1d preparation for GDN prefill.
 
 Replaces the chain:
@@ -63,7 +64,8 @@ def _fused_post_conv_kernel(
 
     HK: tl.constexpr = H * K
 
-    offs_t = i_tb * BLOCK_T + tl.arange(0, BLOCK_T)  # [BLOCK_T]
+    # Widen before stride products.
+    offs_t = (i_tb * BLOCK_T + tl.arange(0, BLOCK_T)).to(tl.int64)
     mask_t = offs_t < L
 
     if i_head < H:

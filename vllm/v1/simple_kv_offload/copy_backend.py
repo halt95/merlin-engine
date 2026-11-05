@@ -142,7 +142,6 @@ class DmaCopyBackend:
         self._chunk_blocks = max(0, chunk_blocks)
         self._load_stream = load_stream
         self._store_stream = store_stream
-        # Timing events made here.
         if self.store_census is not None:
             self._census_events = CensusEventPool(store_stream)
 
@@ -354,8 +353,6 @@ class DmaCopyBackend:
                 census_kw["census_events"] = self._census_events
             self._run_copy_loop(
                 q, device, stream, chunk_blocks, self._discard,
-                # Each stream has its own debug
-                # fault quota (FAIL_LOADS restores, FAIL_STORES demotions).
                 **(
                     {"fault_kind": "store"}
                     if self._store_stream is not None
@@ -389,7 +386,6 @@ class DmaCopyBackend:
         fault_kind: str = "load",
         census_events: CensusEventPool | None = None,
     ) -> None:
-        # State belongs to this rank's loop.
         from vllm.merlin.kv_host_tier_faults import (
             RestoreFailureInjector,
             StoreFailureInjector,
@@ -426,15 +422,15 @@ class DmaCopyBackend:
             # before it, so a GPU-side stream.wait_event(compute_done) would
             # make this thread hold that lock while compute waits for work
             # (the PLE pull transport, the main thread's next launch) that
-            # needs it: a whole-worker deadlock until the executor timeout
-            # (the guard_telemetry NonBlockingReader hang, here for stores).
+            # needs it: a whole-worker deadlock until the executor timeout.
             if wait_event is not None:
                 # Discarded at shutdown: never issued.
                 if not _host_wait(wait_event, discard):
                     continue
                 stream.wait_event(wait_event)  # complete: a no-op ordering edge
             step = chunk_blocks if chunk_blocks > 0 else max(1, len(src_blocks))
-            # After compute wait, no synchronize.
+            # The timing start is recorded after
+            # the compute wait, with no synchronize.
             start = pair = None
             submitted = time.monotonic()
             if timings is not None:
@@ -443,9 +439,9 @@ class DmaCopyBackend:
                 pair = census_take(census_events, timings)
                 start = pair[0]
                 start.record(stream)
-            # Only the generated tier supplies
-            # failed_events; other connectors never arm a hook. A restore
-            # never consumes the store quota, nor a store the restore quota.
+            # failed_events is set only by the host
+            # tier, so other connectors never arm a hook. A restore never consumes
+            # the store quota, nor a store the restore quota.
             if failed_events is not None and injector is None:
                 injector = (
                     StoreFailureInjector()

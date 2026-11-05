@@ -9,46 +9,34 @@ GPU worker rank logs one line per model role it holds::
     ple_weight_dtype=<dtype> breakable=<ON|OFF> compile_mode=<mode>
     cudagraph_mode=<mode> role=<target|draft>
 
-(one line in the log). ``role=target`` is logged after model loading;
-``role=draft`` is logged only where a draft model is loaded (the last PP
-stage), once the drafter's graph modes are resolved (after the KV cache is
-initialised -- see below). Every value is read from the live objects:
+``role=target`` is logged after model loading; ``role=draft`` only where a draft
+model is loaded (the last PP stage), once the drafter's graph modes are resolved
+(after the KV cache is initialised, from ``Worker.initialize_from_config``).
+Every value is read from the live objects:
 
 * ``ple_backend``: the class of each PLE layer's ``ple_embedding`` module, and
-  the transport that serves its rows on this rank, read from the placeholder's
-  armed state -- ``host-mapped-pull`` (``_is_cpu_offloaded`` with a host output
-  pointer), ``ipc-push`` (offloaded, no host pointer) or ``local:<device>`` (the
-  rank owns the table).
+  the transport that serves its rows on this rank: ``host-mapped-pull``
+  (offloaded with a host output pointer), ``ipc-push`` (offloaded, no host
+  pointer) or ``local:<device>`` (the rank owns the table).
 * ``ple_method``: the embedding's live ``quant_method``, or, on an offloaded
   placeholder, the ``_offload_quant_method`` the rank dequantizes with.
 * ``ple_weight_dtype``: the table's dtype where the rank owns it; on an
-  offloaded placeholder, the dtype of the armed transfer buffer, into which the
-  offload process copies the table's rows unchanged
+  offloaded placeholder, the dtype of the armed transfer buffer
   (``get_offload_output_dtype``).
 * ``breakable``: ``is_breakable_cudagraph_enabled()``, the switch the capture
   path itself reads.
-* ``compile_mode`` / ``cudagraph_mode`` for ``role=target``: the engine's
-  ``CompilationConfig`` (config level, i.e. before KV-cache-time capture-mode
+* ``compile_mode`` / ``cudagraph_mode``, ``role=target``: the engine's
+  ``CompilationConfig`` (config level, before KV-cache-time capture-mode
   resolution).
-* ``compile_mode`` / ``cudagraph_mode`` for ``role=draft``: the DRAFTER's own
-  resolved state, not the config. The drafter is built with the target's
-  VllmConfig and there is one ``CompilationConfig`` in the engine, so the
-  config fields name the target's profile.
-  What the drafter actually runs is:
-
-  - ``compile_mode``: the mode of the draft model's live
-    ``@support_torch_compile`` wrapper(s) (``do_not_compile`` false -- the
-    property the capture path tests, ``gpu/cudagraph_utils.py``
-    ``has_compiled_submodule``); ``NONE`` when no wrapper is live.
-  - ``cudagraph_mode``: the mode each speculator cudagraph manager holds after
-    ``init_cudagraph_manager`` (V2 runner): ``prefill:<m>,decode:<m>`` for the
-    autoregressive / MTP speculator, the bare mode for a single-manager
-    speculator; for a V1 drafter, its dispatcher's mode. These are the values
-    ``e2-guard[runtime]`` checks before capture. ``unresolved`` if a manager
-    does not exist yet.
-
-  Hence the draft line is logged from ``Worker.initialize_from_config`` after
-  ``initialize_kv_cache``, not at load time.
+* ``compile_mode`` / ``cudagraph_mode``, ``role=draft``: the DRAFTER's own
+  resolved state, because the engine has one ``CompilationConfig`` and its
+  fields name the target's profile. ``compile_mode`` is the mode of the draft
+  model's live ``@support_torch_compile`` wrapper(s) (``NONE`` when none is
+  live); ``cudagraph_mode`` is the mode each speculator cudagraph manager holds
+  after ``init_cudagraph_manager`` (``prefill:<m>,decode:<m>`` for the
+  autoregressive / MTP speculator, the bare mode for a single-manager
+  speculator; a V1 drafter reports its dispatcher's mode), or ``unresolved`` if
+  a manager does not exist yet.
 
 A role with no PLE layer reports ``none`` for the three PLE fields; several
 distinct values on one rank are joined with ``,``.

@@ -6,7 +6,7 @@
 > None is a new 0.32 measurement. For Merlin 3.0.0, built on vLLM 0.32.0, see the
 > [2026-10-20 bench card](../benchmarks/2026-10-20/BENCH-CARD.md).
 
-Earlier release notes, moved here from the [README](../README.md). The current release is Merlin 3.0.1; the notes of v3.0.0 and of the v2.5.x releases are in
+Earlier release notes, moved here from the [README](../README.md). The current release is Merlin 3.0.2; the notes of v3.0.0 and of the v2.5.x releases are in
 [CHANGELOG.md](../CHANGELOG.md); v2.5.3 and v2.5.2 are public releases of the package repository (tags `v2.5.3`, `v2.5.2`).
 
 ## The releases in brief (v3.0.0, v2.5.1, v2.2.0, v2.0.1, v2)

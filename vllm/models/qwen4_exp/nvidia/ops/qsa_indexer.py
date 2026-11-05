@@ -12,6 +12,7 @@ from vllm.model_executor.warmup.jit_warmup_triton_helper import (
 )
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
+from vllm.utils.math_utils import round_up
 from vllm.v1.worker import guard_telemetry
 
 logger = init_logger(__name__)
@@ -150,7 +151,7 @@ def _qsa_mqa_paged_uniform_kernel(
             mask=live,
             other=-1,
         )
-        # Mirror of the QSA attention kernel (qsa.py:137): the VALUE read out of
+        # Mirror of the page bound in ``_qsa_sparse_attention``: the VALUE read out of
         # the page table is untrusted and must be bounded before it becomes an
         # address. Folds into the existing live mask.
         page_bad = live & ((physical_page < 0) | (physical_page >= num_cache_blocks))
@@ -271,9 +272,7 @@ def _qsa_mqa_paged_prefill_kernel(
         other=0.0,
     )
     column_offsets = tl.arange(0, BLOCK_N)
-    # Bounds-guard instrumentation: accumulate in registers inside the pipelined loop
-    # and do the cross-lane reduction + atomics once after it, so an
-    # atomic-bearing conditional does not sit in the loop body.
+    # Bounds-guard instrumentation, accumulated as in the kernel above.
     guard_bad_n = tl.zeros([BLOCK_N], dtype=tl.int32)
     guard_bad_col = tl.full([BLOCK_N], -1, tl.int32)
     for tile in tl.range(k_tile_start, k_tile_end, num_stages=STAGES):
@@ -286,9 +285,7 @@ def _qsa_mqa_paged_prefill_kernel(
             mask=live,
             other=-1,
         )
-        # Mirror of the QSA attention kernel (qsa.py:137): the VALUE read out of
-        # the page table is untrusted and must be bounded before it becomes an
-        # address. Folds into the existing live mask.
+        # Same untrusted page-table bound as in the kernel above.
         page_bad = live & ((physical_page < 0) | (physical_page >= num_cache_blocks))
         guard_bad_n += page_bad.to(tl.int32)
         guard_bad_col = tl.maximum(
@@ -323,7 +320,6 @@ def _qsa_mqa_paged_prefill_kernel(
             mask=store_mask,
         )
 
-    # Bounds-guard instrumentation: one reduction and at most one atomic per program.
     guard_n = tl.sum(guard_bad_n, axis=0)
     if guard_n > 0:
         tl.atomic_add(guard_ctr, guard_n.to(tl.int64))
@@ -497,6 +493,8 @@ def warmup_qsa_mqa_paged_decode(
     return profiles
 
 
+# Serving sizes; the profile bound in
+# vllm/merlin/qsa_scratch.py is checked against them.
 def _prefill_workspace_bytes(
     max_num_batched_tokens: int,
     max_model_len: int,
@@ -526,6 +524,54 @@ def _prefill_backing_numel(
     granule = granule_mb * 2**20 // _FP32_BYTES
     rounded = -(-need // granule) * granule
     return max(need, min(rounded, max_logits_bytes // _FP32_BYTES))
+
+
+def _prefill_backing_request(
+    rows: int,
+    logits_width: int,
+    backing_bytes: int | None,
+    granule_mb: int,
+    max_logits_bytes: int,
+    rows_per_chunk: int,
+) -> tuple[int | None, int]:
+    """(backing elements, or None for per-chunk logits; rows per chunk)."""
+    if backing_bytes is not None and granule_mb == 0:
+        # Retain the existing one-row exception if a row exceeds the cap.
+        backing_numel = max(backing_bytes // _FP32_BYTES, logits_width)
+        return backing_numel, max(1, backing_numel // logits_width)
+    if granule_mb > 0:
+        numel = _prefill_backing_numel(
+            min(rows, rows_per_chunk), logits_width, granule_mb, max_logits_bytes
+        )
+        return numel, rows_per_chunk
+    return None, rows_per_chunk
+
+
+def _selection_logits(
+    shape: tuple[int, ...], device: torch.device, use_workspace: bool
+) -> torch.Tensor:
+    """fp32 selection logits of ``shape``.
+
+    With ``use_workspace`` (VLLM_MERLIN_QSA_SCRATCH=workspace) a view of the
+    shared MRV2 workspace that the profile run reserved, when it already holds
+    the request and no CUDA graph is being captured; otherwise (and in the
+    other modes) a fresh allocation. Same shape, stride and dtype
+    either way, so the kernels see identical inputs.
+    """
+    if use_workspace and not (
+        device.type == "cuda" and torch.cuda.is_current_stream_capturing()
+    ):
+        from vllm.v1.worker.workspace import (
+            current_workspace_manager,
+            is_workspace_manager_initialized,
+        )
+
+        if is_workspace_manager_initialized():
+            manager = current_workspace_manager()
+            spec = (shape, torch.float32)
+            if manager.fits_without_growth(spec):
+                return manager.get_simultaneous(spec)[0]
+    return torch.empty(shape, dtype=torch.float32, device=device)
 
 
 def _prefill_logits(
@@ -673,6 +719,8 @@ def qsa_select_paged_decode(
     compress_ratio: int,
     decode_query_len: int,
     block_indices: torch.Tensor,
+    *,
+    use_workspace: bool = False,
 ) -> None:
     """Score and select compressed blocks for a request-major decode batch.
 
@@ -698,7 +746,9 @@ def qsa_select_paged_decode(
     assert visible_blocks.shape == (q.shape[0],)
 
     columns = page_table.shape[1] * k_cache.shape[1]
-    logits = torch.empty((q.shape[0], columns), dtype=torch.float32, device=q.device)
+    # Uses the shared workspace when it
+    # fits.
+    logits = _selection_logits((q.shape[0], columns), q.device, use_workspace)
     tiles_per_program = _decode_tiles_per_program(num_requests, columns)
     grid = (
         num_requests,
@@ -749,6 +799,8 @@ def qsa_select_paged_prefill(
     block_indices: torch.Tensor,
     max_seq_len: int,
     backing_bytes: int | None = None,
+    *,
+    use_workspace: bool = False,
 ) -> None:
     """Score and select compressed prefill blocks in bounded chunks.
 
@@ -765,8 +817,8 @@ def qsa_select_paged_prefill(
         max_query_len: Maximum number of query tokens in one request.
         block_indices: Compressed-index output buffer.
         max_seq_len: Longest context length in the batch this step.
-        backing_bytes: Fixed size.
-            Computed at indexer initialization. A nonzero granule knob
+        backing_bytes: Fixed size of the logits backing buffer in bytes,
+            computed at indexer initialization. A nonzero granule knob
             overrides this size.
 
     """
@@ -777,7 +829,7 @@ def qsa_select_paged_prefill(
     # No row scores beyond cdiv(max_seq_len, compress_ratio) compressed
     # columns. Round up to 64 to keep the logits row stride
     # cooperative_topk-compatible.
-    logits_width = triton.cdiv(triton.cdiv(max_seq_len, compress_ratio), 64) * 64
+    logits_width = round_up(triton.cdiv(max_seq_len, compress_ratio), 64)
     logits_width = min(max(64, logits_width), page_table.shape[1] * k_cache.shape[1])
 
     # chunk the inputs to keep temp logits below VLLM_SPARSE_INDEXER_MAX_LOGITS_MB
@@ -786,33 +838,21 @@ def qsa_select_paged_prefill(
     topk_workspace = torch.empty(
         (_TOPK_WORKSPACE_BYTES,), dtype=torch.uint8, device=q.device
     )
+    # One sizing for serving and the
+    # profile bound; the backing comes from the shared workspace when it fits.
     # A fixed backing (as upstream vLLM #57105), sized from the serving bounds.
     granule_mb = envs.VLLM_E2_QSA_LOGITS_GRANULE_MB
-    backing = None
-    if backing_bytes is not None and granule_mb == 0:
-        # Retain the existing one-row exception if a row exceeds the cap.
-        backing_numel = max(backing_bytes // _FP32_BYTES, logits_width)
-        rows_per_chunk = max(1, backing_numel // logits_width)
-        backing = torch.empty(
-            (backing_numel,), dtype=torch.float32, device=q.device
-        )
-    elif granule_mb > 0:
+    if granule_mb > 0:
         logger.info_once(
             "QSA prefill logits backing: granule %d MiB (VLLM_E2_QSA_LOGITS_GRANULE_MB)",
             granule_mb,
         )
-        backing = torch.empty(
-            (
-                _prefill_backing_numel(
-                    min(rows, rows_per_chunk),
-                    logits_width,
-                    granule_mb,
-                    max_logits_bytes,
-                ),
-            ),
-            dtype=torch.float32,
-            device=q.device,
-        )
+    backing_numel, rows_per_chunk = _prefill_backing_request(
+        rows, logits_width, backing_bytes, granule_mb, max_logits_bytes, rows_per_chunk
+    )
+    backing = None
+    if backing_numel is not None:
+        backing = _selection_logits((backing_numel,), q.device, use_workspace)
 
     for query_start in range(0, rows, rows_per_chunk):
         query_end = min(query_start + rows_per_chunk, rows)

@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright 2026 halt95 (Merlin modifications)
 # Create a Proxmox VE LXC container for Flash-Next, modelled on the reference host: a PRIVILEGED Debian 13
 # container with the four cards passed through as devices. Run ON THE PROXMOX HOST as root:
 #

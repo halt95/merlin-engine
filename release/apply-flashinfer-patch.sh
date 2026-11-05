@@ -1,15 +1,17 @@
 #!/usr/bin/env bash
-# Apply the FlashInfer 0.7.0.post1 sm_86 FP8 small-q verify tile to an existing venv.
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright 2026 halt95 (Merlin modifications)
+# Apply the FlashInfer 0.7.2.post1 sm_86 FP8 small-q verify tile to an existing venv.
 # Installs the release's version-specific tile patch without enabling it.
 # The launcher must set FLASHINFER_SM8X_FP8_SMALLQ=cta32 to select the 32-row tile.
 #
 #   release/apply-flashinfer-patch.sh <venv-path>
 #
-# Fails closed unless: flashinfer-python is exactly 0.7.0.post1 and installed in the venv's
+# Fails closed unless: flashinfer-python is exactly 0.7.2.post1 and installed in the venv's
 # purelib; flashinfer-jit-cache is NOT installed (its prebuilt kernels would stand in for the
-# patched JIT build); all five touched files are byte-identical to the 0.7.0.post1 wheel on PyPI (whole-file
+# patched JIT build); all five touched files are byte-identical to the 0.7.2.post1 wheel on PyPI (whole-file
 # sha256) or byte-identical to the result of this patch. A tree that already carries exactly this patch
-# (hashes, marker _sm8x_smallq_070_v1, patch cleanly reversible) is left alone, exit 0. The five files are
+# (hashes, marker _sm8x_smallq_072_v1, patch cleanly reversible) is left alone, exit 0. The five files are
 # checked before anything is changed and again after the patch is applied.
 # Anything else (including the rev-1 _sm8x_smallq_v5 port, a half-applied or edited tree) is an error:
 # reinstall flashinfer-python and run again. The package Python actually imports must be the one
@@ -22,9 +24,9 @@ set -euo pipefail
 
 VENV="${1:?usage: apply-flashinfer-patch.sh <venv-path>}"
 RELEASE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PATCH="$RELEASE/patches/flashinfer-0.7.0.post1/0001-sm8x-fp8-smallq-verify-tile-070.patch"
-WANT_VERSION="0.7.0.post1"
-MARKER="_sm8x_smallq_070_v1"
+PATCH="$RELEASE/patches/flashinfer-0.7.2.post1/0001-sm8x-fp8-smallq-verify-tile-072.patch"
+WANT_VERSION="0.7.2.post1"
+MARKER="_sm8x_smallq_072_v1"
 # every file the patch touches, relative to the flashinfer package directory
 TARGETS=(
   data/csrc/batch_prefill.cu
@@ -33,22 +35,22 @@ TARGETS=(
   data/include/flashinfer/attention/scheduler.cuh
   jit/attention/modules.py
 )
-# sha256 of every touched file, in TARGETS order: PRISTINE_SHA = the files in flashinfer-python 0.7.0.post1 from PyPI
-# (wheel sha256 c7adf826568d61fc1b7d3aadd4cae387a35a138bfc08e2deca2f34ecfa280716);
+# sha256 of every touched file, in TARGETS order: PRISTINE_SHA = the files in flashinfer-python 0.7.2.post1 from PyPI
+# (wheel sha256 bfdc18b9e1e4d8d0730fe4343dc0e284cd0c160086de80f99888bc4867922d49);
 # PATCHED_SHA = the same files after `patch -p1 --fuzz=0` with this release's patch.
 PRISTINE_SHA=(
-  4190105e8b5c93621af44356b9aa50861560a5fbf8ff3279301487860604d932
+  02264092de3836b9e75cb76533d820b3a8998417f83001216b368f394b250838
   1e41a0ea9795847272674c1058a9d72f220facf296037cbf1f95ce6b77225a63
-  e66bce2652c0a3c5b54f88510aff2b4b48ff6a52c4ee23fa97f91fa06a935b87
-  425ba78815ba77ae848c67507d1af6b024d05edd257a7d9b331166afcef9b17c
-  747c92bd33ecc40297bddfd4b9d388e86e1e70aac5d2d71a37bdfa752c19cca6
+  ad8be30492fb04131edc25b539ae77e911177af8647c7e2007cf172a4a69d029
+  b1fb27078084262158ed070e220ad317467306d1f0b32e0d9624bf85e6ef97ce
+  5d0e9d9d104699ddb45b35d3e12319c909aedfa6c3b06af9d250f4010e2996fa
 )
 PATCHED_SHA=(
-  0e669eee017eb01ef5c4b23915a026c9ad4217a5edce0c99be1926a58b3824c8
+  6f3a7033af4426889585e6a5ab2fb959c4a965a98e106072c175631ed4d3a68e
   500fcecb03e267e6c7bd85c1240ba34581e5e1f9b1c82dd671f1a669f740e041
-  49cf57d1718eefe01d164a91ce36dd6bcbdf1b831d175fe5723b62a8dcc3ef61
-  a8a7ccf79e488e7ff41dca6512f4c9bf6cb075ca4dfed0c9fb392de61eef80a4
-  c38076b0c3c8a1d0e802dc6fc02a68e6da36604210bb03110df8774e220f37b5
+  4e371ab99e5170f6c76d9556f48cd8297e85254ce35c43edfa6cebdc0f401062
+  f45a12be6583888bb23a6fe4fed5d192c67757dbb58e9d209e8efd3a8f59ba5b
+  36127818bd5c0ef66947105248398810c30c4c1999c4eb3dd0c0cfd98e75c4f4
 )
 
 die() { echo "apply-flashinfer-patch: FAIL: $*" >&2; exit 1; }

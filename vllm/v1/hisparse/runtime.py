@@ -39,6 +39,9 @@ if TYPE_CHECKING:
 # fp8_ds_mla KV row: 512 B quantized NoPE + 16 B scales + 128 B RoPE.
 FP8_DS_MLA_ROW_BYTES = 656
 HiSparseTopKResult: TypeAlias = torch.Tensor | tuple[torch.Tensor, torch.Tensor]
+# trtllm-gen sparse MLA reads up to ~250 rows from the start of its KV cache
+# whatever the cache's size: https://github.com/flashinfer-ai/flashinfer/issues/6484
+_MIN_STAGED_PREFILL_KV_ROWS = 256
 
 
 def is_hisparse_decode_batch(attn_metadata: Any | None) -> bool:
@@ -223,7 +226,9 @@ class HiSparseHostPool:
         self.shared_region: SharedOffloadRegion | None = None
 
     def allocate(self, size: int) -> torch.Tensor:
-        assert self.backing is None, "HiSparse host pool is already allocated."
+        if self.backing is not None:
+            assert self.backing.numel() == size, "HiSparse host pool size changed."
+            return self.backing
         config = self.kv_cache_config
         if config.hisparse_shared_host_pool:
             tensor_sizes = [
@@ -251,6 +256,23 @@ class HiSparseHostPool:
             check_hisparse_host_memory(size)
             self.backing, self.registered = allocate_pinned_host_pool(size)
         return self.backing
+
+
+_host_pools: dict[str, HiSparseHostPool] = {}
+
+
+def get_hisparse_host_pool(
+    vllm_config: VllmConfig, kv_cache_config: KVCacheConfig
+) -> HiSparseHostPool:
+    """Return the engine's host pool, which outlives the profiling KV cache."""
+    instance_id = vllm_config.instance_id
+    if instance_id not in _host_pools:
+        _host_pools[instance_id] = HiSparseHostPool(vllm_config, kv_cache_config)
+    return _host_pools[instance_id]
+
+
+def drop_hisparse_host_pool(vllm_config: VllmConfig) -> None:
+    _host_pools.pop(vllm_config.instance_id, None)
 
 
 def use_shared_hisparse_host_pool(vllm_config: VllmConfig) -> bool:
@@ -367,6 +389,7 @@ def allocate_hisparse_host_pools(
             None,
         )
 
+    tp_group = get_tp_group()
     region = SharedOffloadRegion(
         engine_id=(
             f"hisparse_{vllm_config.instance_id}_"
@@ -376,9 +399,9 @@ def allocate_hisparse_host_pools(
         rank=0,
         kv_bytes_per_chunk=num_blocks * host_block_stride,
         cpu_page_size=sum(tensor_sizes),
-        barrier=get_tp_group().barrier,
+        barrier=tp_group.barrier,
         creator_memory_check=check_hisparse_host_memory,
-        populate_only_on_creator=True,
+        populate_shard=(tp_group.rank_in_group, tp_group.world_size),
     )
     try:
         for start, end in _hisparse_registration_ranges(
@@ -828,15 +851,13 @@ class HiSparseRuntime:
             )
         row_width = kv_cache.shape[-1]
 
+        num_blocks = plan.row_ids.shape[1] // plan.block_size
+        min_blocks = cdiv(_MIN_STAGED_PREFILL_KV_ROWS, plan.block_size)
         staged = torch.empty(
-            (
-                plan.row_ids.shape[1] // plan.block_size,
-                plan.block_size,
-                row_width,
-            ),
+            (max(num_blocks, min_blocks), plan.block_size, row_width),
             dtype=kv_cache.dtype,
             device=plan.block_table.device,
-        )
+        )[:num_blocks]
         if plan.gpu_row_ids is not None and resident_cache is not None:
             gpu_rows = plan.gpu_row_ids[0].to(torch.long)
             src = gpu_rows.clamp_min(0)
@@ -1123,13 +1144,13 @@ def update_hisparse_residency(
 ) -> None:
     """Apply scheduled requests' residency changes.
 
-    ``residency`` is ``[state rows, resident groups, pages]``: the GPU block of
+    ``residency`` is ``[resident groups, state rows, pages]``: the GPU block of
     each page, or block 0 when the page is read from the host.
     """
     if not updates:
         return
     batch_rows = {request_id: row for row, request_id in enumerate(request_ids)}
-    num_groups = residency.shape[1]
+    num_groups = residency.shape[0]
     rows: list[int] = []
     pages: list[int] = []
     block_ids: list[list[int]] = [[] for _ in range(num_groups)]
@@ -1150,7 +1171,7 @@ def update_hisparse_residency(
         host_values, device=request_state_indices.device, dtype=torch.int32
     )
     state_rows = request_state_indices[values[:, 0]]
-    residency[state_rows, :, values[:, 1]] = values[:, 2:]
+    residency[:, state_rows, values[:, 1]] = values[:, 2:].T
 
 
 class HiSparseCacheHandle:
@@ -1175,7 +1196,6 @@ class HiSparseCacheHandle:
         # Speculator layers write their rows after the target forward.
         self.draft_layer = False
         self.index_group_caches: list[HiSparseCacheHandle] = [self]
-        self._batch_block_table: torch.Tensor | None = None
 
     def prepare_group_for_batch(self, attn_metadata: Any | None) -> None:
         assert self.runtime.is_group_leader
@@ -1184,7 +1204,6 @@ class HiSparseCacheHandle:
 
     def _prepare_for_batch(self, attn_metadata: Any | None) -> None:
         self.dummy_batch = attn_metadata is None
-        self._batch_block_table = None
         self.runtime.begin_forward()
         self.num_actual_tokens = (
             attn_metadata.num_actual_tokens if attn_metadata is not None else 0
@@ -1199,17 +1218,6 @@ class HiSparseCacheHandle:
         self.host_mirror_required = attn_metadata is not None and (
             not self.decode_batch or self.runtime.eager_host_mirror
         )
-
-    def batch_block_table(self) -> torch.Tensor:
-        """Resident rows by this step's batch row, for the prefill paths."""
-        if self._batch_block_table is None:
-            assert self.block_table is not None
-            indices = self.runtime.request_state_indices
-            assert indices is not None
-            self._batch_block_table = self.block_table.index_select(
-                0, indices.clamp(min=0)
-            )
-        return self._batch_block_table
 
     def write_target(
         self, num_input_rows: int, num_slot_rows: int

@@ -3,9 +3,9 @@
 # --- GDN in_proj_ba split-K (sm_86, small M) ---
 """Split-K GEMM for the GDN in_proj_ba projection at small token counts.
 
-For x[M <= 16, 5120] @ W[48, 5120]^T (the per-rank in_proj_ba at TP=2 during an MTP K=3 verify
-step, M = 4) cuBLAS on sm_86 picks a cutlass wmma kernel with a 4-CTA grid: ~28 us on an idle
-3090, ~41 us in-server, x 48 GDN layers per step. Splitting K 16 ways fills the SMs (6.7 us).
+For x[M <= 16, 5120] @ W[48, 5120]^T (the per-rank in_proj_ba at TP=2 during an MTP K=3
+verify step, M = 4) cuBLAS on sm_86 picks a cutlass wmma kernel with a 4-CTA grid that
+leaves most SMs idle. Splitting K 16 ways fills the SMs.
 M > 16 and K not a multiple of 16 x 64 take F.linear unchanged (cuBLAS is already fast there).
 Reduction order differs from cuBLAS, so the result is not bit-identical to it (fp32 accumulate).
 

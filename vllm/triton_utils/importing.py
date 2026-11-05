@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by the Merlin project; see NOTICE.
 
 import os
 import types
@@ -127,6 +128,8 @@ class TritonLanguagePlaceholder(types.ModuleType):
         self.dtype = None
         self.int64 = None
         self.int32 = None
+        # Kernel signatures annotate tl.int1.
+        self.int1 = None
         self.uint8 = None
         self.pointer_type = lambda element_ty: None
         self.tensor = None

@@ -207,7 +207,6 @@ def _topk_topp_kernel(
                 k_pivots_num = tl.zeros((), dtype=tl.uint32)
                 min_larger = float("inf")
                 num_min_larger = tl.zeros((), dtype=tl.uint32)
-                # Port of vllm#61213.
                 if num_finite_total <= k:
                     # All finite logits survive top-k; skip the cutoff search.
                     k_pivot = -float("inf")
@@ -993,6 +992,8 @@ _SPLIT_ROUNDS = 5
 _TRITON_SPLIT_CACHE: dict[torch.device, dict[str, torch.Tensor]] = {}
 
 
+# The split count follows batch size and SM count only. Upstream's small-batch split
+# top-p (#61996) is not taken: it may change the reduction order.
 def _topp_split_count(batch_size: int, num_sm: int) -> int:
     splits = 1
     while splits < _SPLIT_MAX_SPLITS and splits * 2 * batch_size <= num_sm:
@@ -1476,7 +1477,6 @@ def _topp_sb_mask_kernel(
         return
     if fin < 0.0:
         fin = best_fin
-    # Port of vllm#58231: no logit-space pivot
     # numdup/numkeep are exact small integers held in fp32.
     ties = numkeep < numdup
     num_preceding = 0.0
@@ -1502,7 +1502,6 @@ def _topp_sb_mask_kernel(
     for i in range(start, end, BLOCK):
         mask_n = i + offs < end
         x = tl.load(ROW + i + offs, mask=mask_n, other=-float("inf"))
-        # Port of vllm#58231.
         # Mask in probability space (bitwise the step kernels' predicate);
         # the logit-space pivot rounds to M for huge |M|.
         prob = tl.exp(x - M) / Z
@@ -1512,7 +1511,6 @@ def _topp_sb_mask_kernel(
             cum = tl.cumsum(dmask.to(tl.int32)).to(tl.float32) + num_preceding
             keep_dup = dmask & (cum <= numkeep)
             keep = keep & (~dmask | keep_dup)
-            # Port of vllm#62046.
             num_preceding += tl.sum(dmask.to(tl.float32))
         tl.store(ROW + i + offs, tl.where(keep, x, MASK_VALUE), mask=mask_n)
 

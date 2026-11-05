@@ -7,7 +7,6 @@ from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.scheduler import Scheduler
-from vllm.v1.request import Request, RequestStatus
 
 logger = init_logger(__name__)
 
@@ -22,6 +21,49 @@ class AsyncScheduler(Scheduler):
         self.decode_stagger = self.pp_size
         if current_platform.is_xpu() and not envs.VLLM_XPU_PP_MICROBATCH:
             self.decode_stagger = 1
+        # Default off.
+        self.pp_decode_balance = envs.VLLM_MERLIN_PP_DECODE_BALANCE
+        self._pp_decode_logged_rows = 0
+        self._pp_decode_next_log_step = 0
+        if self.pp_decode_balance:
+            self._log_pp_decode_state()
+
+    def _log_pp_decode_state(self) -> None:
+        # A flat A/B needs this line and the running count in _pp_decode_cap:
+        # they tell "the cap did nothing" apart from "the cap never engaged".
+        logger.info(
+            "PP decode balance: knob on, cap %s "
+            "(V2 runner %s, decode stagger %d)",
+            "active"
+            if self.use_v2_model_runner and self.decode_stagger > 1
+            else "inactive",
+            self.use_v2_model_runner,
+            self.decode_stagger,
+        )
+
+    def _pp_decode_cap(self) -> int | None:
+        # With the V2 runner a request decodes every decode_stagger (pp_size)
+        # steps, so the decoding requests form decode_stagger microbatches that
+        # keep whatever split admission gave them (e.g. 7/1), and every step is
+        # paced by the biggest one. Cap a step at ceil(decoding / stagger) decode
+        # rows; a row over the cap stays eligible for the next step.
+        if not (
+            self.pp_decode_balance
+            and self.use_v2_model_runner
+            and self.decode_stagger > 1
+        ):
+            return None
+        # At most one line per 1000 steps, and only when the count moved.
+        rows = self.pp_decode_deferred_rows
+        if (
+            rows != self._pp_decode_logged_rows
+            and self.current_step >= self._pp_decode_next_log_step
+        ):
+            logger.info("PP decode balance: %d decode rows deferred", rows)
+            self._pp_decode_logged_rows = rows
+            self._pp_decode_next_log_step = self.current_step + 1000
+        num_decoding = sum(1 for r in self.running if not r.is_prefill_chunk)
+        return -(-num_decoding // self.decode_stagger)
 
     def _update_after_schedule(self, scheduler_output: SchedulerOutput) -> None:
         super()._update_after_schedule(scheduler_output)
@@ -56,27 +98,3 @@ class AsyncScheduler(Scheduler):
                 request.next_decode_eligible_step = (
                     self.current_step + self.decode_stagger
                 )
-
-    def _update_request_with_output(
-        self, request: Request, new_token_ids: list[int], is_stale: bool = False
-    ) -> tuple[list[int], bool]:
-        status_before_update = request.status
-        # Port of vllm#58668.
-        # Tokens trimmed at a stop resolve their placeholders too.
-        num_new_tokens = len(new_token_ids)
-        new_token_ids, stopped = super()._update_request_with_output(
-            request, new_token_ids, is_stale
-        )
-
-        # Placeholders were zeroed at preemption; a stale delivery must not
-        # decrement them (it would underflow).
-        if not is_stale:
-            request.num_output_placeholders -= num_new_tokens
-            assert request.num_output_placeholders >= 0
-
-        # Cache the new tokens. Preempted requests should be skipped.
-        if status_before_update == RequestStatus.RUNNING:
-            self.kv_cache_manager.cache_blocks(
-                request, request.num_computed_tokens - request.num_output_placeholders
-            )
-        return new_token_ids, stopped

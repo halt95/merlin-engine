@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+// Modified by the Merlin project; see NOTICE.
 /*
  * Shared 4096-bin single-CTA TopK helpers.
  */
@@ -9,7 +12,7 @@
 #include <cuda_runtime.h>
 #include <cstdint>
 
-namespace merlin {  // was vllm; merlin-hook: csrc-topk-vendored
+namespace merlin {
 namespace topk_histogram_4096 {
 
 constexpr uint32_t kBlockSize = 1024;
@@ -510,7 +513,7 @@ __device__ void histogram_4096_topk(const float* __restrict__ scores,
     }
   } else if (num_ties <=
              kWarpSize *
-                 2) {  // TODO (roberto): try to refactor this with <=32 case
+                 2) {
     //  Same idea but each thread handles 2 tie elements
     const auto lane_id = tx % kWarpSize;
     const auto warp_id = tx / kWarpSize;

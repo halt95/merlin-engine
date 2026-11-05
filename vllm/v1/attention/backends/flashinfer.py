@@ -22,7 +22,11 @@ from flashinfer import (
 )
 from flashinfer.decode import fast_decode_plan, trtllm_batch_decode_with_kv_cache
 from flashinfer.prefill import trtllm_batch_context_with_kv_cache
-from flashinfer.utils import FP4Tensor
+from flashinfer.utils import (
+    FP4Tensor,
+    get_device_sm_count,
+    get_trtllm_gen_multi_ctas_kv_counter_bytes,
+)
 from typing_extensions import override
 
 from vllm.v1.qwen35_series import series_active
@@ -62,12 +66,11 @@ from vllm.utils.flashinfer import (
     use_trtllm_attention,
 )
 from vllm.utils.gpu_sync_debug import gpu_sync_allowed
-from vllm.utils.math_utils import cdiv
+from vllm.utils.math_utils import cdiv, round_up
 from vllm.utils.torch_utils import (
     PIN_MEMORY,
     canonicalize_singleton_dim_strides,
     get_dtype_size,
-    is_quantized_kv_cache,
     is_strictly_contiguous,
     nvfp4_kv_cache_full_dim,
     nvfp4_split_data_scale,
@@ -107,6 +110,7 @@ from vllm.v1.attention.backends.fi_plan_staging import (
 from vllm.v1.attention.ops.dcp import (
     cp_lse_ag_out_rs,
     dcp_a2a_lse_reduce,
+    mask_dcp_empty_shards_,
 )
 from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
 from vllm.v1.kv_cache_interface import (
@@ -114,6 +118,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheLayout,
     KVCacheSpec,
     KVQuantMode,
+    is_quantized_kv_cache,
     iter_layer_specs,
 )
 from vllm.v1.utils import CpuGpuBuffer
@@ -332,6 +337,11 @@ def _nvfp4_kv_on_fa2() -> bool:
     return any(current_platform.is_device_capability_family(f) for f in (80, 90, 120))
 
 
+def _use_fa2_native_decode() -> bool:
+    # Below SM90, native decode runs fa2, which takes uniform multi-token queries.
+    return not current_platform.has_device_capability(90)
+
+
 _KVPair = tuple[torch.Tensor, torch.Tensor]
 
 
@@ -365,6 +375,24 @@ def _get_trtllm_workspace_buffer():
             envs.VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE, dtype=torch.uint8, device="cuda"
         )
     return trtllm_workspace_buffer
+
+
+_fi_multi_ctas_kv_counter: torch.Tensor | None = None
+
+
+def _get_multi_ctas_kv_counter_buffer(
+    min_bytes: int, device: torch.device
+) -> torch.Tensor:
+    """Shared multi-CTA-KV counter buffer; the kernels re-zero it after each launch."""
+    global _fi_multi_ctas_kv_counter
+    if (
+        _fi_multi_ctas_kv_counter is None
+        or _fi_multi_ctas_kv_counter.numel() < min_bytes
+    ):
+        _fi_multi_ctas_kv_counter = torch.zeros(
+            min_bytes, dtype=torch.uint8, device=device
+        )
+    return _fi_multi_ctas_kv_counter
 
 
 def _pack_draft_block_bool_mask(
@@ -537,18 +565,104 @@ def trtllm_prefill_attn_kvfp8_dequant(
     return mock_kv_cache, mock_block_table
 
 
+class TrtllmDCPContextWrapper:
+    """trtllm-gen stand-in for the native wrapper in the DCP context pass."""
+
+    # Plan state checked by FlashInferImpl.forward(), as on the native wrapper.
+    _window_left = -1
+    _logits_soft_cap = 0.0
+    _causal = False
+
+    @staticmethod
+    def fits_workspace(qo_indptr_cpu: torch.Tensor, num_qo_heads: int) -> bool:
+        # Mirrors the LSE softmax-stats carve-out in FlashInfer's trtllm-gen
+        # launcher: heads * batch * round_up(max_q_len, 256) float2s + 1 MiB.
+        batch_size = qo_indptr_cpu.shape[0] - 1
+        max_q_len = int((qo_indptr_cpu[1:] - qo_indptr_cpu[:-1]).max())
+        stats_bytes = num_qo_heads * batch_size * round_up(max_q_len, 256) * 8
+        return stats_bytes + (1 << 20) <= _get_trtllm_workspace_buffer().nbytes
+
+    def plan(
+        self,
+        *,
+        qo_indptr: torch.Tensor,
+        paged_kv_indptr: torch.Tensor,
+        seq_lens: torch.Tensor,
+        block_tables: torch.Tensor,
+        causal: bool,
+        sm_scale: float,
+        window_left: int,
+        logits_soft_cap: float | None,
+        **kwargs,
+    ) -> None:
+        assert not causal and window_left == -1 and not logits_soft_cap
+        device = block_tables.device
+        self._block_tables = block_tables
+        self._seq_lens = seq_lens.to(device, non_blocking=True)
+        self._cum_seq_lens_q = qo_indptr.to(device, non_blocking=True)
+        self._cum_seq_lens_kv = paged_kv_indptr.to(device, non_blocking=True)
+        self._max_q_len = int((qo_indptr[1:] - qo_indptr[:-1]).max())
+        self._max_kv_len = int(seq_lens.max())
+        self._has_empty_ctx = bool((seq_lens == 0).any())
+        self._sm_scale = sm_scale
+
+    def run(
+        self,
+        q: torch.Tensor,
+        kv_cache: tuple[torch.Tensor, torch.Tensor],
+        k_scale: float,
+        v_scale: float,
+        return_lse: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        assert return_lse
+        q = canonicalize_singleton_dim_strides(q.contiguous())
+        # trtllm-gen writes neither the output nor the LSE of requests without
+        # local context; the combine weights them by 0, so the output must be
+        # finite and the LSE -inf.
+        out = torch.zeros_like(q) if self._has_empty_ctx else torch.empty_like(q)
+        lse = torch.empty(q.shape[:2], dtype=torch.float32, device=q.device)
+        if self._max_kv_len > 0:
+            trtllm_batch_context_with_kv_cache(
+                query=q,
+                kv_cache=kv_cache,
+                workspace_buffer=_get_trtllm_workspace_buffer(),
+                block_tables=self._block_tables,
+                seq_lens=self._seq_lens,
+                max_q_len=self._max_q_len,
+                max_kv_len=self._max_kv_len,
+                bmm1_scale=self._sm_scale * k_scale,
+                bmm2_scale=v_scale,
+                batch_size=self._seq_lens.shape[0],
+                cum_seq_lens_q=self._cum_seq_lens_q,
+                cum_seq_lens_kv=self._cum_seq_lens_kv,
+                causal=False,
+                return_lse=True,
+                lse=lse,
+                out=out,
+            )
+        if self._has_empty_ctx:
+            mask_dcp_empty_shards_(lse, self._seq_lens, self._cum_seq_lens_q)
+        return out, lse
+
+
 class BatchDCPPrefillWrapper:
     def __init__(
         self,
         kv_layout: str,
         workspace_buffer: torch.Tensor | None = None,
         dcp_a2a: bool = False,
+        use_trtllm_context: bool = False,
     ):
         if dcp_a2a:
             self._dcp_combine = partial(dcp_a2a_lse_reduce, is_lse_base_on_e=False)
         else:
             self._dcp_combine = partial(cp_lse_ag_out_rs, is_lse_base_on_e=False)
-        self._context = BatchPrefillWithPagedKVCacheWrapper(workspace_buffer, kv_layout)
+        self._native_context = BatchPrefillWithPagedKVCacheWrapper(
+            workspace_buffer, kv_layout
+        )
+        self._trtllm_context = TrtllmDCPContextWrapper() if use_trtllm_context else None
+        # The context-pass wrapper planned for this step.
+        self._context: BatchPrefillWithPagedKVCacheWrapper | TrtllmDCPContextWrapper
         self._new_tokens = BatchPrefillWithRaggedKVCacheWrapper(workspace_buffer)
 
     def plan(
@@ -570,8 +684,16 @@ class BatchDCPPrefillWrapper:
         kv_cache_dtype: torch.dtype,
         prefill_fixed_split_size: int,
         disable_split_kv: bool,
+        block_tables: torch.Tensor,
     ):
         """Plan the prefill operation with given parameters."""
+        self._context = self._native_context
+        if self._trtllm_context is not None and (
+            TrtllmDCPContextWrapper.fits_workspace(
+                qo_indptr_cpu, num_qo_heads * dcp_world_size
+            )
+        ):
+            self._context = self._trtllm_context
         staging_fence(self._context)
         self._context.plan(
             qo_indptr=qo_indptr_cpu,
@@ -591,6 +713,7 @@ class BatchDCPPrefillWrapper:
             kv_data_type=kv_cache_dtype,
             fixed_split_size=prefill_fixed_split_size,
             disable_split_kv=disable_split_kv,
+            block_tables=block_tables,
         )
         staging_record(self._context)
         staging_fence(self._new_tokens)
@@ -655,6 +778,8 @@ class BatchDCPPrefillWrapper:
 
 
 class FlashInferBackend(AttentionBackend):
+    supports_kv_cache_update_bypass: bool = True
+
     @classmethod
     def customize_spec(cls, spec: "AttentionSpec") -> "AttentionSpec":
         """NVFP4 stores K and V as separate per-head slots of packed fp4 data
@@ -1002,8 +1127,8 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             os.environ.get("FLASHINFER_SM8X_FP8_SMALLQ") == "cta32"
         )
         self._decode_wrappers_smallq: dict[int, Any] = {}
-        # only the spec-as-decode clause below asks
-        # the wider gate (it also admits Qwen3.5 MoE with MERLIN_MOE_UNIFORM_VERIFY=1).
+        # The wider uniform-verify gate (it also admits Qwen3.5 MoE with
+        # MERLIN_MOE_UNIFORM_VERIFY=1); only the spec-as-decode clause below asks it.
         self._uniform_verify = uniform_verify_active(vllm_config, device=device)
         # VLLM_DRAFT_BOUNDED_PLAN (same family/device gate as the other series patches);
         # cleared for good if a plan ever disagrees with the CPU schedule replica.
@@ -1060,7 +1185,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         )
         if self.enable_cuda_graph:
             # For full cudagraph capture, one `decode_wrapper` for each batch
-            # size is needed for FlashInfer.
+            # size and query length is needed for FlashInfer.
             self._decode_wrappers_cudagraph: dict[
                 tuple[int, int] | tuple[int, int, int],
                 BatchDecodeWithPagedKVCacheWrapper,
@@ -1197,15 +1322,17 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             == FlashInferDecodeKernel.TRTLLM_GEN
             and not self.use_dcp
         )
+        # No use_fa2_native_decode (upstream #60532); sm_8x verify keeps Merlin's gate.
         self._init_reorder_batch_threshold(
             1,
             supports_spec_as_decode=(
                 self.flashinfer_trtllm_api_decode_kernel is not None
                 or (
-                    # Ampere re-land: 0.30
-                    # gates spec-as-decode on a trtllm/XQA decode kernel, which is None
-                    # on sm_86, so without this clause MTP verify batches take the
-                    # prefill path and FULL cudagraphs cannot capture. The FI native
+                    # Spec-as-decode on sm_8x via the FI native decode wrapper.
+                    # Upstream gates spec-as-decode on a trtllm/XQA decode kernel,
+                    # which is None on sm_86, so without this clause MTP verify
+                    # batches take the prefill path and FULL cudagraphs cannot
+                    # capture. The FI native
                     # decode wrapper can plan uniform verify batches when FlashInfer is
                     # new enough.
                     not self.use_trtllm_decode_attention
@@ -1232,6 +1359,19 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         self.sm_scale = self.global_hyperparameters.sm_scale
         self.window_left = self.global_hyperparameters.window_left
         self.logits_soft_cap = self.global_hyperparameters.logits_soft_cap
+        # The DCP prefill context pass runs on trtllm-gen when available, with
+        # an unquantized KV cache and no sliding window or soft-capping.
+        self.use_trtllm_dcp_prefill = (
+            self.use_dcp
+            and can_use_trtllm_attention(
+                self.num_qo_heads, self.num_kv_heads, is_prefill=True
+            )
+            and self.kv_cache_spec.kv_quant_mode == KVQuantMode.NONE
+            and self.window_left == -1
+            and not self.logits_soft_cap
+        )
+        if self.use_trtllm_dcp_prefill:
+            logger.info_once("Using the trtllm-gen context kernel for DCP prefill.")
         self.has_sinks = self.global_hyperparameters.has_sinks
         if self.has_sinks and (self.nvfp4_fa2 or not FlashInferBackend.supports_sink()):
             raise NotImplementedError(
@@ -1328,6 +1468,10 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             return AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
 
         kv_specs = iter_layer_specs(kv_cache_spec)
+        # Upstream #60532 returns UNIFORM_BATCH unconditionally below
+        # SM90 here; our sm_8x verify path keeps its own gate below
+        # (uniform_verify_active + FlashInfer multi-token decode support).
+
         num_qo_heads = vllm_config.model_config.get_num_attention_heads(
             vllm_config.parallel_config
         )
@@ -1378,8 +1522,10 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
     ) -> int | None:
         # The uniform gate already covers DCP, head geometry, the XQA head-dim
         # limit and causality, and yields None for subclasses that force NEVER.
+        # The native fa2 decode wrapper takes only uniform query lengths.
         if (
-            cls.get_cudagraph_support(vllm_config, kv_cache_spec)
+            _use_fa2_native_decode()
+            or cls.get_cudagraph_support(vllm_config, kv_cache_spec)
             != AttentionCGSupport.UNIFORM_BATCH
         ):
             return None
@@ -1401,7 +1547,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             )
         return self._workspace_buffer
 
-    # the size check of a shared buffer needs it
+    # Used by the size check of a shared buffer.
     def _workspace_bytes(self) -> int:
         """Bytes of the float workspace this builder would allocate for itself."""
         buffer_size = envs.VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE
@@ -1573,6 +1719,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                     kv_layout=get_flashinfer_layout_string(self.kv_cache_layout),
                     workspace_buffer=self._get_workspace_buffer(),
                     dcp_a2a=self.dcp_a2a,
+                    use_trtllm_context=self.use_trtllm_dcp_prefill,
                 )
             else:
                 if self.has_sinks and (
@@ -1629,6 +1776,9 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 paged_kv_last_page_len = None
             # NVFP4 KV cache requires the trtllm-gen backend inside
             # the wrapper on SM100; SM8x, SM90 and SM12x read it with fa2.
+            # The decode backend stays "auto" (upstream #60532 forces "fa2" below SM90):
+            # with use_tensor_cores=True FlashInfer resolves "auto" to fa2 on
+            # sm_8x anyway, and the sm_8x small-q verify tile is planned on it.
             backend = "trtllm-gen" if self.nvfp4_trtllm else "auto"
             decode_wrapper = BatchDecodeWithPagedKVCacheWrapper(
                 self._get_workspace_buffer(),
@@ -1719,7 +1869,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
 
         The CPU halves of the buffers get the UPPER-BOUND page table (only the planner reads
         them: fast_decode_plan in cudagraph mode does not copy them to the GPU, FlashInfer
-        decode.py L3911-3933). The GPU buffers the kernel reads get the TRUE page table,
+        fast_decode_plan). The GPU buffers the kernel reads get the TRUE page table,
         computed on the device from the device seq_lens by _draft_bounded_kv_fixup_kernel
         with the same arithmetic as the synced path. No host<->device copy, no sync.
         """
@@ -1791,7 +1941,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             # The graph replays read the WRAPPER's paged-KV buffers; the fix-up kernel
             # writes the builder's. They must be the same storage (_get_decode_wrapper
             # hands the builder buffers to cudagraph wrappers; fast_decode_plan never
-            # copies into them in cudagraph mode, decode.py L3911-3933).
+            # copies into them in cudagraph mode).
             or wrapper._paged_kv_indptr_buf.data_ptr()
             != self.paged_kv_indptr.gpu.data_ptr()
             or wrapper._paged_kv_indices_buf.data_ptr()
@@ -1807,14 +1957,15 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         cta_tile_q = int(plan_info[3])
         gqa = self.num_qo_heads // self.num_kv_heads
         # In cudagraph mode padded_batch_size = max(max_batch_size_if_split, total_num_tiles_q)
-        # (scheduler.cuh L672-673, L611). When it exceeds the q-tile bound it IS FlashInfer's
-        # max_batch_size_if_split (L788-791), read back rather than re-derived from SM counts.
+        # (scheduler.cuh PrefillSplitQOKVIndptr). When it exceeds the q-tile bound it
+        # IS FlashInfer's max_batch_size_if_split, read back rather than re-derived
+        # from SM counts.
         tiles_q_bound = -(-num_decodes * gqa // cta_tile_q) + num_decodes - 1
         if padded <= tiles_q_bound or padded > _BP_MAX_PADDED_BATCH or cta_tile_q <= 0:
             d["bp_ineligible_sync"] += 1
             return None
         q_tiles = -(-gqa // cta_tile_q)
-        min_chunk = max(128 // self.page_size, 1)  # scheduler.cuh L579
+        min_chunk = max(128 // self.page_size, 1)  # as in scheduler.cuh
         decision = decide_bounded_plan(
             lb, ub, self.page_size, q_tiles, padded, min_chunk
         )
@@ -1832,7 +1983,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         """Give a draft wrapper a ring of pinned host staging buffers for its plans.
 
         FlashInfer's planner writes the schedule into the wrapper's pinned host buffer and
-        enqueues an async H2D copy of it (scheduler.cuh L887-888). With no sync between draft
+        enqueues an async H2D copy of it (scheduler.cuh). With no sync between draft
         steps, the next step's plan would overwrite that host buffer before the GPU (still
         busy with the verify forward) has executed the copy. Rotating buffers, guarded by an
         event per slot, makes each in-flight copy read its own plan.
@@ -2193,7 +2344,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                     num_prefills,
                     num_decode_tokens,
                     decode_with_flashinfer_trtllm_api,
-                    False,  # use_cascade: cascade attention removed in 0.32
+                    False,  # use_cascade: cascade attention is not used by this build
                 )
             if _bp is not None:
                 # Upper bounds; the true lengths only ever exist on the GPU here.
@@ -2240,7 +2391,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                     num_prefills,
                     num_decode_tokens,
                     decode_with_flashinfer_trtllm_api,
-                    False,  # use_cascade: cascade attention removed in 0.32
+                    False,  # use_cascade: cascade attention is not used by this build
                 )
             ) is not None:
                 # exact (== seq_lens.cpu()), read without waiting for the draft steps
@@ -2468,6 +2619,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                         kv_cache_dtype=self.kv_cache_dtype,
                         prefill_fixed_split_size=self.prefill_fixed_split_size,
                         disable_split_kv=self.disable_split_kv,
+                        block_tables=block_table_tensor[prefill_start:],
                     )
                 else:
                     assert isinstance(
@@ -2764,6 +2916,22 @@ class FlashInferImpl(AttentionImpl):
         self.bmm1_scale: float | None = None
         self.bmm2_scale: float | None = None
         self.o_sf_scale: float | None = None
+
+        # Allocated eagerly to stay out of CUDA-graph capture; DCP all-gathers
+        # the decode query over heads.
+        # Only the trtllm-gen/XQA calls (SM90+) take this buffer, so pre-SM90 skips
+        # the allocation and keeps the KV memory budget.
+        self._multi_ctas_kv_counter_buffer: torch.Tensor | None = None
+        if vllm_config is not None and current_platform.has_device_capability(90):
+            _sched = vllm_config.scheduler_config
+            self._multi_ctas_kv_counter_buffer = _get_multi_ctas_kv_counter_buffer(
+                get_trtllm_gen_multi_ctas_kv_counter_bytes(
+                    _sched.max_num_batched_tokens or _sched.max_num_seqs,
+                    num_heads * self.dcp_world_size,
+                    get_device_sm_count(torch.device("cuda")),
+                ),
+                torch.device("cuda"),
+            )
 
         # Pre-allocated FP8 output buffer for NVFP4 without fused output quant.
         if self.nvfp4_trtllm and vllm_config is not None:
@@ -3222,6 +3390,7 @@ class FlashInferImpl(AttentionImpl):
                     o_sf_scale=self.o_sf_scale,
                     out=out,
                     kv_cache_sf=prefill_kv_block_scales,
+                    multi_ctas_kv_counter_buffer=self._multi_ctas_kv_counter_buffer,
                 )
 
                 if needs_fp8_out:
@@ -3449,6 +3618,7 @@ class FlashInferImpl(AttentionImpl):
                     ),
                     lse=lse,
                     return_lse=self.need_to_return_lse_for_decode,
+                    multi_ctas_kv_counter_buffer=self._multi_ctas_kv_counter_buffer,
                 )
 
                 if use_dcp:
@@ -3608,6 +3778,7 @@ def fast_plan_decode(
             seq_lens=seq_lens_cpu,
             fixed_split_size=fixed_split_size,
             disable_split_kv=disable_split_kv,
+            # q_len_per_req is passed only when FlashInfer supports it.
             **uniform_decode_kwargs,
         )
         staging_record(self)
@@ -3623,7 +3794,7 @@ def fast_plan_decode(
     # >> fa2 ONLY. The SM90/SM100 planners DO read kv_len_arr per request. This path serves sm_86.
     # >> Single-entry by design: _plan_info is offsets into a per-wrapper workspace holding
     #    only the LAST plan. A dict cache would return offsets into overwritten bytes.
-    # fa2 is enforced, not assumed: FlashInfer 0.6.18 resolves backend="auto" to a
+    # fa2 is enforced, not assumed: FlashInfer resolves backend="auto" to a
     # concrete name in the first plan() (always taken above), so anything other than
     # "fa2" here (fa3, trtllm-gen, cute-dsl, unresolved) bypasses the cache.
     _pending_plan_key = None
@@ -3695,6 +3866,7 @@ def fast_plan_decode(
         non_blocking=non_blocking,
         fixed_split_size=fixed_split_size,
         disable_split_kv=disable_split_kv,
+        # q_len_per_req is passed only when FlashInfer supports it.
         **uniform_decode_kwargs,
     )
     staging_record(self)
