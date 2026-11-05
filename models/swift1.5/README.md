@@ -22,24 +22,24 @@ The canonical [serve.sh](serve.sh) is generated from the checkpoint profile in `
 | Swift vision at 8 MP (8,388,608 pixels per image) | Measured on 2026-10-15 on 4× RTX 3090 / 0.32: **stage-0 minimum free memory 902 MiB** (different served configuration). Generated launcher, 2026-10-16 8 MP burst after 8K prefill: **544 MiB**, 20 MiB above the 524 MiB floor |
 | Generated 0.32 launcher on the assembled release tree | a boot-and-check run of the generated launcher (2026-10-16) and the 2026-10-20 release bench card both ran clean: tested on the reference host |
 | KV pool and session residency | 924,993 tokens was measured on the generated launcher (2026-10-16); 3 × 262K and 6 × 131K sessions held at once on the 2026-10-20 bench card |
-| Decode, prefill, follow-up latency and quality | 2026-11-05 Merlin 3.0.2 bench card (below): decode 181 / 187 / 186 tok/s at 4K / 131K / 262K, cold prefill 6,569 / 6,932 tok/s at 10K / 100K. The 2026-11-02 3.0.1 card: decode 176 / 186 / 186 tok/s, cold prefill 6,623 / 7,043 tok/s; agents (8 × 16K) 673 tok/s thinking on, 650 thinking off; GSM8K-200 199/200 at medium. The 2026-10-20 3.0.0 card (BF16 draft head): decode 177 / 180 / 177 tok/s, cold prefill 5,676 / 6,055 tok/s, agents 643 tok/s, GSM8K-200 197/200 thinking off. Historical, the 2026-10-17 pre-release bench run (INT8 draft head): agents aggregate 256 / 409 / 657 tok/s at n=2 / 4 / 8, GSM8K 198/200. The launcher qualification measured GSM8K-20 19/20 and ITL 18.78 / 18.84 ms at 4K / 32K; other earlier results are historical |
+| Decode, prefill, follow-up latency and quality | 2026-11-05 Merlin 3.0.2 bench card (below): decode 181 / 187 / 186 tok/s at 4K / 131K / 262K, cold prefill 6,569 / 6,932 tok/s at 10K / 100K; agents (8 × 16K) 659 tok/s thinking on; GSM8K-200 199/200 at medium. The 2026-11-02 3.0.1 card: decode 176 / 186 / 186 tok/s, cold prefill 6,623 / 7,043 tok/s; agents (8 × 16K) 673 tok/s thinking on, 650 thinking off; GSM8K-200 199/200 at medium. The 2026-10-20 3.0.0 card (BF16 draft head): decode 177 / 180 / 177 tok/s, cold prefill 5,676 / 6,055 tok/s, agents 643 tok/s, GSM8K-200 197/200 thinking off. Historical, the 2026-10-17 pre-release bench run (INT8 draft head): agents aggregate 256 / 409 / 657 tok/s at n=2 / 4 / 8, GSM8K 198/200. The launcher qualification measured GSM8K-20 19/20 and ITL 18.78 / 18.84 ms at 4K / 32K; other earlier results are historical |
 
 [Swift1.5-Huihui](../swift1.5-huihui/README.md) inherits Swift's heavy results. Its generated launcher independently passed the 2026-10-16 8 MP check with 902 MiB minimum free.
 
 ## Merlin 3.0.2 bench card (2026-11-05)
 
-Maintainer measurements on 4× RTX 3090 (220 W, PCIe Gen4) with P2P (the aikitoria patched driver) and the Zagitta [gpu-unlock](https://github.com/Zagitta/gpu-unlock) kernel module, on vLLM 0.33.0, one fresh `merlin serve` boot, 2026-11-05; method and every cell in the [bench card](benchmarks/2026-11-05/BENCH-CARD.md). Decode is one stream with thinking on at reasoning effort medium, the server default (tok/s after the first streamed token); prefill is one cold request. With thinking on, a 512-token agent follow-up may end inside the reasoning, and reasoning tokens count. Rows marked (3.0.1 run) were not re-run for 3.0.2 and are on the 3.0.1 card below.
+Maintainer measurements on 4× RTX 3090 (220 W, PCIe Gen4) with P2P (the aikitoria patched driver) and the Zagitta [gpu-unlock](https://github.com/Zagitta/gpu-unlock) kernel module, on vLLM 0.33.0, two fresh `merlin serve` boots (decode and prefill; agents and GSM8K), 2026-11-05; method and every cell in the [bench card](benchmarks/2026-11-05/BENCH-CARD.md). Decode is one stream with thinking on at reasoning effort medium, the server default (tok/s after the first streamed token); prefill is one cold request. With thinking on, a 512-token agent follow-up may end inside the reasoning, and reasoning tokens count. Rows marked (3.0.1 run) were not re-run for 3.0.2 and are on the 3.0.1 card below.
 
 | Measurement | Swift1.5 |
 |---|---|
 | Decode, 4K / 131K / 262K prompt | 181 / 187 / 186 tok/s |
 | Cold prefill, 10K / 100K / 262K prompt | 6,569 / 6,932 / 6,762 tok/s |
-| Agents at once (8 × 16K conversations), total, thinking on / off | 673 / 650 tok/s (3.0.1 run) |
-| GSM8K-200 (5-shot), correct of 200, thinking on at medium / thinking off | 199 / 197 (3.0.1 run; thinking off from the 3.0.0 run) |
+| Agents at once (8 × 16K conversations), total, thinking on / off | 659 tok/s / 650 tok/s (the off figure is a 3.0.1 run) |
+| GSM8K-200 (5-shot), correct of 200, thinking on at medium / thinking off | 199 / 197 (thinking off from the 3.0.0 run) |
 | Sessions held at once | Not re-measured on 3.0.2. 3.0.0 run: 3 × 262K and 6 × 131K, every session resident (re-sent prompts ≥ 99.91 % cached), 0 preemptions. |
 | 8 MP image, one and two requests at once | Not re-measured on 3.0.2 (Pillow 13). 3.0.0 run, Pillow 12: correct; lowest free memory 1,158 MiB on any card. |
 | KV pool | 924,993 tokens |
-| Against 3.0.1 | Within run-to-run spread: decode +3 % / 0 % / 0 % at 4K / 131K / 262K, 262K prefill 0 %. |
+| Against 3.0.1 | Within run-to-run spread: decode +3 % / 0 % / 0 % at 4K / 131K / 262K, 262K prefill 0 %, 8 agents -2 %. GSM8K-200 thinking on unchanged (199). |
 
 ## Merlin 3.0.1 bench card (2026-11-02)
 

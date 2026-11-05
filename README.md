@@ -53,19 +53,19 @@ from source, which takes about 1.5 hours on 8 cores. The first start compiles ke
 
 ## Models
 
-| Model | Type | GPUs | KV pool, tokens | Decode at 262K | 8 agents, thinking on | 8 agents, thinking off (3.0.1 run) | GSM8K-200, thinking on (3.0.1 run) | GSM8K-200, thinking off (3.0.1 run) |
+| Model | Type | GPUs | KV pool, tokens | Decode at 262K | 8 agents, thinking on | 8 agents, thinking off (3.0.1 run) | GSM8K-200, thinking on | GSM8K-200, thinking off (3.0.1 run) |
 |---|---|---|---|---|---|---|---|---|
-| [Flash-Next](https://huggingface.co/halt95/Qwen3.8-Flash-Next-W4A16-Merlin) | 125B MoE | 4 | 924,993 | 207 tok/s | 654 tok/s | 664 tok/s | 197 | 199 |
-| [Swift1.5](https://huggingface.co/halt95/Swift1.5-Qwen3.8-Flash-Next-W4A16-Merlin) | Flash-Next fine-tune | 4 | 924,993 | 186 tok/s | 673 tok/s (3.0.1 run) | 650 tok/s | 199 | 197 |
-| [Swift1.5-Huihui](https://huggingface.co/halt95/Swift1.5-Huihui-Qwen3.8-Flash-Next-W4A16-Merlin) | Swift1.5, abliterated | 4 | 924,993 | 193 tok/s | 703 tok/s (3.0.1 run) | 681 tok/s | 198 | 198 |
-| [Qwen3.8-27B](https://huggingface.co/halt95/Qwen3.8-27B-W4A16-Merlin) | 27B dense | 1 / 2 / 4 | 271,506 / 826,689 / 2,012,105 | 77 / 146 / 250 tok/s | – / 682 / 940 tok/s | – / 615 / 854 tok/s | 198 (4 GPUs) | 195 / 194 / 197 |
-| [ThinkingCap](https://huggingface.co/halt95/ThinkingCap-Qwen3.8-27B-W4A16-Merlin) | 27B fine-tune | 2 / 4 | 826,689 / 2,012,105 | 160 / 223 tok/s | 697 / 952 tok/s (3.0.1 run) | 633 / 832 tok/s | 198 (4 GPUs) | 193 / 195 |
-| [Nemotron 3.5 Super VL](https://huggingface.co/halt95/Nemotron-3.5-Super-VL-120B-A12B-W4A16-Merlin) | 120B MoE, 1M context | 4 | 1,856,367 | 106 tok/s | 432 tok/s (3.0.1 run) | 432 tok/s | 197 | 195 |
-| [Ornith 1.5](https://huggingface.co/halt95/Ornith-1.5-122B-A10B-W4A16-Merlin) | 122B MoE | 4 | 894,618 | 111 tok/s | 528 tok/s (3.0.1 run) | 486 tok/s | 196 | 190 |
+| [Flash-Next](https://huggingface.co/halt95/Qwen3.8-Flash-Next-W4A16-Merlin) | 125B MoE | 4 | 924,993 | 207 tok/s | 654 tok/s | 664 tok/s | 197 (3.0.1 run) | 199 |
+| [Swift1.5](https://huggingface.co/halt95/Swift1.5-Qwen3.8-Flash-Next-W4A16-Merlin) | Flash-Next fine-tune | 4 | 924,993 | 186 tok/s | 659 tok/s | 650 tok/s | 199 | 197 |
+| [Swift1.5-Huihui](https://huggingface.co/halt95/Swift1.5-Huihui-Qwen3.8-Flash-Next-W4A16-Merlin) | Swift1.5, abliterated | 4 | 924,993 | 193 tok/s | 718 tok/s | 681 tok/s | 198 | 198 |
+| [Qwen3.8-27B](https://huggingface.co/halt95/Qwen3.8-27B-W4A16-Merlin) | 27B dense | 1 / 2 / 4 | 271,506 / 826,689 / 2,012,105 | 77 / 146 / 250 tok/s | – / 682 / 940 tok/s | – / 615 / 854 tok/s | 198 (4 GPUs; 3.0.1 run) | 195 / 194 / 197 |
+| [ThinkingCap](https://huggingface.co/halt95/ThinkingCap-Qwen3.8-27B-W4A16-Merlin) | 27B fine-tune | 2 / 4 | 826,689 / 2,012,105 | 160 / 223 tok/s | 708 / 939 tok/s | 633 / 832 tok/s | 198 (4 GPUs) | 193 / 195 |
+| [Nemotron 3.5 Super VL](https://huggingface.co/halt95/Nemotron-3.5-Super-VL-120B-A12B-W4A16-Merlin) | 120B MoE, 1M context | 4 | 1,856,367 | 106 tok/s | 432 tok/s (3.0.1 run) | 432 tok/s | 197 (3.0.1 run) | 195 |
+| [Ornith 1.5](https://huggingface.co/halt95/Ornith-1.5-122B-A10B-W4A16-Merlin) | 122B MoE | 4 | 894,618 | 111 tok/s | 528 tok/s (3.0.1 run) | 486 tok/s | 196 (3.0.1 run) | 190 |
 
 <sub>Merlin 3.0.2. Measured on 4 x RTX 3090 at 220 W with P2P enabled (aikitoria's open-gpu-kernel-modules P2P driver) and Zagitta's gpu-unlock. Decode is one stream with thinking on (reasoning effort medium where the checkpoint has one; the Nemotron 3.5 Super VL and Ornith 1.5 templates have no effort levels), at the full
 262,144-token context. 8 agents is total throughput for eight simultaneous follow-ups on 16K conversations; with thinking on (effort medium) a 512-token follow-up may end inside the reasoning, and reasoning tokens count. GSM8K-200 is correct answers out
-of 200. The GSM8K-200 figures are from the 3.0.1 run on vLLM 0.32 (the 3.0.1 card's protocol) and were not re-run for 3.0.2: thinking on at effort medium on four cards, thinking off from the 3.0.0 run, as the weights are unchanged. On the full GSM8K test set (1,319 problems, 5-shot, thinking off, temperature 0, 512 tokens) Flash-Next on 3.0.2 scored 1,281 (97.1 %), against 1,276 and 1,275 (96.7 %) for 3.0.1 in two runs of the same session. (3.0.1 run): figure from Merlin 3.0.1 on vLLM 0.32, not re-run for 3.0.2. All models use an FP8 KV cache and MTP speculative decoding. The bench cards
+of 200. GSM8K-200 follows the 3.0.1 card's protocol: thinking on at effort medium on four cards, re-run on 3.0.2 for Swift1.5, Swift1.5-Huihui and ThinkingCap; thinking off is from the 3.0.0 run, as the weights are unchanged. On the full GSM8K test set (1,319 problems, 5-shot, thinking off, temperature 0, 512 tokens) Flash-Next on 3.0.2 scored 1,281 (97.1 %), against 1,276 and 1,275 (96.7 %) for 3.0.1 in two runs of the same session. (3.0.1 run): figure from Merlin 3.0.1 on vLLM 0.32, not re-run for 3.0.2. All models use an FP8 KV cache and MTP speculative decoding. The bench cards
 have the full figures and method.</sub>
 
 ## Features

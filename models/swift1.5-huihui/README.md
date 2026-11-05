@@ -21,18 +21,18 @@ The 924,993-token KV pool was measured on this generated launcher (2026-10-16). 
 
 ## Merlin 3.0.2 bench card (2026-11-05)
 
-Maintainer measurements on 4× RTX 3090 (220 W, PCIe Gen4) with P2P (the aikitoria patched driver) and the Zagitta [gpu-unlock](https://github.com/Zagitta/gpu-unlock) kernel module, on vLLM 0.33.0, one fresh `merlin serve` boot, 2026-11-05; method and every cell in the [bench card](benchmarks/2026-11-05/BENCH-CARD.md). Decode is one stream with thinking on at reasoning effort medium, the server default (tok/s after the first streamed token); prefill is one cold request. With thinking on, a 512-token agent follow-up may end inside the reasoning, and reasoning tokens count. Rows marked (3.0.1 run) were not re-run for 3.0.2 and are on the 3.0.1 card below.
+Maintainer measurements on 4× RTX 3090 (220 W, PCIe Gen4) with P2P (the aikitoria patched driver) and the Zagitta [gpu-unlock](https://github.com/Zagitta/gpu-unlock) kernel module, on vLLM 0.33.0, two fresh `merlin serve` boots (decode and prefill; agents and GSM8K), 2026-11-05; method and every cell in the [bench card](benchmarks/2026-11-05/BENCH-CARD.md). Decode is one stream with thinking on at reasoning effort medium, the server default (tok/s after the first streamed token); prefill is one cold request. With thinking on, a 512-token agent follow-up may end inside the reasoning, and reasoning tokens count. Rows marked (3.0.1 run) were not re-run for 3.0.2 and are on the 3.0.1 card below.
 
 | Measurement | Swift1.5-Huihui |
 |---|---|
 | Decode, 4K / 131K / 262K prompt | 180 / 189 / 193 tok/s |
 | Cold prefill, 10K / 100K / 262K prompt | 6,608 / 7,008 / 6,830 tok/s |
-| Agents at once (8 × 16K conversations), total, thinking on / off | 703 / 681 tok/s (3.0.1 run) |
-| GSM8K-200 (5-shot), correct of 200, thinking on at medium / thinking off | 198 / 198 (3.0.1 run; thinking off from the 3.0.0 run) |
+| Agents at once (8 × 16K conversations), total, thinking on / off | 718 tok/s / 681 tok/s (the off figure is a 3.0.1 run) |
+| GSM8K-200 (5-shot), correct of 200, thinking on at medium / thinking off | 198 / 198 (thinking off from the 3.0.0 run) |
 | Sessions held at once | Not re-measured on 3.0.2. 3.0.0 run: 3 × 262K and 6 × 131K, every session resident (re-sent prompts ≥ 99.91 % cached), 0 preemptions. |
 | 8 MP image, one and two requests at once | Not re-measured on 3.0.2 (Pillow 13). 3.0.0 run, Pillow 12: correct; lowest free memory 1,136 MiB on any card. |
 | KV pool | 924,993 tokens |
-| Against 3.0.1 | Within run-to-run spread: decode +1 % / 0 % / -2 % at 4K / 131K / 262K, 262K prefill -1 %. Thinking off at 262K reads -10 %, with the 3.0.1 figure inside the spread of the three 3.0.2 sends (144 to 164 tok/s): the step time is level and MTP acceptance lower. |
+| Against 3.0.1 | Within run-to-run spread: decode +1 % / 0 % / -2 % at 4K / 131K / 262K, 262K prefill -1 %, 8 agents +2 %; GSM8K-200 thinking on unchanged (198). Thinking off at 262K reads -10 %, with the 3.0.1 figure inside the spread of the three 3.0.2 sends (144 to 164 tok/s): the step time is level and MTP acceptance lower. |
 
 ## Merlin 3.0.1 bench card (2026-11-02)
 

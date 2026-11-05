@@ -2,11 +2,11 @@
 
 > **Provenance.** Maintainer measurements on the reference host. Measured on 4 x RTX 3090 at 220 W with P2P enabled (aikitoria's open-gpu-kernel-modules P2P driver) and Zagitta's gpu-unlock. PCIe Gen4, no NVLink, driver 610.43.02.
 > Engine: Merlin 3.0.2 on vLLM 0.33.0, the 3.0.2 release tree. Served by `merlin serve` with the shipped
-> defaults, one fresh boot; measured 2026-11-05 (UTC).
+> defaults, one fresh boot for the decode and prefill rows and another for the agents and GSM8K rows; measured 2026-11-05 (UTC).
 > Streams are client-timed; drivers, raw streams and boot logs are not published.
 >
 > Checkpoint: [halt95/Swift1.5-Qwen3.8-Flash-Next-W4A16-Merlin](https://huggingface.co/halt95/Swift1.5-Qwen3.8-Flash-Next-W4A16-Merlin). The 3.0.1 column is the [2026-11-02 card](../2026-11-02/BENCH-CARD.md).
-> Layout: TP2 × PP2 + EP on four cards (`fn-swift1.5-quad-3090`), MTP K=3 probabilistic, FP8 KV; thinking-on effort `medium` (the server default); boot 407 s; KV pool 924,993 tokens.
+> Layout: TP2 × PP2 + EP on four cards (`fn-swift1.5-quad-3090`), MTP K=3 probabilistic, FP8 KV; thinking-on effort `medium` (the server default); boot 407 s (agents and GSM8K boot 372 s); KV pool 924,993 tokens.
 
 ## 1. Single-stream decode ladder
 
@@ -52,6 +52,24 @@ One cold send per depth (8 tokens out at 10K and 100K). The 3.0.2 262K row is th
 prompt tokens / time to first token. The 3.0.1 262K row is the 2026-11-01 run's cold send, as the 3.0.1 card notes, so
 its time to first token can differ slightly from that card's table 2.
 
-## 4. Not re-run
+## 4. Agents at once
 
-The 8-agent runs (thinking on and off), GSM8K-200, sessions held at once, images and the needle panel were not re-run for 3.0.2; the [3.0.1 card](../2026-11-02/BENCH-CARD.md) and the [3.0.0 card](../2026-10-20/BENCH-CARD.md) have them.
+Same method as the 3.0.1 card: eight 16K conversations, then eight simultaneous 512-token follow-ups, temperature 0.
+**Thinking on, reasoning effort medium** (the server default), each request setting medium. A 512-token follow-up may
+end inside the reasoning, and reasoning tokens count, so these totals measure decoded tokens, not finished answers.
+Total tok/s = tokens decoded while all eight stream / that overlap window. The thinking-off 8-agent run was not repeated
+for 3.0.2; the [3.0.1 card](../2026-11-02/BENCH-CARD.md) has it.
+
+| layout | 3.0.2 total tok/s, thinking on | 3.0.1 | change | overlap window s |
+|---|---|---|---|---|
+| Four cards | 659 | 673 | −2 % | 5.59 |
+
+## 5. GSM8K-200 at reasoning effort medium
+
+The 3.0.1 card's set and method (the same 200 problems, 5-shot, same scorer, temperature 0), with thinking on at
+medium, on four cards: **199/200** correct, none cut at the 8,192-token cap (mean 277 tokens, longest 2,322). The
+3.0.1 card scored 199/200; the thinking-off score on the 3.0.0 card is 197/200.
+
+## 6. Not re-run
+
+The thinking-off 8-agent run, the thinking-off GSM8K-200, sessions held at once, images and the needle panel were not re-run for 3.0.2; the [3.0.1 card](../2026-11-02/BENCH-CARD.md) and the [3.0.0 card](../2026-10-20/BENCH-CARD.md) have them.

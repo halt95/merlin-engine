@@ -92,20 +92,21 @@ ThinkingCap 2026-11-05). Columns as in 3.0.1:
 - decode is one stream, thinking on (effort medium where the template has levels), median of 3;
 - 8 agents is the total of eight simultaneous follow-ups on 16K conversations.
 
-\* marks a figure carried over from the 3.0.1 card. GSM8K-200 is carried over in every row: thinking on from the
-3.0.1 run, thinking off from the 3.0.0 run (the weights are unchanged). For Flash-Next, the full test set was run on
+\* marks a figure carried over from the 3.0.1 card. GSM8K-200 thinking on was re-run on 3.0.2 for Swift1.5,
+Swift1.5-Huihui and ThinkingCap; every other GSM8K-200 figure is carried over: thinking on from the 3.0.1 run,
+thinking off from the 3.0.0 run (the weights are unchanged). For Flash-Next, the full test set was run on
 3.0.2 (see Highlights).
 
 | Checkpoint | GPUs | KV pool, tokens | Decode, tok/s, 4K / 131K / 262K | 262K prefill | 8 agents, tok/s, thinking on / off | GSM8K-200, thinking on / off |
 |---|---|---|---|---|---|---|
 | Flash-Next | 4x | 924,993 | 172 / 189 / 207 | 6,782 tok/s | 654 / 664\* | 197 / 199 |
-| Swift1.5 | 4x | 924,993 | 181 / 187 / 186 | 6,762 tok/s | 673\* / 650\* | 199 / 197 |
-| Swift1.5-Huihui | 4x | 924,993 | 180 / 189 / 193 | 6,830 tok/s | 703\* / 681\* | 198 / 198 |
+| Swift1.5 | 4x | 924,993 | 181 / 187 / 186 | 6,762 tok/s | 659 / 650\* | 199 / 197 |
+| Swift1.5-Huihui | 4x | 924,993 | 180 / 189 / 193 | 6,830 tok/s | 718 / 681\* | 198 / 198 |
 | Qwen3.8-27B | 1x | 271,506 | 131 / 100 / 77 | 586 tok/s | n/a (two at most) | - / 195 |
 | Qwen3.8-27B | 2x | 826,689 | 211 / 184 / 146 | 1,112 tok/s | 682 / 615\* | - / 194 |
 | Qwen3.8-27B | 4x | 2,012,105 | 258 / 255 / 250 | 2,111 tok/s | 940 / 854\* | 198 / 197 |
-| ThinkingCap | 2x | 826,689 | 205 / 169 / 160 | 1,115 tok/s | 697\* / 633\* | - / 193 |
-| ThinkingCap | 4x | 2,012,105 | 238 / 235 / 223 | 2,108 tok/s | 952\* / 832\* | 198 / 195 |
+| ThinkingCap | 2x | 826,689 | 205 / 169 / 160 | 1,115 tok/s | 708 / 633\* | - / 193 |
+| ThinkingCap | 4x | 2,012,105 | 238 / 235 / 223 | 2,108 tok/s | 939 / 832\* | 198 / 195 |
 | Nemotron 3.5 Super VL | 4x | 1,856,367 (the shipped 1M context) | 101 / 101 / 106 | 4,217 tok/s | 432\* / 432\* | 197 / 195 |
 | Ornith 1.5 | 4x | 894,618 | 145 / 122 / 111 | 2,288 tok/s | 528\* / 486\* | 196 / 190 |
 

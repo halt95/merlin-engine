@@ -3,9 +3,9 @@
 One card per checkpoint, measured on the reference host on vLLM 0.33.0. Measured on 4 x RTX 3090 at 220 W with P2P enabled (aikitoria's open-gpu-kernel-modules P2P driver) and Zagitta's gpu-unlock.
 Each card has the single-stream decode ladder at 4K and 131K with thinking on and off (the Swift1.5, Swift1.5-Huihui and ThinkingCap cards at
 4K, 32K, 131K and 259K), the exact 262K row
-(261,888 prompt tokens + 128 out) and cold prefill, compared with the 3.0.1 card. The Flash-Next and Qwen3.8-27B (2 and 4
-GPUs) cards also carry a fresh 8-agent row with thinking on; the Nemotron 3.5 Super VL, Ornith 1.5, Swift1.5, Swift1.5-Huihui and ThinkingCap 8-agent runs were
-not repeated for 3.0.2 (their 3.0.1 cards have them). The Flash-Next card also has a same-session quality A/B against 3.0.1.
+(261,888 prompt tokens + 128 out) and cold prefill, compared with the 3.0.1 card. The Flash-Next, Qwen3.8-27B (2 and 4
+GPUs), Swift1.5, Swift1.5-Huihui and ThinkingCap (2 and 4 GPUs) cards also carry a fresh 8-agent row with thinking on; the Nemotron 3.5 Super VL and Ornith 1.5 8-agent runs were
+not repeated for 3.0.2 (their 3.0.1 cards have them). The Swift1.5, Swift1.5-Huihui and ThinkingCap cards also have GSM8K-200 with thinking on. The Flash-Next card also has a same-session quality A/B against 3.0.1.
 
 | card | checkpoint | GPUs | compared with |
 |---|---|---|---|
