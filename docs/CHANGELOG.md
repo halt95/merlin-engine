@@ -43,7 +43,8 @@ Nothing yet.
   3.0.1 again) scored the full GSM8K test set at 1,281 of 1,319 (97.1 %) on 3.0.2 against 1,276 and 1,275 (96.7 %) on
   3.0.1. On the nine 32K needle prompts 3.0.2 refused two more requests than 3.0.1 (it answered 4 of 9, 3.0.1 6 of 9 in
   both runs; the needle is phrased as a secret passphrase), with no wrong recall on any side: every miss was a refusal.
-  Swift1.5, Swift1.5-Huihui and ThinkingCap were not run on the 3.0.2 wheel before release. The NCCL and P2P sweep, the
+  Swift1.5 booted, served a 262K request and had its bench card re-run on 3.0.2 on 2026-11-05 (no identity run);
+  Swift1.5-Huihui and ThinkingCap were not run on the 3.0.2 wheel before release. The NCCL and P2P sweep, the
   vision check, the Triton requalification and the heavier A/Bs were not run for 3.0.2.
 - **FlashInfer 0.7.2.post1 with the sm_86 FP8 patches re-ported.** The small-query verify tile (patch 0001) and the
   workload plan mode (patch 0002) are rebuilt for the new FlashInfer and keep their switches and defaults: the tile is on
@@ -147,7 +148,7 @@ Nothing yet.
 ### Measured on Merlin 3.0.2
 
 4x RTX 3090 without NVLink, P2P on, Zagitta's gpu-unlock, 220 W, 2026-11-04 bench cards (runs measured
-2026-11-04 UTC). Decode: one stream, thinking on (reasoning effort medium where the checkpoint has one; the
+2026-11-04 UTC; Swift1.5 2026-11-05). Decode: one stream, thinking on (reasoning effort medium where the checkpoint has one; the
 Nemotron 3.5 Super VL and Ornith 1.5 templates have no effort levels), median of 3, at a 4K / 131K prompt and the full
 262,144-token context (261,888 prompt + 128 out). 8 agents: total throughput of eight simultaneous follow-ups on 16K
 conversations; with thinking on a 512-token follow-up may end inside the reasoning, and reasoning tokens count. GSM8K-200 is
@@ -159,7 +160,7 @@ On the full GSM8K test set (1,319 problems, 5-shot, thinking off, temperature 0,
 | Checkpoint | GPUs | KV pool, tokens | Decode, tok/s, 4K / 131K / 262K | 262K prefill | 8 agents, tok/s, thinking on / off | GSM8K-200, thinking on / off |
 |---|---|---|---|---|---|---|
 | Flash-Next | 4x | 924,993 | 172 / 189 / 207 | 6,782 tok/s | 654 / 664 (3.0.1 run) | 197 / 199 (both 3.0.1 run) |
-| Swift1.5 (3.0.1 run) | 4x | 924,993 | 176 / 186 / 186 | 6,783 tok/s | 673 / 650 | 199 / 197 |
+| Swift1.5 | 4x | 924,993 | 181 / 187 / 186 | 6,762 tok/s | 673 / 650 (both 3.0.1 run) | 199 / 197 (both 3.0.1 run) |
 | Swift1.5-Huihui (3.0.1 run) | 4x | 924,993 | 178 / 189 / 196 | 6,866 tok/s | 703 / 681 | 198 / 198 |
 | Qwen3.8-27B | 1x | 271,506 | 131 / 100 / 77 | 586 tok/s | n/a (two at most) | - / 195 (3.0.1 run) |
 | Qwen3.8-27B | 2x | 826,689 | 211 / 184 / 146 | 1,112 tok/s | 682 / 615 (3.0.1 run) | - / 194 (3.0.1 run) |
@@ -176,13 +177,13 @@ depth. Card-to-card decode figures move with MTP acceptance, which varies by sev
 these runs and are neither gains nor losses; read decode by the step time instead: on Flash-Next it is 1.2-1.9 % shorter
 than on 3.0.1 in every row. Flash-Next cold prefill is level with 3.0.1 in a same-session A/B (+0.5 % at 10K, -0.2 % at 100K). Rows 2 % or
 more below the 3.0.1 card: Flash-Next 4K decode -3 % (-4 % with thinking off); Qwen3.8-27B thinking-off 4K decode -2 %,
--3 % and -4 % on 4, 2 and 1 GPUs and thinking-off 262K -2 % on 2 GPUs; Ornith 1.5 thinking-off 4K and 262K -3 %; Super VL
+-3 % and -4 % on 4, 2 and 1 GPUs and thinking-off 262K -2 % on 2 GPUs; Ornith 1.5 thinking-off 4K and 262K -3 %; Swift1.5 thinking-off 259K -2 % and cold prefill -2 % at 100K; Super VL
 thinking-off 131K -4 % (one valid send); 8 agents with thinking on -3 % on Flash-Next and on two-card 27B (the 27B totals
-come from overlap windows under 4 s; read them loosely). Swift1.5, Swift1.5-Huihui and ThinkingCap were not re-run. Each checkpoint's card is under `models/<checkpoint>/benchmarks/2026-11-04/`,
+come from overlap windows under 4 s; read them loosely). Swift1.5-Huihui and ThinkingCap were not re-run. Each checkpoint's card is under `models/<checkpoint>/benchmarks/2026-11-04/` (Swift1.5's under `2026-11-05/`),
 for example [Flash-Next](../models/flash-next/benchmarks/2026-11-04/BENCH-CARD.md) and
 [Qwen3.8-27B](../models/qwen38-27b/benchmarks/2026-11-04/BENCH-CARD.md). Figures marked (3.0.1 run) are carried over
-from the 3.0.1 cards for rows that were not re-run: every Swift1.5, Swift1.5-Huihui and ThinkingCap row (those checkpoints were not benchmarked for
-3.0.2); every GSM8K-200 figure; every thinking-off 8-agent figure; the 8-agent figures for Nemotron 3.5 Super VL and Ornith 1.5.
+from the 3.0.1 cards for rows that were not re-run: every Swift1.5-Huihui and ThinkingCap row (those checkpoints were not benchmarked for
+3.0.2); every GSM8K-200 figure; every thinking-off 8-agent figure; the 8-agent figures for Swift1.5, Nemotron 3.5 Super VL and Ornith 1.5.
 
 ### Before you upgrade
 

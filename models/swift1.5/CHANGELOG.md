@@ -10,8 +10,8 @@ Release notes, newest first. To install and run the current release, see the [RE
 ## Merlin 3.0.2
 
 The Swift recipe runs on **vLLM 0.33.0** in Merlin 3.0.2; the recipe version stays 3.0.0. See the
-[engine changelog](../../docs/CHANGELOG.md#merlin-302). This recipe was not benchmarked for 3.0.2; the latest card is the
-[2026-11-02 bench card](benchmarks/2026-11-02/BENCH-CARD.md) (the 3.0.1 card; no 3.0.2 card). Swift1.5 and Swift1.5-Huihui now refuse a
+[engine changelog](../../docs/CHANGELOG.md#merlin-302). This recipe's results are in the
+[2026-11-05 bench card](benchmarks/2026-11-05/BENCH-CARD.md); the 2026-11-02 card stays as the 3.0.1 comparator. Swift1.5 and Swift1.5-Huihui now refuse a
 directory whose `config.json` matches but that has neither the release scales file nor the verified marker (pass `SCALES=` or run
 `merlin pull`), because `config.json` is identical across Flash-Next, Swift1.5 and Swift1.5-Huihui.
 

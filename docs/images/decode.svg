@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1280" height="1466" viewBox="0 0 1280 1466" role="img" aria-labelledby="ttl dsc">
 <title id="ttl">Decode speed at 4K, 131K and the full 262K context</title>
-<desc id="dsc">One stream, thinking on, median of 3. Merlin 3.0.2, RTX 3090s at 220 W. * 3.0.1 run, not re-run for 3.0.2. Flash-Next 4× 3090: 172 at 4K, 189 at 131K, 207 at 262K; Swift1.5 * 4× 3090: 176 at 4K, 186 at 131K, 186 at 262K; Swift1.5-Huihui * 4× 3090: 178 at 4K, 189 at 131K, 196 at 262K; Qwen3.8-27B 1× 3090: 131 at 4K, 100 at 131K, 77 at 262K; Qwen3.8-27B 2× 3090: 211 at 4K, 184 at 131K, 146 at 262K; Qwen3.8-27B 4× 3090: 258 at 4K, 255 at 131K, 250 at 262K; ThinkingCap * 2× 3090: 203 at 4K, 162 at 131K, 160 at 262K; ThinkingCap * 4× 3090: 244 at 4K, 230 at 131K, 238 at 262K; Nemotron 3.5 Super VL 4× 3090: 101 at 4K, 101 at 131K, 106 at 262K; Ornith 1.5 4× 3090: 145 at 4K, 122 at 131K, 111 at 262K (tok/s).</desc>
+<desc id="dsc">One stream, thinking on, median of 3. Merlin 3.0.2, RTX 3090s at 220 W. * 3.0.1 run, not re-run for 3.0.2. Flash-Next 4× 3090: 172 at 4K, 189 at 131K, 207 at 262K; Swift1.5 4× 3090: 181 at 4K, 187 at 131K, 186 at 262K; Swift1.5-Huihui * 4× 3090: 178 at 4K, 189 at 131K, 196 at 262K; Qwen3.8-27B 1× 3090: 131 at 4K, 100 at 131K, 77 at 262K; Qwen3.8-27B 2× 3090: 211 at 4K, 184 at 131K, 146 at 262K; Qwen3.8-27B 4× 3090: 258 at 4K, 255 at 131K, 250 at 262K; ThinkingCap * 2× 3090: 203 at 4K, 162 at 131K, 160 at 262K; ThinkingCap * 4× 3090: 244 at 4K, 230 at 131K, 238 at 262K; Nemotron 3.5 Super VL 4× 3090: 101 at 4K, 101 at 131K, 106 at 262K; Ornith 1.5 4× 3090: 145 at 4K, 122 at 131K, 111 at 262K (tok/s).</desc>
 <defs>
 <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#0a0f24"/><stop offset="0.55" stop-color="#121638"/><stop offset="1" stop-color="#1d1145"/></linearGradient>
 <radialGradient id="glow" cx="0.9" cy="0.05" r="0.5"><stop offset="0" stop-color="#5b6cff" stop-opacity="0.22"/><stop offset="1" stop-color="#5b6cff" stop-opacity="0"/></radialGradient>
@@ -35,11 +35,11 @@
 <text x="899.2" y="302.0" font-size="19" font-weight="500" fill="#9aa4bf">189</text>
 <path d="M428.0,310.0 H928.1 Q933.1,310.0 933.1,315.0 V325.0 Q933.1,330.0 928.1,330.0 H428.0 Z" fill="#b9a4ff"/>
 <text x="943.1" y="327.0" font-size="21" font-weight="700" fill="#ffffff">207</text>
-<text x="56" y="401.0" font-size="23" font-weight="600" fill="#eef1fb">Swift1.5 *<tspan font-weight="400" fill="#7f88a6" dx="10">4× 3090</tspan></text>
-<path d="M428.0,358.0 H852.4 Q857.4,358.0 857.4,363.0 V373.0 Q857.4,378.0 852.4,378.0 H428.0 Z" fill="#3f4fa8"/>
-<text x="867.4" y="375.0" font-size="19" font-weight="500" fill="#9aa4bf">176</text>
-<path d="M428.0,383.0 H876.8 Q881.8,383.0 881.8,388.0 V398.0 Q881.8,403.0 876.8,403.0 H428.0 Z" fill="#6f7fe8"/>
-<text x="891.8" y="400.0" font-size="19" font-weight="500" fill="#9aa4bf">186</text>
+<text x="56" y="401.0" font-size="23" font-weight="600" fill="#eef1fb">Swift1.5<tspan font-weight="400" fill="#7f88a6" dx="10">4× 3090</tspan></text>
+<path d="M428.0,358.0 H864.6 Q869.6,358.0 869.6,363.0 V373.0 Q869.6,378.0 864.6,378.0 H428.0 Z" fill="#3f4fa8"/>
+<text x="879.6" y="375.0" font-size="19" font-weight="500" fill="#9aa4bf">181</text>
+<path d="M428.0,383.0 H879.3 Q884.3,383.0 884.3,388.0 V398.0 Q884.3,403.0 879.3,403.0 H428.0 Z" fill="#6f7fe8"/>
+<text x="894.3" y="400.0" font-size="19" font-weight="500" fill="#9aa4bf">187</text>
 <path d="M428.0,408.0 H876.8 Q881.8,408.0 881.8,413.0 V423.0 Q881.8,428.0 876.8,428.0 H428.0 Z" fill="#b9a4ff"/>
 <text x="891.8" y="425.0" font-size="21" font-weight="700" fill="#ffffff">186</text>
 <text x="56" y="499.0" font-size="23" font-weight="600" fill="#eef1fb">Swift1.5-Huihui *<tspan font-weight="400" fill="#7f88a6" dx="10">4× 3090</tspan></text>
