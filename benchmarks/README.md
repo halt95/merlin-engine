@@ -8,7 +8,7 @@ two 2026-10-12 cards.
 
 | date | card | release |
 |---|---|---|
-| 2026-11-04 | [Merlin 3.0.2: Flash-Next, Swift1.5, Qwen3.8-27B, Nemotron 3.5 Super VL, Ornith 1.5](2026-11-04/README.md) | Merlin 3.0.2 (vLLM 0.33; Swift1.5 run 2026-11-05; the other checkpoints keep their 3.0.1 cards) |
+| 2026-11-04 | [Merlin 3.0.2: Flash-Next, Swift1.5, Swift1.5-Huihui, Qwen3.8-27B, Nemotron 3.5 Super VL, Ornith 1.5](2026-11-04/README.md) | Merlin 3.0.2 (vLLM 0.33; Swift1.5 and Swift1.5-Huihui run 2026-11-05; ThinkingCap keeps its 3.0.1 card) |
 | 2026-11-02 | [Merlin 3.0.1: all checkpoints](2026-11-02/README.md) | Merlin 3.0.1 (measured with gpu-unlock plus P2P) |
 | 2026-10-20 | [Merlin 3.0.0: all checkpoints](2026-10-20/README.md) | Merlin 3.0.0 (one engine for every checkpoint) |
 | 2026-10-12 | [Flash-Next v2.5.2](2026-10-12/Flash-Next-BENCH-CARD.md) | qwen38-flash-next-3090s v2.5.2 |

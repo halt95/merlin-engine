@@ -15,13 +15,24 @@ Recipe version: [3.0.0](VERSION). This is the abliterated Swift 1.5 W4A16 checkp
 
 The canonical [serve.sh](serve.sh) is generated from `tools/merlin/profiles/flash-next.json` by `tools/merlin/preflight.py`, using profile `fn-swift1.5-huihui-quad-3090`. It starts this checkout directly. A boot-and-check run of the generated launcher on 2026-10-16 gave: boot 398 s, GSM8K-20 20/20, ITL 4K / 32K 18.78 / 18.87 ms, and the Merlin 3.0.0 release bench card on the release wheel (2026-10-20): the Huihui quad is tested on the reference host.
 
-Huihui has its own [3.0.1 bench card](benchmarks/2026-11-02/BENCH-CARD.md) (below) and its own [3.0.0 bench card](benchmarks/2026-10-20/BENCH-CARD.md) (2026-10-20: decode, prefill, residency, 8 MP image, 2-agent, GSM8K-200 and needles, the needle panel from a 2026-10-17 pre-release build; its 8 agents were re-run on the released install, 2026-10-21); the remaining heavy results are **inherited from Swift**. Swift at 8 MP (8,388,608 pixels per image) on 4× RTX 3090 / 0.32 measured **stage-0 minimum free memory 902 MiB** on 2026-10-15. Huihui's generated launcher independently passed the 2026-10-16 8 MP check with 902 MiB minimum free; broader heavy results remain inherited from Swift. See [Swift's qualification status](../swift1.5/README.md#qualification-status).
+Huihui has its own [3.0.2 bench card](benchmarks/2026-11-05/BENCH-CARD.md) and [3.0.1 bench card](benchmarks/2026-11-02/BENCH-CARD.md) (both below) and its own [3.0.0 bench card](benchmarks/2026-10-20/BENCH-CARD.md) (2026-10-20: decode, prefill, residency, 8 MP image, 2-agent, GSM8K-200 and needles, the needle panel from a 2026-10-17 pre-release build; its 8 agents were re-run on the released install, 2026-10-21); the remaining heavy results are **inherited from Swift**. Swift at 8 MP (8,388,608 pixels per image) on 4× RTX 3090 / 0.32 measured **stage-0 minimum free memory 902 MiB** on 2026-10-15. Huihui's generated launcher independently passed the 2026-10-16 8 MP check with 902 MiB minimum free; broader heavy results remain inherited from Swift. See [Swift's qualification status](../swift1.5/README.md#qualification-status).
 
 The 924,993-token KV pool was measured on this generated launcher (2026-10-16). Earlier quality and speed numbers are recorded in the [2026-10-12 bench card](benchmarks/2026-10-12/Huihui-BENCH-CARD.md); those vLLM 0.30 results do not qualify Merlin 3.0.0.
 
-## Merlin 3.0.2
+## Merlin 3.0.2 bench card (2026-11-05)
 
-This checkpoint was not benchmarked for 3.0.2. It was not run on the 3.0.2 wheel before release. The 3.0.1 bench card below is the latest measurement and was taken on vLLM 0.32. There is no 3.0.2 card.
+Maintainer measurements on 4× RTX 3090 (220 W, PCIe Gen4) with P2P (the aikitoria patched driver) and the Zagitta [gpu-unlock](https://github.com/Zagitta/gpu-unlock) kernel module, on vLLM 0.33.0, one fresh `merlin serve` boot, 2026-11-05; method and every cell in the [bench card](benchmarks/2026-11-05/BENCH-CARD.md). Decode is one stream with thinking on at reasoning effort medium, the server default (tok/s after the first streamed token); prefill is one cold request. With thinking on, a 512-token agent follow-up may end inside the reasoning, and reasoning tokens count. Rows marked (3.0.1 run) were not re-run for 3.0.2 and are on the 3.0.1 card below.
+
+| Measurement | Swift1.5-Huihui |
+|---|---|
+| Decode, 4K / 131K / 262K prompt | 180 / 189 / 193 tok/s |
+| Cold prefill, 10K / 100K / 262K prompt | 6,608 / 7,008 / 6,830 tok/s |
+| Agents at once (8 × 16K conversations), total, thinking on / off | 703 / 681 tok/s (3.0.1 run) |
+| GSM8K-200 (5-shot), correct of 200, thinking on at medium / thinking off | 198 / 198 (3.0.1 run; thinking off from the 3.0.0 run) |
+| Sessions held at once | Not re-measured on 3.0.2. 3.0.0 run: 3 × 262K and 6 × 131K, every session resident (re-sent prompts ≥ 99.91 % cached), 0 preemptions. |
+| 8 MP image, one and two requests at once | Not re-measured on 3.0.2 (Pillow 13). 3.0.0 run, Pillow 12: correct; lowest free memory 1,136 MiB on any card. |
+| KV pool | 924,993 tokens |
+| Against 3.0.1 | Within run-to-run spread: decode +1 % / 0 % / -2 % at 4K / 131K / 262K, 262K prefill -1 %. Thinking off at 262K reads -10 %, with the 3.0.1 figure inside the spread of the three 3.0.2 sends (144 to 164 tok/s): the step time is level and MTP acceptance lower. |
 
 ## Merlin 3.0.1 bench card (2026-11-02)
 
