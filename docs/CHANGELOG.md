@@ -32,7 +32,7 @@ the 3.0.2 bench table were measured for this release, except those marked as car
 - **vLLM 0.33.0 base.** torch 2.14.0 (NCCL 2.30.7), torchvision 0.29.0, Triton 3.8.0, FlashInfer 0.7.2.post1,
   humming-kernels 0.1.19, Transformers 5.20.2 and Pillow 13.0.0. The CUDA 13.0 toolkit and the sm_80/86/89 build are
   unchanged.
-  - **Lanes:** every lane except ThinkingCap was re-run on 3.0.2: it booted, served a 262K request and has a new
+  - **Lanes:** every lane was re-run on 3.0.2: it booted, served a 262K request and has a new
     bench card. The KV host tier reached 98.3 % (Flash-Next) and 98.2 % (Qwen3.8-27B) of the trace's ceiling.
   - **Temperature-0 output:** the 27B (two cards) and Super VL match 3.0.1 within the variation 3.0.1 shows on its
     own. Flash-Next's output differs from 3.0.1's (new torch, Triton and FlashInfer), by less than 3.0.1's own
@@ -87,8 +87,8 @@ the 3.0.2 bench table were measured for this release, except those marked as car
 
 ### Measured on Merlin 3.0.2
 
-4× RTX 3090 without NVLink, P2P on, Zagitta's gpu-unlock, 220 W; runs of 2026-11-04 (Swift1.5 and Swift1.5-Huihui
-2026-11-05). Columns as in 3.0.1:
+4× RTX 3090 without NVLink, P2P on, Zagitta's gpu-unlock, 220 W; runs of 2026-11-04 (Swift1.5, Swift1.5-Huihui and
+ThinkingCap 2026-11-05). Columns as in 3.0.1:
 - decode is one stream, thinking on (effort medium where the template has levels), median of 3;
 - 8 agents is the total of eight simultaneous follow-ups on 16K conversations.
 
@@ -104,8 +104,8 @@ the 3.0.2 bench table were measured for this release, except those marked as car
 | Qwen3.8-27B | 1x | 271,506 | 131 / 100 / 77 | 586 tok/s | n/a (two at most) | - / 195 |
 | Qwen3.8-27B | 2x | 826,689 | 211 / 184 / 146 | 1,112 tok/s | 682 / 615\* | - / 194 |
 | Qwen3.8-27B | 4x | 2,012,105 | 258 / 255 / 250 | 2,111 tok/s | 940 / 854\* | 198 / 197 |
-| ThinkingCap (3.0.1 run) | 2x | 826,689 | 203 / 162 / 160 | 1,114 tok/s | 697 / 633 | - / 193 |
-| ThinkingCap (3.0.1 run) | 4x | 2,012,105 | 244 / 230 / 238 | 2,099 tok/s | 952 / 832 | 198 / 195 |
+| ThinkingCap | 2x | 826,689 | 205 / 169 / 160 | 1,115 tok/s | 697\* / 633\* | - / 193 |
+| ThinkingCap | 4x | 2,012,105 | 238 / 235 / 223 | 2,108 tok/s | 952\* / 832\* | 198 / 195 |
 | Nemotron 3.5 Super VL | 4x | 1,856,367 (the shipped 1M context) | 101 / 101 / 106 | 4,217 tok/s | 432\* / 432\* | 197 / 195 |
 | Ornith 1.5 | 4x | 894,618 | 145 / 122 / 111 | 2,288 tok/s | 528\* / 486\* | 196 / 190 |
 
@@ -116,15 +116,18 @@ Against 3.0.1:
   3.0.1's in every row.
 - **A few rows read 2-4 % lower,** mostly thinking-off 4K. Swift1.5-Huihui's thinking-off 262K reads 10 % lower, from
   MTP acceptance: its step time is level, and the 3.0.1 figure is inside the spread of its three 3.0.2 sends.
+- **ThinkingCap's four-card 262K reads 6 % lower** with thinking on, also from MTP acceptance (4.00 against 4.27
+  tokens per step; step time 19.60 against 19.56 ms). All three 3.0.2 sends read below the 3.0.1 figure; the 259K
+  ladder cell reads 8 % higher.
 
 Every row is in the bench cards:
 - [Flash-Next](../models/flash-next/benchmarks/2026-11-04/BENCH-CARD.md);
 - [Swift1.5](../models/swift1.5/benchmarks/2026-11-05/BENCH-CARD.md);
 - [Swift1.5-Huihui](../models/swift1.5-huihui/benchmarks/2026-11-05/BENCH-CARD.md);
 - [Qwen3.8-27B](../models/qwen38-27b/benchmarks/2026-11-04/BENCH-CARD.md);
+- [ThinkingCap](../models/thinkingcap/benchmarks/2026-11-05/BENCH-CARD.md);
 - [Super VL](../models/nemotron-super-vl/benchmarks/2026-11-04/BENCH-CARD.md);
-- [Ornith 1.5](../models/ornith1.5/benchmarks/2026-11-04/BENCH-CARD.md);
-- ThinkingCap's latest is its [3.0.1 card](../models/thinkingcap/benchmarks/2026-11-02/BENCH-CARD.md).
+- [Ornith 1.5](../models/ornith1.5/benchmarks/2026-11-04/BENCH-CARD.md).
 
 ### Before you upgrade
 
@@ -261,13 +264,13 @@ Each waits for a hit-rate or token-identity comparison:
   marker next to punctuation or code.
 - **The compile-cache guard cannot see a fault that kills the process before Python does.**
 - **The KV RAM cache limits from 3.0.1 still apply.**
-- **Not re-checked on 3.0.2:** ThinkingCap; the NCCL/P2P sweep; the Triton autotune requalification; the 27B 8 MP image
+- **Not re-checked on 3.0.2:** the NCCL/P2P sweep; the Triton autotune requalification; the 27B 8 MP image
   check.
 
 ### Docs
 
 - Install lines, badges and lock references name 0.33.0, `release/requirements-0.33.lock` and FlashInfer 0.7.2.post1.
-- Every model card except ThinkingCap gains a 3.0.2 bench-card section.
+- Every model card gains a 3.0.2 bench-card section.
 
 ## Merlin 3.0.1
 

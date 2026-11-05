@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1280" height="1466" viewBox="0 0 1280 1466" role="img" aria-labelledby="ttl dsc">
 <title id="ttl">Decode speed at 4K, 131K and the full 262K context</title>
-<desc id="dsc">One stream, thinking on, median of 3. Merlin 3.0.2, RTX 3090s at 220 W. * 3.0.1 run, not re-run for 3.0.2. Flash-Next 4× 3090: 172 at 4K, 189 at 131K, 207 at 262K; Swift1.5 4× 3090: 181 at 4K, 187 at 131K, 186 at 262K; Swift1.5-Huihui 4× 3090: 180 at 4K, 189 at 131K, 193 at 262K; Qwen3.8-27B 1× 3090: 131 at 4K, 100 at 131K, 77 at 262K; Qwen3.8-27B 2× 3090: 211 at 4K, 184 at 131K, 146 at 262K; Qwen3.8-27B 4× 3090: 258 at 4K, 255 at 131K, 250 at 262K; ThinkingCap * 2× 3090: 203 at 4K, 162 at 131K, 160 at 262K; ThinkingCap * 4× 3090: 244 at 4K, 230 at 131K, 238 at 262K; Nemotron 3.5 Super VL 4× 3090: 101 at 4K, 101 at 131K, 106 at 262K; Ornith 1.5 4× 3090: 145 at 4K, 122 at 131K, 111 at 262K (tok/s).</desc>
+<desc id="dsc">One stream, thinking on, median of 3. Merlin 3.0.2, RTX 3090s at 220 W. Flash-Next 4× 3090: 172 at 4K, 189 at 131K, 207 at 262K; Swift1.5 4× 3090: 181 at 4K, 187 at 131K, 186 at 262K; Swift1.5-Huihui 4× 3090: 180 at 4K, 189 at 131K, 193 at 262K; Qwen3.8-27B 1× 3090: 131 at 4K, 100 at 131K, 77 at 262K; Qwen3.8-27B 2× 3090: 211 at 4K, 184 at 131K, 146 at 262K; Qwen3.8-27B 4× 3090: 258 at 4K, 255 at 131K, 250 at 262K; ThinkingCap 2× 3090: 205 at 4K, 169 at 131K, 160 at 262K; ThinkingCap 4× 3090: 238 at 4K, 235 at 131K, 223 at 262K; Nemotron 3.5 Super VL 4× 3090: 101 at 4K, 101 at 131K, 106 at 262K; Ornith 1.5 4× 3090: 145 at 4K, 122 at 131K, 111 at 262K (tok/s).</desc>
 <defs>
 <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#0a0f24"/><stop offset="0.55" stop-color="#121638"/><stop offset="1" stop-color="#1d1145"/></linearGradient>
 <radialGradient id="glow" cx="0.9" cy="0.05" r="0.5"><stop offset="0" stop-color="#5b6cff" stop-opacity="0.22"/><stop offset="1" stop-color="#5b6cff" stop-opacity="0"/></radialGradient>
@@ -11,7 +11,7 @@
 <rect width="1280" height="1466" fill="url(#bg)"/>
 <rect width="1280" height="1466" fill="url(#glow)"/>
 <text x="56" y="76" font-size="36" font-weight="700" fill="#ffffff">Decode speed at 4K, 131K and the full 262K context</text>
-<text x="56" y="114" font-size="22" fill="#9aa4bf">One stream, thinking on, median of 3. Merlin 3.0.2, RTX 3090s at 220 W. * 3.0.1 run, not re-run for 3.0.2.</text>
+<text x="56" y="114" font-size="22" fill="#9aa4bf">One stream, thinking on, median of 3. Merlin 3.0.2, RTX 3090s at 220 W.</text>
 <rect x="56" y="142" width="20" height="20" rx="5" fill="#3f4fa8"/>
 <text x="86" y="159" font-size="20" fill="#c9d1e6">4K prompt</text>
 <rect x="222.79999999999998" y="142" width="20" height="20" rx="5" fill="#6f7fe8"/>
@@ -72,20 +72,20 @@
 <text x="1060.2" y="842.0" font-size="19" font-weight="500" fill="#9aa4bf">255</text>
 <path d="M428.0,850.0 H1033.0 Q1038.0,850.0 1038.0,855.0 V865.0 Q1038.0,870.0 1033.0,870.0 H428.0 Z" fill="#b9a4ff"/>
 <text x="1048.0" y="867.0" font-size="21" font-weight="700" fill="#ffffff">250</text>
-<text x="56" y="941.0" font-size="23" font-weight="600" fill="#eef1fb">ThinkingCap *<tspan font-weight="400" fill="#7f88a6" dx="10">2× 3090</tspan></text>
-<path d="M428.0,898.0 H918.3 Q923.3,898.0 923.3,903.0 V913.0 Q923.3,918.0 918.3,918.0 H428.0 Z" fill="#3f4fa8"/>
-<text x="933.3" y="915.0" font-size="19" font-weight="500" fill="#9aa4bf">203</text>
-<path d="M428.0,923.0 H818.3 Q823.3,923.0 823.3,928.0 V938.0 Q823.3,943.0 818.3,943.0 H428.0 Z" fill="#6f7fe8"/>
-<text x="833.3" y="940.0" font-size="19" font-weight="500" fill="#9aa4bf">162</text>
+<text x="56" y="941.0" font-size="23" font-weight="600" fill="#eef1fb">ThinkingCap<tspan font-weight="400" fill="#7f88a6" dx="10">2× 3090</tspan></text>
+<path d="M428.0,898.0 H923.2 Q928.2,898.0 928.2,903.0 V913.0 Q928.2,918.0 923.2,918.0 H428.0 Z" fill="#3f4fa8"/>
+<text x="938.2" y="915.0" font-size="19" font-weight="500" fill="#9aa4bf">205</text>
+<path d="M428.0,923.0 H835.4 Q840.4,923.0 840.4,928.0 V938.0 Q840.4,943.0 835.4,943.0 H428.0 Z" fill="#6f7fe8"/>
+<text x="850.4" y="940.0" font-size="19" font-weight="500" fill="#9aa4bf">169</text>
 <path d="M428.0,948.0 H813.4 Q818.4,948.0 818.4,953.0 V963.0 Q818.4,968.0 813.4,968.0 H428.0 Z" fill="#b9a4ff"/>
 <text x="828.4" y="965.0" font-size="21" font-weight="700" fill="#ffffff">160</text>
-<text x="56" y="1039.0" font-size="23" font-weight="600" fill="#eef1fb">ThinkingCap *<tspan font-weight="400" fill="#7f88a6" dx="10">4× 3090</tspan></text>
-<path d="M428.0,996.0 H1018.4 Q1023.4,996.0 1023.4,1001.0 V1011.0 Q1023.4,1016.0 1018.4,1016.0 H428.0 Z" fill="#3f4fa8"/>
-<text x="1033.4" y="1013.0" font-size="19" font-weight="500" fill="#9aa4bf">244</text>
-<path d="M428.0,1021.0 H984.2 Q989.2,1021.0 989.2,1026.0 V1036.0 Q989.2,1041.0 984.2,1041.0 H428.0 Z" fill="#6f7fe8"/>
-<text x="999.2" y="1038.0" font-size="19" font-weight="500" fill="#9aa4bf">230</text>
-<path d="M428.0,1046.0 H1003.7 Q1008.7,1046.0 1008.7,1051.0 V1061.0 Q1008.7,1066.0 1003.7,1066.0 H428.0 Z" fill="#b9a4ff"/>
-<text x="1018.7" y="1063.0" font-size="21" font-weight="700" fill="#ffffff">238</text>
+<text x="56" y="1039.0" font-size="23" font-weight="600" fill="#eef1fb">ThinkingCap<tspan font-weight="400" fill="#7f88a6" dx="10">4× 3090</tspan></text>
+<path d="M428.0,996.0 H1003.7 Q1008.7,996.0 1008.7,1001.0 V1011.0 Q1008.7,1016.0 1003.7,1016.0 H428.0 Z" fill="#3f4fa8"/>
+<text x="1018.7" y="1013.0" font-size="19" font-weight="500" fill="#9aa4bf">238</text>
+<path d="M428.0,1021.0 H996.4 Q1001.4,1021.0 1001.4,1026.0 V1036.0 Q1001.4,1041.0 996.4,1041.0 H428.0 Z" fill="#6f7fe8"/>
+<text x="1011.4" y="1038.0" font-size="19" font-weight="500" fill="#9aa4bf">235</text>
+<path d="M428.0,1046.0 H967.1 Q972.1,1046.0 972.1,1051.0 V1061.0 Q972.1,1066.0 967.1,1066.0 H428.0 Z" fill="#b9a4ff"/>
+<text x="982.1" y="1063.0" font-size="21" font-weight="700" fill="#ffffff">223</text>
 <line x1="56" y1="1084" x2="1224" y2="1084" stroke="#ffffff" stroke-opacity="0.08"/>
 <text x="56" y="1120" font-size="16" font-weight="700" fill="#7f88a6" letter-spacing="1.2">NEMOTRON  ·  120B-A12B MOE</text>
 <text x="56" y="1187.0" font-size="23" font-weight="600" fill="#eef1fb">Nemotron 3.5 Super VL<tspan font-weight="400" fill="#7f88a6" dx="10">4× 3090</tspan></text>

@@ -59,7 +59,7 @@ from source, which takes about 1.5 hours on 8 cores. The first start compiles ke
 | [Swift1.5](https://huggingface.co/halt95/Swift1.5-Qwen3.8-Flash-Next-W4A16-Merlin) | Flash-Next fine-tune | 4 | 924,993 | 186 tok/s | 673 tok/s (3.0.1 run) | 650 tok/s | 199 | 197 |
 | [Swift1.5-Huihui](https://huggingface.co/halt95/Swift1.5-Huihui-Qwen3.8-Flash-Next-W4A16-Merlin) | Swift1.5, abliterated | 4 | 924,993 | 193 tok/s | 703 tok/s (3.0.1 run) | 681 tok/s | 198 | 198 |
 | [Qwen3.8-27B](https://huggingface.co/halt95/Qwen3.8-27B-W4A16-Merlin) | 27B dense | 1 / 2 / 4 | 271,506 / 826,689 / 2,012,105 | 77 / 146 / 250 tok/s | – / 682 / 940 tok/s | – / 615 / 854 tok/s | 198 (4 GPUs) | 195 / 194 / 197 |
-| [ThinkingCap](https://huggingface.co/halt95/ThinkingCap-Qwen3.8-27B-W4A16-Merlin) (3.0.1 run) | 27B fine-tune | 2 / 4 | 826,689 / 2,012,105 | 160 / 238 tok/s | 697 / 952 tok/s | 633 / 832 tok/s | 198 (4 GPUs) | 193 / 195 |
+| [ThinkingCap](https://huggingface.co/halt95/ThinkingCap-Qwen3.8-27B-W4A16-Merlin) | 27B fine-tune | 2 / 4 | 826,689 / 2,012,105 | 160 / 223 tok/s | 697 / 952 tok/s (3.0.1 run) | 633 / 832 tok/s | 198 (4 GPUs) | 193 / 195 |
 | [Nemotron 3.5 Super VL](https://huggingface.co/halt95/Nemotron-3.5-Super-VL-120B-A12B-W4A16-Merlin) | 120B MoE, 1M context | 4 | 1,856,367 | 106 tok/s | 432 tok/s (3.0.1 run) | 432 tok/s | 197 | 195 |
 | [Ornith 1.5](https://huggingface.co/halt95/Ornith-1.5-122B-A10B-W4A16-Merlin) | 122B MoE | 4 | 894,618 | 111 tok/s | 528 tok/s (3.0.1 run) | 486 tok/s | 196 | 190 |
 
@@ -197,9 +197,7 @@ have the full figures and method.</sub>
 
 ## Performance
 
-<img src="docs/images/decode.svg" alt="Single-stream decode at 4K, 131K and 262K context for every model on Merlin 3.0.2 (vLLM 0.33); ThinkingCap shows its 3.0.1 figures" width="100%">
-
-In the chart, rows marked * (ThinkingCap) show the 3.0.1 figures; that checkpoint was not re-run for 3.0.2. The tables label the same rows (3.0.1 run).
+<img src="docs/images/decode.svg" alt="Single-stream decode at 4K, 131K and 262K context for every model on Merlin 3.0.2 (vLLM 0.33)" width="100%">
 
 <details>
 <summary><b>Prefill and time to first token at 262K</b></summary>
@@ -210,7 +208,7 @@ In the chart, rows marked * (ThinkingCap) show the 3.0.1 figures; that checkpoin
 | Swift1.5 | 4 | 6,762 tok/s | 38.7 s |
 | Swift1.5-Huihui | 4 | 6,830 tok/s | 38.3 s |
 | Qwen3.8-27B | 1 / 2 / 4 | 586 / 1,112 / 2,111 tok/s | 447.3 / 235.4 / 124.1 s |
-| ThinkingCap (3.0.1 run) | 2 / 4 | 1,114 / 2,099 tok/s | 235.2 / 124.7 s |
+| ThinkingCap | 2 / 4 | 1,115 / 2,108 tok/s | 234.9 / 124.2 s |
 | Nemotron 3.5 Super VL | 4 | 4,217 tok/s | 62.1 s |
 | Ornith 1.5 | 4 | 2,288 tok/s | 114.5 s |
 
@@ -218,7 +216,7 @@ In the chart, rows marked * (ThinkingCap) show the 3.0.1 figures; that checkpoin
 
 </details>
 
-**Bench cards:** [Flash-Next](models/flash-next/benchmarks/2026-11-04/BENCH-CARD.md) · [Swift1.5](models/swift1.5/benchmarks/2026-11-05/BENCH-CARD.md) · [Swift1.5-Huihui](models/swift1.5-huihui/benchmarks/2026-11-05/BENCH-CARD.md) · [Qwen3.8-27B](models/qwen38-27b/benchmarks/2026-11-04/BENCH-CARD.md) · [ThinkingCap](models/thinkingcap/benchmarks/2026-11-02/BENCH-CARD.md) · [Nemotron 3.5 Super VL](models/nemotron-super-vl/benchmarks/2026-11-04/BENCH-CARD.md) · [Ornith 1.5](models/ornith1.5/benchmarks/2026-11-04/BENCH-CARD.md)
+**Bench cards:** [Flash-Next](models/flash-next/benchmarks/2026-11-04/BENCH-CARD.md) · [Swift1.5](models/swift1.5/benchmarks/2026-11-05/BENCH-CARD.md) · [Swift1.5-Huihui](models/swift1.5-huihui/benchmarks/2026-11-05/BENCH-CARD.md) · [Qwen3.8-27B](models/qwen38-27b/benchmarks/2026-11-04/BENCH-CARD.md) · [ThinkingCap](models/thinkingcap/benchmarks/2026-11-05/BENCH-CARD.md) · [Nemotron 3.5 Super VL](models/nemotron-super-vl/benchmarks/2026-11-04/BENCH-CARD.md) · [Ornith 1.5](models/ornith1.5/benchmarks/2026-11-04/BENCH-CARD.md)
 
 ## Hardware
 
