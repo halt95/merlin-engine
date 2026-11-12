@@ -4,7 +4,10 @@ import os
 
 from vllm.ray.ray_env import RAY_NON_CARRY_OVER_ENV_VARS
 
-_RAY_WORKER_PRE_IMPORT_ENV_VARS = frozenset({"VLLM_USE_BREAKABLE_CUDAGRAPH"})
+# The Qwen3.5-lineage names resolve at import.
+_RAY_WORKER_PRE_IMPORT_ENV_VARS = frozenset(
+    {"VLLM_USE_BREAKABLE_CUDAGRAPH", "MERLIN_QWEN35_ARCH_ALIASES"}
+)
 
 
 def get_driver_env_vars(

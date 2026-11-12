@@ -1,4 +1,4 @@
-# Swift1.5-Huihui · Merlin 3.0.2
+# Swift1.5-Huihui · Merlin 3.0.2.1
 
 The launcher serves Froggeric's fixed Qwen3.8 template,
 [`froggeric-qwen-v22.5.jinja`](../qwen38-27b/templates/froggeric-qwen-v22.5.jinja), the same template as the
@@ -15,9 +15,24 @@ Recipe version: [3.0.0](VERSION). This is the abliterated Swift 1.5 W4A16 checkp
 
 The canonical [serve.sh](serve.sh) is generated from `tools/merlin/profiles/flash-next.json` by `tools/merlin/preflight.py`, using profile `fn-swift1.5-huihui-quad-3090`. It starts this checkout directly. A boot-and-check run of the generated launcher on 2026-10-16 gave: boot 398 s, GSM8K-20 20/20, ITL 4K / 32K 18.78 / 18.87 ms, and the Merlin 3.0.0 release bench card on the release wheel (2026-10-20): the Huihui quad is tested on the reference host.
 
-Huihui has its own [3.0.2 bench card](benchmarks/2026-11-05/BENCH-CARD.md) and [3.0.1 bench card](benchmarks/2026-11-02/BENCH-CARD.md) (both below) and its own [3.0.0 bench card](benchmarks/2026-10-20/BENCH-CARD.md) (2026-10-20: decode, prefill, residency, 8 MP image, 2-agent, GSM8K-200 and needles, the needle panel from a 2026-10-17 pre-release build; its 8 agents were re-run on the released install, 2026-10-21); the remaining heavy results are **inherited from Swift**. Swift at 8 MP (8,388,608 pixels per image) on 4× RTX 3090 / 0.32 measured **stage-0 minimum free memory 902 MiB** on 2026-10-15. Huihui's generated launcher independently passed the 2026-10-16 8 MP check with 902 MiB minimum free; broader heavy results remain inherited from Swift. See [Swift's qualification status](../swift1.5/README.md#qualification-status).
+Huihui has its own [3.0.2.1 bench card](benchmarks/2026-11-12/BENCH-CARD.md), [3.0.2 bench card](benchmarks/2026-11-05/BENCH-CARD.md) and [3.0.1 bench card](benchmarks/2026-11-02/BENCH-CARD.md) (all below) and its own [3.0.0 bench card](benchmarks/2026-10-20/BENCH-CARD.md) (2026-10-20: decode, prefill, residency, 8 MP image, 2-agent, GSM8K-200 and needles, the needle panel from a 2026-10-17 pre-release build; its 8 agents were re-run on the released install, 2026-10-21); the remaining heavy results are **inherited from Swift**. Swift at 8 MP (8,388,608 pixels per image) on 4× RTX 3090 / 0.32 measured **stage-0 minimum free memory 902 MiB** on 2026-10-15. Huihui's generated launcher independently passed the 2026-10-16 8 MP check with 902 MiB minimum free; broader heavy results remain inherited from Swift. See [Swift's qualification status](../swift1.5/README.md#qualification-status).
 
 The 924,993-token KV pool was measured on this generated launcher (2026-10-16). Earlier quality and speed numbers are recorded in the [2026-10-12 bench card](benchmarks/2026-10-12/Huihui-BENCH-CARD.md); those vLLM 0.30 results do not qualify Merlin 3.0.0.
+
+## Merlin 3.0.2.1 bench card (2026-11-12)
+
+Maintainer measurements on 4× RTX 3090 (220 W, PCIe Gen4) with P2P (the aikitoria patched driver) and the Zagitta [gpu-unlock](https://github.com/Zagitta/gpu-unlock) kernel module, on vLLM 0.33.0, fresh `merlin serve` boots, 2026-11-11, published wheel, except the thinking-off 8-agent row: its run on the published wheel ended early and was not used, so it comes from the previous build of that wheel (2026-11-11, without the new prefill schedule); method and every cell in the [bench card](benchmarks/2026-11-12/BENCH-CARD.md). Decode is one stream with thinking on at reasoning effort medium, the server default (tok/s after the first streamed token); prefill is one cold request. With thinking on, a 512-token agent follow-up may end inside the reasoning, and reasoning tokens count. Sessions held at once and the 8 MP image panels were not re-run; they stay on the earlier cards below.
+
+| Measurement | Swift1.5-Huihui |
+|---|---|
+| Decode, 4K / 131K / 262K prompt | 178 / 190 / 203 tok/s |
+| Cold prefill, 10K / 100K / 262K prompt | 6,720 / 7,076 / 6,893 tok/s |
+| Agents at once (8 × 16K conversations), total, thinking on / off | 719 tok/s / 668 tok/s |
+| GSM8K-200 (5-shot), correct of 200, thinking on at medium / thinking off | 198 / 197 |
+| Sessions held at once | Not re-measured on 3.0.2.1. 3.0.0 run: 3 × 262K and 6 × 131K, every session resident (re-sent prompts ≥ 99.91 % cached), 0 preemptions. |
+| 8 MP image, one and two requests at once | Not re-measured on 3.0.2.1. 3.0.0 run: correct; lowest free memory 1,136 MiB on any card. |
+| KV pool | 924,993 tokens |
+| Against 3.0.2 | Decode −1 % / +1 % at 4K / 131K, within run-to-run spread; +5 % at 262K, where each decode step is within 1 % of 3.0.2 and the 128-token figure varies with the text sent (sends 197.9–209.3 tok/s). 262K prefill +1 %. 8 agents 0 % in one run of 8; the same row on Flash-Next spread 5 % over six repeated runs. |
 
 ## Merlin 3.0.2 bench card (2026-11-05)
 
@@ -80,7 +95,7 @@ Set `VENV` to the environment in which this checkout was installed. Reference ho
 
 ## Launcher defaults
 
-The layout and engine settings follow [Swift](../swift1.5/README.md#launcher-defaults): 4× RTX 3090 with P2P, TP2 × PP2 + EP (25,23), 262,144-token per-request limit, 8 sequences, FP8 E4M3 KV at 4.1e9 bytes per card, 42 images with an 8 MP cap, MTP K=3 and FGPC off. Thinking defaults to `medium` (`xhigh` per request). The MTP head scores the full vocabulary (`DRAFT_HEAD` default `bf16`); reduced draft vocabulary was removed in 3.0.1, and `REDUCED_DRAFT_VOCAB` or `DRAFT_VOCAB` set in the environment stops the launch (an empty value, or `REDUCED_DRAFT_VOCAB=0`, is accepted).
+The layout and engine settings follow [Swift](../swift1.5/README.md#launcher-defaults): 4× RTX 3090 with P2P, TP2 × PP2 + EP (25,23), 262,144-token per-request limit, 8 sequences, FP8 E4M3 KV at 4.1e9 bytes per card, 42 images with an 8 MP cap, MTP K=3 and FGPC on (since 3.0.2.1). Thinking defaults to `medium` (`xhigh` per request). The MTP head scores the full vocabulary (`DRAFT_HEAD` default `bf16`); reduced draft vocabulary was removed in 3.0.1, and `REDUCED_DRAFT_VOCAB` or `DRAFT_VOCAB` set in the environment stops the launch (an empty value, or `REDUCED_DRAFT_VOCAB=0`, is accepted).
 
 Huihui uses its own [dense-recalibrated scale sidecar](scales/qsa_kv_scales_swift_huihui_dense.json), distinct served names and checkpoint marker. The [checksum list](checkpoint.sha256) covers its 38 checkpoint files. `SCALES` can override the sidecar; other environment defaults are documented in the [Swift reference](../swift1.5/docs/reference.md#build-and-serve). Select the Huihui profile explicitly; automatic hardware selection continues to choose Flash-Next.
 

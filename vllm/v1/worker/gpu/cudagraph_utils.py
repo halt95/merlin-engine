@@ -39,6 +39,9 @@ from vllm.logger import init_logger
 from vllm.merlin.flashinfer_smallq import (
     plan_identity,
 )
+from vllm.merlin.kv_init_overhead import (
+    measure_kv_init_overhead,
+)
 from vllm.model_executor.layers.ple_offload_layer import (
     observe_ple_copy_geometry,
 )
@@ -93,6 +96,7 @@ class BatchExecutionDescriptor:
     num_active_loras: int = 0
     # Number of microbatches the batch is split into (DBO). 1 means no splitting.
     num_ubatches: int = 1
+
     flashinfer_smallq: tuple = ()
 
 
@@ -506,6 +510,7 @@ class CudaGraphManager:
                         if desc.cg_mode == CUDAGraphMode.PIECEWISE:
                             forward_fn(CUDAGraphMode.PIECEWISE)
                             continue
+
                         identity = getattr(
                             forward_fn, "_merlin_flashinfer_smallq", ()
                         )
@@ -541,6 +546,7 @@ class CudaGraphManager:
                             torch.accelerator.synchronize()
                             free_after = torch.accelerator.get_memory_info()[0]
                             self._capture_mem_samples.append(free_before - free_after)
+
                         self.graphs[graph_desc] = graph
                         compilation_counter.num_cudagraph_captured += 1
 
@@ -656,16 +662,19 @@ class CudaGraphManager:
             num_ubatches=num_ubatches,
         )
 
+
     def has_fullgraph(self, desc: BatchExecutionDescriptor, identity: tuple) -> bool:
         return all(mode != 0 for _, _, mode in identity) and (
             replace(desc, flashinfer_smallq=identity) in self.graphs
         )
+
 
     def run_fullgraph(self, desc: BatchExecutionDescriptor, identity: tuple = ()):
         """Replay a captured FULL cudagraph."""
         assert desc.cg_mode == CUDAGraphMode.FULL, (
             f"Expected FULL mode, got {desc.cg_mode}"
         )
+
         graph_desc = replace(desc, flashinfer_smallq=identity) if identity else desc
         assert graph_desc in self.graphs, f"No cudagraph for {graph_desc}"
         if (
@@ -680,6 +689,7 @@ class CudaGraphManager:
         # cannot see. Without this, replay could overwrite static buffers
         # while those copies are still in flight.
         get_offloader().sync_prev_onload()
+
         # bounds-guard producer coverage: a replay inherits this stream
         guard_telemetry.check_replay_stream()
         self.graphs[graph_desc].replay()
@@ -922,6 +932,7 @@ class ModelCudaGraphManager(CudaGraphManager):
 
                 store_capture_output(num_tokens, model_output)
 
+
             if self._workload_tile and desc.cg_mode == CUDAGraphMode.FULL:
                 forward_fn._merlin_flashinfer_smallq = plan_identity(attn_metadata)
             return forward_fn
@@ -929,9 +940,11 @@ class ModelCudaGraphManager(CudaGraphManager):
         super().capture(create_forward_fn, progress_bar_desc)
 
     def run_fullgraph(
+
         self, desc: BatchExecutionDescriptor, identity: tuple = ()
     ) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]] | IntermediateTensors:
         """Replay a captured FULL cudagraph and return hidden states."""
+
         super().run_fullgraph(desc, identity)
         if not self.is_last_pp_rank:
             assert self.intermediate_tensors is not None
@@ -1085,6 +1098,9 @@ def profile_cudagraph_memory(runner: "GPUModelRunner") -> int:
     gc.collect()
     torch.accelerator.empty_cache()
 
+    runner.kv_init_overhead_bytes = 0
+    free_before_kv_init = torch.accelerator.get_memory_info()[0]
+
     # Run the whole profiling phase against a throwaway CUDA graph pool by
     # pointing the global graph pool singleton at it: objects that bind the
     # pool lazily during profiling (speculator cudagraph managers, breakable
@@ -1102,6 +1118,11 @@ def profile_cudagraph_memory(runner: "GPUModelRunner") -> int:
     try:
         with set_current_vllm_config(runner.vllm_config):
             _init_minimal_kv_cache_for_profiling(runner)
+
+        runner.kv_init_overhead_bytes = measure_kv_init_overhead(
+            free_before_kv_init,
+            _profiling_kv_cache_bytes(getattr(runner, "kv_caches", ())),
+        )
 
         manager = runner.cudagraph_manager
         assert manager is not None

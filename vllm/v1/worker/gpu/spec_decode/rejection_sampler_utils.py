@@ -8,6 +8,7 @@ from vllm.triton_utils import tl, tldevice, triton
 from vllm.v1.spec_decode.fly import compute_fly_entropy
 from vllm.v1.worker.gpu.sample.gumbel import (
     gumbel_block_argmax,
+
     step_keyed_accept_uniform,
     tl_rand32,
 )
@@ -692,6 +693,7 @@ def _rejection_kernel(
             target_argmax = tl.full((), 0, tl.int64)
             can_defer = False
             accepted = False
+
             # The step-keyed draw is opt-in (VLLM_SPEC_STEP_KEYED_RNG); by default
             # the draw is keyed by absolute position, not by upstream #61161's
             # spec_step_seed(seed, i).
@@ -1288,6 +1290,7 @@ def rejection_sample(
     fly_window_size: int = 0,
     fly_entropy_threshold: float = 0.3,
     fly_entropy_top_k: int = 3,
+
     # Step-keyed acceptance draws. Takes effect only together with
     # use_block_verification; standard/synthetic keying is never changed.
     step_keyed_rng: bool = False,

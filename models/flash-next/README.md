@@ -23,6 +23,8 @@ sidecar, calibration tooling, Proxmox LXC recipe and docs for
 The engine source is at the repository root; checkpoints stay on Hugging Face. Recipe version:
 [3.0.0](VERSION).
 
+![Qwen3.8-Flash-Next on 4× RTX 3090, Merlin 3.0.2.1 at a glance: decode, KV pool, cold prefill, agents and GSM8K-200 from the 2026-11-12 bench card, other rows carried from an earlier card](docs/images/flashnext-merlin-3.0.2.1-summary.png)
+
 ## Why use it
 
 Maintainer measurements on 4× RTX 3090, vLLM 0.32, 2026-10-15.
@@ -40,6 +42,24 @@ See the [0.32 measurement summary](benchmarks/2026-10-15/BENCH-CARD.md) for the 
 
 The cache-hit measurement has MTP off; it does not establish that result for the launcher's default MTP K=3.
 The concurrent decode workload is six **127K** sessions; six-131K residency was measured separately on 2026-10-20 (below).
+
+## Merlin 3.0.2.1 bench card (2026-11-12)
+
+Maintainer measurements on 4× RTX 3090 (220 W, PCIe Gen4) with P2P (the aikitoria patched driver) and the Zagitta [gpu-unlock](https://github.com/Zagitta/gpu-unlock) kernel module, on vLLM 0.33.0, fresh `merlin serve` boots. The 4 × 24 GB rows were measured on the published wheel on 2026-11-11, except the thinking-off 8-agent row (its run on the published wheel ended early and was not used); that row (2026-11-11) and the 4 × 20 GB rows (2026-11-10) come from the previous build of that wheel (built on 2026-11-10, before the prefill runs change); method and every cell in the [bench card](benchmarks/2026-11-12/BENCH-CARD.md). Decode is one stream with thinking on at reasoning effort medium, the server default (tok/s after the first streamed token); prefill is one cold request. With thinking on, a 512-token agent follow-up may end inside the reasoning, and reasoning tokens count. Sessions held at once and the 24 GB 8 MP image panels were not re-run; they stay on the earlier cards below.
+
+| Measurement | Flash-Next |
+|---|---|
+| Decode, 4K / 131K / 262K prompt | 174 / 188 / 192 tok/s |
+| Cold prefill, 10K / 100K / 262K prompt | 6,666 / 7,036 / 6,839 tok/s |
+| Agents at once (8 × 16K conversations), total, thinking on / off | 640 tok/s / 641 tok/s (thinking on: one run; six repeated runs gave 661–697 tok/s) |
+| GSM8K-200 (5-shot), correct of 200, thinking on at medium / thinking off | 197 / 198 |
+| GSM8K, full test set (1,319, 5-shot), thinking off, 512 tokens | 1,276 (96.7 %); the previous build of the wheel scored 1,282 (97.2 %), a run-to-run difference (replies vary under concurrency); 3.0.2: 1,281 (97.1 %) |
+| 32K needle prompts (9) | 5 of 9 answered, all correct; every miss a refusal (the needle is phrased as a secret passphrase), not a wrong recall. |
+| 4 × 20 GB, emulated (4 GiB held back per card) | decode 147 / 158 / 165 tok/s, prefill 4,434 / 4,656 / 4,555 tok/s; one 262K session; 8 agents n/a (pool holds 7 of 8); not measured on real 20 GB cards |
+| Sessions held at once | Not re-measured on 3.0.2.1. 3.0.0 run: 3 × 262K and 6 × 131K, every session resident (re-sent prompts ≥ 99.91 % cached), 0 preemptions. |
+| 8 MP image, one and two requests at once | Not re-measured on 3.0.2.1. 3.0.0 run: correct; lowest free memory on any card 1,028 MiB (one request) and 1,026 MiB (two at once). |
+| KV pool | 924,993 tokens |
+| Against 3.0.2 | Within run-to-run spread: decode +1 % / 0 % at 4K / 131K, 262K prefill +1 %. 8 agents −2 % in one run of 8, smaller than the spread of repeated runs, so not a loss. At 262K each decode step is within 2 % of 3.0.2; the 128-token figure varies with the text sent (sends 191.4–200.3 tok/s here), and the published 3.0.2 figure came from different send texts (a repeat run of Flash-Next on 3.0.2 measured 193 tok/s, sends 184–207). |
 
 ## Merlin 3.0.2 bench card (2026-11-04)
 
@@ -81,8 +101,9 @@ Maintainer measurements on 4× RTX 3090 (220 W, PCIe Gen4) with P2P (the aikitor
   (`mm_processor_kwargs`) goes past that headroom and can run the engine out of memory.
   The 1x M-RoPE cache is automatic on this engine. Up to 42 images are allowed by the launcher;
   the cap measurement does not establish every combination of image count and concurrent load.
-- **FGPC off:** Flash-Next omits `--enable-mamba-shared-prefix-checkpoint`.
-  Prefix caching remains enabled; FGPC is a separate feature.
+- **FGPC on (since 3.0.2.1):** Flash-Next passes `--enable-mamba-shared-prefix-checkpoint`, so a first turn behind a
+  shared prompt of at least one 4,096-token attention block resumes from the shared-prefix junction. Prefix caching is on
+  as before. `merlin serve flash-next -- --no-enable-mamba-shared-prefix-checkpoint` turns FGPC off.
 - **Launch shape:** TP2 × PP2 with expert parallel, native context limit 262,144 tokens,
   MTP K=3 by default, FP8 KV, and a measured 924,993-token pool.
 
@@ -93,7 +114,7 @@ performance have not been re-measured here on 0.32 or 0.33. Other cards that `to
 profile are **untested / community-validated**: RTX A5000, 3090 Ti and A10 (24 GB class, 3090 rows), A10G and L4 at
 22.5 GiB (AWS g5/g6, GCP g2: pin lowered to the reported VRAM, a quad holds one 262K session), RTX A6000 / A40 (48 GB)
 and the sm_80/sm_89 rows, except the 4 x RTX 4090 24 GB row and the 2- and 4-card CMP 170HX 64 GB rows: those are
-🟡 **testing** (full-model runs passed on cloud-hosted cards; kernel parity qualification is still to run). 12 GB and 20 GB cards (RTX 3080 Ti, 3080 12 GB, RTX A4500) are refused. See the [hardware matrix](../../docs/merlin/hardware-matrix.md). Use the current repository-wide
+🟡 **testing** (full-model runs passed on cloud-hosted cards; kernel parity qualification is still to run). 12 GB cards (RTX 3080 Ti, 3080 12 GB) are refused. Four 20 GB cards have one ⚫ **untested** layout, TP2xPP2+EP with one 262K session and the static cold-expert offload on by default: `fn-quad-20g-sm86` (RTX 3080 20GB, RTX A4500) and `fn-quad-20g-sm89` (RTX 4000 Ada); other counts of 20 GB cards are refused. See the [hardware matrix](../../docs/merlin/hardware-matrix.md). Use the current repository-wide
 [install status](../../release/README.md) for the toolchain and build route.
 
 The imported provisioning guidance allocated 96 GB host RAM and at least 1 GB `/dev/shm`.
@@ -125,7 +146,8 @@ See [health checks](docs/reference.md#check-its-working) and [troubleshooting](d
 
 MTP and the GPU KV pool remain the defaults. `merlin serve flash-next <checkpoint-dir> --spec dflash2`
 selects DFlash2 on the three qualified 4 x 3090 P2P rows in the Flash-Next family. It measured +5–18 %
-decode versus MTP, with a smaller 789,668-token KV pool: 3 x 262K sessions, not 6 x 131K.
+decode versus MTP, with a smaller 815,203-token KV pool (pin 3,630,000,000 B, FP32 GDN state, align-mode
+prefix caching): 3 x 262K sessions (5 x 131K) by the engine's fit, not 6 x 131K.
 Run `./setup.sh --model flash-next --spec dflash2` to download and verify the drafter first.
 
 `merlin serve flash-next <checkpoint-dir> --kv-ram-cache 64g` opts into a host-RAM cache of evicted
@@ -149,7 +171,8 @@ See [3.0.1 options](docs/reference.md#merlin-301-options) for the supported rows
 `merlin serve flash-next <checkpoint-dir> --ple-store disk` (**experimental**) reads the embedding table's rows from the
 checkpoint's own files on NVMe instead of holding the table in host RAM, which frees 47.7–47.8 GiB with FP8 (38.8–38.9 GiB
 with `--ple int6`) for about 2 % slower decode once the table is cached; the figures were measured on the 0.32 tree
-(the 0.33 re-run has not been done for 3.0.2). See [How to serve](../../docs/how-to-serve.md#the-ple-table-on-nvme-experimental) for costs and limits.
+(on 3.0.2 the FP8 table was re-measured on vLLM 0.33: output identical, decode and warm first token within
+run-to-run noise; the INT6 figures are from the 0.32 tree). See [How to serve](../../docs/how-to-serve.md#the-ple-table-on-nvme-experimental) for costs and limits.
 `--context 512k` serves past 262K with YaRN built from the checkpoint's config (**experimental**; see
 [Context size](docs/reference.md#context-size-302)). On the TP2 × PP2 layout, two optional engine switches are off by default:
 `VLLM_RECOVERSSM_PP_SPLIT_RECV=1` and `VLLM_MERLIN_PP_DECODE_BALANCE=1` (see [3.0.2 options](docs/reference.md#merlin-302-options)).
@@ -212,9 +235,9 @@ on 0.32. The [v3.0.0 notes](CHANGELOG.md#v300) and
 
 ## Documentation
 
-- [CHANGELOG.md](CHANGELOG.md): Merlin 3.0.2, 3.0.1, 3.0.0 and historical recipe release notes.
+- [CHANGELOG.md](CHANGELOG.md): Merlin 3.0.2.1, 3.0.2, 3.0.1, 3.0.0 and historical recipe release notes.
 - [docs/reference.md](docs/reference.md): launcher controls, capacity, deployment status and known behaviours.
-- [2026-11-04 bench card](benchmarks/2026-11-04/BENCH-CARD.md): the measured Merlin 3.0.2 claims; [2026-11-02 bench card](benchmarks/2026-11-02/BENCH-CARD.md): the measured Merlin 3.0.1 claims; [2026-10-20 bench card](benchmarks/2026-10-20/BENCH-CARD.md): Merlin 3.0.0; [2026-10-15 0.32 summary](benchmarks/2026-10-15/BENCH-CARD.md): rc-build concurrency, cache-hit and identity runs.
+- [2026-11-12 bench card](benchmarks/2026-11-12/BENCH-CARD.md): the measured Merlin 3.0.2.1 claims; [2026-11-04 bench card](benchmarks/2026-11-04/BENCH-CARD.md): the measured Merlin 3.0.2 claims; [2026-11-02 bench card](benchmarks/2026-11-02/BENCH-CARD.md): the measured Merlin 3.0.1 claims; [2026-10-20 bench card](benchmarks/2026-10-20/BENCH-CARD.md): Merlin 3.0.0; [2026-10-15 0.32 summary](benchmarks/2026-10-15/BENCH-CARD.md): rc-build concurrency, cache-hit and identity runs.
 - [v3.0.0 bench card](benchmarks/2026-10-09/BENCH-CARD.md): **v3.0.0 (0.30) figure** throughout.
 - [docs/topology-selector.md](docs/topology-selector.md): opt-in topology selection.
 - [docs/history.md](docs/history.md): earlier releases with their original measurement scope.
@@ -235,8 +258,8 @@ for historical observations and mitigations.
 
 Qwen ([Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next)), Intel
 ([AutoRound INT4 experts](https://huggingface.co/Intel/Qwen3.8-Flash-Next-W4A16-AutoRound)), RadixArk
-([FP8 PLE table](https://huggingface.co/RadixArk/Qwen3.8-Flash-Next-NVFP4)), a community
-idle-power report and contribution, brandon-nuttall (local-argmax mixin), mgabor3141
+([FP8 PLE table](https://huggingface.co/RadixArk/Qwen3.8-Flash-Next-NVFP4)), [CoolShades](https://github.com/CoolShades)
+(idle-power report and contribution), brandon-nuttall (local-argmax mixin), mgabor3141
 (club-3090 [discussion](https://github.com/noonghunna/club-3090/discussions/1572) report), DominikBucko
 ([MTP INT4 packing recipe](https://github.com/DominikBucko/qwen38-flash-next-2x3090)), the
 [`peakcrosser7` Flash-Next branch](https://github.com/peakcrosser7/vllm/commits/release/qwen38next_offload) behind vLLM

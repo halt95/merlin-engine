@@ -61,8 +61,12 @@ class UVAOffloader(BaseOffloader):
         """Wrap modules with UVA offloading."""
         if prefix:
             prefix = f"{prefix}."
+        # Match on the layer's full name
+        from vllm.merlin.offload_layer_names import layer_name_prefix
+
         modules = [
-            self._maybe_offload_to_cpu(module, prefix) for module in modules_generator
+            self._maybe_offload_to_cpu(module, prefix + layer_name_prefix(module))
+            for module in modules_generator
         ]
         if self.cpu_offload_bytes > 0:
             logger.info(

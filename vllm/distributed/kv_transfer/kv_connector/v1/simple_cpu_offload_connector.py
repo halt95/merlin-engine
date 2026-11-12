@@ -291,6 +291,7 @@ class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
             return self.worker_handler.build_connector_worker_meta()
         return None
 
+
     def shutdown(self) -> None:
         # ensure_kv_transfer_shutdown() calls this; the base class's no-op left
         # the copy threads running and could free the host arenas while queued

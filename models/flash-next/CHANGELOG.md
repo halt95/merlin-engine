@@ -3,6 +3,45 @@
 Release notes of the Flash-Next recipe, newest first. See the [README](README.md) for current serving status
 and [reference](docs/reference.md) for configuration and evidence boundaries.
 
+## Merlin 3.0.2.1
+
+The Flash-Next recipe runs on **vLLM 0.33.0**, as in 3.0.2. The recipe version stays 3.0.0 (the VERSION file is
+unchanged). See the [engine changelog](../../docs/CHANGELOG.md#merlin-3021) for the full release. This
+recipe's results are in the [2026-11-12 bench card](benchmarks/2026-11-12/BENCH-CARD.md); the 2026-11-04 card stays as the
+3.0.2 comparator.
+
+- **FGPC on:** the launcher passes `--enable-mamba-shared-prefix-checkpoint`.
+  - A first turn behind a shared prompt of at least one 4,096-token attention block resumes from the junction, and
+    junctions age like any cached block.
+  - On the swarm launch with a ~9K shared prompt, 43 of 87 and 41 of 85 first turns were served from cache in two
+    runs, against 0 of 82 with FGPC off.
+  - `-- --no-enable-mamba-shared-prefix-checkpoint` turns it off.
+- **`--long-prefill-token-threshold 512` by default** (`LPT`; `LPT=0` = off), so a long cold prefill holds back
+  new turns and running decoders less (they still slow down; see the prefill runs below) while a session slot is free
+  (`SEQS`). Requested in GitHub #6 (item 1).
+- **Prefill runs by default** (`PREFILL_RUNS`; `PREFILL_RUNS=0` = off): while sessions decode, a long cold prompt takes
+  turns with them instead of sharing every step, and `--max-num-batched-tokens` becomes 1,056. Measured in four runs of the shipped
+  setting on 4 x RTX 3090 with three sessions decoding through a cold prefill: they keep 31-38 % of their decode speed
+  during a cold 64K-128K prefill (14-16 % with the slices alone); the cold prompt's first token comes 17-19 % later at
+  64K, 12-14 % at 128K and 19-24 % at 262K, and the p99 gap between streamed tokens is 0.40 s in three of the four runs
+  (0.58 s in one, a client-side reading), against 0.23-0.35 s without the runs. With no session decoding, three cold
+  64K prompts sent together reach their first token (p95) in 34.5-34.7 s against 28.3-28.9 s. A new prompt still waits
+  for a free session slot. When `CHUNK` and the block size do not tile (neither divides the other) or the block is
+  below the hybrid-state floor, the default switches the runs off with a note at start-up; `PREFILL_RUNS=1` refuses. `VLLM_MERLIN_DECODE_FIRST=1` needs
+  `PREFILL_RUNS=0`. See the
+  [reference](docs/reference.md#merlin-301-options). GitHub #6 (item 1), reported by Sudzpel.
+- **4 × 20 GB rows (`fn-quad-20g-sm86`, `fn-quad-20g-sm89`; untested ⚫):**
+  - **Layout:** the quad layout with the KV pin cut to one 262K session.
+  - **Static cold-expert offload** (`MERLIN_COLD_EXPERTS`) on layers 11, 12, 19, 20 and 37 at hot fraction 0.5.
+  - **Row engine settings:** 64 MiB prefill-logits caps, `NCCL_BUFFSIZE=524288`, `NCCL_MAX_NCHANNELS=1`, expandable
+    segments.
+  - **Evidence:** emulated on 4 × RTX 3090 with 4 GiB held back per card.
+- **KV RAM cache:** a full tier keeps its decode speed (GitHub #11), plus the restore, reclaim and forecast fixes in the
+  engine changelog.
+- **Quoted tool calls stay text** on the `qwen3` parser; the launcher passes `MERLIN_QWEN3_LITERAL_SPANS=0|1` through
+  (any other value stops the launch). `MERLIN_KV_TIER_DIAG=1` also passes through.
+- **Decode top-k** reads only valid positions on rows whose length is not a multiple of 4 (port of vllm#62467).
+
 ## Merlin 3.0.2
 
 The Flash-Next recipe is **built on vLLM 0.33.0**; the recipe version stays 3.0.0 (the VERSION file is unchanged). See the
@@ -10,7 +49,7 @@ The Flash-Next recipe is **built on vLLM 0.33.0**; the recipe version stays 3.0.
 [2026-11-04 bench card](benchmarks/2026-11-04/BENCH-CARD.md); the 2026-11-02 card stays as the 3.0.1 comparator.
 
 - **`--ple-store disk` (experimental):** reads the PLE table's rows from the checkpoint's files on NVMe instead of holding
-  the table in host RAM (47.7–47.8 GiB freed with FP8, 38.8–38.9 GiB with `--ple int6`). Measured on the 0.32 tree; the 0.33 re-run has not been done for 3.0.2. See the [3.0.2 options](docs/reference.md#merlin-302-options).
+  the table in host RAM (47.7–47.8 GiB freed with FP8, 38.8–38.9 GiB with `--ple int6`). Measured on the 0.32 tree; on 0.33 the FP8 table was re-measured for 3.0.2 against `ram`: output identical, and decode, warm first token and 262K unchanged within run-to-run noise. See the [3.0.2 options](docs/reference.md#merlin-302-options).
 - **`--context SIZE` (experimental):** YaRN past 262K built from the checkpoint's config; see
   [Context size](docs/reference.md#context-size-302).
 - **Pipeline-parallel decode:** commit kernels warmed on every PP rank at boot, a persistent snapshot ring that reuses its storage instead of allocating it each step, one align-postprocess launch per distinct input set, and two optional off-by-default switches
@@ -27,7 +66,10 @@ The Flash-Next recipe is **built on vLLM 0.33.0**; the recipe version stays 3.0.
 
 - **DFlash2, opt-in:** `--spec dflash2` on `merlin serve` or `./setup.sh`; `SPEC=dflash2` for a direct
   recipe launch. Only the three Flash-Next-family 4 x 3090 P2P rows have qualified geometry.
-  Decode measured +5–18 % versus MTP, with a 789,668-token KV pool (3 x 262K, not 6 x 131K).
+  Decode measured +5–18 % versus MTP. At introduction, the DFlash2 pin was 3,468,165,120 B and the pool was
+  789,668 tokens. Since Merlin 3.0.2.1, the pin is 3,630,000,000 B and the measured pool with prefill runs on
+  is 815,203 tokens (FP32 GDN state, align-mode prefix caching); the engine fits 3 x 262K or 5 x 131K
+  sessions, not 6 x 131K.
   Setup downloads and verifies the drafter; serving requires it at `DFLASH2_MODEL` or
   `~/models/flash-next-dflash2`. MTP remains the default.
 - **Host-RAM KV tier, opt-in:** `--kv-ram-cache SIZE` caches evicted prefix KV blocks for restore
@@ -108,7 +150,7 @@ needle found exactly;
   `.vllm-cache`; the container image is `qwen38-flash-next-3090s` and its cache volume `flash-next-cache`.
   `scripts/serve-v2.5.sh` and `scripts/build-v2.5.sh` remain for this release as deprecation shims. A tree built by the
   pre-v3 `build-v2.5.sh` is v2.5.1 source and is refused by `scripts/serve.sh`; build v3.0.0 with `scripts/build.sh`.
-- Credits for v3.0.0: brandon-nuttall (local-argmax mixin), a community idle-power report and contribution.
+- Credits for v3.0.0: brandon-nuttall (local-argmax mixin), CoolShades (idle-power report and contribution).
 
 
 ## v2.5.3
@@ -159,7 +201,7 @@ the v2.2.0 build-artifacts asset is reused again. To run it: the Quick start of 
   sets it to 1 unless you set it, keeps an inherited value through its knob reset, and refuses anything but 0 or 1.
   It is not a compile factor: changing it does not trigger a recompile.
 - **The same engine change as the Qwen3.8-27B releases.** The fix is the guard commit the 27B v1.3.0 and ThinkingCap
-  v1.0.0 releases are built on, applied from the same patch file. Thanks to the community
+  v1.0.0 releases are built on, applied from the same patch file. Thanks to [CoolShades](https://github.com/CoolShades)'s
   [idle-power report](https://github.com/halt95/merlin-engine/issues/2) and [contribution](https://github.com/halt95/merlin-engine/pull/3), which proposed pausing the reader after a fixed 2 s of idle; the release parks it once the engine
   has drained instead, so it can share one implementation with the 27B releases.
 - Nothing else changed: no kernel, scheduler or numerics code. Single-stream decode and cold prefill read as v2.5.1's

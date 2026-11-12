@@ -356,7 +356,7 @@ def fused_marlin_moe(
     if input_dtype is not None and input_dtype.itemsize == 1:
         block_size_m = max(block_size_m, 16)
 
-    # MERLIN_MARLIN_MOE_CFG: per-shape
+    # MERLIN_MARLIN_MOE_CFG, per-shape
     # block size / thread config among the already compiled kernels. Unset =
     # one env lookup and nothing else changes.
     gemm1_cfg = gemm2_cfg = None
@@ -375,7 +375,10 @@ def fused_marlin_moe(
             block_size_m = override.block_size_m
             gemm1_cfg, gemm2_cfg = override.gemm1, override.gemm2
 
-    sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
+    # Hot GPU + cold UVA rows, one moe_sum
+    from vllm.merlin import cold_experts
+    _align, _gemms = cold_experts.dispatch(w1, moe_align_block_size, _fused_marlin_moe)
+    sorted_token_ids, expert_ids, num_tokens_post_padded = _align(
         topk_ids,
         block_size_m,
         global_num_experts,
@@ -384,7 +387,8 @@ def fused_marlin_moe(
     )
 
     assert activation is not None
-    moe_output = _fused_marlin_moe(
+    # Both halves write one [M*topk, K]
+    moe_output = _gemms(
         hidden_states=hidden_states,
         w1=w1,
         w2=w2,

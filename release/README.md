@@ -1,6 +1,6 @@
-# Merlin 3.0.2 install and release tooling
+# Merlin 3.0.2.1 install and release tooling
 
-Merlin 3.0.2 builds this checkout on **vLLM 0.33.0**. All recipes under
+Merlin 3.0.2.1 builds this checkout on **vLLM 0.33.0**. All recipes under
 [`models/`](../models/README.md) share one environment installer and dependency
 lock. Engine bundles and per-model engine patch series are historical artifacts.
 
@@ -36,8 +36,8 @@ The lock is complete: 223 exact pins with SHA-256 hashes, resolved with uv, and
 a dry-run `--require-hashes` install resolves. From the repository root:
 
 ```bash
-curl -LO https://github.com/halt95/merlin-engine/releases/download/merlin-v3.0.2/vllm-0.33.0+merlin.665f43d2cf-cp313-cp313-linux_x86_64.whl
-MERLIN_WHEEL="$PWD/vllm-0.33.0+merlin.665f43d2cf-cp313-cp313-linux_x86_64.whl"   bash release/install-env.sh "$PWD/venv"
+curl -LO https://github.com/halt95/merlin-engine/releases/download/merlin-v3.0.2.1/vllm-0.33.0+merlin.c56eeed392-cp313-cp313-linux_x86_64.whl
+MERLIN_WHEEL="$PWD/vllm-0.33.0+merlin.c56eeed392-cp313-cp313-linux_x86_64.whl"   bash release/install-env.sh "$PWD/venv"
 bash release/install-env.sh --verify "$PWD/venv"
 ```
 
@@ -45,7 +45,7 @@ Without `MERLIN_WHEEL` the installer compiles the engine (about 1.5 hours on 8 c
 `release/build-wheel.sh` builds the wheel itself.
 
 A fresh install from the 3.0.0 release wheel on the 0.32 lock was verified on the reference host and on
-a second host with 4× RTX 4090 (2026-10-20); a fresh install of the 3.0.2 wheel on this lock has not been done; the container image is not yet qualified. A tile
+a second host with 4× RTX 4090 (2026-10-20); a fresh install of the 3.0.2 or 3.0.2.1 wheel on this lock has not been done; the container image is not yet qualified. A tile
 hash check or import check does not replace a successful model request and the
 separate live tile proof. See [install-0.33.md](install-0.33.md) for the full
 procedure.

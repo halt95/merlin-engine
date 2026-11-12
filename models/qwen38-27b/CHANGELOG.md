@@ -7,6 +7,29 @@ Release notes, newest first. To install and run the current release, see the [RE
 (scripts, serve-script variables and knobs, capacity, known behaviours, measurement method) is in
 [docs/reference.md](docs/reference.md); v1.0.0 and its numbers are in [docs/history.md](docs/history.md).
 
+## Merlin 3.0.2.1
+
+See the [engine changelog](../../docs/CHANGELOG.md#merlin-3021) for the full release. The recipe still runs
+on **vLLM 0.33.0**. This recipe's results are in the [2026-11-12 bench card](benchmarks/2026-11-12/BENCH-CARD.md); the
+2026-11-04 card stays as the 3.0.2 comparator. The 27B on one card (`27b-tp1-3090`) ran in the same runs: decode 131 / 102 / 75 tok/s at 4K / 131K / 262K, 262K prefill 587 tok/s and GSM8K-200 thinking off 194 (same bench card).
+
+- **Two RTX 3090s with P2P on (`27b-tp2-3090`)** set six launcher defaults: `NCCL_PROTO=Simple`,
+  `VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC=1`, `VLLM_DRAFT_BOUNDED_PLAN=1`, `VLLM_GDN_DECODE_FASTPATH=1`,
+  `VLLM_GDN_SHARED_ALIGN_INDEX=1` and `VLLM_TARGET_SEQ_LENS_ASYNC=1`.
+  - **Results** (an A/B of these defaults, not a bench-card row): one-stream decode +16.0 % (pooled, against a 7.2 % run-to-run band), eight streams
+    within the run-to-run band, identical output (28 of 28 checks).
+  - **Ownership:** the first two are set by the P2P mode (an inherited value is not used); a value you export for the
+    other four is kept.
+  - **ThinkingCap's two-card launcher** uses this profile and gets the same defaults (the pooled A/B ran on the 27B checkpoint; ThinkingCap's two-card rows against 3.0.2 are on its
+    bench card).
+  - **Unchanged:** `P2P=off` and the other rows.
+- **20 GB rows (untested ⚫):** `27b-tp4-sm86-20g` / `-sm89-20g` (estimated 5 × 262K) and `27b-tp2-sm86-20g` /
+  `-sm89-20g` (estimated 2 × 262K). Their KV pins come from an emulation on 24 GB cards.
+- **`KV_BYTES=auto`** keeps the CUDA-graph memory estimate on, and the automatic KV size leaves room for what the engine
+  allocates beside the KV. Before, the two-card auto boot could run out of memory during graph capture. Pinned rows are
+  unchanged.
+- **Quoted tool calls stay text** on the `qwen3` parser (`MERLIN_QWEN3_LITERAL_SPANS=0` turns it off).
+
 ## Merlin 3.0.2
 
 See the [engine changelog](../../docs/CHANGELOG.md#merlin-302) for the full release: the recipe now runs on **vLLM 0.33.0** with
@@ -128,7 +151,7 @@ To run it: [Quick start](README.md#quick-start), or [Build and serve](docs/refer
     the always-polling reader, and both serve scripts set it explicitly. Run-time checks keep every guarded kernel on the
     fenced engine stream (a violation falls back to polling, loudly); fatal sites are armed on the first copy that shows
     the count; sleep mode suspends the reader. Detection while serving stays cadence-bound (about one to three 50 ms
-    intervals, then the next step), as before the fix. Thanks to the community Flash-Next
+    intervals, then the next step), as before the fix. Thanks to [CoolShades](https://github.com/CoolShades)'s Flash-Next
     [idle-power report](https://github.com/halt95/merlin-engine/issues/2) and [contribution](https://github.com/halt95/merlin-engine/pull/3),
     which proposed pausing the reader after a fixed idle timeout; the release parks it once the engine has drained
     instead, the same implementation as Flash-Next v2.5.2.

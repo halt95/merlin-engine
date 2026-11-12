@@ -911,10 +911,15 @@ def make_layers(
         num_hidden_layers, get_pp_group().rank_in_group, get_pp_group().world_size
     )
 
+    # Each layer carries its full name
+    # so --cpu-offload-params can name layers (e.g. one PP stage's layers).
+    from vllm.merlin.offload_layer_names import named_layer
+
     modules = torch.nn.ModuleList(
         [PPMissingLayer() for _ in range(start_layer)]
         + get_offloader().wrap_modules(
-            layer_fn(prefix=f"{prefix}.{idx}") for idx in range(start_layer, end_layer)
+            named_layer(layer_fn, f"{prefix}.{idx}")
+            for idx in range(start_layer, end_layer)
         )
         + [PPMissingLayer() for _ in range(end_layer, num_hidden_layers)]
     )

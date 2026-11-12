@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from vllm import flashnext_family
+from vllm import flashnext_family, qwen35_family
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 
@@ -25,7 +25,9 @@ _QWEN_MODEL_TYPES = frozenset(
         "qwen3_5_text",
         "qwen3_5_moe",
         "qwen3_5_moe_text",
+        # Qwen4Exp + Qwen3.5-lineage aliases.
         *flashnext_family.model_types(),
+        *qwen35_family.model_types(),
     }
 )
 

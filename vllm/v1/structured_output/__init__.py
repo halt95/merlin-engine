@@ -537,6 +537,7 @@ class StructuredOutputManager:
                             state_advancements += 1
                         else:
                             failed_index = cumulative_index
+
                             # An expected rejection: trim_spec_tokens keeps
                             # the first invalid draft.
                     cumulative_index += 1

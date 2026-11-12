@@ -703,6 +703,10 @@ class ModelConfig:
         self.hf_config = hf_config
         if dict_overrides:
             self._apply_dict_overrides(hf_config, dict_overrides)
+            # Nested hf_overrides model_type too.
+            from vllm.qwen35_family import canonicalize_config
+
+            canonicalize_config(hf_config)
         self.hf_text_config = get_hf_text_config(self.hf_config)
         self.model_arch_config = self.get_model_arch_config()
         self.attention_chunk_size = getattr(

@@ -292,7 +292,7 @@ class Worker(WorkerBase):
         if self._ple_offload_enabled:
             self._validate_ple_offload_config()
         elif self.rank == 0 and self.parallel_config.data_parallel_rank == 0:
-            # null-safe like _has_ple_layers.
+            # Null-safe like _has_ple_layers.
             text_config = getattr(self.model_config, "hf_text_config", None)
             ple_layer_ids = getattr(text_config, "ple_layer_ids", None)
             # A model with no PLE layers at all (every non-Qwen4Exp model, e.g.
@@ -314,7 +314,7 @@ class Worker(WorkerBase):
 
     def _has_ple_layers(self) -> bool:
         """Return whether this model configuration constructs PLE layers."""
-        # a worker built without a model
+        # A worker built without a model
         # config (upstream's CPU-worker test) has no PLE layers.
         if self.model_config is None:
             return False
@@ -784,6 +784,7 @@ class Worker(WorkerBase):
             # Release temporary warmup allocations before the profiling snapshot.
             gc.collect()
             torch.accelerator.empty_cache()
+            # External weight memory is read above, before the gate snapshot.
             self.init_snapshot = init_snapshot = MemorySnapshot(device=self.device)
             gate_snapshot = (
                 memory_gate_snapshot if memory_gate_snapshot is not None else init_snapshot
@@ -814,6 +815,11 @@ class Worker(WorkerBase):
             alloc_context=lambda: self._maybe_get_memory_pool_context("workspace"),
         )
         self.model_runner: GPUModelRunner = self._make_model_runner()
+        # The TP communicator FlashInfer
+        # PCIe IPC setup uses, created before the profile and the KV cache.
+        from vllm.merlin.pp_comm_eager import warm_tp_pcie_ipc_communicator
+
+        warm_tp_pcie_ipc_communicator(self.device)
         if self.rank == 0:
             # If usage stat is enabled, collect relevant info.
             report_usage_stats(self.vllm_config)
@@ -929,7 +935,7 @@ class Worker(WorkerBase):
             )
 
     def reload_weights(self, *args, **kwargs) -> None:
-        # a Worker built without __init__
+        # A Worker built without __init__
         # (upstream's weight-transfer test) has no PLE transport.
         if getattr(self, "_ple_offload_enabled", False):
             raise NotImplementedError(
@@ -1028,6 +1034,19 @@ class Worker(WorkerBase):
             if envs.VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS
             else 0
         )
+        # initialize_kv_cache's non-KV buffers: neither
+        # profile_run nor the graph estimate holds them (see the module).
+        kv_init_overhead_applied = (
+            int(getattr(self.model_runner, "kv_init_overhead_bytes", 0) or 0)
+            if envs.VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS
+            else 0
+        )
+        if kv_init_overhead_applied:
+            logger.info_once(
+                "KV-init overhead reserved: %s GiB (attention metadata builders, "
+                "workspaces and block tables allocated with the KV cache)",
+                format_gib(kv_init_overhead_applied),
+            )
 
         init_free_memory = self.init_snapshot.free_memory
         free_gpu_memory = profile_result.after_profile.free_memory
@@ -1060,6 +1079,7 @@ class Worker(WorkerBase):
             self.requested_memory
             - profile_result.non_kv_cache_memory
             - cudagraph_memory_estimate_applied
+            - kv_init_overhead_applied
         )
 
         unrequested_memory = self.init_snapshot.free_memory - self.requested_memory

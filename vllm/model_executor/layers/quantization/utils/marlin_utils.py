@@ -457,7 +457,7 @@ def _marlin_gemm(
 ) -> torch.Tensor:
     if workspace is None:
         workspace = get_marlin_workspace(a.device)
-    # a matched rule launches its pinned
+    # A matched rule launches its pinned
     # tile; OFF and unmatched calls fall through to the direct call below. The
     # table is parsed once per process and the device limits are read once per
     # device (env_rules / device_limits), not on every GEMM.

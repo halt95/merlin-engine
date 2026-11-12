@@ -232,8 +232,9 @@ def _host_embed_tables(runner) -> None:
     from vllm import envs
     from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
 
+
     # The architecture allow-list lives in vllm/merlin/envs.py
-    # (HOST_EMBED_ARCHITECTURES).
+    # (host_embed_archs(): the Qwen3.5-lineage table + Nemotron 3.5 Super VL).
     if not envs.host_embed_table_enabled_for_model(
         runner.model_config.architecture
     ):
@@ -252,6 +253,7 @@ def _host_embed_tables(runner) -> None:
 
     config = runner.model_config.hf_text_config
     if getattr(config, "tie_word_embeddings", False):
+
         skip("target", "tied word embeddings")
         return
 
@@ -259,6 +261,7 @@ def _host_embed_tables(runner) -> None:
     draft_model = getattr(runner.speculator, "model", None)
     if draft_model is not None and draft_model is not runner.model:
         roots.append(("draft", draft_model))
+
         draft_model_config = getattr(runner.speculator, "draft_model_config", None)
         draft_config = getattr(draft_model_config, "hf_text_config", None)
         if getattr(draft_config, "tie_word_embeddings", False):
@@ -276,6 +279,7 @@ def _host_embed_tables(runner) -> None:
                 continue
             if p.device.type != "cuda":
                 continue
+
             quant_method = type(getattr(mod, "quant_method", None)).__name__
             if quant_method != "UnquantizedEmbeddingMethod":
                 skip(
@@ -320,6 +324,7 @@ def _host_embed_tables(runner) -> None:
             "across %d table(s)", total / (1024**3), n_tables,
         )
     else:
+
         # Logged even for an explicit 1: a pipeline-parallel rank that holds
         # no embedding table is expected.
         logger.info("host-embed: skipping: no CUDA table was offloaded on this rank")
@@ -385,6 +390,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         # PP broadcast/recv helper. Runs the collective on a side stream.
         self.pp_handler: PPHandler | None = None
+
         self.free_before_deferred_commit = kv_host_tier.free_before_deferred_commit(
             vllm_config
         )
@@ -1449,6 +1455,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if self.pp_handler is not None:
             outputs = self.pp_handler.get_prev_sampled_outputs()
             if outputs is not None:
+
                 # Restore the step's deferred model state (RecoverSSM commits)
                 # so this postprocess commits the step that sampled them.
                 self.model_state.restore_deferred_state(
@@ -1468,6 +1475,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                         commit_early(outputs["idx_mapping"], outputs["num_sampled"])
                     self.pp_handler.main_stream.wait_event(drafts_event)
                 self.postprocess_sampled(**outputs)
+
                 if commit_ack is not None:
                     commit_ack.finish()
 
@@ -2490,6 +2498,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 for_capture=dummy_run and batch_desc.cg_mode == CUDAGraphMode.FULL,
             )
 
+
         smallq_identity = ()
         if self._workload_tile and batch_desc.cg_mode == CUDAGraphMode.FULL:
             smallq_identity = plan_identity(attn_metadata)
@@ -2590,6 +2599,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.kv_connector.pre_forward(
                 scheduler_output, input_batch, attn_metadata=attn_metadata
             )
+
             if smallq_identity:
                 model_output = self.cudagraph_manager.run_fullgraph(
                     batch_desc, identity=smallq_identity
@@ -2761,6 +2771,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             all_decode_next = self.pp_handler.receive(
                 input_batch, recv_drafts=num_spec_tokens > 0
             )
+
             self.pp_handler.attach_deferred_state(
                 self.model_state.detach_deferred_state()
             )
@@ -2844,6 +2855,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             check_ep_fault=self.check_ep_fault,
             pending_aux_output=pending_aux_output,
         )
+
 
         mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None
         # The encoder runner exists only on the first PP rank, so later ranks
@@ -3022,7 +3034,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     def shutdown(self) -> None:
         """Release GPU tensors (model weights, KV caches, workspace) so that
         memory is reclaimable when running in the same process."""
-        # a KV copy that missed its teardown
+        # A KV copy that missed its teardown
         # deadline could hold a device-wide sync forever, and its DMA may still
         # touch the GPU KV: keep every GPU tensor (the arenas stay referenced
         # by worker._FAILED_SHUTDOWN_WORKERS) and skip the sync.

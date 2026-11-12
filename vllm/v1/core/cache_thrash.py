@@ -100,8 +100,8 @@ class EvictGroups:
         self._next_id = 0
         # GPU pool only; CPU eviction stays destructive.
         self.host_tier: HostTierEviction | None = None
-        # Junction checkpoints (see vllm/v1/core/fgpc.py): evicted before any
-        # other cached block, never grouped.
+        # Junction checkpoints (see vllm/v1/core/fgpc.py): they age as ordinary
+        # cached blocks, never grouped.
         self.junctions = JunctionCheckpoints(pool)
 
     def __bool__(self) -> bool:
@@ -169,8 +169,8 @@ class EvictGroups:
 
     def pop_free_blocks(self, num_blocks: int) -> list[KVCacheBlock]:
         """``free_block_queue.popleft_n``, plus: a free junction checkpoint
-        is reused before any other cached block, and a popped member of a
-        yielded session breaks it, so the next pops take the rest of that
+        is reused in plain queue order, like any cached block, and a popped
+        member of a yielded session breaks it, so the next pops take the rest of that
         session."""
         queue = self._pool.free_block_queue
         junctions = self.junctions
@@ -196,6 +196,7 @@ class EvictGroups:
                 self._break(gid, block)
         return ret
 
+
     def is_host_backed(self, blocks: Sequence[KVCacheBlock]) -> bool:
         return (
             bool(blocks)
@@ -203,7 +204,9 @@ class EvictGroups:
             and self.host_tier.is_host_backed(blocks)
         )
 
+
     def _break(self, gid: int, popped: KVCacheBlock) -> None:
+
         """Reuse a session first, retaining its peers' hashes if host-backed.
 
         Referenced members (waiter/grace pins, active tables or DMA leases)
@@ -229,14 +232,16 @@ class EvictGroups:
                 or block.next_free_block is None
             ):
                 continue
-            # a backed peer keeps its hashes: no loss.
+            # A backed peer keeps its hashes: no loss.
             if not demoted and (census := getattr(self, "census", None)):
                 census.on_reclaim(block, collateral=True)
             pool.free_block_queue.remove(block)
+
             if not demoted:
                 pool._maybe_evict_cached_block(block)
             rest.append(block)
         pool.free_block_queue.prepend_n(rest)
+
         emit("break", gid=gid, block=popped.block_id, rest=len(rest), demoted=demoted)
 
 
@@ -273,6 +278,7 @@ class SessionYield:
         computed,
         block_hashes: Sequence = (),
     ):
+        self._pins_moved()
         self.hit_tokens[request_id] = num_hit
         self.prefix_hashes[request_id] = block_hashes
         self._needed_sets.pop(request_id, None)
@@ -284,6 +290,7 @@ class SessionYield:
         ]
 
     def forget(self, request_id: str) -> None:
+        self._pins_moved()
         self.hit_tokens.pop(request_id, None)
         self.anchors.pop(request_id, None)
         self.prefix_hashes.pop(request_id, None)
@@ -296,6 +303,7 @@ class SessionYield:
         the pin pairs with no grace. The waiter stays protected: its hit
         boundary drops to 0, so every cached block of its prompt that the pin
         no longer holds counts as needed."""
+        self._pins_moved()
         kept_ids = {id(block) for block in kept}
         if any(id(a) not in kept_ids for a in self.anchors.get(request_id, ())):
             self.anchors.pop(request_id, None)
@@ -303,7 +311,19 @@ class SessionYield:
                 self.hit_tokens[request_id] = 0
             self._needed_sets.pop(request_id, None)
 
+    def _pins_moved(self) -> None:
+
+        # A waiter pin was taken, trimmed or dropped (``_pinned_hits``): the
+        # copy scheduler's pin census must not outlive it, or a same-size
+        # swap leaves its ``twin_kind`` answers depending on call order.
+        pool = getattr(self.manager, "block_pool", None)
+        groups = getattr(pool, "evict_groups", None)
+        copyq = getattr(getattr(groups, "host_tier", None), "copyq", None)
+        if copyq is not None:
+            copyq.note_pins_changed()
+
     def follow_cow(self, source_block: KVCacheBlock, cow_block: KVCacheBlock) -> None:
+
         # A grace / waiter pin moved to the CoW copy, so the copy scheduler's pin
         # census is stale.
         copyq = self._copy_scheduler()
@@ -354,9 +374,10 @@ class SessionYield:
         hit: tuple[Sequence[KVCacheBlock], ...],
         waiters: list[str],
     ) -> bool:
+
         """Forecast a waiter's last-copy loss.
         The allocation count includes the request's evictable hit blocks.
-        Adopt those hits first, then replay junction priority and session
+        Adopt those hits first, then replay the pool's LRU pop order and session
         expansion on a shadow queue. Backed groups retain their peer hashes;
         other groups unhash peers. Only destroying an unbacked needed block
         parks the miss. This query changes no refs, hashes or queue order.
@@ -390,12 +411,15 @@ class SessionYield:
             while cur is not None and cur is not tail and id(cur) in out:
                 cur = cur.next_free_block
             junctions = [b for b in junctions if id(b) not in out]
-            # Hashed front peers still yield to junctions.
+            # A hashed front peer would yield to a free junction; free junctions
+            # age in plain LRU order (``free_evictable`` returns none), so the branch below stays idle.
             head = front[0] if front else cur
             if head is None or head is tail:
                 break
+
             if head.block_hash is not None and id(head) not in unhashed and junctions:
                 block = junctions.pop(0)
+
             elif front:
                 block = front.pop(0)
             else:
@@ -591,6 +615,7 @@ class SessionYield:
         Returns the number of blocks the released holders held (0: nothing
         released; ``last_best_single_yield`` says how close the best single
         session came)."""
+
         # No shortfall (a demotion wait) releases nothing.
         if shortfall <= 0:
             self.last_best_single_yield = 0
@@ -600,6 +625,7 @@ class SessionYield:
         )
         units = [(unit, self._freeable(unit, hit_ids)) for unit in self._units(keep)]
         self.last_best_single_yield = max((f for _, f in units), default=0)
+
         # Host-aware yield: prefer a host-complete session (its break demotes,
         # nothing is lost); hold back briefly for one whose grace copy is in
         # flight; else yield by need and let the copy scheduler count
@@ -681,6 +707,7 @@ class SessionYield:
 
 
 class Admission:
+
     """Thrash policy for pinned hybrid hits.
 
     Parks young cold misses that would cost protected waiters blocks and

@@ -73,11 +73,15 @@ class BaseModelLoader(ABC):
         with set_default_torch_dtype(model_config.dtype):
             with target_device:
                 time_before_load = time.perf_counter()
-                model = self.create_model(
-                    vllm_config=vllm_config,
-                    model_config=model_config,
-                    prefix=prefix,
-                )
+                # Model construction peak
+                from vllm.merlin import load_peak_log
+
+                with load_peak_log.bracket("<create_model>", target_device):
+                    model = self.create_model(
+                        vllm_config=vllm_config,
+                        model_config=model_config,
+                        prefix=prefix,
+                    )
                 time_after_load = time.perf_counter()
                 logger.info_once(
                     "Initializing model took %.6f seconds",
@@ -85,7 +89,9 @@ class BaseModelLoader(ABC):
                 )
 
             logger.debug("Loading weights on %s ...", load_device)
-            self.load_weights(model, model_config)
+            # Checkpoint load peak
+            with load_peak_log.bracket("<load_weights>", target_device):
+                self.load_weights(model, model_config)
 
             # Release transient tensors held by PyTorch's caching allocator
             # before weight post-processing and raw CUDA driver allocations.

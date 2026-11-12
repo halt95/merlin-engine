@@ -25,7 +25,7 @@ The generator source is `tools/merlin/registry.py`, with profile `fn-swift1.5-qu
 | `PLE_HOME` | `0` |
 | `CUDA_VISIBLE_DEVICES` | `0,1,2,3` |
 
-The checkpoint directory is the required first argument. Extra vLLM arguments come last. The launcher sets thinking on at `medium`; a later `--default-chat-template-kwargs` can override that default. FGPC stays off; do not add `--enable-mamba-shared-prefix-checkpoint` to this launcher.
+The checkpoint directory is the required first argument. Extra vLLM arguments come last. The launcher sets thinking on at `medium`; a later `--default-chat-template-kwargs` can override that default. FGPC is on (since 3.0.2.1, inherited from the Flash-Next launcher); `-- --no-enable-mamba-shared-prefix-checkpoint` turns it off.
 
 ## Container
 
@@ -61,7 +61,7 @@ The profile pins 4.1e9 bytes of FP8 E4M3 KV per card, uses 4,096-token blocks an
 | Engine | Merlin 3.0.2 at repository root; vLLM 0.33.0 base |
 | MTP | K=3, full-vocabulary head (`DRAFT_HEAD`, default bf16); reduced draft vocabulary removed in 3.0.1 |
 | KV scales | [Swift-specific sidecar](../scales/kv_scales-swift-e4m3.json) |
-| Caching | Prefix caching, align mode, RecoverSSM; FGPC off |
+| Caching | Prefix caching, align mode, RecoverSSM; FGPC on (since 3.0.2.1) |
 | Images/tools | Up to 42 images, 8,388,608-pixel default per image; Qwen3 coder and reasoning parsers |
 
 ## Vision evidence

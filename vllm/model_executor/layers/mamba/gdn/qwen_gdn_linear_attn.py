@@ -885,6 +885,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             raise ValueError(f"Duplicate layer name: {prefix}")
         compilation_config.static_forward_context[prefix] = self
 
+
     @staticmethod
     def _decode_paths(
         gdn_decode_kernel: str,

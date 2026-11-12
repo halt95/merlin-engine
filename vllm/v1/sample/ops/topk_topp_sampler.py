@@ -502,12 +502,15 @@ class TopKTopPSampler(nn.Module):
 # Upstream's small-batch split top-p (#61996) is not taken: it may change the
 # reduction order.
 def apply_top_k_top_p(
+
     logits: torch.Tensor, k: torch.Tensor | None, p: torch.Tensor | None
 ) -> torch.Tensor:
+
     if p is None and k is None:
         return logits
 
     if HAS_TRITON:
+
         return apply_top_k_top_p_triton(logits, k, p)
 
     is_cpu = current_platform.is_cpu()

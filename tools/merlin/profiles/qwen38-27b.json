@@ -110,7 +110,8 @@
      25,
      30,
      35,
-     40
+     40,
+     80
     ]
    },
    "capacity": {
@@ -128,8 +129,17 @@
    "notes": [
     "Pins and sequence caps are the K=4 figures.",
     "Images are capped at 8,388,608 pixels (8 MP) by default (MAX_PIXELS).",
-    "RecoverSSM: the TP2 launcher serves --use-replayssm with --mamba-cache-mode align on Model Runner V2 (MTP + prefix caching); the 960-token block and 883-block pin are RecoverSSM-on K=4 figures. Align commits need the single-traversal fix; dense Qwen3.5 refuses Model Runner V1."
+    "RecoverSSM: the TP2 launcher serves --use-replayssm with --mamba-cache-mode align on Model Runner V2 (MTP + prefix caching); the 960-token block and 883-block pin are RecoverSSM-on K=4 figures. Align commits need the single-traversal fix; dense Qwen3.5 refuses Model Runner V1.",
+    "P2P=on also sets the P2P decode settings (p2p_on_env): NCCL_PROTO=Simple, FlashInfer PCIe IPC all-reduce, the bounded draft plan, the GDN decode fast path, the shared align index and async target seq_lens (one-stream decode +16.0 % pooled, eight streams inside the run-to-run band, output identical on 28 of 28 checks)."
    ],
+   "p2p_on_env": {
+    "NCCL_PROTO": "Simple",
+    "VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC": "1",
+    "VLLM_DRAFT_BOUNDED_PLAN": "1",
+    "VLLM_GDN_DECODE_FASTPATH": "1",
+    "VLLM_GDN_SHARED_ALIGN_INDEX": "1",
+    "VLLM_TARGET_SEQ_LENS_ASYNC": "1"
+   },
    "launch_shape": "tp2"
   },
   {
@@ -229,7 +239,9 @@
      25,
      30,
      35,
-     40
+     40,
+     80,
+     120
     ],
     "kv_tier_seqs": {
      "max_num_seqs": 32,
@@ -323,6 +335,276 @@
    "notes": [
     "ThinkingCap serves on this row too (merlin serve 27b-thinkingcap; models/thinkingcap/serve*.sh): the same shape, pin and reasoning effort (medium).",
     "RecoverSSM: the TP4 launcher serves --use-replayssm with --mamba-cache-mode align on Model Runner V2, block 1024 (--block-size) and chunk 4096 (--max-num-batched-tokens); the 1024-token block and 2,011-block pin are RecoverSSM-on K=4 figures (prefill +0.9 % against the RecoverSSM-off layout; all correctness checks passed)."
+   ],
+   "launch_shape": "tp4"
+  },
+  {
+   "id": "27b-tp2-sm86-20g",
+   "title": "Qwen3.8-27B on 2 x 20 GB sm_86 (RTX 3080 20GB, RTX A4500; TP2), the 20 GB emulation pin",
+   "status": "untested",
+   "match": {
+    "arch": [
+     "sm_86"
+    ],
+    "cards": 2,
+    "vram_gib": 20,
+    "p2p": "any"
+   },
+   "launcher": {
+    "path": null,
+    "note": "no shim pins this row; merlin serve --profile 27b-tp2-sm86-20g (or tools/merlin/launch.py --profile) starts it"
+   },
+   "serve": {
+    "tensor_parallel": 2,
+    "max_num_seqs": 16,
+    "max_num_batched_tokens": 2048,
+    "kv_cache_dtype": "fp8_e4m3",
+    "kv_cache_memory": 9375252480,
+    "spec_k": 4,
+    "recoverssm": true,
+    "capture_sizes": [
+     1,
+     2,
+     4,
+     5,
+     8,
+     10,
+     15,
+     20,
+     25,
+     30,
+     35,
+     40
+    ],
+    "provisional": [
+     "image_headroom_8mp",
+     "kv_cache_memory"
+    ],
+    "provisional_basis": "measured only on 4 x RTX 3090 holding 4,096 MiB of ballast each to emulate 20 GB cards (2026-11-06: 1,617 MiB minimum free per card over a 262K prefill, 8 x 32K and c1 decode; no image was run), not on a 20 GB card"
+   },
+   "capacity": {
+    "estimate": true,
+    "pool_tokens": 525224,
+    "fit_262k": 2,
+    "fit_131k": 3,
+    "basis": "Measured under emulation, not on a 20 GB card: the 20 GB emulation run on the reference host (2026-11-06): 4 x RTX 3090 each holding 4,096 MiB of ballast so it looks like a 20 GB card, vLLM started with --gpu-memory-utilization 0.80 on the 24 GB cards to pass the startup check a 20 GB card passes at the shipped 0.96. The 27b-tp2-3090 profile as it was on that date (the earlier capture list, which this row keeps) with only the KV pin cut to 561 whole blocks of 16,711,680 B (960 tokens, fp8_e4m3 KV) = 9,375,252,480 B booted and served a 262K prefill, 8 x 32K and a c1 decode with 1,617 MiB minimum free per card; vLLM logged 525,224 tokens (floor(blocks x 262,144 / 280)). Resident by this registry's rule (D = 280 / 143 blocks per session + 1 null block) the pin holds 2 x 262K or 3 x 131K. Text-only maximum measured, not the default: 605 blocks (10,110,566,400 B, pool 566,418, 2 x 262K / 4 x 131K) served the same requests with only 897 MiB free per card, too little for the 8 MP image headroom; the 2.4x pin (629,145 tokens, 11,230,248,960 B) ran out of memory.",
+    "kv_blocks": 561
+   },
+   "p2p": "Not required: the launcher takes P2P=on|off from merlin serve / preflight.",
+   "evidence": [
+    "None on a 20 GB card. Emulated: the 20 GB emulation run on the reference host (2026-11-06): 4 x RTX 3090 each holding 4,096 MiB of ballast so it looks like a 20 GB card, vLLM started with --gpu-memory-utilization 0.80 on the 24 GB cards to pass the startup check a 20 GB card passes at the shipped 0.96; this row's pin served a 262K prefill, 8 x 32K and c1 decode (1,617 MiB minimum free per card); a text-only maximum of 605 blocks fit with 897 MiB free; the 2.4x pin ran out of memory."
+   ],
+   "notes": [
+    "Images are capped at 8,388,608 pixels (8 MP) by default (MAX_PIXELS).",
+    "RecoverSSM: the TP2 launcher serves --use-replayssm with --mamba-cache-mode align on Model Runner V2 (MTP + prefix caching); the 960-token block and 883-block pin are RecoverSSM-on K=4 figures. Align commits need the single-traversal fix; dense Qwen3.5 refuses Model Runner V1.",
+    "20 GB sm_86 row: untested / community-validated. The 27b-tp2-3090 launch shape (seqs, chunk, block, RecoverSSM, --gpu-memory-utilization 0.96) with the earlier capture list (without size 80) and the KV pin reduced; KV_BYTES overrides the pin.",
+    "Text-only maximum measured (4 x 131K, 605 blocks, KV_BYTES=10110566400), not the default: it left 897 MiB per card, too little for the 8 MP image headroom.",
+    "max-num-seqs stays the shipped 16 (the exact profile): at 32K per session about 13 stay resident in this pool, so a burst of 16 x 32K can preempt.",
+    "ECC must be off on the RTX A4500 / RTX 4000 Ada (it takes about 6 % of the memory; the RTX 3080 20GB has none); with ECC on, preflight lowers the KV pin by the shortfall.",
+    "Bandwidth (spec sheets, not measured): RTX 3080 20GB ~760 GB/s, RTX A4500 ~640 GB/s, RTX 4000 Ada ~360 GB/s, against 936 GB/s on the RTX 3090, so decode is slower than on the 24 GB rows."
+   ],
+   "launch_shape": "tp2"
+  },
+  {
+   "id": "27b-tp2-sm89-20g",
+   "title": "Qwen3.8-27B on 2 x 20 GB sm_89 (RTX 4000 Ada 20GB; TP2), the 20 GB emulation pin",
+   "status": "untested",
+   "match": {
+    "arch": [
+     "sm_89"
+    ],
+    "cards": 2,
+    "vram_gib": 20,
+    "p2p": "any"
+   },
+   "launcher": {
+    "path": null,
+    "note": "no shim pins this row; merlin serve --profile 27b-tp2-sm89-20g (or tools/merlin/launch.py --profile) starts it"
+   },
+   "serve": {
+    "tensor_parallel": 2,
+    "max_num_seqs": 16,
+    "max_num_batched_tokens": 2048,
+    "kv_cache_dtype": "fp8_e4m3",
+    "kv_cache_memory": 9375252480,
+    "spec_k": 4,
+    "recoverssm": true,
+    "capture_sizes": [
+     1,
+     2,
+     4,
+     5,
+     8,
+     10,
+     15,
+     20,
+     25,
+     30,
+     35,
+     40
+    ],
+    "provisional": [
+     "image_headroom_8mp",
+     "kv_cache_memory"
+    ],
+    "provisional_basis": "measured only on 4 x RTX 3090 holding 4,096 MiB of ballast each to emulate 20 GB cards (2026-11-06: 1,617 MiB minimum free per card over a 262K prefill, 8 x 32K and c1 decode; no image was run), not on a 20 GB card"
+   },
+   "capacity": {
+    "estimate": true,
+    "pool_tokens": 525224,
+    "fit_262k": 2,
+    "fit_131k": 3,
+    "basis": "Measured under emulation, not on a 20 GB card: the 20 GB emulation run on the reference host (2026-11-06): 4 x RTX 3090 each holding 4,096 MiB of ballast so it looks like a 20 GB card, vLLM started with --gpu-memory-utilization 0.80 on the 24 GB cards to pass the startup check a 20 GB card passes at the shipped 0.96. The 27b-tp2-3090 profile as it was on that date (the earlier capture list, which this row keeps) with only the KV pin cut to 561 whole blocks of 16,711,680 B (960 tokens, fp8_e4m3 KV) = 9,375,252,480 B booted and served a 262K prefill, 8 x 32K and a c1 decode with 1,617 MiB minimum free per card; vLLM logged 525,224 tokens (floor(blocks x 262,144 / 280)). Resident by this registry's rule (D = 280 / 143 blocks per session + 1 null block) the pin holds 2 x 262K or 3 x 131K. Text-only maximum measured, not the default: 605 blocks (10,110,566,400 B, pool 566,418, 2 x 262K / 4 x 131K) served the same requests with only 897 MiB free per card, too little for the 8 MP image headroom; the 2.4x pin (629,145 tokens, 11,230,248,960 B) ran out of memory.",
+    "kv_blocks": 561
+   },
+   "p2p": "Not required: the launcher takes P2P=on|off from merlin serve / preflight.",
+   "evidence": [
+    "None on a 20 GB card. Emulated: the 20 GB emulation run on the reference host (2026-11-06): 4 x RTX 3090 each holding 4,096 MiB of ballast so it looks like a 20 GB card, vLLM started with --gpu-memory-utilization 0.80 on the 24 GB cards to pass the startup check a 20 GB card passes at the shipped 0.96; this row's pin served a 262K prefill, 8 x 32K and c1 decode (1,617 MiB minimum free per card); a text-only maximum of 605 blocks fit with 897 MiB free; the 2.4x pin ran out of memory."
+   ],
+   "notes": [
+    "Images are capped at 8,388,608 pixels (8 MP) by default (MAX_PIXELS).",
+    "RecoverSSM: the TP2 launcher serves --use-replayssm with --mamba-cache-mode align on Model Runner V2 (MTP + prefix caching); the 960-token block and 883-block pin are RecoverSSM-on K=4 figures. Align commits need the single-traversal fix; dense Qwen3.5 refuses Model Runner V1.",
+    "20 GB sm_89 row: untested / community-validated. The 27b-tp2-3090 launch shape (seqs, chunk, block, RecoverSSM, --gpu-memory-utilization 0.96) with the earlier capture list (without size 80) and the KV pin reduced; KV_BYTES overrides the pin.",
+    "Text-only maximum measured (4 x 131K, 605 blocks, KV_BYTES=10110566400), not the default: it left 897 MiB per card, too little for the 8 MP image headroom.",
+    "max-num-seqs stays the shipped 16 (the exact profile): at 32K per session about 13 stay resident in this pool, so a burst of 16 x 32K can preempt.",
+    "ECC must be off on the RTX A4500 / RTX 4000 Ada (it takes about 6 % of the memory; the RTX 3080 20GB has none); with ECC on, preflight lowers the KV pin by the shortfall.",
+    "Bandwidth (spec sheets, not measured): RTX 3080 20GB ~760 GB/s, RTX A4500 ~640 GB/s, RTX 4000 Ada ~360 GB/s, against 936 GB/s on the RTX 3090, so decode is slower than on the 24 GB rows."
+   ],
+   "launch_shape": "tp2"
+  },
+  {
+   "id": "27b-tp4-sm86-20g",
+   "title": "Qwen3.8-27B on 4 x 20 GB sm_86 (RTX 3080 20GB, RTX A4500; TP4), the 20 GB emulation pin",
+   "status": "untested",
+   "match": {
+    "arch": [
+     "sm_86"
+    ],
+    "cards": 4,
+    "vram_gib": 20,
+    "p2p": "any"
+   },
+   "launcher": {
+    "path": null,
+    "note": "no shim pins this row; merlin serve --profile 27b-tp4-sm86-20g (or tools/merlin/launch.py --profile) starts it"
+   },
+   "serve": {
+    "tensor_parallel": 4,
+    "max_num_seqs": 24,
+    "max_num_batched_tokens": 4096,
+    "block_size": 1024,
+    "kv_cache_dtype": "fp8_e4m3",
+    "kv_cache_memory": 11684806656,
+    "spec_k": 4,
+    "recoverssm": true,
+    "capture_sizes": [
+     1,
+     2,
+     4,
+     5,
+     8,
+     10,
+     15,
+     20,
+     25,
+     30,
+     35,
+     40
+    ],
+    "provisional": [
+     "image_headroom_8mp",
+     "kv_cache_memory"
+    ],
+    "provisional_basis": "measured only on 4 x RTX 3090 holding 4,096 MiB of ballast each to emulate 20 GB cards (2026-11-06: 2,595 MiB minimum free per card over a 262K prefill, 8 x 32K and c1 decode; no image was run), not on a 20 GB card"
+   },
+   "capacity": {
+    "estimate": true,
+    "pool_tokens": 1311720,
+    "fit_262k": 5,
+    "fit_131k": 9,
+    "basis": "Measured under emulation, not on a 20 GB card: the 20 GB emulation run on the reference host (2026-11-06): 4 x RTX 3090 each holding 4,096 MiB of ballast so it looks like a 20 GB card, vLLM started with --gpu-memory-utilization 0.80 on the 24 GB cards to pass the startup check a 20 GB card passes at the shipped 0.96. The 27b-tp4-3090 profile as it was on that date (the earlier capture list, which this row keeps) with only the KV pin cut to 1,311 whole blocks of 8,912,896 B (1,024 tokens, fp8_e4m3 KV) = 11,684,806,656 B booted and served a 262K prefill, 8 x 32K and a c1 decode with 2,595 MiB minimum free per card; vLLM logged 1,311,720 tokens (floor(blocks x 262,144 / 262)). Resident by this registry's rule (D = 262 / 134 blocks per session + 1 null block) the pin holds 5 x 262K or 9 x 131K. Text-only maximum measured, not the default: 1,573 blocks (14,019,985,408 B, pool 1,573,864, 6 x 262K / 11 x 131K) served the same requests with only 395 MiB free per card, too little for the 8 MP image headroom; the 6.4x pin (1,677,921 tokens, 14,946,926,592 B) ran out of memory.",
+    "kv_blocks": 1311
+   },
+   "p2p": "Not required: the launcher takes P2P=on|off from merlin serve / preflight.",
+   "evidence": [
+    "None on a 20 GB card. Emulated: the 20 GB emulation run on the reference host (2026-11-06): 4 x RTX 3090 each holding 4,096 MiB of ballast so it looks like a 20 GB card, vLLM started with --gpu-memory-utilization 0.80 on the 24 GB cards to pass the startup check a 20 GB card passes at the shipped 0.96; this row's pin served a 262K prefill, 8 x 32K and c1 decode (2,595 MiB minimum free per card); a text-only maximum of 1,573 blocks fit with 395 MiB free; the 6.4x pin ran out of memory. c1 decode at 4K tokens measured 195.9 tok/s on the emulation (RTX 3090 memory bandwidth)."
+   ],
+   "notes": [
+    "ThinkingCap serves on this row too (merlin serve 27b-thinkingcap; models/thinkingcap/serve*.sh): the same shape, pin and reasoning effort (medium).",
+    "RecoverSSM: the TP4 launcher serves --use-replayssm with --mamba-cache-mode align on Model Runner V2, block 1024 (--block-size) and chunk 4096 (--max-num-batched-tokens); the 1024-token block and 2,011-block pin are RecoverSSM-on K=4 figures (prefill +0.9 % against the RecoverSSM-off layout; all correctness checks passed).",
+    "20 GB sm_86 row: untested / community-validated. The 27b-tp4-3090 launch shape (seqs, chunk, block, RecoverSSM, --gpu-memory-utilization 0.96) with the earlier capture list (without sizes 80 and 120) and the KV pin reduced; KV_BYTES overrides the pin.",
+    "Text-only maximum measured (6 x 262K, 1,573 blocks, KV_BYTES=14019985408), not the default: it left 395 MiB per card, too little for the 8 MP image headroom.",
+    "c1 decode at 4K tokens measured 195.9 tok/s on the emulation (RTX 3090 memory bandwidth). A real 20 GB card has less memory bandwidth than the RTX 3090, so it decodes slower.",
+    "ECC must be off on the RTX A4500 / RTX 4000 Ada (it takes about 6 % of the memory; the RTX 3080 20GB has none); with ECC on, preflight lowers the KV pin by the shortfall.",
+    "Bandwidth (spec sheets, not measured): RTX 3080 20GB ~760 GB/s, RTX A4500 ~640 GB/s, RTX 4000 Ada ~360 GB/s, against 936 GB/s on the RTX 3090, so decode is slower than on the 24 GB rows."
+   ],
+   "launch_shape": "tp4"
+  },
+  {
+   "id": "27b-tp4-sm89-20g",
+   "title": "Qwen3.8-27B on 4 x 20 GB sm_89 (RTX 4000 Ada 20GB; TP4), the 20 GB emulation pin",
+   "status": "untested",
+   "match": {
+    "arch": [
+     "sm_89"
+    ],
+    "cards": 4,
+    "vram_gib": 20,
+    "p2p": "any"
+   },
+   "launcher": {
+    "path": null,
+    "note": "no shim pins this row; merlin serve --profile 27b-tp4-sm89-20g (or tools/merlin/launch.py --profile) starts it"
+   },
+   "serve": {
+    "tensor_parallel": 4,
+    "max_num_seqs": 24,
+    "max_num_batched_tokens": 4096,
+    "block_size": 1024,
+    "kv_cache_dtype": "fp8_e4m3",
+    "kv_cache_memory": 11684806656,
+    "spec_k": 4,
+    "recoverssm": true,
+    "capture_sizes": [
+     1,
+     2,
+     4,
+     5,
+     8,
+     10,
+     15,
+     20,
+     25,
+     30,
+     35,
+     40
+    ],
+    "provisional": [
+     "image_headroom_8mp",
+     "kv_cache_memory"
+    ],
+    "provisional_basis": "measured only on 4 x RTX 3090 holding 4,096 MiB of ballast each to emulate 20 GB cards (2026-11-06: 2,595 MiB minimum free per card over a 262K prefill, 8 x 32K and c1 decode; no image was run), not on a 20 GB card"
+   },
+   "capacity": {
+    "estimate": true,
+    "pool_tokens": 1311720,
+    "fit_262k": 5,
+    "fit_131k": 9,
+    "basis": "Measured under emulation, not on a 20 GB card: the 20 GB emulation run on the reference host (2026-11-06): 4 x RTX 3090 each holding 4,096 MiB of ballast so it looks like a 20 GB card, vLLM started with --gpu-memory-utilization 0.80 on the 24 GB cards to pass the startup check a 20 GB card passes at the shipped 0.96. The 27b-tp4-3090 profile as it was on that date (the earlier capture list, which this row keeps) with only the KV pin cut to 1,311 whole blocks of 8,912,896 B (1,024 tokens, fp8_e4m3 KV) = 11,684,806,656 B booted and served a 262K prefill, 8 x 32K and a c1 decode with 2,595 MiB minimum free per card; vLLM logged 1,311,720 tokens (floor(blocks x 262,144 / 262)). Resident by this registry's rule (D = 262 / 134 blocks per session + 1 null block) the pin holds 5 x 262K or 9 x 131K. Text-only maximum measured, not the default: 1,573 blocks (14,019,985,408 B, pool 1,573,864, 6 x 262K / 11 x 131K) served the same requests with only 395 MiB free per card, too little for the 8 MP image headroom; the 6.4x pin (1,677,921 tokens, 14,946,926,592 B) ran out of memory.",
+    "kv_blocks": 1311
+   },
+   "p2p": "Not required: the launcher takes P2P=on|off from merlin serve / preflight.",
+   "evidence": [
+    "None on a 20 GB card. Emulated: the 20 GB emulation run on the reference host (2026-11-06): 4 x RTX 3090 each holding 4,096 MiB of ballast so it looks like a 20 GB card, vLLM started with --gpu-memory-utilization 0.80 on the 24 GB cards to pass the startup check a 20 GB card passes at the shipped 0.96; this row's pin served a 262K prefill, 8 x 32K and c1 decode (2,595 MiB minimum free per card); a text-only maximum of 1,573 blocks fit with 395 MiB free; the 6.4x pin ran out of memory. c1 decode at 4K tokens measured 195.9 tok/s on the emulation (RTX 3090 memory bandwidth)."
+   ],
+   "notes": [
+    "ThinkingCap serves on this row too (merlin serve 27b-thinkingcap; models/thinkingcap/serve*.sh): the same shape, pin and reasoning effort (medium).",
+    "RecoverSSM: the TP4 launcher serves --use-replayssm with --mamba-cache-mode align on Model Runner V2, block 1024 (--block-size) and chunk 4096 (--max-num-batched-tokens); the 1024-token block and 2,011-block pin are RecoverSSM-on K=4 figures (prefill +0.9 % against the RecoverSSM-off layout; all correctness checks passed).",
+    "20 GB sm_89 row: untested / community-validated. The 27b-tp4-3090 launch shape (seqs, chunk, block, RecoverSSM, --gpu-memory-utilization 0.96) with the earlier capture list (without sizes 80 and 120) and the KV pin reduced; KV_BYTES overrides the pin.",
+    "Text-only maximum measured (6 x 262K, 1,573 blocks, KV_BYTES=14019985408), not the default: it left 395 MiB per card, too little for the 8 MP image headroom.",
+    "c1 decode at 4K tokens measured 195.9 tok/s on the emulation (RTX 3090 memory bandwidth). A real 20 GB card has less memory bandwidth than the RTX 3090, so it decodes slower.",
+    "ECC must be off on the RTX A4500 / RTX 4000 Ada (it takes about 6 % of the memory; the RTX 3080 20GB has none); with ECC on, preflight lowers the KV pin by the shortfall.",
+    "Bandwidth (spec sheets, not measured): RTX 3080 20GB ~760 GB/s, RTX A4500 ~640 GB/s, RTX 4000 Ada ~360 GB/s, against 936 GB/s on the RTX 3090, so decode is slower than on the 24 GB rows."
    ],
    "launch_shape": "tp4"
   },

@@ -36,11 +36,24 @@ def keep_think_tags(request: Any) -> bool:
     return literal_tool_markup(request) and bool(getattr(request, "tools", None))
 
 
+def offered_tools(request: Any) -> list | None:
+    """The tools a call may name, or None when this request gets no calls.
+
+    The Qwen engine holds an opener until its function name is complete and
+    keeps a header naming anything else as text.
+    """
+    tools = getattr(request, "tools", None)
+    if not tools or literal_tool_markup(request):
+        return None
+    return list(tools)
+
+
 def set_mode(engine: Any, request: Any) -> None:
     """Set the mode from the request, on a ``StreamingParserEngine`` that has it."""
     if hasattr(engine, "literal_tool_markup"):
         engine.literal_tool_markup = literal_tool_markup(request)
         engine.keep_think_tags = keep_think_tags(request)
+        engine.offered_tools = offered_tools(request)
 
 
 def copy_mode(source: Any, target: Any) -> None:
@@ -48,6 +61,7 @@ def copy_mode(source: Any, target: Any) -> None:
     if hasattr(source, "literal_tool_markup"):
         target.literal_tool_markup = source.literal_tool_markup
         target.keep_think_tags = source.keep_think_tags
+        target.offered_tools = source.offered_tools
 
 
 def mark_delegates(parser: Any, request: Any) -> None:

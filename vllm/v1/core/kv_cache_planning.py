@@ -708,7 +708,7 @@ def get_kv_cache_config_from_groups(
         elif group.layer_names:
             layers_by_spec[group_spec].extend(group.layer_names)
 
-        # slot-packed groups: stride of one slot, slots
+        # Slot-packed groups: stride of one slot, slots
         # x blocks
         slots = group.slots_per_block
         group_block_stride = interleaved_block_stride
@@ -731,7 +731,7 @@ def get_kv_cache_config_from_groups(
 
         byte_offset = 0
         for spec, layer_names in layers_by_spec.items():
-            # per-group block stride
+            # Per-group block stride
             # A slot-packed group's block stride is one slot (side-cache layout).
             block_stride = group_block_stride
             padded_page = _get_layer_block_stride(spec)
@@ -740,7 +740,7 @@ def get_kv_cache_config_from_groups(
                 block_stride = padded_page
             layer_stride, block_stride, _, _, _ = compute_layout_strides(
                 spec,
-                # per-group block count
+                # Per-group block count
                 group_num_blocks,
                 len(layer_names),
                 layout,
@@ -1807,6 +1807,7 @@ def get_kv_cache_configs(
     # If original_max_model_len was -1, automatically
     # determine the maximum model length that fits in available GPU memory.
     # We use per-worker projected groups to account for PP sharding.
+
     # The side-cache layout (PLE fold, ring slots) is applied here, where
     # every worker's layers are known, so no PP stage's block can widen.
     global_kv_cache_groups, projected_groups_per_worker = _apply_side_cache_layout(

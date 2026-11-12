@@ -22,7 +22,7 @@ import torch
 from pydantic import ConfigDict, Field, model_validator
 
 import vllm.envs as envs
-from vllm import flashnext_family
+from vllm import flashnext_family, qwen35_family
 from vllm.merlin import kv_host_tier
 from vllm.logger import enable_trace_function_call, init_logger
 from vllm.platforms import current_platform
@@ -79,18 +79,14 @@ logger = init_logger(__name__)
 # Architectures whose GDN (and PLE) layers run RecoverSSM under --use-replayssm.
 _QWEN4EXP_RECOVERSSM_ARCHS = flashnext_family.archs()
 
-_DENSE_QWEN35_RECOVERSSM_ARCHS = (
-    "Qwen3_5ForCausalLM",
-    "Qwen3_5ForConditionalGeneration",
-)
+# Dense Qwen3.5 lineage (vllm/qwen35_family.py: Qwen3_5*, the Qwen 4 candidates,
+# MERLIN_QWEN35_ARCH_ALIASES).
+_DENSE_QWEN35_RECOVERSSM_ARCHS = qwen35_family.dense_archs()
 
 # Qwen3.5 MoE (Ornith-1.5-122B): the same GDN
 # layers and RecoverSSM state as dense Qwen3.5; InternS2Preview subclasses it but
 # stays off.
-_QWEN35_MOE_RECOVERSSM_ARCHS = (
-    "Qwen3_5MoeForCausalLM",
-    "Qwen3_5MoeForConditionalGeneration",
-)
+_QWEN35_MOE_RECOVERSSM_ARCHS = qwen35_family.moe_archs()
 _QWEN35_GDN_RECOVERSSM_ARCHS = (
     *_DENSE_QWEN35_RECOVERSSM_ARCHS,
     *_QWEN35_MOE_RECOVERSSM_ARCHS,

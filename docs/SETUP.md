@@ -15,9 +15,9 @@ New to serving? [How to serve](how-to-serve.md) walks through it end to end, fro
 ## What a run looks like
 
 ```
-Merlin 3.0.2 setup (by Halt95)
+Merlin 3.0.2.1 setup (by Halt95)
   repo     ~/merlin-engine
-  host     GPUs 4 x NVIDIA GeForce RTX 3090 (24 GB), P2P on, driver 595.84, RAM 96 GiB
+  host     GPUs 4 x NVIDIA GeForce RTX 3090 (24 GB), P2P on, driver 610.43.02, RAM 96 GiB
 
 Model  (Enter = recommended)
   1) flash-next         115.3 GiB  Qwen3.8 Flash-Next W4A16 (the reference recipe)  (recommended)
@@ -60,7 +60,7 @@ Change an answer? (Enter = no, or 1-5) [no]:
 
 Downloads
   engine wheel                                                  217 MB
-    github.com/halt95/merlin-engine release merlin-v3.0.2
+    github.com/halt95/merlin-engine release merlin-v3.0.2.1
   Python packages (223 from release/requirements-0.33.lock)    3.4 GiB
     PyPI via uv (cached after the first install); about 10.2 GiB installed
   checkpoint flash-next                                      115.3 GiB
@@ -231,8 +231,9 @@ on `merlin serve` alike (so the cache can be turned on without running setup aga
   262K prompt takes +7 % to +53 % longer with FP8 and +16 % with INT6; cached, it is unchanged. With a large
   `--kv-ram-cache` (96g on a 152 GiB host) the table never fully warms: about +10-11 % decode at 262K and +15-30 % first
   token for as long as it runs. Measured with the FP8 table and the INT6 pack on 4 x RTX 3090 and one Gen4 NVMe; other disks
-  and layouts are untested ⚫, and a slower disk will cost more. The figures were measured on the 0.32 tree; the 0.33 re-run
-  has not been done for 3.0.2. Setup asks after the models folder, for the Flash-Next
+  and layouts are untested ⚫, and a slower disk will cost more. The figures were measured on the 0.32 tree; on 3.0.2 (vLLM 0.33) the
+  FP8 table was re-measured against `ram` (output identical, decode and warm first token within run-to-run noise),
+  and the INT6 figures are from the 0.32 tree. Setup asks after the models folder, for the Flash-Next
   family, only when every table file is on local NVMe; elsewhere it says why in one line and stays on RAM. Enter always
   means RAM; the question says so when your flags would not fit with the table in RAM and would fit on NVMe. `--yes` never
   asks. A saved `disk` is checked on every run and goes back to RAM once the table (with `--ple int6`, the pack) is no
@@ -268,8 +269,9 @@ must hold it (about 48 GiB with FP8, 39 GiB with INT6, plus 4 GiB of headroom); 
 ## Drafter: MTP or DFlash2
 
 `--spec mtp|dflash2` (on `./setup.sh` and `merlin serve`; default `mtp`) picks the speculative drafter. `dflash2` is
-incoai's DFlash2 block-diffusion drafter: +5-18 % decode against MTP on 4 x 3090, but its KV pool is 789,668 tokens,
-which holds 3 x 262K and not 6 x 131K. It runs only on the Flash-Next family rows
+incoai's DFlash2 block-diffusion drafter: +5-18 % decode against MTP on 4 x 3090, but its KV pool is 815,203 tokens
+(pin 3,630,000,000 B, FP32 GDN state, align-mode prefix caching), which holds 3 x 262K (5 x 131K) by the engine's fit and not
+6 x 131K. It runs only on the Flash-Next family rows
 with a qualified DFlash2 geometry, the three 4 x 3090 P2P rows; every other row, and 27B, Super VL and Ornith (which run
 their own MTP head), refuse it, as does the launcher for a raw `SPEC=dflash2`. On cards that report a little less VRAM
 than their class the DFlash2 pin is lowered the same way as the MTP one and the plan marks it untested ⚫.

@@ -11,6 +11,7 @@ The census does not certify readiness: it observes keys, not the per-rank
 commit receipts.
 """
 
+import time
 from collections import Counter, OrderedDict, deque
 from dataclasses import dataclass
 from itertools import islice
@@ -853,11 +854,18 @@ class HistoryIndex:
     E_tier claim from here on is invalid (``efficiency`` returns them None and
     ``ceiling_valid`` False) rather than flattered; ``evicted`` is the total
     number of basis entries lost.
+
+    ``_tails`` remembers the hash of each finished request's last full PROMPT
+    block (its resume point). A new request whose matched prefix passes one
+    is a returning turn of that chain; a match that ends inside other
+    requests' prompts without passing a tail is a shared prefix only (a first
+    turn behind a common system prompt). Bounded like ``_hashes``.
     """
 
     def __init__(self, capacity: int = HISTORY_DEFAULT_CAPACITY) -> None:
         self.capacity = capacity
         self._hashes: dict[bytes, bool] = {}
+        self._tails: dict[bytes, None] = {}
         self.evicted_prompt = 0
         self.evicted_full = 0
         self.finished = 0
@@ -877,6 +885,13 @@ class HistoryIndex:
             h = block_hashes[i]
             in_prompt = index.pop(h, False) or i < prompt
             index[h] = in_prompt
+        if prompt > 0:
+            tails = self._tails
+            tail = block_hashes[prompt - 1]
+            tails.pop(tail, None)
+            tails[tail] = None
+            for t in list(islice(tails, max(0, len(tails) - self.capacity))):
+                del tails[t]
         dropped = max(0, len(index) - self.capacity)
         # Collect the oldest keys in one pass before mutating the dict.
         # Repeated next(iter(index)) would rescan deleted slots for each key.
@@ -893,6 +908,16 @@ class HistoryIndex:
                 break
             n += 1
         return n
+
+    def reaches_tail(self, block_hashes) -> bool:
+        """The chain's matched prompt-basis prefix (before any restore-grid
+        floor) passes an earlier finished request's prompt tail: a returning
+        turn, not just a shared prefix."""
+        tails = self._tails
+        if not tails or not block_hashes:
+            return False
+        n = self.matched_blocks(block_hashes, "prompt")
+        return any(block_hashes[i] in tails for i in range(n))
 
     def reusable_tokens(self, block_hashes, num_tokens: int,
                         hash_block_size: int, align: int | None = None,
@@ -937,8 +962,13 @@ class OutcomeLedger:
         self.miss_tokens: dict[str, int] = {}
         self.miss_n: dict[str, int] = {}
         self._seen: OrderedDict = OrderedDict()
+        # MERLIN_KV_TIER_DIAG=1: one "first-turn" line per first-turn outcome.
+        self._diag = _diag_on()
         # request id -> the decode-inclusive reusable tokens computed beside R_i
         self._full: OrderedDict = OrderedDict()
+        # request ids whose reusable prefix passes an earlier prompt tail
+        # (``HistoryIndex.reaches_tail``): returning turns, never first turns
+        self._returning: OrderedDict = OrderedDict()
         # request id -> (host tokens, host tokens counted in the capped numerator)
         self._pending_restore: OrderedDict = OrderedDict()
         # request id -> its block-hash chain (kept from ``reusable_tokens`` to
@@ -974,6 +1004,10 @@ class OutcomeLedger:
         while len(self._full) > self.PENDING_MAX:
             self._full.popitem(last=False)
         hashes = getattr(request, "block_hashes", None)
+        if r > 0 and hashes and self.history.reaches_tail(hashes):
+            self._returning[request.request_id] = None
+            while len(self._returning) > self.PENDING_MAX:
+                self._returning.popitem(last=False)
         if hashes and self.loss_lookup is not None:
             self._hashes[request.request_id] = hashes
             while len(self._hashes) > self.PENDING_MAX:
@@ -1026,13 +1060,29 @@ class OutcomeLedger:
             self._seen.popitem(last=False)
         reusable = max(0, outcome.reusable_tokens)
         gpu, host = max(0, outcome.gpu_tokens), max(0, outcome.host_tokens)
-        first = bool(outcome.first_turn) or reusable <= max(
-            0, getattr(outcome, "shared_prefix_tokens", 0)
+        # A first turn: nothing reusable, or only a prefix it shares with other
+        # requests (a common system prompt, R <= the shared-prefix boundary).
+        # A request whose R passes an earlier prompt tail is its chain's next
+        # turn even when R <= the junction (the junction can sit past the
+        # previous prompt's tail, e.g. 8,000 vs 8,128 on a 4,096-token FA block).
+        returning = outcome.request_id in self._returning
+        self._returning.pop(outcome.request_id, None)
+        first = bool(outcome.first_turn) or (
+            not returning
+            and reusable <= max(0, getattr(outcome, "shared_prefix_tokens", 0))
         )
         c.outcomes_recorded += 1
         c.outcome_prompt_tokens += outcome.prompt_tokens
         if first:
             c.outcomes_first_turn += 1
+            if self._diag:
+                logger.info(
+                    "KV tier diag: first-turn t=%.3f req=%s prompt=%d "
+                    "shared_prefix=%d reusable=%d gpu=%d host=%d cached=%d",
+                    time.monotonic(), outcome.request_id, outcome.prompt_tokens,
+                    max(0, getattr(outcome, "shared_prefix_tokens", 0)),
+                    reusable, gpu, host, gpu + host,
+                )
         else:
             c.outcome_prompt_tokens_returns += outcome.prompt_tokens
         c.reusable_tokens += reusable
@@ -1107,6 +1157,11 @@ class OutcomeLedger:
                 self.miss_tokens.get("restore_failed", 0) + host_capped
             )
             self.miss_n["restore_failed"] = self.miss_n.get("restore_failed", 0) + 1
+
+    @property
+    def pending_restores(self) -> int:
+        """Admissions whose host restore was handed off and has not retired."""
+        return len(self._pending_restore)
 
     def restore_retired(self, request_id: str, completed: bool | None) -> None:
         """The request's load retired. ``completed`` False: it failed and the
@@ -1291,9 +1346,59 @@ class FlatStoreDetector:
         return False
 
 
+#: Miss causes that mean a returning chain wanted the host and did not get it
+#: (``AdmissionOutcome.miss_cause``): with ``outcome_restores_requested`` they
+#: make the restore demand the stall detector is conditioned on.
+RESTORE_DEMAND_CAUSES = ("host_evicted", "missed_copy", "restore_cap_wait")
+
+
+def restore_demand(restores_requested: int, miss_n: dict) -> int:
+    """Cumulative restore demand: admissions that requested a host restore,
+    plus admissions that lost reusable tokens the host should have served
+    (``RESTORE_DEMAND_CAUSES``). Flat while every return is a GPU hit, so a
+    flat ``restored_requests`` then is no stall."""
+    return int(restores_requested) + sum(
+        int(miss_n.get(cause, 0)) for cause in RESTORE_DEMAND_CAUSES
+    )
+
+
+def series_restore_demand(sample: dict, cum: int | None) -> int | None:
+    """The cumulative restore demand after one ``SimpleCPU tier metrics:``
+    sample. Lines that carry ``restore_demand`` give it directly; older lines
+    carry the per-interval ``restore_outcomes`` and ``miss_<cause>`` counts,
+    which are summed onto ``cum``. None when the line has neither."""
+    if "restore_demand" in sample:
+        return int(sample["restore_demand"])
+    if "restore_outcomes" not in sample:
+        return cum
+    step = int(sample.get("restore_outcomes", 0)) + sum(
+        int(sample.get("miss_" + cause, 0)) for cause in RESTORE_DEMAND_CAUSES
+    )
+    return (cum or 0) + step
+
+
+def _diag_on() -> bool:
+    """MERLIN_KV_TIER_DIAG=1 (debug log lines only)."""
+    try:
+        from vllm.merlin.envs import read_registered
+
+        return bool(read_registered("MERLIN_KV_TIER_DIAG"))
+    except Exception:  # a debug switch must never break the census
+        return False
+
+
 class RestoreProgressDetector:
     """Fires when ``restored_requests`` has not risen for ``window_s`` seconds
-    after the first restore (strictly rising per 10 min)."""
+    after the first restore (strictly rising per 10 min) while restores were
+    wanted.
+
+    With ``demand`` (cumulative, ``restore_demand``) the stall clock starts at
+    the first sample that shows demand above its level at the last restore,
+    and an episode opens only if demand also rose within the last
+    ``window_s``: a quiet spell where every return is a GPU hit is not a stall.
+    ``pending`` (restores handed off and not retired) counts as demand at
+    every sample, so a wedge whose waiters stop admitting still fires.
+    Without ``demand`` (None) the clock runs from the last restore."""
 
     def __init__(self, window_s: float = 600.0) -> None:
         self.window_s = window_s
@@ -1302,17 +1407,58 @@ class RestoreProgressDetector:
         self.open = False
         self.episodes = 0
         self.first_fire_t: float | None = None
+        self.demand_base: int | None = None
+        self.demand_last: int | None = None
+        self.demand_since: float | None = None
+        self.demand_rose_t: float | None = None
 
-    def feed(self, t: float, restored: int) -> bool:
+    def _note_demand(self, t: float, demand: int | None, pending: int = 0) -> None:
+        if demand is None:
+            return
+        if pending > 0:
+            # a restore is in flight: someone waits on it now
+            if self.demand_since is None:
+                self.demand_since = t
+            self.demand_rose_t = t
+        if self.demand_base is None or demand < self.demand_base:
+            # first sample, or the counters restarted
+            self.demand_base = self.demand_last = demand
+            return
+        last = self.demand_last if self.demand_last is not None else demand
+        self.demand_last = demand
+        if demand <= last:
+            return
+        quiet = (self.demand_rose_t is not None
+                 and t - self.demand_rose_t >= self.window_s)
+        if self.demand_since is None or quiet:
+            # the first unmet demand since the last restore, or the first
+            # after a quiet spell: the stall clock starts here
+            self.demand_since = t
+        self.demand_rose_t = t
+
+    def feed(self, t: float, restored: int, demand: int | None = None,
+             pending: int = 0) -> bool:
         if self.last is None:
             self.last, self.last_t = restored, t
+            self.demand_base = self.demand_last = demand
             return False
         if restored > self.last:
             self.last, self.last_t, self.open = restored, t, False
+            self.demand_base = self.demand_last = demand
+            self.demand_since = self.demand_rose_t = None
             return False
+        self._note_demand(t, demand, pending)
         if self.last <= 0 or self.open:
             return False
-        if t - self.last_t >= self.window_s:
+        if demand is None:
+            start = self.last_t
+        elif self.demand_since is None or self.demand_rose_t is None:
+            return False
+        elif t - self.demand_rose_t >= self.window_s:
+            return False  # demand went quiet again: nothing waits on a restore
+        else:
+            start = self.demand_since
+        if t - start >= self.window_s:
             self.open = True
             self.episodes += 1
             if self.first_fire_t is None:

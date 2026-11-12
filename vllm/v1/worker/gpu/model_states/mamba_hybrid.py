@@ -49,6 +49,7 @@ class MambaHybridAttnMetadata(ModelSpecificAttnMetadata):
     num_accepted_tokens: torch.Tensor | None = None
     num_decode_draft_tokens_cpu: torch.Tensor | None = None
 
+
     workload_prefill_flags: list[bool] | None = None
 
     def get_extra_common_attn_kwargs(
@@ -59,6 +60,7 @@ class MambaHybridAttnMetadata(ModelSpecificAttnMetadata):
     def get_extra_attn_kwargs(
         self, attn_metadata_builder: Any, num_reqs: int
     ) -> dict[str, Any]:
+
         if getattr(attn_metadata_builder, "_workload_tile", False):
             return {"workload_prefill_flags": self.workload_prefill_flags}
         if not isinstance(
@@ -402,6 +404,7 @@ class MambaHybridModelState(DefaultModelState):
             num_accepted_tokens=num_accepted_tokens,
             num_decode_draft_tokens_cpu=num_decode_draft_tokens_cpu,
         )
+
         if self._workload_tile:
             mamba_attn_metadata.workload_prefill_flags = scheduled_prefill_flags(
                 input_batch, num_reqs
@@ -439,7 +442,7 @@ class MambaHybridModelState(DefaultModelState):
             )
         return attn_metadata
 
-    # non-last PP rank detaches and restores the step's
+    # Non-last PP rank detaches and restores the step's
     # deferred RecoverSSM commit
     def detach_deferred_state(self) -> Any:
         # Non-last PP rank: the RecoverSSM commit of this step has to wait for
@@ -462,7 +465,7 @@ class MambaHybridModelState(DefaultModelState):
     def commit_deferred_early(
         self, idx_mapping: torch.Tensor, num_sampled: torch.Tensor
     ) -> bool:
-        """
+        """#
         Non-last PP rank: enqueue the restored deferred step's num_accepted
         scatter and RecoverSSM commit before the drafts arrive. Returns False
         (nothing enqueued) unless a deferred step is restored.

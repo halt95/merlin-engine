@@ -1,7 +1,7 @@
 <!-- Modified by the Merlin project from the upstream vLLM README; see NOTICE. -->
 # Merlin engine
 
-Merlin is a vLLM fork tuned for NVIDIA Ampere and Ada (**sm_80, sm_86 and sm_89**) GPUs, with model recipes for the seven checkpoints below. **Merlin 3.0.2 is built on vLLM 0.33.0.** It combines the engine, launchers, checkpoint checksums and installation tooling in one repository. Model weights stay on Hugging Face.
+Merlin is a vLLM fork tuned for NVIDIA Ampere and Ada (**sm_80, sm_86 and sm_89**) GPUs, with model recipes for the seven checkpoints below. **Merlin 3.0.2.1 is built on vLLM 0.33.0.** It combines the engine, launchers, checkpoint checksums and installation tooling in one repository. Model weights stay on Hugging Face.
 
 The fork carries the sm_86 FP8 QSA attention reader, host-memory PLE embedding offload, RecoverSSM, prefix-cache retention, persistent top-k and guard telemetry. It serves an OpenAI-compatible API with vision, reasoning and tool calling. See the [upstream vLLM README](https://github.com/vllm-project/vllm/blob/v0.33.0/README.md) and [vLLM documentation](https://docs.vllm.ai/); Merlin changes are described in [CHANGELOG.md](../CHANGELOG.md) and [NOTICE](../../NOTICE).
 
@@ -19,8 +19,8 @@ The [models/ index](../../models/README.md) leads to each recipe's launchers, re
 | [Nemotron 3.5 Super VL](../../models/nemotron-super-vl/README.md) | 3.0.0 | [Nemotron-3.5-Super-VL-120B-A12B-W4A16-Merlin](https://huggingface.co/halt95/Nemotron-3.5-Super-VL-120B-A12B-W4A16-Merlin) | 4× RTX 3090 |
 | [Ornith 1.5](../../models/ornith1.5/README.md) | 3.0.0 | [Ornith-1.5-122B-A10B-W4A16-Merlin](https://huggingface.co/halt95/Ornith-1.5-122B-A10B-W4A16-Merlin) | 4× RTX 3090, with or without P2P |
 
-Recipe versions stay at 3.0.0 in Merlin 3.0.2 (the VERSION files are unchanged); the recipe changes are in the
-[changelog](../CHANGELOG.md). The previous public release is Merlin 3.0.1.
+Recipe versions stay at 3.0.0 in Merlin 3.0.2.1 (the VERSION files are unchanged); the recipe changes are in the
+[changelog](../CHANGELOG.md). The previous public release is Merlin 3.0.2.
 
 ## Install and serve
 
@@ -39,12 +39,12 @@ git clone https://github.com/halt95/merlin-engine.git && cd merlin-engine && ./s
 
 Ctrl+C stops the server; `./setup.sh` again starts it straight away with the saved answers; `git pull && ./setup.sh` updates the engine without re-downloading the model. `--yes --model 27b` answers nothing, `--dry-run` shows the plan, `--reconfigure` asks again; every option, the update flow, where things live and how to uninstall are in [docs/SETUP.md](../../docs/SETUP.md), and [docs/how-to-serve.md](../../docs/how-to-serve.md) walks through it end to end. Nothing is installed system-wide (uv and Python 3.13 live under `.merlin/`, the engine in `venv/`).
 
-**Manual route.** From the Merlin 3.0.2 checkout, install once with the shared [release/install-env.sh](../../release/install-env.sh), download a checkpoint, then serve it:
+**Manual route.** From the Merlin 3.0.2.1 checkout, install once with the shared [release/install-env.sh](../../release/install-env.sh), download a checkpoint, then serve it:
 
 ```bash
 # Run from the repository root.
-curl -LO https://github.com/halt95/merlin-engine/releases/download/merlin-v3.0.2/vllm-0.33.0+merlin.665f43d2cf-cp313-cp313-linux_x86_64.whl
-MERLIN_WHEEL="$PWD/vllm-0.33.0+merlin.665f43d2cf-cp313-cp313-linux_x86_64.whl" bash release/install-env.sh ./venv   # prebuilt engine for sm_80, sm_86 and sm_89, checked against release/merlin-wheel.sha256
+curl -LO https://github.com/halt95/merlin-engine/releases/download/merlin-v3.0.2.1/vllm-0.33.0+merlin.c56eeed392-cp313-cp313-linux_x86_64.whl
+MERLIN_WHEEL="$PWD/vllm-0.33.0+merlin.c56eeed392-cp313-cp313-linux_x86_64.whl" bash release/install-env.sh ./venv   # prebuilt engine for sm_80, sm_86 and sm_89, checked against release/merlin-wheel.sha256
 # without MERLIN_WHEEL the installer compiles the engine instead (about 1.5 hours on 8 cores)
 
 # Download the checkpoint separately with the Hugging Face CLI.
@@ -79,7 +79,7 @@ Flash-Next on two 24 GB cards is not implemented (it would need a host-RAM exper
 
 ## Measured on RTX 3090
 
-Design-point and cache results below were measured on RTX 3090 GPUs with a pre-release vLLM 0.32 build on 2026-10-15; they are not 0.33 measurements (the 3.0.2 bench cards are). The release-candidate engine and then the merged release-candidate engine matched that reference's T=0 tokens and logprobs on four configurations, with 28/28 documents plus four controls per configuration. Tile results used a separate 0.32 candidate build. These results describe the served configurations; other GPUs and the final assembled release tree require separate qualification. Aggregate throughput and inter-token latency describe different benchmark windows.
+Design-point and cache results below were measured on RTX 3090 GPUs with a pre-release vLLM 0.32 build on 2026-10-15; they are not 0.33 measurements (the 3.0.2.1 bench cards are). The release-candidate engine and then the merged release-candidate engine matched that reference's T=0 tokens and logprobs on four configurations, with 28/28 documents plus four controls per configuration. Tile results used a separate 0.32 candidate build. These results describe the served configurations; other GPUs and the final assembled release tree require separate qualification. Aggregate throughput and inter-token latency describe different benchmark windows.
 
 | Design point | Aggregate decode | Per-agent time | Preemptions |
 |---|---|---|---|
@@ -88,7 +88,7 @@ Design-point and cache results below were measured on RTX 3090 GPUs with a pre-r
 
 Flash-Next cold prefill at that design point was **5,423 tok/s**. With MTP off, the 32K follow-up cache-hit ratios were **0.998** for Flash-Next (TTFT **5.78 → 0.315 s**) and **0.9996** for 27B TP2 (**18.25 → 0.52 s**).
 
-On a vLLM 0.32 candidate build with the FlashInfer 0.7.0.post1 tile enabled (not re-measured at these depths on 0.33 and FlashInfer 0.7.2.post1; the 3.0.2 bench card gives decode at 4K, 131K and 262K), 27B inter-token latency at **4K / 32K / 131K** was **19.99 / 21.41 / 25.27 ms** on TP2 and **15.83 / 16.62 / 18.37 ms** on TP4. The tile-on GSM8K-200 mean was **192.0/200**. These values supersede the earlier untiled 0.32 measurements; they do not qualify the final release assembly.
+On a vLLM 0.32 candidate build with the FlashInfer 0.7.0.post1 tile enabled (not re-measured at these depths on 0.33 and FlashInfer 0.7.2.post1; the 3.0.2.1 bench card gives decode at 4K, 131K and 262K), 27B inter-token latency at **4K / 32K / 131K** was **19.99 / 21.41 / 25.27 ms** on TP2 and **15.83 / 16.62 / 18.37 ms** on TP4. The tile-on GSM8K-200 mean was **192.0/200**. These values supersede the earlier untiled 0.32 measurements; they do not qualify the final release assembly.
 
 The Merlin image cap is **8,388,608 pixels (8 MP)**. 27B TP2 serves images up to 8 MP. With the vision-peak option on (`VLLM_MERLIN_VISION_PEAK=1`, the TP2 launcher default), the 50-item TP2 stress sweep's worst minimum free was 806 MiB per card (2026-10-15), above the 524 MiB floor. A separate knob OFF/ON identity check matched tokens and logprobs on 6/6 prompts. Flash-Next (902 MiB) meets the target. 27B TP4 left 690 MiB free on the retired RecoverSSM-off pin; at the shipped chunk 4096 with RecoverSSM on, the 2026-10-20 bench card measured 862 MiB lowest free (one 8 MP image, two at once, and four in one prompt; 2 cards: 886 MiB), above the 524 MiB floor. Swift's 2026-10-15 window left 902 MiB free on stage 0; the generated Swift launcher passed the 2026-10-16 8 MP burst after 8K prefill with 544 MiB stage-0 minimum free, 20 MiB above the 524 MiB floor. The generated Huihui launcher independently passed the same gate with 902 MiB minimum free. The chunked vision encoder is inert at this cap; larger caps need separate qualification.
 
@@ -100,7 +100,7 @@ The engine now lives at the repository root, and recipes live under `models/<mod
 git remote set-url origin https://github.com/halt95/merlin-engine.git
 ```
 
-Flash-Next FGPC stays off. The 27B keeps FGPC on under `--enable-mamba-shared-prefix-checkpoint`. The launchers also still pass the deprecated `--mamba-cache-mode align`, which has no effect on vLLM 0.33 (Mamba prefix caching follows `--enable-prefix-caching`) and logs one warning at start. The native context remains 262,144 tokens and no shipped profile enables YaRN. A YaRN extension is opt-in through `--hf-overrides` (recipe in [How to serve](../how-to-serve.md#longer-context-with-yarn-flash-next)), is tested on Flash-Next at 393K and 524K (MTP and DFlash2) and 917K (MTP), and changes numerics from the 0.30 releases. Sequence parallelism is off by default and can change output rounding. Oversubscribing the KV pool can still thrash prefix caching, and the upstream `qwen3_coder` parser can drop JSON-form `<tool_call>` blocks.
+Flash-Next and the 27B both run FGPC (`--enable-mamba-shared-prefix-checkpoint`): a first turn behind a shared prompt of at least one attention block resumes from the shared-prefix junction; a shorter shared prefix is not cached. The block is 4,096 tokens on Flash-Next and 1,024 tokens on the 27B four-card rows; the other 27B rows take the block size vLLM computes for the hybrid layout (960 tokens on one RTX 3090). The launchers also still pass the deprecated `--mamba-cache-mode align`, which has no effect on vLLM 0.33 (Mamba prefix caching follows `--enable-prefix-caching`) and logs one warning at start. The native context remains 262,144 tokens and no shipped profile enables YaRN. A YaRN extension is opt-in through `--hf-overrides` (recipe in [How to serve](../how-to-serve.md#longer-context-with-yarn-flash-next)), is tested on Flash-Next at 393K and 524K (MTP and DFlash2) and 917K (MTP), and changes numerics from the 0.30 releases. Sequence parallelism is off by default and can change output rounding. Oversubscribing the KV pool can still thrash prefix caching, and the upstream `qwen3_coder` parser can drop JSON-form `<tool_call>` blocks.
 
 ## Licence and security
 

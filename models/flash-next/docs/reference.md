@@ -1,7 +1,7 @@
 # Reference
 
-The detail behind the [README](../README.md) for Merlin 3.0.2, Merlin engine **built on vLLM 0.33.0**.
-The current measured claims are in the [3.0.2 bench card](../benchmarks/2026-11-04/BENCH-CARD.md) (the [3.0.1 card](../benchmarks/2026-11-02/BENCH-CARD.md) has the previous release's); see also [Benchmarks](#benchmarks). Historical measurements are explicitly marked
+The detail behind the [README](../README.md) for Merlin 3.0.2.1, Merlin engine **built on vLLM 0.33.0**.
+The current measured claims are in the [3.0.2.1 bench card](../benchmarks/2026-11-12/BENCH-CARD.md) (the [3.0.2 card](../benchmarks/2026-11-04/BENCH-CARD.md) is its comparator, and the [3.0.1 card](../benchmarks/2026-11-02/BENCH-CARD.md) has the release before); see also [Benchmarks](#benchmarks). Historical measurements are explicitly marked
 **v3.0.0 (0.30) figure**; their original release labels are retained, and they are not re-measured 0.32 or 0.33 results.
 
 - [Overview](#overview)
@@ -72,7 +72,7 @@ Everything under 3.0.1 options below still applies. New in 3.0.2:
 | `VLLM_RECOVERSSM_PP_SPLIT_RECV=1` | off | Rank 0 waits only for the token counts before it commits the deferred RecoverSSM step; the drafts are waited for afterwards. PP layouts only. Bit-identical by construction; effect on decode not yet measured. |
 | `VLLM_RECOVERSSM_COMMIT_AFTER_PROPOSE=1` | off (the launcher does not set it) | On the last pipeline rank the commit runs after the drafter has proposed. 3.0.2 extends it to the last rank of a PP layout; the other ranks stay refused. |
 | `VLLM_MERLIN_PP_DECODE_BALANCE=1` | off | **Experimental.** Caps decode rows per step at `ceil(decoding / pp_size)`; tokens are unchanged. Untested on 0.33; the A/B has not been done for 3.0.2. |
-| `VLLM_MERLIN_DECODE_FIRST=1` | off | **Experimental.** Reserves running decoders' tokens before a prefill chunk is sized, so a session admitted after a long cold prefill keeps decoding while it runs. Pair with `-- --prefill-schedule-interval N` for a decode-only duty cycle. Not proven token-identical (chunk boundaries move). |
+| `VLLM_MERLIN_DECODE_FIRST=1` | off | **Experimental.** Reserves running decoders' tokens before a prefill chunk is sized, so a session admitted after a long cold prefill keeps decoding while it runs. Pair with `-- --prefill-schedule-interval N` for a decode-only duty cycle. Not proven token-identical (chunk boundaries move). Since 3.0.2.1 it cannot be combined with the prefill runs: set `PREFILL_RUNS=0` to use it. |
 
 Always on, with no switch: commit kernels are warmed on every pipeline rank at boot, duplicate align-postprocess launches in
 one commit chain are dropped, and the deferred commit uses a persistent snapshot ring of `pp_size + 1` slots that reuses its storage instead of
@@ -90,6 +90,38 @@ Launcher knobs new in 3.0.1: `SEQS` (sessions at once; the CUDA-graph capture fo
 length), `PP_PARTITION` (the pipeline split) and `MERLIN_MARLIN_MOE_CFG` (passed through). A value off the tested
 row prints a note. `SPEC=none` turns speculation off for diagnosis only; it is not a serving lane.
 
+Long prefills (3.0.2.1): every Flash-Next row now serves with `--long-prefill-token-threshold 512` (`LPT=512`),
+so a long cold prefill is processed in 512-token slices interleaved with other work. New turns and running
+decoders no longer wait for the whole prefill, as long as a session slot is free (`SEQS`) (GitHub #6 item 1).
+`LPT=<n>` sets another cap; `LPT=0` turns it off.
+
+Prefill runs (3.0.2.1, `PREFILL_RUNS`, on by default): while sessions decode, a long cold prompt takes turns with
+them instead of sharing every step: it prefills in runs of 16 full `CHUNK`-token steps, then the sessions decode alone
+for a configured scheduling target counted in decode rounds (`VLLM_MERLIN_PREFILL_RUNS_DECODE_SHARE`, 0.30), not a
+measured share of time. New turns and late sessions take their steps first while a session slot is free; the 512-token
+slices apply while no session decodes. The launcher raises `--max-num-batched-tokens` to `CHUNK` + one verify row per
+session slot (1,056 on `fn-quad-3090`). Measured in four runs of the shipped setting on 4 x RTX 3090 with three
+sessions decoding through a cold prefill: those sessions keep 31-38 % of their decode speed during a cold 64K-128K prefill
+(14-16 % with the slices alone); the cold prompt's own first token comes 17-19 % later at 64K, 12-14 % at 128K and
+19-24 % at 262K; the p99 gap between streamed tokens is 0.40 s in three of the four runs (0.58 s in one, a client-side
+reading), against 0.23-0.35 s without the runs. With no session decoding, three cold 64K prompts sent together reach
+their first token (p95) in 34.5-34.7 s against 28.3-28.9 s, and a lone prompt is within the run-to-run spread of
+about 1 %. `PREFILL_RUNS=0` restores the plan
+without it; `VLLM_MERLIN_DECODE_FIRST=1` and `-- --prefill-schedule-interval N` need `PREFILL_RUNS=0`, and extra
+`--max-num-batched-tokens`, `--max-num-scheduled-tokens` or `--max-num-seqs` flags below what the runs need are
+refused with the knob to change. When `CHUNK` and the block size (`BLOCK_SIZE`) do not tile (neither divides the
+other) or the block is below the hybrid-state floor, the default switches the runs off with a note at start-up; an
+explicit `PREFILL_RUNS=1` refuses to start instead.
+
+4 x 20 GB cards (3.0.2.1): `fn-quad-20g-sm86` (RTX 3080 20GB, RTX A4500) and `fn-quad-20g-sm89` (RTX 4000 Ada) start
+now, untested. They serve the quad layout (TP2xPP2+EP, 25/23, chunk 1024) with a 1 x 262K KV pin (265,888 tokens) and
+static cold-expert offload: in MoE layers 11, 12, 19, 20 and 37 half of each rank's experts stay on the GPU;
+the rest are read from pinned host RAM (~8 GiB more host RAM; output identical). The row also sets 64 MiB prefill-logits
+caps, `NCCL_BUFFSIZE=524288`, `NCCL_MAX_NCHANNELS=1` and expandable segments. `MERLIN_COLD_EXPERTS=0` turns the offload
+off. Measured only in a 20 GB emulation on 4 x RTX 3090 with 4,096 MiB of ballast each (sm_86; none on sm_89): c1
+7.01 ms per output token, c8 61.9 tok/s aggregate, 262K prefill 56.2 s, minimum free 363 MiB, tokens and logprobs
+identical to the 24 GB row.
+
 ### DFlash2
 
 Use `merlin serve flash-next <checkpoint-dir> --spec dflash2`, or
@@ -103,8 +135,10 @@ Only the three 4 x 3090 P2P rows have qualified DFlash2 geometry: `fn-quad-3090`
 `fn-swift1.5-quad-3090` and `fn-swift1.5-huihui-quad-3090`. Select the corresponding checkpoint name for a
 variant.
 Other rows and the 27B, Super VL and Ornith families refuse DFlash2. The qualified geometry uses a
-3,468,165,120-byte KV pin per rank instead of the MTP pin. Decode measured +5–18 % versus MTP on
-4 x 3090, but the 789,668-token pool holds 3 x 262K sessions, not 6 x 131K.
+3,630,000,000-byte KV pin per rank instead of the MTP pin (3,468,165,120 before 3.0.2.1: the prefill runs' larger
+step budget costs the drafter's sliding-window layers one block per request). Decode measured +5–18 % versus MTP on
+4 x 3090, but the 815,203-token pool (pin 3,630,000,000 B, FP32 GDN state, align-mode prefix caching) holds
+3 x 262K sessions (5 x 131K) by the engine's fit, not 6 x 131K.
 
 ### Host-RAM KV cache
 
@@ -210,8 +244,8 @@ Enter and `--yes` keep native unless a saved/explicit choice says otherwise.
 Before downloading, setup checks the selected layout's pool. Recipe
 construction waits for the downloaded config at serve time.
 
-At the current Flash-Next quad pins the reference pools are 924,993 (MTP)
-and 789,668 (DFlash2). A request limit above the resolved pool is refused.
+At the current Flash-Next quad pins the reference pools are 924,993 (MTP, pin 4,100,000,000 B)
+and 815,203 (DFlash2, pin 3,630,000,000 B), both at FP32 GDN state with align-mode prefix caching. A request limit above the resolved pool is refused.
 The estimate follows a changed KV pin in whole reference blocks, prints
 resident full-context sessions and the scheduler cap, and never counts
 the KV RAM cache as extra request context. The engine's boot capacity
@@ -285,7 +319,7 @@ acceptance, table coverage and image headroom on its own layout.
 
 The shared [container recipe](../../../container/README.md) builds this checkout through
 the 0.33 installer. The route and complete 223-pin SHA-256 dependency lock are
-integrated; on the 3.0.0 release (vLLM 0.32) a fresh install (2026-10-21) and a from-source build (2026-10-22) passed on the reference host, and the 3.0.2 fresh install has not been done; the container image is not yet qualified.
+integrated; on the 3.0.0 release (vLLM 0.32) a fresh install (2026-10-21) and a from-source build (2026-10-22) passed on the reference host, the 3.0.2 fresh install was not done, and on 3.0.2.1 a fresh install from the release wheel passed on the reference host (2026-11-12: install, verify, identity); the container image is not yet qualified.
 
 ## Proxmox LXC
 
@@ -376,9 +410,9 @@ TP2 pairs form two pipeline stages. `VLLM_PP_LAYER_PARTITION=25,23` assigns laye
 Stage 0 owns the vision tower and target embedding; stage 1 owns the MTP drafter and vocabulary head.
 The PLE table stays in host RAM, with rows pulled over PCIe, and token embeddings are host-resident. With `--ple-store disk` (experimental) the table is read from the checkpoint's files on NVMe instead; see [How to serve](../../../docs/how-to-serve.md#the-ple-table-on-nvme-experimental).
 
-![Flash-Next on four RTX 3090s, Merlin 3.0.0: TP2 x PP2 + EP, 25 and 23 layers per pipeline stage, host-resident PLE and embedding tables](images/flashnext-merlin-3.0.0-layout.png)
+![Flash-Next on four RTX 3090s, Merlin 3.0.2.1: TP2 x PP2 + EP, 25 and 23 layers per pipeline stage, host-resident PLE and embedding tables, 924,993-token FP8 KV pool](images/flashnext-merlin-3.0.2.1-layout.png)
 
-The diagram shows the launcher's partition and the 924,993-token pool of the 2026-10-15 card; the retired v2.5 diagram's
+The diagram shows the launcher's partition and the 924,993-token pool of the 2026-11-12 card; the retired v2.5 diagram's
 host-memory sizes were 0.30 figures and are not carried over. See [The KV budget](#the-kv-budget) for the measured pool.
 
 ### Hardware
@@ -422,13 +456,13 @@ The implementation history is in [history.md](history.md).
 | Piece | Merlin 3.0.2 |
 |---|---|
 | Engine | Merlin, built on vLLM 0.33.0; source at the repository root |
-| Environment and compiled ops | Shared 0.33 installer and engine wheel integrated; `release/requirements-0.33.lock` is complete with 223 exact pins and SHA-256 hashes (torch 2.14.0, Triton 3.8.0, FlashInfer 0.7.2.post1); a fresh install (2026-10-21) and a from-source build (2026-10-22) passed on the reference host on the 3.0.0 release (vLLM 0.32); the 3.0.2 fresh install has not been done |
+| Environment and compiled ops | Shared 0.33 installer and engine wheel integrated; `release/requirements-0.33.lock` is complete with 223 exact pins and SHA-256 hashes (torch 2.14.0, Triton 3.8.0, FlashInfer 0.7.2.post1); a fresh install (2026-10-21) and a from-source build (2026-10-22) passed on the reference host on the 3.0.0 release (vLLM 0.32); the 3.0.2 fresh install was not done; on 3.0.2.1 a fresh install from the release wheel passed on the reference host (2026-11-12: install, verify, identity) |
 | Release dependency facts | humming-kernels 0.1.19; instanttensor ≥ 0.2.2 floor |
 | Parallel shape | TP2 × PP2 + EP; layer partition 25,23 |
 | Speculation | MTP K=3, probabilistic; full-vocabulary draft head, precision `DRAFT_HEAD=bf16\|int8\|int4` (default `bf16`); reduced draft vocabulary removed in 3.0.1 (`REDUCED_DRAFT_VOCAB` / `DRAFT_VOCAB` stop the launch; an empty value, or `REDUCED_DRAFT_VOCAB=0`, is accepted) |
 | Context and scheduling | 262,144 tokens per request; up to 8 sequences; 1,024-token prefill chunk |
 | KV | 4.1e9 bytes per rank, FP8 e4m3, shipped scale sidecar; block size 4,096 |
-| Prefix caching | On (`--enable-prefix-caching`; the launcher also passes the deprecated `--mamba-cache-mode align`, which has no effect on 0.33), match unit 64; **FGPC off** (omit `--enable-mamba-shared-prefix-checkpoint`) |
+| Prefix caching | On (`--enable-prefix-caching`; the launcher also passes the deprecated `--mamba-cache-mode align`, which has no effect on 0.33), match unit 64; **FGPC on** since 3.0.2.1 (`--enable-mamba-shared-prefix-checkpoint`; `-- --no-enable-mamba-shared-prefix-checkpoint` turns it off) |
 | Vision | Up to 42 images per request; 8 MP per image; no video |
 | Compilation | FULL_AND_PIECEWISE, captures through 32; breakable graphs off; V2 runner and RecoverSSM |
 | Guard | `warn` by default; `raise` accepted; `off` refused by the launcher |
@@ -452,7 +486,7 @@ Checkpoint checksum lists are in `models/flash-next/checkpoint.sha256`.
 | Need | Current configuration or measured result |
 |---|---|
 | Several long sessions | Concurrent decode: six 127K sessions, 0 preemption |
-| Re-sent context | Prefix caching on, FGPC off; MTP-off 32K cache hit 0.998 and TTFT 5.78 → 0.315 s |
+| Re-sent context | Prefix caching on, FGPC on (since 3.0.2.1); MTP-off 32K cache hit 0.998 and TTFT 5.78 → 0.315 s (measured with FGPC off) |
 | Tools and thinking | Qwen3 coder tool parser, Qwen3 reasoning parser; thinking on at medium effort |
 | Vision | 8 MP cap; 902 MiB measured stage-0 minimum free |
 | Health | Check an actual generation and read the first named failure in the log |
@@ -493,7 +527,8 @@ no new rates, fault campaign or fresh-compile determinism claim are established 
 
 ## What ships next
 
-Merlin 3.0.2 ships the 0.33 launcher, 8 MP cap, FGPC off and the defaults listed in [Stack](#stack).
+Merlin 3.0.2 ships the 0.33 launcher, 8 MP cap, FGPC off and the defaults listed in [Stack](#stack). Merlin 3.0.2.1
+turns FGPC on and serves `--long-prefill-token-threshold 512` and the prefill runs (`PREFILL_RUNS`) by default.
 RecoverSSM metadata reuse and warm-start controls remain configured; the draft head scores the full vocabulary (`DRAFT_HEAD` sets its precision).
 The old 34 MiB INT4 reduced-vocabulary draft-head cost and 22.5–33.0 W idle-power measurements are
 **v3.0.0 (0.30) figure** results, not re-measured on 0.32 or 0.33.
@@ -516,7 +551,7 @@ A fresh install of the 3.0.2 wheel, container qualification and larger image cap
   Prudctual, Karl0007, semerandre and wzhao18. v2.5.1 adds ten more upstream ports, including
   [RecoverSSM](https://github.com/vllm-project/vllm/pull/58863), the GDN state recovery for speculative
   decoding behind the larger pool. Original authorship remains in upstream history and `NOTICE`.
-- Reports and contributions: a community idle-power report and contribution, brandon-nuttall (YaRN past 262K report, `SEQS`/`MAXLEN` launcher fix, local-argmax mixin), R-omk (YaRN past 262K crash report and recipes), mgabor3141 (club-3090 [discussion](https://github.com/noonghunna/club-3090/discussions/1572))
+- Reports and contributions: [CoolShades](https://github.com/CoolShades) (idle-power report and contribution), brandon-nuttall (YaRN past 262K report, `SEQS`/`MAXLEN` launcher fix, local-argmax mixin), R-omk (YaRN past 262K crash report and recipes), mgabor3141 (club-3090 [discussion](https://github.com/noonghunna/club-3090/discussions/1572))
 - Quantised experts: [Intel/Qwen3.8-Flash-Next-W4A16-AutoRound](https://huggingface.co/Intel/Qwen3.8-Flash-Next-W4A16-AutoRound);
   FP8 PLE table: [RadixArk/Qwen3.8-Flash-Next-NVFP4](https://huggingface.co/RadixArk/Qwen3.8-Flash-Next-NVFP4);
   MTP INT4 packing recipe adapted from [DominikBucko/qwen38-flash-next-2x3090](https://github.com/DominikBucko/qwen38-flash-next-2x3090);

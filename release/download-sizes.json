@@ -1,6 +1,6 @@
 {
   "_comment": "Download sizes setup.sh shows when the Hugging Face API is unreachable (bytes; 2026-10-20; ornith1.5 and nemotron-super-vl 2026-10-22: the whole Hub repository at the pinned revision, from the Hugging Face API). pending_publication (optional, per checkpoint; none is set in this release): marks a repository that is not public yet, so there is no revision to pin and setup serves only a local copy (--models-dir). checkpoints: the whole HF repository at the listed revision. packages: the Linux x86_64 / CPython 3.13 artifacts of release/requirements-0.33.lock (PyPI file sizes). wheel: release/merlin-wheel.sha256's wheel. venv_factor: installed size over download size, an estimate for the disk check. drafters: the speculative drafter setup.sh --spec dflash2 fetches (the whole Hub repository at the pinned revision, 2026-10-23, from the Hugging Face API; its checksum list is models/flash-next/dflash2.sha256).",
-  "wheel": {"bytes": 230953280},
+  "wheel": {"bytes": 230991424},
   "packages": {"count": 223, "bytes": 3966172119},
   "venv_factor": 3,
   "checkpoints": {

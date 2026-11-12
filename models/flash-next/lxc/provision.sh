@@ -16,7 +16,7 @@
 # --no-kernel-module; peer-to-peer support remains a host-driver property.
 set -euo pipefail
 REPO_URL="${REPO_URL:-https://github.com/halt95/merlin-engine.git}"
-REPO_REF="${REPO_REF:-merlin-v3.0.2}"
+REPO_REF="${REPO_REF:-merlin-v3.0.2.1}"
 APP="${APP:-/opt/flash-next}"
 VENV="${VENV:-/opt/venv}"
 [ "$(id -u)" = 0 ] || { echo "run provision.sh as root" >&2; exit 1; }
@@ -32,7 +32,7 @@ if ! command -v nvidia-smi >/dev/null 2>&1; then
   sh "$NVIDIA_RUN" --silent --no-kernel-module --no-drm --no-x-check --no-nouveau-check --no-backup
 fi
 nvidia-smi -L || { echo "check the container GPU device mappings and the host driver" >&2; exit 1; }
-# Reference host: NVIDIA driver 610.43.02 (reports CUDA 13.3). The release lock selects a matched CUDA 13.0 toolkit (nvcc, crt, nvvm, nvJitLink 13.0.88, cccl 13.0.85, runtime 13.0.96, the pair torch 2.13.0 cu130 ships with); the release wheel is served on it by every recipe (2026-10-20).
+# Reference host: NVIDIA driver 610.43.02 (reports CUDA 13.3). The release lock selects a matched CUDA 13.0 toolkit (nvcc, crt, nvvm, nvJitLink 13.0.88, cccl 13.0.85, runtime 13.0.96, the pair torch 2.14.0 cu130 ships with); the 3.0.0 release wheel was served on it by every recipe (2026-10-20); the 3.0.2 wheel was served on it on 2026-11-04 by Flash-Next, Qwen3.8-27B (1, 2 and 4 GPUs), Nemotron 3.5 Super VL and Ornith 1.5, each with a 262K request.
 # Other CUDA 13.x drivers (R580 or later) are expected to work through CUDA minor-version
 # compatibility, but are untested.
 # Require the CUDA 13.x floor; see release/install-0.33.md.

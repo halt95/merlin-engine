@@ -712,6 +712,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         # One launch does the indexer prepare, the main QK-norm/RoPE/gate and
         # the main K/V cache write (see QSAIndexer.forward); otherwise all of
         # them take the separate kernels.
+
         fp8_layer = _is_qsa_fp8_cache_dtype(self.kv_cache_dtype)
         self.use_fused_qsa_prepare = (
             self.use_fused_qk_norm_rope_gate
@@ -748,9 +749,12 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         # index; the sparse attention kernel reads it as its loop bound.
         # MTP skip_topk steps reuse rows frozen from step 0; the count is
         # a row column, so compaction/reuse keep it paired with the content.
+        # The target model's layers on
+        # one stage share this buffer; the MTP drafter keeps its own.
+        from vllm.merlin.qsa_shared_index import qsa_topk_index_buffer
         self.register_buffer(
             "topk_indices_buffer",
-            torch.empty(
+            qsa_topk_index_buffer(
                 max_tokens,
                 self.indexer.packed_output_width,
                 dtype=torch.int32,

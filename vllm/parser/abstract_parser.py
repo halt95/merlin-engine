@@ -107,6 +107,16 @@ class StreamState:
             self.previous_token_ids = current_token_ids
 
 
+def _ended_at_held_opener(parser: object) -> bool:
+    """Whether the reasoning engine's final flush ended reasoning at a held
+    tool opener (Qwen3StreamingParserEngine.opened_held_call)."""
+    engine = getattr(getattr(parser, "_parser_engine", None), "_engine", None)
+    if not getattr(engine, "opened_held_call", False):
+        return False
+    engine.opened_held_call = False
+    return True
+
+
 @contextlib.contextmanager
 def _token_aligned(parser: object, token_ids: Sequence[int] | None):
     """Hand ``token_ids`` to an engine adapter for one non-streaming call."""
@@ -1104,7 +1114,8 @@ class DelegatingParser(Parser):
 
         if finished:
             delta_message = self.finalize_generation(delta_message, request, state)
-            delta_message = self._flush_engine_parsers(delta_message)
+            # Request for the name gate
+            delta_message = self._flush_engine_parsers(delta_message, request)
 
         # Suppress reasoning deltas if not requested
         if delta_message and not request.include_reasoning:
@@ -1127,7 +1138,10 @@ class DelegatingParser(Parser):
         return self._reasoning_parser.count_reasoning_tokens(token_ids)
 
     def _flush_engine_parsers(
-        self, delta_message: DeltaMessage | None
+        # Request for the name gate
+        self,
+        delta_message: DeltaMessage | None,
+        request: ChatCompletionRequest | ResponsesRequest | None = None,
     ) -> DeltaMessage | None:
         """Flush buffered state from engine-based parsers at stream end."""
         reasoning_ended = self._stream_state.reasoning_ended
@@ -1145,6 +1159,41 @@ class DelegatingParser(Parser):
             if finish is None:
                 continue
             flush_delta = finish()
+            # A tool block held in
+            # reasoning becomes a call only at the end of output; its text goes
+            # to the tool pass (as text, no ids) instead of to content.
+            if (
+                parser is self._reasoning_parser
+                and flush_delta is not None
+                and flush_delta.content
+                and request is not None
+                and self._tool_parser is not None
+                and _ended_at_held_opener(parser)
+            ):
+                state = self._stream_state
+                state.reasoning_ended = True
+                text, flush_delta.content = flush_delta.content, None
+                tool_delta, state.function_name_returned = (
+                    self._extract_tool_calls_streaming(
+                        previous_text="",
+                        current_text=text,
+                        delta_text=text,
+                        previous_token_ids=[],
+                        current_token_ids=[],
+                        delta_token_ids=[],
+                        request=request,  # type: ignore[arg-type]
+                        tool_call_idx=state.history_tool_call_cnt,
+                        tool_call_id_type=state.tool_call_id_type,
+                        function_name_returned=state.function_name_returned,
+                    )
+                )
+                if tool_delta is not None:
+                    flush_delta.content = tool_delta.content
+                    flush_delta.tool_calls = tool_delta.tool_calls
+                    if tool_delta.tool_calls:
+                        state.history_tool_call_cnt += sum(
+                            tc.id is not None for tc in tool_delta.tool_calls
+                        )
             if flush_delta is None:
                 continue
             if delta_message is None:

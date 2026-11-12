@@ -13,7 +13,7 @@ with vision, tool calls and MTP speculative decoding, behind one OpenAI-compatib
 [![Context](https://img.shields.io/badge/context-262K_per_request-ffb000)](../qwen38-27b/docs/reference.md#the-kv-budget)
 [![ThinkingCap](https://img.shields.io/badge/%F0%9F%A4%97_checkpoint-ThinkingCap--Qwen3.8--27B--W4A16--Merlin-ffd21e)](https://huggingface.co/halt95/ThinkingCap-Qwen3.8-27B-W4A16-Merlin)
 
-> **Recipe 3.0.0 / Merlin 3.0.2:** **vLLM 0.33.0**. ThinkingCap is a profile of the
+> **Recipe 3.0.0 / Merlin 3.0.2.1:** **vLLM 0.33.0**. ThinkingCap is a profile of the
 > [Qwen3.8-27B recipe](../qwen38-27b/README.md). Its wrappers forward to the TP2/TP4 base launchers.
 > Both use **FGPC ON** (`--enable-mamba-shared-prefix-checkpoint`), pools **826,689 / 2,012,105 tokens** (TP4 = RecoverSSM on; ThinkingCap TP4 check PASS, 32/32 checks),
 > and the **8 MP (8,388,608 pixel)** release cap. The integrated launchers default to this cap.
@@ -42,9 +42,22 @@ it is **not** published, reviewed or endorsed by BottleCap AI or Qwen.
 | Weights licence | Apache-2.0 | PolyForm Small Business 1.0.0 plus BottleCap AI's personal-use permission ([License](#license)) |
 | Historical 0.30 numbers | single-stream thinking decode at 32K: 198 tok/s dual card, 249 quad card | x0.860 of the base's median thinking tokens at medium effort at the same GSM8K accuracy (97.27 %, 1,319 items); 172.8 tok/s at 32K on dual card (2026-10-08 check) and 223.4 on quad card (2026-10-12) |
 
-Both checkpoints run on the same engine, pins, port (8100) and served name (`qwen38-27b`). The 3.0.2 measurements are in the
-[2026-11-05 card](benchmarks/2026-11-05/BENCH-CARD.md), the 3.0.1 ones in the [2026-11-02 card](benchmarks/2026-11-02/BENCH-CARD.md), and the older ones, dated per row, in the [2026-10-12 card](benchmarks/2026-10-12/ThinkingCap-BENCH-CARD.md); the profile's detail (what differs, token cost by effort,
+Both checkpoints run on the same engine, pins, port (8100) and served name (`qwen38-27b`). The 3.0.2.1 measurements are in the
+[2026-11-12 card](benchmarks/2026-11-12/BENCH-CARD.md), the 3.0.2 ones in the [2026-11-05 card](benchmarks/2026-11-05/BENCH-CARD.md), the 3.0.1 ones in the [2026-11-02 card](benchmarks/2026-11-02/BENCH-CARD.md), and the older ones, dated per row, in the [2026-10-12 card](benchmarks/2026-10-12/ThinkingCap-BENCH-CARD.md); the profile's detail (what differs, token cost by effort,
 capacity rows) is in [ThinkingCap checkpoint profile](../qwen38-27b/docs/reference.md#thinkingcap-checkpoint-profile).
+
+## Merlin 3.0.2.1 bench card (2026-11-12)
+
+Maintainer measurements on 4× RTX 3090 (220 W, PCIe Gen4) with P2P (the aikitoria patched driver) and the Zagitta [gpu-unlock](https://github.com/Zagitta/gpu-unlock) kernel module, on vLLM 0.33.0, fresh `merlin serve` boots, 2026-11-10 and 2026-11-11, on the previous build of the 3.0.2.1 wheel (built on 2026-11-10, before the prefill runs change; not re-measured on the published wheel, except the two-card 262K decode, re-measured on it on 2026-11-12 with 12 sends); method and every cell in the [bench card](benchmarks/2026-11-12/BENCH-CARD.md). Decode is one stream with thinking on at reasoning effort medium, the server default (tok/s after the first streamed token); prefill is one cold request. With thinking on, a 512-token agent follow-up may end inside the reasoning, and reasoning tokens count. Sessions held at once and the 8 MP image panels were not re-run; they stay on the earlier cards below.
+
+| Measurement | 2× RTX 3090 (TP2) | 4× RTX 3090 (TP4) |
+|---|---|---|
+| Decode, 4K / 131K / 262K prompt | 244 / 179 / 163 tok/s | 240 / 238 / 233 tok/s |
+| Cold prefill, 10K / 100K / 262K prompt | 2,332 / 1,679 / 1,116 tok/s | 3,879 / 3,017 / 2,115 tok/s |
+| Agents at once (8 × 16K conversations), total, thinking on / off (a window under 5 s is short: read that total loosely) | 731 tok/s (4.83 s, short) / 663 tok/s (5.68 s) | 974 tok/s (3.55 s, short) / 856 tok/s (4.31 s, short) |
+| GSM8K-200 (5-shot), correct of 200, thinking on at medium / thinking off | – / 195 | 196 / 193 |
+| KV pool | 826,689 tokens | 2,012,105 tokens |
+| Against 3.0.2 | Decode +19 % / +6 % at 4K / 131K (the two-card P2P launcher defaults) and level at 262K: the step time is 29.26 ms against 29.34 ms, and the 128-token rate varies with the text sent (12 sends on the published wheel, 144.9–165.2 tok/s); 262K prefill 0 %; 8 agents +3 %. | Within run-to-run spread: decode +1 % / +1 % / +4 % at 4K / 131K / 262K, 262K prefill 0 %, 8 agents +4 %; GSM8K-200 thinking on 196 (198 on 3.0.2). |
 
 ## Merlin 3.0.2 bench card (2026-11-05)
 

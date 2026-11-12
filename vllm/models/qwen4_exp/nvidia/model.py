@@ -613,9 +613,14 @@ class Qwen4ExpModel(nn.Module, EagleModelMixin):
                 prefix=prefix,
             )
 
-        self.start_layer, self.end_layer, self.layers = make_layers(
-            config.num_hidden_layers, get_layer, prefix=f"{prefix}.layers"
-        )
+        # This stage's QSA layers share
+        # one top-k index buffer (vllm/merlin/qsa_shared_index.py).
+        from vllm.merlin.qsa_shared_index import shared_qsa_index_buffers
+
+        with shared_qsa_index_buffers(f"{prefix}.layers"):
+            self.start_layer, self.end_layer, self.layers = make_layers(
+                config.num_hidden_layers, get_layer, prefix=f"{prefix}.layers"
+            )
         self.is_fused_shared_expert_enabled = is_model_fused_shared_expert_compatible(
             self.layers,
             Qwen4ExpSparseMoeBlock,
@@ -952,6 +957,7 @@ class Qwen4ExpForCausalLM(
         assert_graph_profile_is_executable(vllm_config, role="target")
         assert_ple_mode(vllm_config, role="target")
         config: Qwen4ExpTextConfig = vllm_config.model_config.hf_text_config
+
         # Port of vllm#62318: packed_modules_mapping never lists the indexer
         # projection; QSA fuses it into qkv_proj itself (qsa.py) only without
         # LoRA and with a matching quant method.
@@ -1239,6 +1245,7 @@ class Qwen4ExpForConditionalGeneration(
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "model") -> None:
         nn.Module.__init__(self)
         config: Qwen4ExpConfig = vllm_config.model_config.hf_config
+
         # Port of vllm#62318: packed_modules_mapping never lists the indexer
         # projection; QSA fuses it into qkv_proj itself (qsa.py) only without
         # LoRA and with a matching quant method.

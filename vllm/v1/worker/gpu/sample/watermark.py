@@ -655,6 +655,7 @@ def _philox_gumbel_kernel(
             )
             seed = tl.load(seeds_ptr + req_state_idx, mask=valid_req, other=0)
             pos = tl.load(pos_ptr + row)
+
             # Position keying only, with no cache-column mix.
             logits_row = logits_ptr + row * logits_stride
             logits = tl.load(logits_row + candidate, mask=mask, other=float("-inf")).to(

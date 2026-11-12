@@ -12,6 +12,7 @@ default to ``SHIPPED_KERNEL_TOGGLE_DEFAULTS``. Imports nothing but the
 standard library at module level, so vllm.envs can import it first.
 """
 
+import math
 import os
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
@@ -60,6 +61,17 @@ if TYPE_CHECKING:
     # prefill still gets its step. Strict "0"/"1", default off. AOT: no.
     # CAPTURE: no -- scheduler-side step composition only.
     VLLM_MERLIN_DECODE_FIRST: bool = False
+    # Prefill runs (vllm/merlin/prefill_runs.py): while sessions decode, a long
+    # prefill advances in runs of CHUNKS full chunks of CHUNK_TOKENS, then
+    # yields a decode-only window sized from DECODE_SHARE and the TICK_COSTS
+    # constants ("prefill tick ms,decode round ms,fill ticks"). Strict
+    # "0"/"1", default off. AOT: no. CAPTURE: no -- scheduler-side step
+    # composition only.
+    VLLM_MERLIN_PREFILL_RUNS: bool = False
+    VLLM_MERLIN_PREFILL_RUNS_CHUNKS: int = 16
+    VLLM_MERLIN_PREFILL_RUNS_CHUNK_TOKENS: int = 1024
+    VLLM_MERLIN_PREFILL_RUNS_DECODE_SHARE: float = 0.30
+    VLLM_MERLIN_PREFILL_RUNS_TICK_COSTS: tuple[float, float, float] = (139.0, 25.0, 1.0)
     # Compile-cache fault guard, default on; exactly "0" disables. After
     # a sticky CUDA fault the run's compile cache dirs are marked, and the next
     # boot moves a marked dir to .merlin-quarantine/ and recompiles; AOT
@@ -115,6 +127,11 @@ if TYPE_CHECKING:
     # store batch, with no extra synchronisation.
     # Runtime-only: AOT: no. CAPTURE: no.
     MERLIN_KV_HOST_TIER_CENSUS: bool = False
+    # DEBUG ONLY: KV tier diagnosis log lines (FGPC junction publish / pop,
+    # first-turn cached tokens, host eviction victims with the host row
+    # split); 0/unset = off, and nothing else changes. Runtime-only: AOT: no.
+    # CAPTURE: no.
+    MERLIN_KV_TIER_DIAG: bool = False
     # DEBUG ONLY: fail the first N restore transfers per rank (0/unset = off).
     # Requires the host tier on. Runtime-only: AOT: no. CAPTURE: no.
     MERLIN_KV_HOST_TIER_FAIL_LOADS: int = 0
@@ -289,6 +306,20 @@ if TYPE_CHECKING:
     # names resolve to the family at config and registry time; no kernel, op or
     # captured graph depends on it. Runtime-only (ignored_factors).
     VLLM_FLASHNEXT_FAMILY_ALIASES: str = ""
+    # Qwen3.5-lineage (dense 27B / MoE) architecture and model_type names,
+    # "Name,alias=canonical,-Name" (vllm/qwen35_family.py is the parser and the
+    # documentation; docs/merlin/qwen4-27b-day-one.md is the day-one use). Default
+    # unset/"": the canonical sets are the historical Qwen3_5* literals plus the
+    # default Qwen 4 candidates, which match no shipped checkpoint. qwen35_family
+    # is stdlib-only, so it parses os.environ itself; this entry is the
+    # registration. AOT: no (ignored_factors), on the same rule as the Flash-Next
+    # aliases: it decides which names resolve to the lineage at config and
+    # registry time, and registering it must not move the release AOT cache key.
+    # An entry changes the compiled graph only for the checkpoint it names, which
+    # could not boot as a Qwen3.5-lineage model before; after changing an entry
+    # for a checkpoint that already booted, use a fresh VLLM_CACHE_ROOT.
+    # CAPTURE: no.
+    MERLIN_QWEN35_ARCH_ALIASES: str = ""
     #
     # --- determinism toggles -----------------------------------------
     # FULL_K, QSA_SORT and TIE_DET/TIE_RECENT default to the shipped value 1
@@ -380,6 +411,25 @@ if TYPE_CHECKING:
     MERLIN_MARLIN_MOE_CFG: str | None = None
     # Exact-shape W8A16 tiles; default OFF.
     MERLIN_MARLIN_DENSE_CFG: str | None = None
+    # Static cold-expert offload: profile path (unset, blank or 0 = OFF), optional
+    # layer list and hot-fraction overrides. Parsed only by
+    # vllm/merlin/cold_experts_plan.py, at load time. IGNORED as compile
+    # factors, see MERLIN_IGNORED.
+    MERLIN_COLD_EXPERTS: str | None = None
+    MERLIN_COLD_EXPERTS_LAYERS: str | None = None
+    MERLIN_COLD_EXPERTS_HOT_FRAC: str | None = None
+    # Boot-memory helpers, both around post-load weight processing:
+    # MERLIN_REPACK_RELEASE (default on, 0 = stock) empty_caches the allocator
+    # after a module's repack (vllm/merlin/repack_release.py);
+    # MERLIN_LOAD_PEAK_LOG=1 logs per-module load peaks, a diagnostic
+    # (vllm/merlin/load_peak_log.py). Both readers parse os.environ themselves;
+    # these entries are the registration. IGNORED as compile factors.
+    MERLIN_REPACK_RELEASE: bool = True
+    MERLIN_LOAD_PEAK_LOG: bool = False
+    # Qwen3 tool-call parser literal spans, default on, 0 = off: fenced
+    # spans and tool blocks quoted in closed reasoning stay text. Parser-only
+    # (vllm/parser/qwen3.py reads it). IGNORED as a compile factor.
+    MERLIN_QWEN3_LITERAL_SPANS: bool = True
     #
     # NOT REGISTERED: MERLIN_TOPK_EXACT_TRAP is a build-time -D define in
     # persistent_topk.cuh, not an environment variable.
@@ -474,6 +524,47 @@ def _qsa_scratch_mode() -> str:
     return raw
 
 
+def _prefill_runs_share() -> float:
+    """VLLM_MERLIN_PREFILL_RUNS_DECODE_SHARE: a decimal in [0, 1); 0 keeps the
+    full-chunk cap and drops the decode-only windows."""
+    name = "VLLM_MERLIN_PREFILL_RUNS_DECODE_SHARE"
+    raw = os.environ.get(name)
+    if raw is None:
+        return 0.30
+    try:
+        value = float(raw)
+    except ValueError:
+        value = -1.0
+    if not (raw.strip() == raw and math.isfinite(value) and 0.0 <= value < 1.0):
+        raise ValueError(f"{name} must be a decimal in [0, 1), got {raw!r}")
+    return value
+
+
+def _prefill_runs_tick_costs() -> tuple[float, float, float]:
+    """VLLM_MERLIN_PREFILL_RUNS_TICK_COSTS: "prefill tick ms,decode round
+    ms,fill ticks", e.g. "139,25,1"; the first two > 0, the third >= 0."""
+    name = "VLLM_MERLIN_PREFILL_RUNS_TICK_COSTS"
+    raw = os.environ.get(name)
+    if raw is None:
+        return (139.0, 25.0, 1.0)
+    parts = raw.split(",")
+    try:
+        values = tuple(float(p) for p in parts)
+    except ValueError:
+        values = ()
+    if (
+        len(values) != 3
+        or any(p.strip() != p or not p for p in parts)
+        or not all(math.isfinite(v) for v in values)
+        or not (values[0] > 0 and values[1] > 0 and values[2] >= 0)
+    ):
+        raise ValueError(
+            f'{name} must be "prefill tick ms,decode round ms,fill ticks" '
+            f"(two positive finite numbers and one >= 0), got {raw!r}"
+        )
+    return values  # type: ignore[return-value]
+
+
 def _e2_nonneg_int(name: str, default: int = 0) -> int:
     """Parse a fork knob that accepts only a plain non-negative decimal integer.
 
@@ -528,23 +619,26 @@ def _e2_positive_int(name: str, default: int) -> int:
 
 
 # Architectures whose embedding tables may be kept in pinned host memory
-# (VLLM_HOST_EMBED_TABLE). Other architectures never take this path.
-HOST_EMBED_ARCHITECTURES: tuple[str, ...] = (
-    "Qwen3_5ForCausalLM",
-    "Qwen3_5ForConditionalGeneration",
-    "Qwen3_5MoeForCausalLM",
-    "Qwen3_5MoeForConditionalGeneration",
-    "NemotronH_Omni_Reasoning_V3",  # Nemotron 3.5 Super VL
-)
+# (VLLM_HOST_EMBED_TABLE): host_embed_archs(). Other architectures never take
+# this path.
+def host_embed_archs() -> tuple[str, ...]:
+    """Architectures whose embedding shards may live on the host: the Qwen3.5 lineage
+    (vllm/qwen35_family.py, dense and MoE) and Nemotron 3.5 Super VL."""
+    from vllm import qwen35_family
+
+    return (
+        *qwen35_family.gdn_archs(),
+        "NemotronH_Omni_Reasoning_V3",  # Nemotron 3.5 Super VL
+    )
 
 
 def host_embed_table_enabled_for_model(architecture: str) -> bool:
     """Resolve VLLM_HOST_EMBED_TABLE for one architecture.
 
-    Only ``HOST_EMBED_ARCHITECTURES`` are eligible. For those, ``1`` turns
+    Only ``host_embed_archs()`` are eligible. For those, ``1`` turns
     host embedding on, ``0`` turns it off and unset means on (the default).
     """
-    if architecture not in HOST_EMBED_ARCHITECTURES:
+    if architecture not in host_embed_archs():
         return False
     # Read through vllm.envs so the value comes from the same (possibly cached)
     # module __getattr__ as every other reader; keep module imports stdlib-only.
@@ -657,11 +751,13 @@ MERLIN_ENV: dict[str, Callable[[], Any]] = {
     # values seq_lens.cpu() returns, so the page table and FlashInfer plan are identical).
     # Off by default; VLLM_TARGET_SEQ_LENS_ASYNC=1 enables it. _VERIFY=1 also syncs, compares
     # against seq_lens.cpu(), logs and uses the synced lengths on a mismatch (diagnostic).
-    # Registered here (not read from os.environ) so both are part of the compile cache key.
+    # Both are registered runtime controls (not read from os.environ) and are excluded from the
+    # compile cache key (MERLIN_IGNORED below).
     "VLLM_TARGET_SEQ_LENS_ASYNC": lambda: _e2_strict_switch(
         "VLLM_TARGET_SEQ_LENS_ASYNC", default=False, legacy="int"
     ),
-    # None when unset so unset and explicit 0 are distinct compile factors.
+    # None when unset, keeping it distinct from an explicit 0; a runtime control,
+    # excluded from the compile cache key (MERLIN_IGNORED).
     "VLLM_TARGET_SEQ_LENS_ASYNC_VERIFY": lambda: _e2_strict_switch(
         "VLLM_TARGET_SEQ_LENS_ASYNC_VERIFY", legacy="int", none_if_unset=True
     ),
@@ -770,6 +866,8 @@ MERLIN_ENV: dict[str, Callable[[], Any]] = {
     "VLLM_FLASHNEXT_FAMILY_ALIASES": lambda: os.getenv(
         "VLLM_FLASHNEXT_FAMILY_ALIASES", ""
     ),
+    # Qwen3.5-lineage names; raw passthrough, qwen35_family.py is the parser.
+    "MERLIN_QWEN35_ARCH_ALIASES": lambda: os.getenv("MERLIN_QWEN35_ARCH_ALIASES", ""),
     # Determinism toggles. See the declaration block above for the AOT /
     # capture classification and for why three of these are raw passthroughs.
     # All four are absent from ignored_factors on purpose, so all four are
@@ -810,6 +908,15 @@ MERLIN_ENV: dict[str, Callable[[], Any]] = {
     "MERLIN_MARLIN_MOE_CFG": lambda: os.getenv("MERLIN_MARLIN_MOE_CFG", None),
     # Blank/unset is preserved as OFF.
     "MERLIN_MARLIN_DENSE_CFG": lambda: os.getenv("MERLIN_MARLIN_DENSE_CFG", None),
+    # Static cold-expert offload: raw passthroughs; cold_experts_plan.py parses them.
+    "MERLIN_COLD_EXPERTS": lambda: os.getenv("MERLIN_COLD_EXPERTS", None),
+    "MERLIN_COLD_EXPERTS_LAYERS": lambda: os.getenv("MERLIN_COLD_EXPERTS_LAYERS", None),
+    "MERLIN_COLD_EXPERTS_HOT_FRAC": lambda: os.getenv("MERLIN_COLD_EXPERTS_HOT_FRAC", None),
+    # Boot-memory helpers and the Qwen3 parser literal spans: the
+    # same parse as their readers (repack_release.py, load_peak_log.py, parser/qwen3.py).
+    "MERLIN_REPACK_RELEASE": lambda: os.getenv("MERLIN_REPACK_RELEASE", "1") != "0",
+    "MERLIN_LOAD_PEAK_LOG": lambda: os.getenv("MERLIN_LOAD_PEAK_LOG", "0") == "1",
+    "MERLIN_QWEN3_LITERAL_SPANS": lambda: os.getenv("MERLIN_QWEN3_LITERAL_SPANS", "1") != "0",
     # Prefix-cache thrash fixes (default ON). Read in cache_thrash.py.
     "VLLM_E2_SCHED_MISS_DEFER_S": lambda: _e2_nonneg_int(
         "VLLM_E2_SCHED_MISS_DEFER_S", default=120
@@ -827,6 +934,19 @@ MERLIN_ENV: dict[str, Callable[[], Any]] = {
     "VLLM_MERLIN_DECODE_FIRST": lambda: _e2_strict_switch(
         "VLLM_MERLIN_DECODE_FIRST", default=False
     ),
+    # Prefill runs and their tunables, default off. Read in
+    # vllm/merlin/prefill_runs.py.
+    "VLLM_MERLIN_PREFILL_RUNS": lambda: _e2_strict_switch(
+        "VLLM_MERLIN_PREFILL_RUNS", default=False
+    ),
+    "VLLM_MERLIN_PREFILL_RUNS_CHUNKS": lambda: _e2_positive_int(
+        "VLLM_MERLIN_PREFILL_RUNS_CHUNKS", 16
+    ),
+    "VLLM_MERLIN_PREFILL_RUNS_CHUNK_TOKENS": lambda: _e2_positive_int(
+        "VLLM_MERLIN_PREFILL_RUNS_CHUNK_TOKENS", 1024
+    ),
+    "VLLM_MERLIN_PREFILL_RUNS_DECODE_SHARE": lambda: _prefill_runs_share(),
+    "VLLM_MERLIN_PREFILL_RUNS_TICK_COSTS": lambda: _prefill_runs_tick_costs(),
     # Compile-cache fault guard, default on. Read in
     # vllm/merlin/compile_cache_guard.py.
     "VLLM_MERLIN_COMPILE_CACHE_GUARD": lambda: _e2_strict_switch(
@@ -848,6 +968,8 @@ MERLIN_ENV: dict[str, Callable[[], Any]] = {
     "MERLIN_KV_HOST_TIER_CENSUS": lambda: _e2_strict_switch(
         "MERLIN_KV_HOST_TIER_CENSUS", default=False
     ),
+    # Read in vllm/v1/core/fgpc.py, kv_host_tier_census.py, kv_host_tier_units.py.
+    "MERLIN_KV_TIER_DIAG": lambda: _e2_strict_switch("MERLIN_KV_TIER_DIAG", default=False),
     "MERLIN_KV_HOST_TIER_FAIL_LOADS": kv_host_tier_fail_loads,
     "MERLIN_KV_HOST_TIER_FAIL_STORES": kv_host_tier_fail_stores,
     # Host-tier write-back pacing (copy credits P, admission escape steps,
@@ -956,6 +1078,14 @@ MERLIN_IGNORED: frozenset[str] = frozenset(
     # Decode-first step budget: how many tokens a prefill chunk takes
     # this step; shapes stay within the captured batch sizes either way.
     "VLLM_MERLIN_DECODE_FIRST",
+    # Prefill runs: which rows a step schedules and how large a prefill chunk
+    # is (never above --max-num-batched-tokens); shapes stay within the
+    # configured budget either way.
+    "VLLM_MERLIN_PREFILL_RUNS",
+    "VLLM_MERLIN_PREFILL_RUNS_CHUNKS",
+    "VLLM_MERLIN_PREFILL_RUNS_CHUNK_TOKENS",
+    "VLLM_MERLIN_PREFILL_RUNS_DECODE_SHARE",
+    "VLLM_MERLIN_PREFILL_RUNS_TICK_COSTS",
     # Compile-cache fault guard: where the cache lives and whether it is
     # trusted, never what is compiled; must not move the AOT cache key.
     "VLLM_MERLIN_COMPILE_CACHE_GUARD",
@@ -976,6 +1106,8 @@ MERLIN_IGNORED: frozenset[str] = frozenset(
     "MERLIN_KV_HOST_TIER__ADMISSION",
     # Debug census of the tier (scheduler-side bookkeeping and log lines).
     "MERLIN_KV_HOST_TIER_CENSUS",
+    # Debug diagnosis log lines of the KV tiers (scheduler-side only).
+    "MERLIN_KV_TIER_DIAG",
     # Debug copy-thread errors only; no compiled/captured operations.
     "MERLIN_KV_HOST_TIER_FAIL_LOADS",
     "MERLIN_KV_HOST_TIER_FAIL_STORES",
@@ -1050,6 +1182,26 @@ MERLIN_IGNORED: frozenset[str] = frozenset(
     # only native launch parameters change, not persisted compiled code.
     # CUDA graphs are process-local; changing the table requires a restart.
     "MERLIN_MARLIN_DENSE_CFG",
+    # Static cold-expert offload. AOT: no -- the expert tensors are read
+    # only inside the opaque vllm.moe_forward custom op, which Inductor does not
+    # trace, and the split changes where expert bytes live, not any compiled
+    # graph. CAPTURE: the hot/cold tensors and maps are fixed before capture and
+    # graphs are never persisted. Hashing these would give every placement arm
+    # its own compile cache (the cross-cache class), which is what this
+    # placement path exists to avoid.
+    "MERLIN_COLD_EXPERTS",
+    "MERLIN_COLD_EXPERTS_LAYERS",
+    "MERLIN_COLD_EXPERTS_HOT_FRAC",
+    # Repack release: synchronise + empty_cache after a module's
+    # post-load processing; frees cached allocator blocks only, before any
+    # compile or capture. Weights, kernels and graphs are unchanged.
+    "MERLIN_REPACK_RELEASE",
+    # Load-peak log: a diagnostic that brackets post-load processing
+    # with memory reads and logs them; nothing compiled or captured reads it.
+    "MERLIN_LOAD_PEAK_LOG",
+    # Qwen3 parser literal spans: API-server output parsing only; the
+    # model forward never sees it.
+    "MERLIN_QWEN3_LITERAL_SPANS",
     # --- 27B lane knobs: ignored factors and their reasons. ---
     # RecoverSSM commit order (after vs before the MTP proposal): eager Python
     # call order after sampling; nothing compiled or captured depends on it.
@@ -1086,6 +1238,7 @@ MERLIN_IGNORED: frozenset[str] = frozenset(
     # Family-name aliases: resolved to architecture / model_type names at
     # config and registry time; no compiled or captured artifact depends on it.
     "VLLM_FLASHNEXT_FAMILY_ALIASES",
+    "MERLIN_QWEN35_ARCH_ALIASES",
     # ------------------------------------------------------------------
     }
 )
@@ -1108,17 +1261,23 @@ MERLIN_RETIRED: dict[str, str] = {}
 
 
 # MERLIN_* names read by the Merlin command-line tools (launcher, setup,
-# release scripts), never by the engine. They may sit in the same shell as an
-# engine boot, so the engine neither warns about them nor calls them misspelt.
+# release scripts, container entrypoint), never by the engine. They may sit in
+# the same shell as an engine boot, so the engine neither warns about them nor
+# calls them misspelt. A CPU test checks that
+# every name the tools read or the docs name is here or a registered knob.
 MERLIN_TOOL_ONLY: frozenset[str] = frozenset({
+    "MERLIN_ALLOW_SERVER_DEV_MODE",
     "MERLIN_CHECKPOINT_DIR",
+    "MERLIN_EMULATE_VRAM_CLASS",
     "MERLIN_HOME",
     "MERLIN_LIBCUDA",
     "MERLIN_LOG_DIR",
     "MERLIN_MODEL",
     "MERLIN_PLE_PACK_DIR",
     "MERLIN_PLE_TEST_TABLE",
+    "MERLIN_PROFILE",
     "MERLIN_PYTHON",
+    "MERLIN_READY_BANNER",
     "MERLIN_RELEASE_VERSION",
     "MERLIN_SKIP_PORT_CHECK",
     "MERLIN_SKIP_RAM_CHECK",

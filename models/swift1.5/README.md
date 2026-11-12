@@ -1,4 +1,4 @@
-# Swift 1.5 · Merlin 3.0.2
+# Swift 1.5 · Merlin 3.0.2.1
 
 The launcher serves Froggeric's fixed Qwen3.8 template,
 [`froggeric-qwen-v22.5.jinja`](../qwen38-27b/templates/froggeric-qwen-v22.5.jinja), the same template as the
@@ -13,6 +13,8 @@ Recipe version: [3.0.0](VERSION). The engine lives at the repository root and cu
 
 This is a W4A16 build of [UkisAI's Swift 1.5](https://huggingface.co/ukisai/Swift1.5-Qwen3.8-Flash-Next) post-train: the Merlin checkpoint with Swift's 300 changed dense tensors transplanted. It is an independent derivative made by halt95, not made, reviewed or endorsed by UkisAI or Qwen.
 
+![Swift 1.5 on 4× RTX 3090, Merlin 3.0.2.1 at a glance: headline figures and the bench card each comes from](docs/images/swift15-merlin-3.0.2.1-summary.png)
+
 ## Qualification status
 
 The canonical [serve.sh](serve.sh) is generated from the checkpoint profile in `tools/merlin/profiles/flash-next.json` by `tools/merlin/preflight.py`; it starts this checkout directly. A boot-and-check run of the generated launcher on 2026-10-16 gave: boot 443 s, GSM8K-20 19/20, ITL 4K / 32K 18.78 / 18.84 ms, 27/27 T=0 outputs matched the Flash-Next quad's Swift 1.5 outputs (report-only because argv differs); the 2026-10-20 Merlin 3.0.0 release bench card then measured GSM8K-200 197/200, pool 924,993; needles 23/23 at 262K and 10/10 at 131K (needle panel from the 2026-10-17 pre-release build). It is tested on the reference host.
@@ -22,9 +24,24 @@ The canonical [serve.sh](serve.sh) is generated from the checkpoint profile in `
 | Swift vision at 8 MP (8,388,608 pixels per image) | Measured on 2026-10-15 on 4× RTX 3090 / 0.32: **stage-0 minimum free memory 902 MiB** (different served configuration). Generated launcher, 2026-10-16 8 MP burst after 8K prefill: **544 MiB**, 20 MiB above the 524 MiB floor |
 | Generated 0.32 launcher on the assembled release tree | a boot-and-check run of the generated launcher (2026-10-16) and the 2026-10-20 release bench card both ran clean: tested on the reference host |
 | KV pool and session residency | 924,993 tokens was measured on the generated launcher (2026-10-16); 3 × 262K and 6 × 131K sessions held at once on the 2026-10-20 bench card |
-| Decode, prefill, follow-up latency and quality | 2026-11-05 Merlin 3.0.2 bench card (below): decode 181 / 187 / 186 tok/s at 4K / 131K / 262K, cold prefill 6,569 / 6,932 tok/s at 10K / 100K; agents (8 × 16K) 659 tok/s thinking on; GSM8K-200 199/200 at medium. The 2026-11-02 3.0.1 card: decode 176 / 186 / 186 tok/s, cold prefill 6,623 / 7,043 tok/s; agents (8 × 16K) 673 tok/s thinking on, 650 thinking off; GSM8K-200 199/200 at medium. The 2026-10-20 3.0.0 card (BF16 draft head): decode 177 / 180 / 177 tok/s, cold prefill 5,676 / 6,055 tok/s, agents 643 tok/s, GSM8K-200 197/200 thinking off. Historical, the 2026-10-17 pre-release bench run (INT8 draft head): agents aggregate 256 / 409 / 657 tok/s at n=2 / 4 / 8, GSM8K 198/200. The launcher qualification measured GSM8K-20 19/20 and ITL 18.78 / 18.84 ms at 4K / 32K; other earlier results are historical |
+| Decode, prefill, follow-up latency and quality | 2026-11-12 Merlin 3.0.2.1 bench card (below): decode 180 / 185 / 182 tok/s at 4K / 131K / 262K, cold prefill 6,604 / 6,964 tok/s at 10K / 100K; agents (8 × 16K) 688 tok/s thinking on, 661 thinking off; GSM8K-200 199/200 at medium, 198/200 thinking off. The 2026-11-05 3.0.2 card: decode 181 / 187 / 186 tok/s at 4K / 131K / 262K, cold prefill 6,569 / 6,932 tok/s at 10K / 100K; agents (8 × 16K) 659 tok/s thinking on; GSM8K-200 199/200 at medium. The 2026-11-02 3.0.1 card: decode 176 / 186 / 186 tok/s, cold prefill 6,623 / 7,043 tok/s; agents (8 × 16K) 673 tok/s thinking on, 650 thinking off; GSM8K-200 199/200 at medium. The 2026-10-20 3.0.0 card (BF16 draft head): decode 177 / 180 / 177 tok/s, cold prefill 5,676 / 6,055 tok/s, agents 643 tok/s, GSM8K-200 197/200 thinking off. Historical, the 2026-10-17 pre-release bench run (INT8 draft head): agents aggregate 256 / 409 / 657 tok/s at n=2 / 4 / 8, GSM8K 198/200. The launcher qualification measured GSM8K-20 19/20 and ITL 18.78 / 18.84 ms at 4K / 32K; other earlier results are historical |
 
 [Swift1.5-Huihui](../swift1.5-huihui/README.md) inherits Swift's heavy results. Its generated launcher independently passed the 2026-10-16 8 MP check with 902 MiB minimum free.
+
+## Merlin 3.0.2.1 bench card (2026-11-12)
+
+Maintainer measurements on 4× RTX 3090 (220 W, PCIe Gen4) with P2P (the aikitoria patched driver) and the Zagitta [gpu-unlock](https://github.com/Zagitta/gpu-unlock) kernel module, on vLLM 0.33.0, fresh `merlin serve` boots, 2026-11-11, published wheel; method and every cell in the [bench card](benchmarks/2026-11-12/BENCH-CARD.md). Decode is one stream with thinking on at reasoning effort medium, the server default (tok/s after the first streamed token); prefill is one cold request. With thinking on, a 512-token agent follow-up may end inside the reasoning, and reasoning tokens count. Sessions held at once and the 8 MP image panels were not re-run; they stay on the earlier cards below.
+
+| Measurement | Swift1.5 |
+|---|---|
+| Decode, 4K / 131K / 262K prompt | 180 / 185 / 182 tok/s |
+| Cold prefill, 10K / 100K / 262K prompt | 6,604 / 6,964 / 6,793 tok/s |
+| Agents at once (8 × 16K conversations), total, thinking on / off | 688 tok/s / 661 tok/s |
+| GSM8K-200 (5-shot), correct of 200, thinking on at medium / thinking off | 199 / 198 |
+| Sessions held at once | Not re-measured on 3.0.2.1. 3.0.0 run: 3 × 262K and 6 × 131K, every session resident (re-sent prompts ≥ 99.91 % cached), 0 preemptions. |
+| 8 MP image | Not re-measured on 3.0.2.1; see the 3.0.1 and 3.0.0 cards. |
+| KV pool | 924,993 tokens |
+| Against 3.0.2 | Within run-to-run spread: decode −1 % / −1 % / −2 % at 4K / 131K / 262K (262K sends 173.4–192.8 tok/s), 262K prefill 0 %. 8 agents +4 % in one run of 8; the same row on Flash-Next spread 5 % over six repeated runs, so not a gain. |
 
 ## Merlin 3.0.2 bench card (2026-11-05)
 
@@ -81,11 +98,11 @@ Set `VENV` to the environment in which this checkout was installed. Reference ho
 |---|---|
 | Profile | `fn-swift1.5-quad-3090` (select explicitly; automatic hardware selection chooses Flash-Next) |
 | Hardware/layout | 4× RTX 3090 24 GB with P2P; TP2 × PP2 + EP, layer partition 25,23 |
-| Context/admission | 262,144 tokens per request, 8 sequences, 1,024 batched tokens |
+| Context/admission | 262,144 tokens per request, 8 sequences, 1,056 batched tokens by default (`CHUNK` 1,024 plus one verify row per session slot; 1,024 with `PREFILL_RUNS=0`) |
 | KV | FP8 E4M3, `--kv-cache-memory-bytes 4100000000` per card; [Swift-specific scales](scales/kv_scales-swift-e4m3.json) |
 | Images | Up to 42; default cap 8,388,608 pixels per image, overridden with `IMG_CAP_PX` |
 | MTP | K=3, full-vocabulary head (`DRAFT_HEAD=bf16\|int8\|int4`, default bf16); reduced draft vocabulary removed in 3.0.1 (`REDUCED_DRAFT_VOCAB` / `DRAFT_VOCAB` stop the launch; an empty value, or `REDUCED_DRAFT_VOCAB=0`, is accepted) |
-| Caching | Prefix caching and RecoverSSM, block size 4,096, prefix-match unit 64; FGPC **off** |
+| Caching | Prefix caching and RecoverSSM, block size 4,096, prefix-match unit 64; FGPC **on** (since 3.0.2.1, from the Flash-Next launcher) |
 | Thinking/tools | Thinking on at `medium` (`xhigh` per request); Qwen3 reasoning and Qwen3 coder tool parsers |
 | Served names | `flash-next-v2`, `flash-next`, `flash-mtp`, `flash-next-mtp` |
 | Endpoint | `127.0.0.1:8000` by default; `HOST`, `PORT`, `MODEL_NAME` override it |

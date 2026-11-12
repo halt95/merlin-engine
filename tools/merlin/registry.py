@@ -10,7 +10,9 @@ Standard library only (Python >= 3.10), no GPU needed. The registry lives in
   estimate, evidence, status label). ``fn-quad-3090`` is the reference row; the Swift 1.5 and
   Huihui quads were qualified on the 3.0.0 bench card. Rows whose full-model runs passed on cloud-hosted hardware (4 x RTX 4090 24 GB,
   CMP 170HX 64 GB) are labelled "testing" until kernel parity qualification runs; every
-  other row is labelled "untested / community-validated" until a run says otherwise.
+  other row is labelled "untested / community-validated" until a run says otherwise. A row with a ``blocked``
+  reason (a hardware class with no proven fit) is listed but refused by preflight, merlin serve and launch.py. A row's
+  ``env`` holds the engine exports it was measured with (the 4 x 20 GB rows: the static cold-expert offload).
 * ``qwen38-27b.json`` / ``nemotron-super-vl.json`` / ``ornith.json``: the 27B (1 / 2 / 4 cards), Super VL and Ornith 1.5 rows; their
   ``launch`` block holds the family values ``launch.py`` needs. Their launcher files are shims too.
 
@@ -60,6 +62,30 @@ N_LAYERS = (
 MTP_K = 3
 # The qualified DFlash2 FP8 geometry (TP2 x PP2, 24/24) uses this many bytes per block (measured 2026-10-22).
 DFLASH2_KV_BLOCK_BYTES = 14155776
+# KV blocks one 262,144-token request holds on that geometry with the prefill runs on (step budget 2,080): 64 for the
+# target's full-attention group, the rest for the GDN state groups and the drafter's sliding-window layers (81 with the
+# runs off). The engine's pool is (blocks - 1) / this x 262,144: 815,203 at 256 blocks, measured 2026-11-11/12.
+DFLASH2_BLOCKS_PER_262K_REQUEST = 82
+
+
+def _dflash2_pool(kv_blocks: int) -> int:
+    """The engine's reported pool (tokens) for kv_blocks DFlash2 blocks with the prefill runs on."""
+    return (kv_blocks - 1) * 262144 // DFLASH2_BLOCKS_PER_262K_REQUEST
+
+
+def _dflash2_min_blocks(sessions_262k: int) -> int:
+    """The fewest DFlash2 blocks whose engine fit, (blocks - 1) // (per request + 1), holds that many 262K sessions."""
+    return sessions_262k * (DFLASH2_BLOCKS_PER_262K_REQUEST + 1) + 1
+
+
+def dflash2_pool_tokens(profiles_dir: Path | None = None) -> int:
+    """The measured DFlash2 pool the notes quote: the Flash-Next profiles' serve.dflash2 pool_tokens, one value shared
+    by every row with that geometry."""
+    reg = load_registry("flash-next", profiles_dir)
+    pools = {p["serve"]["dflash2"]["pool_tokens"] for p in reg["profiles"] if p.get("serve", {}).get("dflash2")}
+    if len(pools) != 1:
+        raise ProfileError(f"serve.dflash2 rows disagree on pool_tokens: {sorted(pools)}")
+    return pools.pop()
 
 # vLLM-style capture-size ladder used by the shipped profile; extended in steps of 16 above 32,
 # matching the octo profiles ([.., 32, 40, 48, 64, 80, 96, 112, 128]).
@@ -102,12 +128,93 @@ def capture_sizes_for(max_num_seqs: int, k: int = MTP_K) -> list[int]:
     return sizes
 
 
+# Nominal VRAM classes (GiB). The +-7 % windows are disjoint: 20 x 1.07 = 21.4 < 24 x 0.93 = 22.32, so a 22.5 GiB
+# A10 / L4 stays in the 24 GiB class and a 20 GB card (RTX 3080 20GB, RTX A4500, RTX 4000 Ada) is in the 20 GiB class.
+VRAM_CLASSES = (20, 24, 32, 40, 48, 64, 80)
+VRAM_SLACK = 0.07
+
+
 def vram_class(gib: float) -> int | None:
-    """Nominal VRAM class (24/32/40/48/64/80 GiB) of a card, tolerant to ~7 % of reporting slack."""
-    for nominal in (24, 32, 40, 48, 64, 80):
-        if nominal * 0.93 <= gib <= nominal * 1.07:
+    """Nominal VRAM class (20/24/32/40/48/64/80 GiB) of a card, tolerant to ~7 % of reporting slack; None between
+    or outside the classes."""
+    for nominal in VRAM_CLASSES:
+        if nominal * (1 - VRAM_SLACK) <= gib <= nominal * (1 + VRAM_SLACK):
             return nominal
     return None
+
+
+def blocked_reason(p: dict[str, Any]) -> str | None:
+    """Why a row may not start yet (``"blocked"``: a row whose hardware class has no proven fit, for example a measured
+    out-of-memory at its pin), None for a startable row. Preflight, merlin serve and launch.py refuse a blocked row,
+    named or not; it stays in the registry so the class is listed and the refusal says why."""
+    reason = p.get("blocked")
+    return reason if isinstance(reason, str) and reason.strip() else None
+
+
+def _check_blocked(reg: dict[str, Any], p: dict[str, Any]) -> list[str]:
+    """A blocked row is untested, carries an estimated capacity and has no rendered launcher file."""
+    if "blocked" not in p:
+        return []
+    pid = p.get("id")
+    errs = []
+    if blocked_reason(p) is None:
+        errs.append(f"{pid}: blocked must be a non-empty reason")
+    if p.get("status") != LABEL_UNTESTED:
+        errs.append(f"{pid}: a blocked row must be {LABEL_UNTESTED}")
+    if (p.get("capacity") or {}).get("estimate") is not True:
+        errs.append(f"{pid}: a blocked row's capacity must be marked estimate")
+    if pid in reg.get("launchers", []) or p.get("recipe_launcher"):
+        errs.append(f"{pid}: a blocked row has no rendered launcher (remove it from launchers / recipe_launcher)")
+    return errs
+
+
+# A Flash-Next row's ``env``: engine exports the row was measured with (launch.py sets them over its own defaults; a
+# non-blank value in the caller's environment still wins), plus optionally the static cold-expert offload:
+# MERLIN_COLD_EXPERTS = a profile path relative to the repo, with the optional layer / hot-fraction overrides. A
+# caller's MERLIN_COLD_EXPERTS replaces the row's profile; blank or 0 turns the offload off.
+ROW_COLD_EXPERTS = ("MERLIN_COLD_EXPERTS", "MERLIN_COLD_EXPERTS_LAYERS", "MERLIN_COLD_EXPERTS_HOT_FRAC")
+# Variables a row's env may not set: the layout / interconnect / GPU set decide them, and the memstats knobs are
+# instrumentation, never a serving setting.
+ROW_ENV_RESERVED = frozenset({
+    "CUDA_VISIBLE_DEVICES", "CUDA_DEVICE_ORDER", "VLLM_PP_LAYER_PARTITION", "VLLM_SKIP_P2P_CHECK",
+    "NCCL_P2P_DISABLE", "NCCL_P2P_LEVEL", "NCCL_PROTO", "NCCL_ALGO", "VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC",
+    "VLLM_E2_MEMSTATS", "VLLM_E2_MEMSTATS_DIR", "PYTHONPATH", "VLLM_QSA_KV_SCALES",
+})
+REPO_ROOT = HERE.parents[1]
+
+
+def row_env(p: dict[str, Any]) -> dict[str, str]:
+    """The row's ``env`` (engine exports + cold-expert defaults); {} for a row without one."""
+    return dict(p.get("env") or {})
+
+
+def _check_row_env(reg: dict[str, Any], p: dict[str, Any]) -> list[str]:
+    if "env" not in p:
+        return []
+    pid = p.get("id")
+    env = p["env"]
+    if reg.get("model") != "flash-next":
+        return [f"{pid}: env is for Flash-Next rows only"]
+    if not isinstance(env, dict) or not env:
+        return [f"{pid}: env must be a non-empty object of NAME: string value"]
+    errs = []
+    for k, v in env.items():
+        if not (isinstance(k, str) and re.fullmatch(r"[A-Z][A-Z0-9_]*", k)) or not isinstance(v, str) or not v.strip():
+            errs.append(f"{pid}: env {k!r} must be an upper-case name with a non-empty string value")
+        elif k in ROW_ENV_RESERVED:
+            errs.append(f"{pid}: env may not set {k} (the layout / interconnect / launcher decides it, or it is instrumentation)")
+        elif k.startswith("MERLIN_") and k not in ROW_COLD_EXPERTS:
+            errs.append(f"{pid}: env may set only {', '.join(ROW_COLD_EXPERTS)} among the MERLIN_ knobs, not {k}")
+    prof = env.get(ROW_COLD_EXPERTS[0])
+    if any(k in env for k in ROW_COLD_EXPERTS[1:]) and not prof:
+        errs.append(f"{pid}: env {ROW_COLD_EXPERTS[1]} / {ROW_COLD_EXPERTS[2]} need {ROW_COLD_EXPERTS[0]}")
+    if isinstance(prof, str) and prof.strip():
+        rel = Path(prof)
+        if rel.is_absolute() or ".." in rel.parts or prof.startswith(("/", "\\")):
+            errs.append(f"{pid}: env {ROW_COLD_EXPERTS[0]} must be a path relative to the repo")
+        elif not (REPO_ROOT / rel).is_file():
+            errs.append(f"{pid}: env {ROW_COLD_EXPERTS[0]} {prof} is not a file in the repo")
+    return errs
 
 
 def _check_swarm_gate(p: dict[str, Any]) -> list[str]:
@@ -252,7 +359,7 @@ def _check_flash_next_profile(p: dict[str, Any], labels: dict[str, Any]) -> list
             errs.append(f"{pid}: kv_alt {dtype} needs max_num_seqs in 1..8")
     errs.extend(_check_swarm_gate(p))
     dfl = srv.get("dflash2")
-    if dfl is not None:  # SPEC=dflash2's geometry: a PP split, chunk and whole-block KV pin that hold 3 x 262K
+    if dfl is not None:  # SPEC=dflash2's geometry: a PP split, chunk and KV pin (kv_blocks whole blocks in it) that hold 3 x 262K
         keys = ("partition", "max_num_batched_tokens", "kv_cache_memory", "kv_blocks", "pool_tokens", "fit_262k", "basis")
         if not isinstance(dfl, dict) or any(k not in dfl for k in keys):
             errs.append(f"{pid}: serve.dflash2 needs {', '.join(keys)}")
@@ -262,9 +369,21 @@ def _check_flash_next_profile(p: dict[str, Any], labels: dict[str, Any]) -> list
                 errs.append(f"{pid}: serve.dflash2 partition {dpart} must have pp={lay['pp']} (>= 2) entries summing to {N_LAYERS}")
             if not all(isinstance(dfl[k], int) and dfl[k] > 0 for k in keys[1:6]):
                 errs.append(f"{pid}: serve.dflash2 sizes must be positive integers")
-            elif dfl["kv_cache_memory"] != dfl["kv_blocks"] * DFLASH2_KV_BLOCK_BYTES:
-                errs.append(f"{pid}: serve.dflash2 kv_cache_memory must be kv_blocks whole blocks "
-                            f"of {DFLASH2_KV_BLOCK_BYTES} bytes")
+            elif dfl["kv_cache_memory"] // DFLASH2_KV_BLOCK_BYTES != dfl["kv_blocks"]:
+                errs.append(f"{pid}: serve.dflash2 kv_cache_memory {dfl['kv_cache_memory']:,} B holds "
+                            f"{dfl['kv_cache_memory'] // DFLASH2_KV_BLOCK_BYTES} whole KV blocks of "
+                            f"{DFLASH2_KV_BLOCK_BYTES:,} B, not the declared kv_blocks {dfl['kv_blocks']}; restore the qualified "
+                            "pin, or update kv_blocks and re-measure pool_tokens")
+            elif (dfl["kv_blocks"] - 1) // (DFLASH2_BLOCKS_PER_262K_REQUEST + 1) < dfl["fit_262k"]:
+                errs.append(f"{pid}: serve.dflash2 kv_blocks {dfl['kv_blocks']} fit fewer than {dfl['fit_262k']} "
+                            f"262K sessions at {DFLASH2_BLOCKS_PER_262K_REQUEST} blocks per session (prefill runs on); "
+                            f"raise kv_cache_memory to at least {_dflash2_min_blocks(dfl['fit_262k']) * DFLASH2_KV_BLOCK_BYTES:,} B "
+                            f"({_dflash2_min_blocks(dfl['fit_262k'])} whole blocks) with kv_blocks to match and "
+                            "re-measure pool_tokens, or lower fit_262k")
+            elif dfl["pool_tokens"] != _dflash2_pool(dfl["kv_blocks"]):
+                errs.append(f"{pid}: serve.dflash2 pool_tokens {dfl['pool_tokens']:,} is not the engine's pool for "
+                            f"{dfl['kv_blocks']} blocks ({_dflash2_pool(dfl['kv_blocks']):,}): re-measure the pool "
+                            "when the pin changes")
             elif dfl["pool_tokens"] < dfl["fit_262k"] * 262144:
                 errs.append(f"{pid}: serve.dflash2 pool_tokens {dfl['pool_tokens']} does not hold fit_262k x 262144")
             if srv["kv_cache_dtype"] != "fp8_e4m3":
@@ -358,6 +477,10 @@ def validate_registry(reg: dict[str, Any]) -> list[str]:
         if pid in seen:
             errs.append(f"duplicate id {pid}")
         seen.add(pid)
+        errs.extend(_check_blocked(reg, p))
+        errs.extend(_check_row_env(reg, p))
+        if (p.get("match") or {}).get("vram_gib") not in VRAM_CLASSES:
+            errs.append(f"{pid}: match.vram_gib must be one of the VRAM classes {VRAM_CLASSES}")
         if reg["model"] == "flash-next":
             errs.extend(_check_flash_next_profile(p, labels))
             checkpoint = p.get("checkpoint")
@@ -535,6 +658,19 @@ def restore_unit_min_gib_per_rank(model: str | None, p: dict[str, Any] | None, r
     return -(-RESTORE_UNIT_FALLBACK_GIB // max(ranks, 1))
 
 
+def profiles_for(reg: dict[str, Any], name: str) -> list[dict[str, Any]]:
+    """The rows a checkpoint name serves from ``reg``: on the Flash-Next registry, ``flash-next`` gets the vanilla rows
+    and a derived checkpoint (Swift1.5, Huihui) its own rows, never each other's. Any other name gets every row: that
+    is what the 27B, Super VL and Ornith registries need (their checkpoint names, such as 27b-thinkingcap, and model
+    names are not keys of a ``checkpoints`` map and their rows carry no ``checkpoint``), and callers only pass names
+    the checkpoint table already accepted."""
+    if name == "flash-next":
+        return [p for p in reg["profiles"] if "checkpoint" not in p]
+    if name in reg.get("checkpoints", {}):
+        return [p for p in reg["profiles"] if p.get("checkpoint") == name]
+    return list(reg["profiles"])
+
+
 def get_profile(reg: dict[str, Any], profile_id: str) -> dict[str, Any]:
     for p in reg["profiles"]:
         if p["id"] == profile_id:
@@ -691,6 +827,9 @@ def render_launcher(reg: dict[str, Any], p: dict[str, Any]) -> str:
         raise ProfileError(
             "only Flash-Next profiles are rendered; 27B and Super VL entries point at the shims under models/"
         )
+    blocked = blocked_reason(p)
+    if blocked:  # like a parked row, a blocked row has no launcher: a shim would only exec launch.py's refusal
+        raise ProfileError(f"{p.get('variant_of') or p['id']} is blocked and has no launcher: {blocked}")
     variant = p.get("variant_of")
     pid = variant or p["id"]
     kv = KV_TAG[p["serve"]["kv_cache_dtype"]] if variant else None

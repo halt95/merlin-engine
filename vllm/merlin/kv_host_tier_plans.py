@@ -125,6 +125,17 @@ class PlanCounters:
     touch_skipped_offchain: int = 0
     # Once-per-admission outcomes handed to the metrics sink.
     admission_outcomes: int = 0
+    # Parked-load reservations (the scheduler): restore admissions refused
+    # for GPU room (once per admission), the ones of those whose host rows
+    # were then evicted (their ``host_evicted`` miss), preemptions of a
+    # resumable session short only by a parked load's reservation and the
+    # computed tokens they dropped, and landed loads released to the prefix
+    # cache because nothing could free a block for their next chunk.
+    restore_refused: int = 0
+    restore_refused_evicted: int = 0
+    reservation_preemptions: int = 0
+    reservation_preempt_tokens: int = 0
+    restore_released: int = 0
 
 
 @dataclass
@@ -238,6 +249,8 @@ class TierPlans:
         # and the miss is settled once at admission (``_settle_miss``).
         # Cleared on admission / forget / reset.
         self._looked_up: set[str] = set()
+        # Restore admissions refused for GPU room, until their admission.
+        self._refused: set[str] = set()
         # Restore progress: +1 per credit batch resolved on every rank and per
         # load retired. The issue step / wall time of each request's batch in
         # flight and the EWMAs of issue -> commit latency in steps and in
@@ -344,7 +357,9 @@ class TierPlans:
             logs.append(pool.key_log)
         return logs
 
-    def _signature(self, request: Request, level: int) -> tuple:
+    def _signature(
+        self, request: Request, level: int, max_tokens: int | None = None
+    ) -> tuple:
         # Readiness (the commit frontier, staged assembly members, this
         # step's exclusions) is not part of it: a resolve that met such a
         # source is provisional and never reused, and a probe it never made
@@ -352,15 +367,20 @@ class TierPlans:
         return (
             level, self._epoch(), request.num_tokens, len(request.block_hashes),
             self.lookup_enabled(request),
+            max_tokens,  # the consumer hit limit
         )
 
-    def _cached_plan(self, request: Request, level: int) -> PrefixHitPlan | None:
+    def _cached_plan(
+        self, request: Request, level: int, max_tokens: int | None = None
+    ) -> PrefixHitPlan | None:
         """The request's previous plan when nothing could have lengthened it:
         same cap, epoch and fallback level, no key of this request inserted
         in either pool since, and it was not provisional. A shortened plan is caught by the lease
         validation every use runs. The plan holds no storage."""
         entry = self._plans.get(request.request_id)
-        if entry is None or entry.signature != self._signature(request, level):
+        if entry is None or entry.signature != self._signature(
+            request, level, max_tokens
+        ):
             return None
         from vllm.v1.core.kv_cache_utils import get_block_hash
 
@@ -370,7 +390,10 @@ class TierPlans:
                 return None
         return entry.plan
 
-    def _remember(self, request: Request, level: int, plan: PrefixHitPlan) -> None:
+    def _remember(
+        self, request: Request, level: int, plan: PrefixHitPlan,
+        max_tokens: int | None = None,
+    ) -> None:
         if plan.provisional:
             self._plans.pop(request.request_id, None)
             return
@@ -382,7 +405,7 @@ class TierPlans:
         )
         gpu_log, host_log = self._key_logs()
         self._plans[request.request_id] = _CachedPlan(
-            self._signature(request, level), plan, hashes,
+            self._signature(request, level, max_tokens), plan, hashes,
             (gpu_log.end, host_log.end),
         )
 
@@ -490,10 +513,14 @@ class TierPlans:
         logged at INFO only with the census on (DEBUG otherwise).
         A request that leaves or a cache reset before it is
         admitted recomputed nothing and books nothing."""
+        refused = request.request_id in self._refused
+        self._refused.discard(request.request_id)
         got = self._miss_cause(request, adopted, cap_age, reusable)
         if got is None:
             return
         cause, age = got
+        if refused and cause == "host_evicted":
+            self.counters.restore_refused_evicted += 1
         if cause in self.MISS_CAUSES:
             self.miss_causes[cause] = self.miss_causes.get(cause, 0) + 1
         (logger.info if self._miss_at_info else logger.debug)(
@@ -713,14 +740,23 @@ class TierPlans:
         )
         self._settle_miss(request, 0, cap_age, reusable)
 
-    def admit(self, request: Request) -> PlanHit | None:
+    def admit(
+        self, request: Request, max_tokens: int | None = None
+    ) -> PlanHit | None:
+        """``max_tokens``: a consumer's hit limit (the auxiliary-output
+        history, ``AuxOutputSchedulerConnector.max_cache_hit``), applied to
+        every resolve of this admission (retries, the GPU-only fallback) and
+        to the plan-cache signature: the plan is resolved at the limit, never
+        sliced."""
         t0 = time.perf_counter()
         try:
-            return self._admit(request)
+            return self._admit(request, max_tokens)
         finally:
             self.lookup_seconds += time.perf_counter() - t0
 
-    def _admit(self, request: Request) -> PlanHit | None:
+    def _admit(
+        self, request: Request, max_tokens: int | None = None
+    ) -> PlanHit | None:
         """Resolve and lease this request's plan for one admission attempt.
 
         None: wait (a coalesced promotion or a draining old incarnation).
@@ -750,14 +786,16 @@ class TierPlans:
         level = self.fallback.get(req_id, UNION)
         lease = None
         plan = None
-        cached = self._cached_plan(request, level)
+        cached = self._cached_plan(request, level, max_tokens)
         for attempt in range(MAX_RESOLVE_ATTEMPTS):
             if attempt == 0 and cached is not None:
                 plan = cached
                 self.counters.plan_cache_hits += 1
             else:
-                plan = self.resolve(request, gpu_only=level >= GPU_ONLY)
-                self._remember(request, level, plan)
+                plan = self.resolve(
+                    request, max_tokens, gpu_only=level >= GPU_ONLY
+                )
+                self._remember(request, level, plan, max_tokens)
             if plan.boundary == 0:
                 break
             # Validate, but take no refs: within one pass nothing reclaims a
@@ -811,7 +849,7 @@ class TierPlans:
                 )
             # What this pass returns (plan or zero hit) is the fallback.
             self._fallback_pass.add(req_id)
-            plan = self.resolve(request, gpu_only=True)
+            plan = self.resolve(request, max_tokens, gpu_only=True)
             lease = PrefixLease(plan, self.version, self._epoch)
             # An invalid GPU-only lease recomputes from token 0.
             if plan.boundary == 0 or not lease.valid():
@@ -930,6 +968,9 @@ class TierPlans:
         pending = self._pending.get(request.request_id)
         if pending is None or pending.plan.boundary == 0:
             return
+        if pending.restore and request.request_id not in self._refused:
+            self._refused.add(request.request_id)
+            self.counters.restore_refused += 1
         pool = self.sched._gpu_block_pool
         assert pool is not None
         needed = shortfall + pool.get_num_free_blocks()
@@ -1162,7 +1203,7 @@ class TierPlans:
         in_flight = sum(self._issued.values())
         cap = max(wb.credits_cap, 1)
         # The restore direction has its
-        # own P_r; demotions in flight (``wb.in_flight``) no longer reduce it.
+        # own P_r; demotions in flight (``wb.in_flight``) do not reduce it.
         self._tick_budget = cap - in_flight
 
     def waiting_for_credit(self) -> int:
@@ -1263,6 +1304,7 @@ class TierPlans:
             if not reqs:
                 self.sched._load_event_to_reqs.pop(event, None)
         state.load_event = None
+        state.issued_at = None  # nothing in flight
         return True
 
     def release_for_key(self, key) -> None:
@@ -1275,6 +1317,11 @@ class TierPlans:
             state = s._reqs_to_load.get(rid)
             if state is not None and state.finished and state.load_event is not None:
                 self.release_unoutstanding(rid, state)
+
+    def is_plan_load(self, request_id: str) -> bool:
+        """A restore handed off to the scheduler and issued in credit
+        batches (``on_admitted``) that has not retired yet."""
+        return request_id in self._plan_loads
 
     def release_unoutstanding(self, request_id: str, state, *, keep_complete: bool = True) -> None:
         """Keep the whole manifest leased until any active DMA has retired.
@@ -1528,6 +1575,7 @@ class TierPlans:
         self._zero_hit.pop(request_id, None)
         # Left before admission: nothing recomputed, no miss.
         self._looked_up.discard(request_id)
+        self._refused.discard(request_id)
         self._cap_waits.pop(request_id, None)
         self._cap_fallback.pop(request_id, None)
         self._fallback_pass.discard(request_id)
@@ -1545,6 +1593,7 @@ class TierPlans:
         # The reset ends each logical lookup: a waiting request's next lookup
         # counts again; its miss is still settled once, at its admission.
         self._looked_up.clear()
+        self._refused.clear()
         self._cap_waits.clear()
         self._cap_fallback.clear()
         self._fallback_pass.clear()

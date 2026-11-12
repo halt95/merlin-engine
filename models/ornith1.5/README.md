@@ -11,7 +11,7 @@ The model's own chat template and sampling are served as shipped: T 0.6, top_p 0
 is `qwen3` and the tool-call parser `qwen3_coder`.
 
 > **Status: tested on the reference host** (registry profile `ornith-quad-3090`, 4 × RTX 3090 with P2P), and on a
-> 4 × RTX 3090 host without P2P (`ornith-quad-3090-nop2p`). The full 3.0.0 bench card ran on the reference host on 2026-10-21; the 3.0.1 card re-measured decode, prefill, agents and GSM8K (2026-11-02); the 3.0.2 card re-measured them on vLLM 0.33.
+> 4 × RTX 3090 host without P2P (`ornith-quad-3090-nop2p`). The full 3.0.0 bench card ran on the reference host on 2026-10-21; the 3.0.1 card re-measured decode, prefill, agents and GSM8K (2026-11-02); the 3.0.2 card re-measured decode and prefill on vLLM 0.33, and agents and GSM8K were re-measured for 3.0.2.1.
 
 ```bash
 MODEL=/path/to/Ornith-1.5-122B-A10B-W4A16-Merlin PORT=8000 bash models/ornith1.5/serve.sh
@@ -40,6 +40,19 @@ Extra arguments go to `vllm serve` after the launcher's own flags; later flags w
 | `PP_PARTITION` | `25,23` (two counts summing to 48; empty = the engine's even split) |
 | `MAX_PIXELS` | `8388608` (at least 8,388,608) |
 | `UV` | `1` (uniform verify on; `0` = off) |
+
+## Merlin 3.0.2.1 bench card (2026-11-12)
+
+Maintainer measurements on 4× RTX 3090 (220 W, PCIe Gen4) with P2P (the aikitoria patched driver) and the Zagitta [gpu-unlock](https://github.com/Zagitta/gpu-unlock) kernel module, on vLLM 0.33.0, fresh `merlin serve` boots, 2026-11-10 and 2026-11-11, on the previous build of the 3.0.2.1 wheel (built on 2026-11-10, before the prefill runs change; not re-measured on the published wheel); method and every cell in the [bench card](benchmarks/2026-11-12/BENCH-CARD.md). Decode is one stream with thinking on (this template has no effort levels) (tok/s after the first streamed token); prefill is one cold request. With thinking on, a 512-token agent follow-up may end inside the reasoning, and reasoning tokens count. The prompts-sent-at-once test and the image panel were not re-run; they stay on the earlier cards below.
+
+| Measurement | Ornith 1.5 |
+|---|---|
+| Decode, 4K / 131K / 262K prompt | 149 / 122 / 107 tok/s |
+| Cold prefill, 10K / 100K / 262K prompt | 6,411 / 4,059 / 2,284 tok/s |
+| Agents at once (8 × 16K conversations), total, thinking on / off | 516 / 484 tok/s |
+| GSM8K-200 (5-shot), correct of 200, thinking on / thinking off | 195 / 191 |
+| KV pool | 894,618 tokens |
+| Against 3.0.2 | Within run-to-run spread: decode +3 % / 0 % / −4 % at 4K / 131K / 262K, 262K prefill 0 %. Against the 3.0.1-run agents figure −2 %; prompts sent at once and the images were not re-measured. |
 
 ## Merlin 3.0.2 bench card (2026-11-04)
 

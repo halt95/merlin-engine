@@ -428,7 +428,7 @@ class EngineCore:
         if max_model_len_after != max_model_len_before:
             self.collective_rpc("update_max_model_len", args=(max_model_len_after,))
 
-        # a connector's host pool is sized from the
+        # A connector's host pool is sized from the
         # widest PP stage (kv_host_tier.take_widest_stage_tensors).
         scheduler_kv_cache_config = generate_scheduler_kv_cache_config(
             kv_cache_configs,
@@ -1588,6 +1588,7 @@ class EngineCoreProc(EngineCore):
         engine_core: EngineCoreProc | None = None
         signal_callback: SignalCallback | None = None
         clean_shutdown = False
+
         # A shared event that proves a clean shutdown; it is set only after
         # teardown finishes.
         shutdown_complete = kwargs.pop("shutdown_complete", None)
@@ -1692,7 +1693,7 @@ class EngineCoreProc(EngineCore):
 
         except SystemExit as e:
             logger.info_once("[shutdown] EngineCore: exiting busy loop")
-            # a signal alone cannot excuse a crash.
+            # A signal alone cannot excuse a crash.
             requested_exit = (
                 engine_core is not None
                 and shutdown_requested
@@ -1709,7 +1710,7 @@ class EngineCoreProc(EngineCore):
             )
             raise
         except Exception as e:
-            # in-process workers (uniproc
+            # In-process workers (uniproc
             # executor) registered their compile caches in this process.
             from vllm.merlin import compile_cache_guard
 

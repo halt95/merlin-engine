@@ -9,9 +9,15 @@ other family (Flash-Next = Qwen4Exp included) and every other device must take t
 stock path, so each patch asks series_active() and fails closed. The FULL-graph MTP
 verify sites ask uniform_verify_active(), which also admits Qwen3.5 MoE when
 MERLIN_MOE_UNIFORM_VERIFY=1.
+
+The architecture names come from the one Qwen3.5-lineage table
+(vllm/qwen35_family.py): today's Qwen3_5* names, the default Qwen 4 candidates
+and MERLIN_QWEN35_ARCH_ALIASES, resolved once at import.
 """
 
-DENSE_QWEN35_ARCHS = ("Qwen3_5ForCausalLM", "Qwen3_5ForConditionalGeneration")
+from vllm import qwen35_family
+
+DENSE_QWEN35_ARCHS = qwen35_family.dense_archs()
 
 
 def is_dense_qwen35(architecture: str | None) -> bool:
@@ -20,7 +26,7 @@ def is_dense_qwen35(architecture: str | None) -> bool:
 
 # Qwen3.5 MoE (Ornith-1.5-122B) may take the
 # FULL-graph MTP verify path (and only that path; see uniform_verify_active).
-QWEN35_MOE_ARCHS = ("Qwen3_5MoeForCausalLM", "Qwen3_5MoeForConditionalGeneration")
+QWEN35_MOE_ARCHS = qwen35_family.moe_archs()
 
 
 _UNRESOLVED_WARNED = False

@@ -64,6 +64,7 @@ class BlockHashToBlockMap:
             BlockHashWithGroupId, KVCacheBlock | dict[int, KVCacheBlock]
         ] = {}
 
+
     def get_blocks(self, key: BlockHashWithGroupId) -> tuple[KVCacheBlock, ...]:
         """Read every duplicate so lookup can select a ready publication."""
         blocks = self._cache.get(key)
@@ -322,6 +323,7 @@ class BlockPool:
                 blk,
                 num_tokens=num_hash_tokens,
             )
+
             if self.tier is not None:
                 self.tier.on_published(blk, request)
             if new_hashes is not None:
@@ -583,6 +585,7 @@ class BlockPool:
             block,
             num_tokens=num_hash_blocks * self.hash_block_size,
         )
+
         if self.tier is not None:
             self.tier.on_published(block, request)
         if self.enable_kv_cache_events and not already_cached:
@@ -696,6 +699,7 @@ class BlockPool:
                 is not None
             ):
                 removed_hashes.append(block_hash)
+
         if self.tier is not None:
             self.tier.on_unhashed(block, removed_hashes)
         block.reset_hash()
@@ -737,8 +741,10 @@ class BlockPool:
                 block_hash_with_group_id
             )
         self.cached_block_hash_to_block.insert(block_hash_with_group_id, block)
+
         if self.key_log is not None:
             self.key_log.append(block_hash_with_group_id)
+
 
     def publish_restored(
         self,
@@ -772,6 +778,7 @@ class BlockPool:
         for block_hash in self._remove_cached_block_hashes(src_block):
             # `num_tokens` only applies to the first (primary) insertion.
             self._insert_block_hash(block_hash, dst_block, num_tokens=num_tokens)
+
         if self.tier is not None:
             self.tier.on_moved(src_block, dst_block)
 
@@ -798,6 +805,7 @@ class BlockPool:
         # In order to only iterate the list once, we duplicated code a bit
         if self.enable_caching:
             for block in ret:
+
                 if self.tier is not None:
                     self.tier.on_reclaim(block)
                 self._maybe_evict_cached_block(block)
@@ -926,6 +934,7 @@ class BlockPool:
         for pool, blocks in other_pools.items():
             pool.free_blocks(blocks)
 
+
     def free_blocks_to_front(self, ordered_blocks: Iterable[KVCacheBlock]) -> None:
         """Release references like ``free_blocks``, but every block that
         reaches ref 0 goes to the front of the free queue with its hashes
@@ -997,6 +1006,7 @@ class BlockPool:
         # Remove all hashes from all blocks.
         for block in self.blocks:
             block.reset_hash()
+
         if self.tier is not None:
             self.tier.on_reset()
 

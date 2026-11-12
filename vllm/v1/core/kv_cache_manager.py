@@ -252,9 +252,12 @@ class KVCacheManager:
         )
         # Shortfall (blocks) of the last allocate_slots that returned None.
         self.last_alloc_shortfall = 0
+        # Each check the last
+        # allocation failed, as (shortfall, reservation it carried).
+        self.last_alloc_checks: tuple[tuple[int, int], ...] = ()
         # Whether the last allocate_slots was refused by its evicts_needed check.
         self.last_alloc_evicts_needed = False
-        # write-back admission gate, installed by
+        # Write-back admission gate, installed by
         # the host-RAM KV tier at connector bind (vllm/merlin/
         # kv_host_tier_writeback.py WriteBack.admit): (request, fresh blocks,
         # real shortfall, adopted blocks) -> (shortfall, demotion_wait).
@@ -264,7 +267,7 @@ class KVCacheManager:
         # Exact H_run (WriteBack.account_running),
         # called by the scheduler once per step after allocation.
         self.running_headroom_hook: Callable[..., int] | None = None
-        # a waiting/preempted admission
+        # A waiting/preempted admission
         # refused before the gate (non-coherent full-sequence check) still
         # names its need to the write-back (WriteBack.note_head): (request,
         # full-sequence blocks, shortfall) -> None.
@@ -464,8 +467,10 @@ class KVCacheManager:
         reserved_blocks: int = 0,
         has_scheduled_reqs: bool = True,
         skip_zeroing_group_ids: tuple[int, ...] = (),
-        # young-miss eviction check (cache_thrash.Admission)
+        # Young-miss eviction check (cache_thrash.Admission)
         evicts_needed: Callable[[int, tuple], bool] | None = None,
+        full_sequence_reserved_blocks: int | None = None,
+        full_sequence_lookahead_tokens: int | None = None,
     ) -> KVCacheBlocks | None:
         """Add slots for a request with new tokens to append.
 
@@ -493,9 +498,14 @@ class KVCacheManager:
                 requests when chunked prefill would otherwise only check the first chunk
             reserved_blocks: Number of free blocks that must be left available for
                 other in-flight sequences to complete. The actual allocation is only
-                made if it fits within (free blocks - reserved_blocks). Used to gate
-                async KV-connector loads so their initial allocation cannot consume
-                blocks an already in-flight (prefilling) sequence is relying on.
+                made if it fits within
+                (free - reserved_blocks), in the full-sequence check too unless
+                ``full_sequence_reserved_blocks`` is given for that check. A
+                check that draws no block passes whatever is reserved.
+                ``full_sequence_lookahead_tokens``, if given, replaces
+                ``num_lookahead_tokens`` in the full-sequence check only.
+                ``last_alloc_checks`` records each failing check's shortfall
+                and the reservation it carried.
             has_scheduled_reqs: Whether any requests are already scheduled to run
                 this step, controls whether watermark is applied.
             skip_zeroing_group_ids: Groups whose external-token blocks will be
@@ -590,6 +600,12 @@ class KVCacheManager:
             self.max_model_len,
         )
 
+        self.last_alloc_checks = ()
+        full_reserved_blocks = (
+            reserved_blocks
+            if full_sequence_reserved_blocks is None
+            else full_sequence_reserved_blocks
+        )
         watermark_blocks = 0
         # The watermark is applied to waiting/preempted requests only, and only
         # when there's at least one request already scheduled.
@@ -623,7 +639,13 @@ class KVCacheManager:
             # chunk gate below does: without them a prompt that fits only
             # without them is admitted, and its last chunk can never allocate.
             full_num_slot_tokens = min(
-                full_num_tokens + num_lookahead_tokens, self.max_model_len
+                full_num_tokens
+                + (
+                    num_lookahead_tokens
+                    if full_sequence_lookahead_tokens is None
+                    else full_sequence_lookahead_tokens
+                ),
+                self.max_model_len,
             )
 
             num_blocks_to_allocate = self.coordinator.get_num_blocks_to_allocate(
@@ -638,13 +660,24 @@ class KVCacheManager:
                 prefill_end=prefill_end,
             )
             required_blocks = num_blocks_to_allocate + watermark_blocks
-            if required_blocks > self.block_pool.get_num_free_blocks():
-                # a non-coherent refusal
+            # The full prompt must fit
+            # alongside other requests' reserved tails.
+            available_blocks = self.block_pool.get_num_free_blocks() - (
+                full_reserved_blocks if required_blocks else 0
+            )
+            if required_blocks > available_blocks:
+                # A non-coherent refusal
                 # still names the waiting head to the write-back (its head
                 # floor and shortfall wait: head_need_hook -> WriteBack.note_head).
-                full_shortfall = required_blocks - self.block_pool.get_num_free_blocks()
+                full_shortfall = required_blocks - available_blocks
                 if not self.thrash.coherent:
                     self.last_alloc_shortfall = full_shortfall
+                    self.last_alloc_checks = (
+                        (
+                            full_shortfall,
+                            full_reserved_blocks if required_blocks else 0,
+                        ),
+                    )
                     self.last_alloc_evicts_needed = False
                     if self.head_need_hook is not None and request.status in (
                         RequestStatus.WAITING,
@@ -684,7 +717,7 @@ class KVCacheManager:
             max(0, total_computed_tokens - request.num_in_flight_tokens),
             num_prompt_tokens=request.num_prompt_tokens,
         )
-        # re-measures the gate's slots
+        # Re-measures the gate's slots
         if full_shortfall:
             # Coherent yields only: the cleanup may have freed blocks, so
             # measure the full gate again.
@@ -702,6 +735,7 @@ class KVCacheManager:
                     prefill_end=prefill_end,
                 )
                 + watermark_blocks
+                + full_reserved_blocks
                 - self.block_pool.get_num_free_blocks(),
             )
         # the eviction check counts the whole prompt
@@ -739,7 +773,22 @@ class KVCacheManager:
         # additional watermark of headroom for waiting/preempted admissions.
         available_blocks = self.block_pool.get_num_free_blocks() - reserved_blocks
         required_blocks = num_blocks_to_allocate + watermark_blocks
+        # A step that draws no block
+        # takes nothing from a reservation.
+        if required_blocks == 0:
+            available_blocks = max(available_blocks, 0)
         shortfall = max(full_shortfall, required_blocks - available_blocks)
+        self.last_alloc_checks = tuple(
+            check
+            for check in (
+                (full_shortfall, full_reserved_blocks),
+                (
+                    required_blocks - available_blocks,
+                    reserved_blocks if required_blocks else 0,
+                ),
+            )
+            if check[0] > 0
+        )
         # New requests never reclaim un-copied
         # blocks; running requests are never gated.
         self.last_alloc_demotion_wait = False
@@ -774,8 +823,13 @@ class KVCacheManager:
         self.last_alloc_shortfall = 0
         # the gate passed: refuse an admission that
         # would un-hash a block a protected waiter needs.
+        # The restore destinations and
+        # private tails allocated below are fresh pops too, drawn
+        # before the chunk, as the write-back gate above counts them.
         self.last_alloc_evicts_needed = evicts_needed is not None and evicts_needed(
-            max(num_blocks_to_allocate, prompt_blocks), new_computed_block_list
+            max(num_blocks_to_allocate, prompt_blocks)
+            + len(restore_slots) + restore_tails,
+            new_computed_block_list,
         )
         if self.last_alloc_evicts_needed:
             return None
@@ -911,7 +965,7 @@ class KVCacheManager:
         self._grace_pins[request_id] = keep
         self._grace_block_ids[request_id] = frozenset(seen)
         self._grace_prompt_tokens[request_id] = request.num_prompt_tokens
-        # lifecycle: the grace is a copy source; overflow is host-aware
+        # Lifecycle: the grace is a copy source; overflow is host-aware
         hooks = self.tier_hooks
         if hooks is not None:
             hooks.grace_taken(request, keep)
@@ -928,7 +982,7 @@ class KVCacheManager:
         copy scheduler, for example "yield" (a waiter needed the blocks),
         "overflow" (more graces than MAX_GRACE_PINS) or "hit" (the turn
         resumed on the GPU)."""
-        # lifecycle: the copy scheduler sees every grace release
+        # Lifecycle: the copy scheduler sees every grace release
         if self.tier_hooks is not None and request_id in self._grace_pins:
             self.tier_hooks.grace_released(request_id, reason)
         blocks = self._grace_pins.pop(request_id, None)
@@ -969,7 +1023,7 @@ class KVCacheManager:
         reach = num_hit_tokens + 2 * self.block_pool.hash_block_size
         for request_id in [r for r in self._grace_block_ids if r in candidates]:
             if reach >= self._grace_prompt_tokens.get(request_id, 0):
-                # lifecycle: a hit ends the grace (its copy is moot)
+                # Lifecycle: a hit ends the grace (its copy is moot)
                 self.release_grace_pin(request_id, "hit")
 
     def _pins_follow_moved_hash(
@@ -1224,7 +1278,7 @@ class KVCacheManager:
         yielded = 0
         # Grace pins first (oldest finished conversation first), then the
         # waiters' pins (most recently pinned first).
-        # host-aware grace order (plain oldest-first without the tier)
+        # Host-aware grace order (plain oldest-first without the tier)
         for request_id in self.thrash.grace_yield_order():
             if limit is not None and yielded >= limit:
                 return released
@@ -1585,7 +1639,7 @@ class KVCacheManager:
     def new_step_starts(self) -> None:
         """Notify the coordinator that a new step is starting."""
         self.coordinator.new_step_starts()
-        # pin-miss freshness mark.
+        # Pin-miss freshness mark.
         if self.block_pool.key_log is not None:
             self._step_key_mark = self.block_pool.key_log.end
 

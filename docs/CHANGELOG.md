@@ -3,10 +3,11 @@
 Every Merlin release in one place, newest first. Until 3.0.0 each model shipped from its own repository with its own
 version numbers; here each sits under the engine release it ran on, with its original tag named. Figures under the 2.x
 releases were measured on vLLM 0.28-0.30 when they shipped and are kept as published; they are not re-measured on 3.0.0.
-Figures under 3.0.0 and 3.0.1 were measured on vLLM 0.32; the 3.0.2 figures are measured on 0.33 except those marked as carried over from 3.0.1.
+Figures under 3.0.0 and 3.0.1 were measured on vLLM 0.32; the 3.0.2 figures are measured on 0.33 except those marked as carried over from 3.0.1. The 3.0.2.1 figures are measured on 0.33 on every row of its table; each bench card lists the earlier panels it carries over.
 
 | Release | Date | Engine | Models |
 |---|---|---|---|
+| [3.0.2.1](#merlin-3021) | 2026-11-12 | vLLM 0.33.0 | Flash-Next, Swift1.5, Swift1.5-Huihui, Qwen3.8-27B, ThinkingCap, Nemotron 3.5 Super VL, Ornith 1.5 |
 | [3.0.2](#merlin-302) | 2026-11-05 | vLLM 0.33.0 | Flash-Next, Swift1.5, Swift1.5-Huihui, Qwen3.8-27B, ThinkingCap, Nemotron 3.5 Super VL, Ornith 1.5 |
 | [3.0.1](#merlin-301) | 2026-11-02 | vLLM 0.32.0 | Flash-Next, Swift1.5, Swift1.5-Huihui, Qwen3.8-27B, ThinkingCap, Nemotron 3.5 Super VL, Ornith 1.5 |
 | [3.0.0](#merlin-300) | 2026-10-22 | vLLM 0.32.0 | Flash-Next, Swift1.5, Swift1.5-Huihui, Qwen3.8-27B, ThinkingCap, Nemotron 3.5 Super VL, Ornith 1.5 |
@@ -18,9 +19,381 @@ Figures under 3.0.0 and 3.0.1 were measured on vLLM 0.32; the 3.0.2 figures are 
 | [2](#v2) | 2026-09-17 | vLLM pre-0.30 | Flash-Next |
 | [1](#v1) | 2026-09 | vLLM 0.28.0 + patches | Flash-Next |
 
-## Unreleased
+## Merlin 3.0.2.1
 
-Nothing yet.
+2026-11-12. Built on vLLM 0.33.0, like 3.0.2, with the same seven models. This release fixes the KV RAM
+cache slowdown on a full cache, ships the 4 × 20 GB Flash-Next family rows and changes five serving defaults: shared-prefix
+checkpoints and prefill runs on Flash-Next, quoted tool calls kept as text on the Qwen3 parser, the
+two-card 27B P2P levers, and Super VL's earlier turns keeping their thinking in the prompt.
+
+### Highlights
+
+- **The KV RAM cache no longer slows decode once it is full** (halt95/merlin-engine#11, reported by
+  [jbeemer1](https://github.com/jbeemer1)).
+  - **The cause:** once the host cache was full, the write-back planner rebuilt its list of eviction candidates on
+    every step. One-stream decode fell from about 120 tok/s on a fresh cache to 72.6 tok/s on a full one, with the
+    planner taking 78 % of the engine's step time.
+
+  - **The fix:** the planner now keeps that list from step to step and re-derives only what changed. It picks the same
+    blocks to evict as 3.0.2, with one exception: a stale pin count that could misclassify a block is fixed.
+  - **Results:**
+    - full cache, one stream: 72.6 → 122.3 tok/s, with the planner at 18.4 % (a fresh cache does about 120);
+
+    - full cache, eight streams: 389–460 → 596 tok/s (two stock reference runs);
+
+    - output tokens identical;
+    - on a realistic multi-turn trace the hit rate stays at 97.4 % of what the trace can reuse, 0.25 points below
+      3.0.2 and inside the run-to-run band.
+
+    These figures come from the reporter's stress probe on 4 × RTX 3090 (thinking off, temperature 0, three
+    fixed-length 800-token sends, steady-window tok/s), not the bench-card protocol. On ordinary chat output with
+    thinking on, see the bench-card decode figures in the table below.
+- **More KV RAM cache fixes.** None of these changes output tokens.
+  - **A cancelled restore cleans up.** Before, a request cancelled while its restore waited between copy batches (or
+    for its first batch) kept its GPU blocks until the server restarted, and an engine reset at that moment left the
+    request waiting for good. Now an aborted request frees its blocks and a reset request recomputes. The host copies
+    it read are kept.
+  - **Host memory is fully reused.** Two cases left host rows that no conversation owned unavailable until a reset:
+    two copies of the same block, and a row partly replaced by a newer turn. Both rows are now reclaimed.
+  - **A conversation's previous turn is released once the next turn is stored,** also when the turn boundary falls
+    inside an attention page. The turn just before the newest one is kept, so a retry, a regenerate or a fork of the last
+    turn still restores from the cache.
+  - **Admitting a new request beside a host restore no longer evicts a block that a waiting conversation needs.** The
+    eviction forecast now counts the blocks the restore itself takes. This case was not seen on the shipped Flash-Next
+    launch in a realistic soak.
+  - **A returning conversation's restore keeps the GPU blocks it needs.** While its prefix is copied back from host
+    RAM, new requests no longer take the blocks it still needs to finish its prefill. Ordinary running requests reserve
+    nothing for it and are not preempted or slowed for it. A session on the streaming-input API (no shipped launcher
+    uses it) leaves the restore the same room when it grows, and preempts itself if that room is all it lacks. If a restore still cannot get its blocks while nothing else runs, it goes back to the
+    prefix cache and is admitted again, with no work lost, instead of waiting for good.
+  - **With routed-expert capture on,** a host restore stops at the captured history, as a GPU cache hit does.
+  - **Long runs with many preemptions** no longer grow a per-request table without bound.
+  - **With the optional per-rank copy byte cap** (`MERLIN_KV_HOST_TIER__COPY_BYTES_D_MIB`, off by default), one
+    write-back pass stays within the cap.
+
+  Every fix above except the returning-restore one was measured over six realistic multi-turn soaks against the same
+  build without them: hit rate, churn and speed are within their bands, output tokens are identical, and cached
+  conversation checkpoints lost per million prompt tokens fall from about 4.4 to about 3.8.
+
+  The returning-restore fix was soaked on its own against the previous development build over three pooled runs on the shipped swarm
+  launch: hit rate (89.4 % against 89.4 %), cached conversation checkpoints lost per million prompt tokens
+  (3.7 against 4.3) and output tokens were unchanged within the run-to-run band, with no reservation
+  preemption or forced release recorded.
+- **Flash-Next: shared-prefix checkpoints (FGPC) are on.** Sessions often open behind the same system prompt. When that
+  shared prefix covers at least one 4,096-token attention block, a new session's first turn now resumes from the cached
+  junction instead of recomputing the prompt.
+  - **Measured on the shipped swarm launch with a ~9K shared system prompt:**
+    - first turns served from the cache: 0 of 82 with FGPC off, 43 of 87 and 41 of 85 in two runs with it on;
+
+    - speed, a long soak and output tokens are within their run-to-run bands;
+    - retrieval from a junction matches a cold recompute (48 of 48 needles on both), and its output drift is no larger
+      than a plain prefix-cache hit's.
+
+  - **Where it applies:** Swift1.5 and Swift1.5-Huihui use the same launcher and get it too. The 27B family already ran
+    FGPC.
+  - **Turning it off:** `merlin serve <model> -- --no-enable-mamba-shared-prefix-checkpoint`.
+  - **Junction ageing:** junction blocks now age like any other cached block. Before, a free junction was the first
+    block taken, so under a full pool the next session often found it gone.
+- **Flash-Next: a long cold prompt now takes turns with the running sessions** (halt95/merlin-engine#6 item 1, reported
+  by Sudzpel). Instead of sharing every step with them, the prompt prefills in runs of 16 full 1,024-token steps, and
+  between runs the sessions decode alone. How long they decode alone is a configured scheduling target (decode share
+  0.30), counted in decode rounds, not a measured share of time.
+  - **Measured on the reference box (4 × RTX 3090) in four runs of the shipped setting** (decode share 0.30: one on the
+    first build of this change, three with the shipped default launch line; one more run at share 0.25, not the shipped
+    setting, is not counted), **with three sessions decoding through a cold prefill:**
+    - those sessions keep 31–38 % of their decode speed during a cold 64K–128K prefill (36–37 % at 64K, 31–38 % at
+      128K), up from 14–16 % with 512-token slices alone;
+    - a session that starts decoding during the prefill: first token 0.65–0.69 s, with a free session slot (0.69–0.78 s
+      with slices alone);
+    - the cold prompt's own first token comes later: +17 to +19 % at 64K, +12 to +14 % at 128K, +19 to +24 % at 262K;
+    - the p99 gap between streamed tokens is 0.40 s in three of the four runs and 0.58 s in one where the engine showed
+      no slow step (a client-side reading), against 0.23–0.35 s without the runs.
+  - **Measured in the same four runs with no session decoding:**
+    - three 64K prompts sent together: first token p95 34.5–34.7 s (28.3–28.9 s with slices alone);
+    - a returning turn's first token, with no session decoding when it arrives: 1.0–1.2 s against 1.1–1.3 s without
+      the runs once the kernels were cached; in the other two runs the returning turns met the compile pause under
+      Known limits (one step stalled about 2.6–2.7 s) and the row read about 2.3 s (2.29 and 2.31 s); the previous
+      build's first boot met the same pause;
+    - lone prompts and prefill: within the run-to-run spread of about 1 %;
+    - a single session's output is token-identical.
+  - **Memory:** lowest free GPU memory over a run 943–957 MiB, against 959–971 MiB with slices alone.
+  - **Where it applies:** the Flash-Next family launcher rows only (Swift1.5 and Swift1.5-Huihui use the same launcher),
+    with `--spec dflash2` too on the 4 × 24 GB rows (see Fixes for its KV pin). The launcher raises `--max-num-batched-tokens` by one verify row per session slot (1,056 on four 24 GB cards), so the
+    sessions never shrink a prefill step. The 27B, Super VL and Ornith launchers and a direct `vllm serve` are unchanged.
+  - **Turning it off:** `PREFILL_RUNS=0` restores the plan without it (512-token slices, budget 1,024 on four 24 GB
+    cards). `LPT=<n>` still sets the slice size used while no session is decoding. When `CHUNK` and the block size
+    (`BLOCK_SIZE`) do not tile (neither divides the other) or `BLOCK_SIZE` is below the hybrid-state floor, the default
+    switches the runs off with a note at start-up; an explicit `PREFILL_RUNS=1` refuses to start instead.
+  - **Not covered:** with every session slot in use, a new prompt still waits for a slot (`SEQS`, the launcher's
+    `--max-num-seqs`; 8 on four 24 GB cards).
+  - `VLLM_MERLIN_DECODE_FIRST=1` (experimental) cannot be combined with this default: the launcher refuses it unless
+    `PREFILL_RUNS=0`.
+- **Flash-Next on four 20 GB cards (profiles included, not yet tested on real cards ⚫).** Two new rows:
+  - **The rows:** `fn-quad-20g-sm86` for the RTX 3080 20GB and RTX A4500, and `fn-quad-20g-sm89` for the RTX 4000 Ada.
+    Each holds one 262K session.
+  - **Static cold-expert offload, on by default on these rows:**
+    - on MoE layers 11, 12, 19, 20 and 37, the most-used half of each card's experts stays on the GPU;
+    - the rest is kept in pinned host RAM and read over PCIe;
+    - placement only, output identical.
+  - **Turning it off:** `MERLIN_COLD_EXPERTS=0`. The 20 GB fit was measured only with it on.
+  - **Host RAM:** the offload pins about 8 GiB of extra host RAM, which preflight's RAM check does not count.
+  - **ECC:** turn it off on the RTX A4500 and RTX 4000 Ada.
+  - **Evidence:** emulation only (4 × RTX 3090, each with 4 GiB held back), five emulated boots
+    on 2026-11-07 and 2026-11-09, outputs identical to the earlier 20 GB run (four identity prompts).
+  - **Swift1.5 and Swift1.5-Huihui** get the same two rows (`fn-swift1.5-quad-20g-sm86`, `fn-swift1.5-quad-20g-sm89`, `fn-swift1.5-huihui-quad-20g-sm86`, `fn-swift1.5-huihui-quad-20g-sm89`): same layout, pin, env and
+    cold-expert profile (the three checkpoints share one config.json); the evidence is the Flash-Next emulation, and
+    neither fine-tune was booted at 20 GB.
+
+  The Qwen3.8-27B family gains 20 GB rows too, also untested ⚫: TP4 (`27b-tp4-sm86-20g`, `27b-tp4-sm89-20g`) and TP2
+  (`27b-tp2-sm86-20g`, `27b-tp2-sm89-20g`). Preflight and `merlin serve --dry-run` accept `--simulate 4x3080-20g` and
+  `--simulate 4x4000ada` (`2x...` for the TP2 rows).
+- **Qwen3 parser: quoted tool calls stay text (on by default).** This applies to the `qwen3` parser and the parsers built
+  on it, which the Flash-Next family, the 27B family and Ornith 1.5 serve with.
+  - **Code blocks:** a tool call inside a fenced code block is returned as text, not as a real call.
+  - **Quoted reasoning:** a tool block quoted inside reasoning that the model then closes is returned as text too.
+  - **Unoffered names:** a call to a tool the request did not offer is kept as text in the field the model wrote it in,
+    and it no longer ends reasoning.
+
+  `MERLIN_QWEN3_LITERAL_SPANS=0` turns the quoting rules off (the 3.0.2 behaviour). This narrows the 3.0.2 known limit
+  (see Known limits).
+- **Qwen3.8-27B on two RTX 3090s with P2P on** (`27b-tp2-3090`) sets six launcher defaults: `NCCL_PROTO=Simple`,
+  `VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC=1`, `VLLM_DRAFT_BOUNDED_PLAN=1`, `VLLM_GDN_DECODE_FASTPATH=1`,
+  `VLLM_GDN_SHARED_ALIGN_INDEX=1` and `VLLM_TARGET_SEQ_LENS_ASYNC=1`.
+  - **Results** (an A/B of these defaults, not a bench-card row; the card's figures against 3.0.2 are below): one-stream decode +16.0 % (pooled, against a 7.2 % run-to-run band); eight streams within the
+    run-to-run band; outputs identical on all 28 identity checks.
+
+  - **ThinkingCap's two-card launcher** uses the same profile, so it gets these defaults too (on 3.0.2.1 its decode is +19 % / +6 % at 4K / 131K against 3.0.2, and level at 262K (step time 29.26 ms against 29.34 ms; the 128-token rate varies with the text sent, 12 sends on the published wheel); see its bench card).
+  - **Unchanged:** the other 27B rows, and this row with `P2P=off`.
+- **Qwen3.8-27B captures CUDA graphs for its widest decode steps.**
+  - **Four cards** (`27b-tp4-3090`; ThinkingCap's four-card launcher uses the same row): decode sizes 80 and 120, the
+    steps at 16 and 24 streams. With the new graphs in use, 16 streams decode at 1,218.3 tok/s and 24 streams at
+    1,332.6 tok/s (ThinkingCap: 1,202.7 and 1,321.5 tok/s). Outputs at 16 and 24 streams were compared with the previous capture list over repeated runs and
+    showed no difference distinguishable from run-to-run variation; byte-identical output under concurrency is not
+    claimed. The 8 MP image floor is 796 MiB on every card, counted as total minus used and sampled every 100 ms on a fresh boot with no decode before the images (the 27B checkpoint and ThinkingCap, one run each); with decode run first, the readings at one-second sampling were 798 and 796 MiB.
+  - **Unchanged:** the other four-card rows keep the shipped list.
+  - **Two cards** (`27b-tp2-3090`; ThinkingCap's two-card launcher uses the same row): decode size 80, the step at 16
+    streams. The 8 MP image floor is 764 MiB, counted as total minus used. The other two-card rows keep the shipped
+    list.
+- **Nemotron 3.5 Super VL keeps earlier turns' thinking in the prompt by default.** Its chat template used to drop the
+  thinking of earlier answers at every new user turn. The prompt then forked inside the previous answer, and the prefix
+  cache missed from there.
+  - **The change:** the launcher now passes `{"truncate_history_thinking": false}`, so returning turns hit the cache.
+  - **The cost:** the returning prompt is longer (thinking included), so its first token comes later: median 0.348 s
+    against 0.313 s. Returning turns are served from cache more often (80.1–80.7 % against 78.4–78.7 %), and decode is
+    unchanged within run-to-run noise.
+
+  - **Opting out:** a request's own `chat_template_kwargs` can still set `truncate_history_thinking: true`.
+
+### Measured on Merlin 3.0.2.1
+
+4× RTX 3090 without NVLink, P2P on, Zagitta's gpu-unlock, 220 W; runs of 2026-11-10 to 2026-11-12 (UTC). The Flash-Next 4× 24 GB, Swift1.5 and Swift1.5-Huihui cells were measured on the published wheel on 2026-11-11, except two thinking-off 8-agent cells; ThinkingCap's two-card 262K decode was re-measured on it on 2026-11-12 (12 sends); the other cells were not re-measured on it and come from the previous build of that wheel (built on 2026-11-10, before the prefill runs change), which does not have the new prefill schedule (on by default on the Flash-Next 20 GB row too, and not measured there); Super VL's thinking-off ladder on its card ran on an earlier build (2026-11-09). Columns as in 3.0.2:
+- decode is one stream, thinking on (effort medium where the template has levels), median of 3 (ThinkingCap 2× at 262K: median of 12);
+- 8 agents is the total of eight simultaneous follow-ups on 16K conversations.
+
+The 20 GB row is measured on 4 × RTX 3090 that emulate 20 GB cards (4 GiB held back per card), not on real 20 GB cards.
+The Flash-Next and Swift1.5-Huihui thinking-off 8-agent cells are from the previous build: their runs on the published wheel ended early (one reply stopped by itself; overlap windows of 0.25 and 0.29 s) and were not used.
+
+| Checkpoint | GPUs | KV pool, tokens | Decode, tok/s, 4K / 131K / 262K | 262K prefill | 8 agents, tok/s, thinking on / off | GSM8K-200, thinking on / off |
+|---|---|---|---|---|---|---|
+| Flash-Next | 4× 24 GB | 924,993 | 174 / 188 / 192 | 6,839 tok/s | 640 / 641 | 197 / 198 |
+| Flash-Next | 4× 20 GB (emulated) | 265,888 | 147 / 158 / 165 | 4,555 tok/s | n/a (pool holds 7 of 8) | n/a |
+| Qwen3.8-27B | 2× | 826,689 | 248 / 197 / 160 | 1,117 tok/s | 740 / 677 | - / 194 |
+| Qwen3.8-27B | 4× | 2,012,105 | 262 / 258 / 233 | 2,115 tok/s | 970 / 857 | 198 / 195 |
+| Swift1.5 | 4× | 924,993 | 180 / 185 / 182 | 6,793 tok/s | 688 / 661 | 199 / 198 |
+| Swift1.5-Huihui | 4× | 924,993 | 178 / 190 / 203 | 6,893 tok/s | 719 / 668 | 198 / 197 |
+| Qwen3.8-27B | 1× | 271,506 | 131 / 102 / 75 | 587 tok/s | n/a (two at most) | - / 194 |
+| ThinkingCap | 2× | 826,689 | 244 / 179 / 163 | 1,116 tok/s | 731 / 663 | - / 195 |
+| ThinkingCap | 4× | 2,012,105 | 240 / 238 / 233 | 2,115 tok/s | 974 / 856 | 196 / 193 |
+| Nemotron 3.5 Super VL | 4× | 1,856,367 | 105 / 102 / 101 | 4,193 tok/s | 444 / 417 | 196 / 194 |
+| Ornith 1.5 | 4× | 894,618 | 149 / 122 / 107 | 2,284 tok/s | 516 / 484 | 195 / 191 |
+
+The 20 GB row has no GSM8K run; the one- and two-card rows have no thinking-on GSM8K-200 run (`-`), as in 3.0.2, because it runs on the four-card boot.
+
+Against 3.0.2:
+- **Flash-Next 4× 24 GB:** Thinking on, decode +1 % / 0 % at 4K / 131K, within run-to-run spread, and 191.8 tok/s at 262K (−7 %; median of 3 sends, 191.4–200.3); thinking off, 143.6 tok/s at 262K (−6 %; 142.6–147.4); 262K prefill +1 %; eight agents −2 % in one run of 8, which is no gain or loss: the same row gave 661–697 tok/s (mean 680) over six repeated runs.
+- **Qwen3.8-27B 2×:** Thinking on, decode +18 % / +7 % at 4K / 131K and 159.9 tok/s at 262K (+10 %; median of 3 sends, 153.1–165.9); thinking off, 105.1 tok/s at 262K (−2 %; 96.1–118.6); 262K prefill 0 %; eight agents +9 % in one run of 8, a short overlap window, so read it loosely (the six P2P launcher defaults above).
+- **Qwen3.8-27B 4×:** Thinking on, decode +2 % / +1 % at 4K / 131K, within run-to-run spread, and 232.7 tok/s at 262K (−7 %; median of 3 sends, 230.7–252.6); thinking off, 163.3 tok/s at 262K (0 %; 163.0–165.9); 262K prefill 0 %; eight agents +3 % in one run of 8, a short overlap window, so read it loosely.
+- **Qwen3.8-27B 1×:** 262K decode −2 % thinking on, +1 % off.
+- **ThinkingCap 2×:** 262K decode level on step time (29.26 against 29.34 ms on, 28.72 against 28.73 ms off; 12 sends on the published wheel).
+- **ThinkingCap 4×:** 262K decode +4 % thinking on, −1 % off.
+- **Swift1.5:** 262K decode −2 % thinking on, +11 % off.
+- **Swift1.5-Huihui:** 262K decode +5 % thinking on, −5 % off.
+- **Nemotron 3.5 Super VL:** 262K decode −4 % thinking on, +9 % off.
+- **Ornith 1.5:** 262K decode −4 % thinking on, +6 % off.
+- **Exact-262K decode:** 191.6 tok/s (172.4–200.3) on Flash-Next and 238.1 tok/s (230.7–252.6) on the 27B 4× (median and
+  range over 6 sends). These rows generate 128 tokens from a 261,888-token prompt, one stream, and each send uses a different prompt
+  text. With speculative decoding the number of tokens produced per decode step depends on the text being generated, so at
+  128 tokens the rate varies from send to send with the text; the bench cards give the range beside each median. Measured on
+  this release on the 27B two-card layout with thinking off: the same text sent 100 times, across four server starts, gave
+  identical output and 100.0–103.5 tok/s (2.783 tokens per step on every send); three other texts gave 106.9–110.3 tok/s;
+  the time per decode step was flat, 27.5–27.9 ms at the client and 28.3–28.6 ms in the server. On that row the previous
+  development build and this release gave identical output and the same rate (a paired difference of +0.3 to +0.5 %, inside
+  the difference of about 1 % between two starts of the same build). That was measured on that one layout and thinking mode.
+  On Flash-Next each decode step at exact 262K is within 2 % of 3.0.2; the published 3.0.2 figure of 207 tok/s came from
+  different send texts (a repeat run of Flash-Next on 3.0.2 measured 193 tok/s, sends 184–207).
+
+Every row is in the bench cards: [Flash-Next](../models/flash-next/benchmarks/2026-11-12/BENCH-CARD.md) · [Swift1.5](../models/swift1.5/benchmarks/2026-11-12/BENCH-CARD.md) · [Swift1.5-Huihui](../models/swift1.5-huihui/benchmarks/2026-11-12/BENCH-CARD.md) · [Qwen3.8-27B](../models/qwen38-27b/benchmarks/2026-11-12/BENCH-CARD.md) · [ThinkingCap](../models/thinkingcap/benchmarks/2026-11-12/BENCH-CARD.md) · [Nemotron 3.5 Super VL](../models/nemotron-super-vl/benchmarks/2026-11-12/BENCH-CARD.md) · [Ornith 1.5](../models/ornith1.5/benchmarks/2026-11-12/BENCH-CARD.md).
+
+### Before you upgrade
+
+- **New wheel.** The wheel is `vllm-0.33.0+merlin.c56eeed392-cp313-cp313-linux_x86_64.whl`; `release/merlin-wheel.sha256` names it, so this checkout refuses the 3.0.2
+  wheel. The dependency lock (`release/requirements-0.33.lock`, 223 pins) is unchanged. On the reference host, with the published wheel, Swift1.5 booted in 432 s and Swift1.5-Huihui in 412 s, each the first start of its configuration (graphs compiled, none loaded from cache). On the previous build, a later start of the four-card Flash-Next layout that loaded the cached compiled graphs was ready in 166 s against 301 s for its first start; the saving is the compile cache and graph warm-up, and weight loading was not faster (most weights were read from disk in both starts).
+- **New defaults you may notice:**
+  - Flash-Next family: FGPC on, `--long-prefill-token-threshold 512`, and the prefill runs, which raise
+    `--max-num-batched-tokens` to 1,056 on four 24 GB cards; see Highlights for how to turn each off.
+  - Qwen3 parser: fenced and quoted tool calls are returned as text; `MERLIN_QWEN3_LITERAL_SPANS=0` restores 3.0.2.
+  - Super VL: earlier turns keep their thinking in the prompt.
+  - 27B on two cards with `P2P=on`: an inherited `NCCL_PROTO` or `VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC` is not
+    used (the P2P mode sets them). Your own values of the other four switches are kept.
+- **Flash-Next launchers pass two more `MERLIN_` variables through.** These launchers clear every inherited `MERLIN_`
+  export except the ones they own.
+  - `MERLIN_QWEN3_LITERAL_SPANS` and `MERLIN_KV_TIER_DIAG` now reach the server. Any value other than `0` or `1` stops
+    the launch.
+  - `MERLIN_REPACK_RELEASE` and `MERLIN_LOAD_PEAK_LOG` are still cleared there, so the engine defaults apply.
+- **`KV_BYTES=auto` on the 27B** keeps the CUDA-graph memory estimate on, and the automatic KV size now leaves room for
+  what the engine allocates beside the KV cache. An automatic pool can be slightly smaller than in 3.0.2. Pinned rows (the
+  default) are unchanged.
+
+### Fixes
+
+- **DFlash2 KV pin 3,468,165,120 → 3,630,000,000 bytes, pool 789,668 → 815,203 tokens.** The prefill runs' step
+  budget costs the DFlash2 drafter's sliding-window layers one block per request, which took the pool below
+  3 × 262K. At the raised pin (FP32 GDN state, align-mode prefix caching) the engine fits three 262K sessions as
+  before (five 131K), and the prefill runs are on with DFlash2 as on the rest of the family.
+- **Flash-Next on 20 GB cards starts reliably:**
+  - the pipeline-parallel and PCIe-IPC communicators are created before memory profiling, so the KV sizing sees
+    their memory;
+  - the allocator's cache is freed after each module's weight repack (`MERLIN_REPACK_RELEASE`, on by default);
+  - the QSA top-k index buffer is shared across a stage's layers.
+
+  None changes numerics.
+- **Weight offload with Marlin MoE checkpoints works again on 0.33.** With `--cpu-offload-gb` / `--cpu-offload-params`,
+  the repacked expert weights stayed on the GPU layer after layer, and the boot ran out of memory (from
+  vllm#62326 in the 0.33 base). Offloaded weights now go back to host RAM.
+- **`--cpu-offload-params` can name a layer.** A pattern such as `layers.3.mlp.experts` now selects layer 3 only (not
+  layer 30), on the card that builds it. Existing patterns match as before.
+- **Flash-Next decode top-k reads only valid positions** (port of vllm#62467). On a row whose length is not a multiple
+  of 4 and that has fewer than top-k finite scores, the selection could read past the row and return an out-of-range
+  index.
+
+- **`./setup.sh` reads a four-part release heading.** The release version comes from the first `## Merlin`
+  heading in this changelog, and it was cut to three parts. A four-part heading therefore gave the wrong wheel download
+  URL, and the wrong version in the `./setup.sh` and `merlin pull` banners. `MERLIN_RELEASE_VERSION` still overrides it.
+- **The compile-cache guard no longer stalls other ranks when it cannot set a cache aside.** If moving a faulted
+  compile cache aside failed, or the check was interrupted, the process kept an exclusive lock on that cache directory
+  for its whole life, so the other ranks and any other engine using the directory waited at start with no end. A failed
+  move is now served as before, with the same warning, and the other ranks start; an interrupted check runs again on
+  the next try.
+- **No "unknown variable" warning for documented tool variables.** `MERLIN_READY_BANNER`, `MERLIN_PROFILE`,
+  `MERLIN_ALLOW_SERVER_DEV_MODE` and `MERLIN_EMULATE_VRAM_CLASS` are read only by the Merlin tools, but every boot that
+  followed the docs warned that they might be misspelt.
+- **KV RAM cache:** see Highlights. The restore-stall warning in the tier census now fires only while restores are
+  wanted; before, a cache that served every return from the GPU could trip it.
+
+### Engine
+
+- **Prefill runs** (`VLLM_MERLIN_PREFILL_RUNS`, off in the engine, on from the Flash-Next launcher): while a session
+  decodes, a long prefill advances in runs of full chunks and then waits for a decode-only window; a short prefill (a
+  new turn, a session joining late) takes its steps first while a session slot is free. The windows are counted in
+  decode rounds, not timed: the runs' decisions depend only on the scheduler-visible sequence of arrivals, completions
+  and cache state, not on timers. One log line per 1,000 steps counts the windows and runs.
+- **New debug lines:** `MERLIN_KV_TIER_DIAG=1` logs shared-prefix junction events, one line per first-turn admission and
+  one line per host eviction. Off by default; output is unchanged.
+- **Boot memory report:** `MERLIN_LOAD_PEAK_LOG=1` logs per-module memory peaks for model construction, weight loading
+  and post-load processing. Off by default.
+- **Profile rows can be marked blocked:** preflight then refuses them with the reason, and no launcher is rendered.
+  No row ships blocked.
+- **Tier counters:** the KV RAM cache counters line gains `units_lost_covered_early` (evicted kept predecessors among
+  `units_lost`), and the tier metrics line gains `restore_demand` and `restores_pending`; the plan counters gain `restore_refused`,
+  `restore_refused_evicted`, `reservation_preemptions`, `reservation_preempt_tokens` and `restore_released`
+  (parked-restore reservations).
+
+### New flags and environment variables
+
+| Name | Where | Default | What it does |
+|---|---|---|---|
+| `--enable-mamba-shared-prefix-checkpoint` (FGPC) | Flash-Next family launcher | **on** (was off) | Sibling first turns resume from the shared-prefix junction. `-- --no-enable-mamba-shared-prefix-checkpoint` turns it off. |
+| `LPT=<n>` (`--long-prefill-token-threshold`) | Flash-Next family launcher | **512** (was off) | Prefill slice size for long prompts while no session is decoding (the prefill runs take over while one is); `LPT=0` turns slicing off. |
+| `PREFILL_RUNS` | Flash-Next family launcher | **1** (new) | A long cold prompt takes turns with the running sessions (see Highlights). `0` turns it off and restores the step budget to `CHUNK`. Blank is unset (on). The launcher steps it aside, with a note, when `CHUNK` and `BLOCK_SIZE` do not tile (neither divides the other) or `BLOCK_SIZE` is below the hybrid-state floor; `PREFILL_RUNS=1` refuses those instead. |
+| `VLLM_MERLIN_PREFILL_RUNS` | engine | off; on from the Flash-Next launcher | The engine switch behind `PREFILL_RUNS`; with it on, the engine refuses `VLLM_MERLIN_DECODE_FIRST=1`, `--prefill-schedule-interval` above 1, a step budget (`--max-num-batched-tokens` or `--max-num-scheduled-tokens`) without one verify row per session slot, a chunk or a nonzero `--long-prefill-token-threshold` below 256 tokens, and a chunk below the drafter's prefill lookahead. The launcher checks the same after your extra flags and names the knob to change. |
+| `VLLM_MERLIN_DECODE_FIRST=1` | engine | off | Still experimental (see 3.0.2); cannot be combined with the prefill runs: on a Flash-Next row set `PREFILL_RUNS=0` to use it. |
+| `MERLIN_QWEN3_LITERAL_SPANS` | engine (`qwen3` parser); reaches the server from every launcher | on | `0` turns the fenced-span and quoted-reasoning rules off (3.0.2 behaviour); the unoffered-name rule stays on. The Flash-Next launchers accept only `0` or `1`. |
+| `MERLIN_COLD_EXPERTS=<profile.json>` | engine; checked by every launcher | off; on from the row on the 4 × 20 GB rows | Static cold-expert offload. Unset, blank or `0` is off everywhere, direct engine use included. A path replaces the row's profile. Every launcher (Flash-Next, 27B, Super VL, Ornith) checks a profile before the boot, including that it matches the checkpoint's `config.json`; on a lane other than Flash-Next, a profile that fits is noted as not measured there. A profile not tied to a checkpoint, or one checked against a checkpoint with no local `config.json`, is allowed with a warning. |
+| `MERLIN_COLD_EXPERTS_LAYERS` | as above | the profile's | Comma-separated decoder layers to offload. Ignored, with a launcher note and an engine warning, when `MERLIN_COLD_EXPERTS` is off. |
+| `MERLIN_COLD_EXPERTS_HOT_FRAC` | as above | the profile's | Share of each layer's experts kept on the GPU, from 0 up to but not including 1 (0 = the whole layer offloaded). Ignored, with a launcher note and an engine warning, when `MERLIN_COLD_EXPERTS` is off. |
+| `REASONING_PARSER`, `TOOL_CALL_PARSER` | every launcher | the recipe's parsers | A vLLM parser name replaces the recipe's (`hf` reads the checkpoint's own `response_template`). `none` turns the parser off: the launcher leaves out the recipe's `--reasoning-parser`, or its `--tool-call-parser` and `--enable-auto-tool-choice`, and says so. An empty value is unset, with a note. |
+| `GENERATION_OVERRIDE` | Flash-Next, 27B and Ornith launchers | the recipe's sampling | A JSON object for `--override-generation-config`. `none` leaves out the recipe's `--override-generation-config`, with a note when the recipe passes one. An empty value is unset, with a note. |
+| `USE_CKPT_TEMPLATE` | Flash-Next and 27B launchers | on for a checkpoint of a newer model generation that the launcher does not recognise by name and that ships a chat template, with a note; off otherwise | `1`: the checkpoint's own chat template and sampling; `0`: the recipe's; blank is unset. |
+| `MERLIN_REPACK_RELEASE` | engine | on | Frees the allocator's cache after each module's weight repack when at least 256 MiB is cached. `0` = stock vLLM. Cleared by the Flash-Next launchers. |
+| `MERLIN_LOAD_PEAK_LOG=1` | engine | off | Logs the memory peaks of model construction, weight loading and each module's post-load processing. Cleared by the Flash-Next launchers. |
+| `MERLIN_KV_TIER_DIAG=1` | engine; passed through by every launcher | off | Debug log lines for shared-prefix junctions, first turns and host evictions. Only `0` or `1`. |
+| `MERLIN_EMULATE_VRAM_CLASS=<GiB>` | `merlin serve` | off | **Test only.** Matches every card as a smaller VRAM class (for example `20`), with an `EMULATION:` note. It only goes down, and it never reaches the engine. |
+| `--simulate 4x3080-20g`, `--simulate 4x4000ada` | preflight, `merlin serve --dry-run` | n/a | Plan for RTX 3080 20GB or RTX 4000 Ada cards without them. |
+| `--cpu-offload-params layers.N...` | vLLM | n/a | A pattern can now name one layer (see Fixes). |
+| `VLLM_DRAFT_BOUNDED_PLAN`, `VLLM_GDN_DECODE_FASTPATH`, `VLLM_GDN_SHARED_ALIGN_INDEX`, `VLLM_TARGET_SEQ_LENS_ASYNC` | 27B launcher, `27b-tp2-3090` with `P2P=on` | **1** (was unset) | Two-card P2P decode levers. Your own value is kept. |
+
+### Known limits
+
+- **The 20 GB rows are untested on real 20 GB cards** ⚫. Their evidence is the emulation on 24 GB cards.
+  - **Flash-Next:** one 262K session; eight agents do not fit the pool (it holds seven of the eight 16K follow-ups; two lost their cached prefix). The emulated `fn-quad-20g-sm86` row fits
+    with at least 128 MiB reported free by nvidia-smi (`memory.free`) on every card, 8 MP images included. Over the 8 MP image rows the lowest free memory,
+    counted as total minus used and sampled every 100 ms, was 955 MiB on two cards and 903 MiB on the other two on the previous build (2026-11-10; not re-measured on the published wheel), and 835 and 863 MiB in an earlier run on the previous development build: 835 to 955 MiB across the two runs, all above the 24 GB rows' 524 MiB margin.
+  - **The 27B 20 GB rows** have estimated capacity only.
+  - **Decode will be slower than the emulation shows** on cards with less memory bandwidth (RTX A4500, RTX 4000 Ada).
+- **The Flash-Next prefill runs cost the cold prompt and the gaps between streamed tokens:**
+  - **The cold prompt's own first token** comes later when sessions are running: +17 to +19 % at 64K, +12 to +14 % at
+    128K, +19 to +24 % at 262K.
+  - **The p99 gap between streamed tokens** is 0.40 s in three of the four runs and 0.58 s in one (a client-side
+    reading; the engine showed no slow step), against 0.23–0.35 s with 512-token slices alone.
+  - **Three cold 64K prompts sent together** with no session decoding reach their first token (p95) in 34.5–34.7 s,
+    against 28.3–28.9 s with slices alone.
+  - **A new prompt still waits for a session slot** when every slot is in use (`SEQS`, the launcher's `--max-num-seqs`).
+  - **Measured on Flash-Next in four runs of the shipped setting on the reference box** (4 × RTX 3090) with three
+    sessions decoding through the cold prefill; the Swift1.5 and Swift1.5-Huihui rows use the same settings and were
+    not measured for this.
+
+  `PREFILL_RUNS=0` turns the runs off.
+- **After a fresh install, the first step that mixes several short prefills with decode rows can pause once for 2–3 s**
+  (for example returning turns whose first tokens are being decoded)
+  while its kernels compile (on the published wheel and on the previous build alike); it does not recur once the cache
+  holds them.
+- **The eight-agent rows are single runs** and move by several percent between identical runs (661–697 tok/s across six
+  repetitions on Flash-Next). A thinking-off eight-agent row is void when any one reply ends early; that happened on
+  at least one model in each run of this release, and those rows keep a figure from another run.
+- **Engine: a prompt that ends within the speculative lookahead of a block boundary can stall** with a draft head of
+  more than one prediction layer and more than one speculative token. Every checkpoint in this release has a one-layer head, so it cannot occur on the shipped models; 3.0.2 has it too.
+
+- **`tool_choice="auto"` can still return quoted tool-call markup as a real call** when the quote is not fenced and is
+  outside reasoning. An example block naming an offered tool, followed by the real call, is still read as a call. Send
+  `tool_choice="none"` for explain-only requests. The other 3.0.2 parser limits still apply.
+- **Inline code is not yet treated as code in tool-call markup.** On the Qwen3 parser, a tool call quoted in a fenced
+  code block (a line that starts with three or more backticks or tildes) stays text. A call quoted in inline code
+  (single backticks inside a sentence) is still read as markup.
+- **Restores from the KV RAM cache can still wait, and a new request can wait for one.** Neither loses work.
+  - A returning conversation's restore can still wait behind requests that were already running when it landed.
+    Ordinary running requests are not preempted for it (a growing streaming-input session can preempt itself), and
+    requests that arrive meanwhile queue behind it.
+  - A newly arrived request that fits the free blocks, but not beside a restore that is landing, waits for that
+    restore: about one restore copy, slightly longer on lanes that keep recurrent-state checkpoints.
+  - The parked-session stall on the streaming-input API (a session whose input arrives in chunks, used by realtime
+    speech-to-text and by no shipped launcher) is unchanged in this release.
+- **The stable-residual repair for speculative decoding is off by default.** With sampling (temperature above 0), the
+  rejection sampler computes the leftover distribution in plain floating point, which can lose precision when the
+  draft and the target model agree closely. `VLLM_SPEC_STABLE_RESIDUAL=1`, set before `merlin serve`, computes it in
+  log space instead. It changes the numerics, so output is not identical to the default. Only `0` and `1` are
+  accepted.
+- **Not measured on 3.0.2.1:** FGPC's shared-prefix reuse and the prefill runs on Swift1.5 and Swift1.5-Huihui (their
+  decode and prefill rows ran with both on); sessions held at once, the residency panels and the 8 MP image panels other than the 20 GB row's and the 27B memory floor (carried over, dated, in each bench card).
+- **The 3.0.2 limits still apply** (KV RAM cache, FIM tokens, control-marker replay, compile-cache guard), as does
+  the list of items not re-checked on 3.0.2.
+
+### Docs
+
+- Every user-facing 3.0.2.1 knob is in the table above and in README Features; the model references cover the knobs
+  specific to their model.
+- The hardware matrix and How to serve gain the 20 GiB class rows. The Flash-Next, Swift1.5 and Swift1.5-Huihui
+  references state FGPC on, the 512-token slices and the prefill runs.
+- The cache-thrash page notes that its rules also run with the KV RAM cache.
 
 ## Merlin 3.0.2
 

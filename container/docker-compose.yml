@@ -1,17 +1,17 @@
 # From the repository root:
 # MODEL_DIR=/absolute/path/to/checkpoint docker compose -f container/docker-compose.yml up --build -d
 # Community-qualified on 8 x RTX 3090 at P2P=off (octo, TP4xPP2), on the 3.0.1 image; not qualified on a
-# 3.0.2 image build. See container/README.md.
+# 3.0.2 or 3.0.2.1 image build. See container/README.md.
 services:
   merlin:
-    image: merlin-engine:${SOURCE_REF:-merlin-v3.0.2}
+    image: merlin-engine:${SOURCE_REF:-merlin-v3.0.2.1}
     pull_policy: build
     platform: linux/amd64
     build:
       context: ..
       dockerfile: container/Dockerfile
       args:
-        SOURCE_REF: "${SOURCE_REF:-merlin-v3.0.2}"
+        SOURCE_REF: "${SOURCE_REF:-merlin-v3.0.2.1}"
         MAX_JOBS: "${MAX_JOBS:-4}"
         MERLIN_WHEEL_URL: "${MERLIN_WHEEL_URL:-}"   # empty = build from source; set = install the release wheel (sha256-checked)
         TORCH_CUDA_ARCH_LIST: "8.0;8.6;8.9"

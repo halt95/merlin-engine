@@ -98,6 +98,7 @@ class SimpleCPUOffloadWorker:
         # Metadata for the current step
         self._connector_metadata: SimpleCPUOffloadMetadata | None = None
 
+        # A compute-done event is made per store (in the store path), not kept here.
         # Pending event index sets, populated in bind_connector_metadata
         self._pending_load_event_indices: set[int] = set()
         self._pending_store_event_indices: set[int] = set()
@@ -110,7 +111,7 @@ class SimpleCPUOffloadWorker:
         # the load copy thread) and the requests to report as failed receives.
         self._failed_load_events: set[int] = set()
         self._failed_recving: set[str] = set()
-        # per-rank transaction outcomes,
+        # Per-rank transaction outcomes,
         # reported once via build_connector_worker_meta:
         # (cache epoch at issue, event) -> success.
         self._failed_store_events: set[int] = set()
@@ -223,7 +224,7 @@ class SimpleCPUOffloadWorker:
         ]
         total_bytes_per_block = sum(per_tensor_bpb)
 
-        # host-tier block count resolved once for every rank
+        # Host-tier block count resolved once for every rank
         if self.host_tier:
             # Ring views and narrower PP stages need
             # fewer bytes per block, but cannot use more IDs than the scheduler.
@@ -354,7 +355,7 @@ class SimpleCPUOffloadWorker:
             )
 
         self._backend = DmaCopyBackend()
-        # store-copy timings feed the
+        # Store-copy timings feed the
         # tier's copy-cost metric, so they are collected whenever the tier is
         # on; MERLIN_KV_HOST_TIER_CENSUS gates only the debug census.
         if self.host_tier:
@@ -484,7 +485,7 @@ class SimpleCPUOffloadWorker:
                 event_idx=metadata.store_event,
                 events_list=self._store_events,
                 wait_event=compute_done,
-                # a failed store copy is reported
+                # A failed store copy is reported
                 # per rank (success=False) instead of failing the engine; its
                 # event still follows every enqueued chunk (quiescent).
                 **(
@@ -599,7 +600,7 @@ class SimpleCPUOffloadWorker:
             committed_steps=steps,
             masked_rows=masked,
         )
-        # per-rank acks for demotion txns.
+        # Per-rank acks for demotion txns.
         if getattr(self, "host_tier", False):
             rank = frozenset((self.vllm_config.parallel_config.rank,))
             meta.store_ack_ranks = dict.fromkeys(self._completed_store_events, rank)
@@ -655,6 +656,7 @@ class SimpleCPUOffloadWorker:
             event_idx, event = self._load_events.pop(0)
             event.synchronize()
             self._load_hwm = event_idx
+        # The pops above leave the list empty; no clear().
 
         while self._store_events:
             event_idx, event = self._store_events.pop(0)

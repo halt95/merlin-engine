@@ -571,6 +571,7 @@ class AsyncLLM(EngineClient):
             child_requests.append(child_request)
 
         self.check_admission(parent_params.n, parent_request.request_id)
+
         self._stall.admit(not self.output_processor.has_unfinished_requests())
         try:
             for idx, child_request in enumerate(child_requests):
@@ -601,6 +602,7 @@ class AsyncLLM(EngineClient):
             self.check_admission(request_id=request.request_id)
 
         # Register locally before the first await so concurrent tasks see this request.
+
         self._stall.admit(not self.output_processor.has_unfinished_requests())
         self.output_processor.add_request(request, prompt, parent_req, index, queue)
 
@@ -1172,6 +1174,7 @@ class AsyncLLM(EngineClient):
             return
         if self.errored:
             raise self.dead_error
+
         busy = self.output_processor.has_unfinished_requests()
         await self._stall.check(busy, self.engine_core)
 

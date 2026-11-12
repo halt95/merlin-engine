@@ -211,6 +211,7 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         divisor = int(config.make_ngram_vocab_size_divisible_by)
         padded_vocab_size = round_up(total_vocab_size, divisor)
         embedding_prefix = f"{prefix}.ngram_embedding"
+
         # Select the PLE table format: a fork format (BF16, INT6 or INT8), else
         # upstream's FP8 or unquantized method.
         from .ple_formats import select_ple_embedding_method as _select_method
@@ -231,7 +232,7 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         embedding_cls = (
             Qwen4ExpPLEPinnedHostEmbedding if use_uva else Qwen4ExpPLEDeviceEmbedding
         )
-        # a file-backed table allocates nothing
+        # A file-backed table allocates nothing
         embedding_cls = self.__dict__.get("_ple_table_cls", embedding_cls)
         # A TP reduce-scatter covers all vocabulary owners only when ETP=TP.
         self.use_reduce_scatter = (

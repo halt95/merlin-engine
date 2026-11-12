@@ -23,7 +23,7 @@ from typing import TYPE_CHECKING, Any, TypeVar
 import torch.nn as nn
 import transformers
 
-from vllm import envs, flashnext_family
+from vllm import envs, flashnext_family, qwen35_family
 from vllm.config import (
     ModelConfig,
     iter_architecture_defaults,
@@ -837,6 +837,21 @@ _TRANSFORMERS_BACKEND_MODELS = {
         "TransformersMultiModalForSequenceClassification",
     ),
 }
+
+# MERLIN_QWEN35_ARCH_ALIASES arch aliases join
+# the text-generation / multimodal maps; an alias naming a registered arch is refused.
+qwen35_family.install_registry_aliases(
+    _TEXT_GENERATION_MODELS,
+    _MULTIMODAL_MODELS,
+    _EMBEDDING_MODELS,
+    _LATE_INTERACTION_MODELS,
+    _REWARD_MODELS,
+    _TOKEN_CLASSIFICATION_MODELS,
+    _SEQUENCE_CLASSIFICATION_MODELS,
+    _SPECULATIVE_DECODING_MODELS,
+    _TRANSFORMERS_SUPPORTED_MODELS,
+    _TRANSFORMERS_BACKEND_MODELS,
+)
 
 _VLLM_MODELS = {
     **_TEXT_GENERATION_MODELS,

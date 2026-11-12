@@ -56,6 +56,7 @@ from vllm.merlin.kv_host_tier_census import (
     OutcomeLedger,
     RestoreProgressDetector,
     TierCensus,
+    restore_demand,
     efficiency,
     interval_delta,
 )
@@ -375,6 +376,8 @@ class TierRuntime:
         sources = (
             (getattr(units, "counters", None), ""),
             (getattr(getattr(units, "policy", None), "counters", None), "slru_"),
+            # Planner work, observational.
+            (getattr(units, "plan_cost", None), "plancost_"),
         )
         for src, prefix in sources:
             if src is None:
@@ -718,6 +721,13 @@ class TierRuntime:
         got = merged.get("restored_requests")
         return int(got) if got is not None else self.counters.restore_completed_requests
 
+    def restore_demand(self) -> int:
+        """Cumulative restore demand (``kv_host_tier_census.restore_demand``):
+        restores requested plus host-restorable misses, from the ledger."""
+        return restore_demand(
+            self.counters.outcome_restores_requested, self.ledger.miss_n
+        )
+
     def poll_metrics(self, now: float | None = None) -> str | None:
         """Feed the run-length detectors (every stats drain, ~10 s) and, once
         per ``metrics_every_s``, log the ``SimpleCPU tier metrics:`` line.
@@ -742,11 +752,18 @@ class TierRuntime:
                 c.host_rows_published, c.stored_blocks,
             )
         restored = self.restored_requests(merged)
-        if self.restore_detector.feed(now, restored):
+        # A stall needs demand: restores requested, host-restorable misses or
+        # a restore in flight. With every return a GPU hit, a flat
+        # restored_requests is idle, not stalled.
+        demand = self.restore_demand()
+        pending = self.ledger.pending_restores
+        if self.restore_detector.feed(now, restored, demand, pending):
             c.restore_stall_episodes += 1
             logger.warning(
                 "SimpleCPU tier restore-stall: restored_requests=%d has not risen "
-                "for %.0f s", restored, self.restore_detector.window_s,
+                "for %.0f s while restores were wanted (restore_demand=%d, "
+                "in flight=%d)", restored, self.restore_detector.window_s,
+                demand, pending,
             )
         epoch = (self.reset_epoch, getattr(self.census.scheduler, "cache_epoch", 0))
         if epoch != self._flush_epoch_seen:
@@ -834,6 +851,8 @@ class TierRuntime:
             if name in merged and name not in fields:
                 fields[name] = merged[name]
         fields["restored_requests"] = restored
+        fields["restore_demand"] = self.restore_demand()
+        fields["restores_pending"] = self.ledger.pending_restores
         for cause, n in sorted(d.get("miss_n", {}).items()):
             fields["miss_" + cause] = n
         line = "SimpleCPU tier metrics: " + " ".join(

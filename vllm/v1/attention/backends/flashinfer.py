@@ -1082,6 +1082,7 @@ class FlashInferMetadata:
     Will be `None` if `num_decode_tokens == 0`.
     """
 
+
     flashinfer_smallq_mode: int = -1
 
 
@@ -1097,9 +1098,11 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         device: torch.device,
     ):
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
+
         # 27B series patches are family/device-gated (dense Qwen3.5 on sm_86 only),
         # asked about this builder's own execution device.
         self._qwen35_series = series_active(vllm_config, device=device)
+
         if (
             envs.MERLIN_FLASHINFER_WORKLOAD_TILE
             and not vllm_config.use_v2_model_runner
@@ -1187,6 +1190,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             # For full cudagraph capture, one `decode_wrapper` for each batch
             # size and query length is needed for FlashInfer.
             self._decode_wrappers_cudagraph: dict[
+
                 tuple[int, int] | tuple[int, int, int],
                 BatchDecodeWithPagedKVCacheWrapper,
             ] = {}
@@ -1322,11 +1326,13 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             == FlashInferDecodeKernel.TRTLLM_GEN
             and not self.use_dcp
         )
+
         # No use_fa2_native_decode (upstream #60532); sm_8x verify keeps Merlin's gate.
         self._init_reorder_batch_threshold(
             1,
             supports_spec_as_decode=(
                 self.flashinfer_trtllm_api_decode_kernel is not None
+
                 or (
                     # Spec-as-decode on sm_8x via the FI native decode wrapper.
                     # Upstream gates spec-as-decode on a trtllm/XQA decode kernel,
@@ -1468,6 +1474,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             return AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
 
         kv_specs = iter_layer_specs(kv_cache_spec)
+
         # Upstream #60532 returns UNIFORM_BATCH unconditionally below
         # SM90 here; our sm_8x verify path keeps its own gate below
         # (uniform_verify_active + FlashInfer multi-token decode support).
@@ -1749,13 +1756,16 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         assert self._prefill_wrapper is not None
         return self._prefill_wrapper
 
+
     def _get_decode_wrapper(
+
         self,
         batch_size: int,
         use_cudagraph: bool = False,
         q_len_per_req: int = 1,
         smallq_mode: int = -1,
     ):
+
         use_cudagraph = use_cudagraph and smallq_mode != 0
         key = decode_wrapper_key(batch_size, q_len_per_req, smallq_mode)
         if use_cudagraph:
@@ -1776,6 +1786,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 paged_kv_last_page_len = None
             # NVFP4 KV cache requires the trtllm-gen backend inside
             # the wrapper on SM100; SM8x, SM90 and SM12x read it with fa2.
+
             # The decode backend stays "auto" (upstream #60532 forces "fa2" below SM90):
             # with use_tensor_cores=True FlashInfer resolves "auto" to fa2 on
             # sm_8x anyway, and the sm_8x small-q verify tile is planned on it.
@@ -1793,6 +1804,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 use_tensor_cores=True,
                 backend=backend,
             )
+
             if smallq_mode != -1:
                 decode_wrapper.sm8x_smallq_mode = smallq_mode
                 note_event(
@@ -1805,6 +1817,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
 
             # save the decode wrapper
             if use_cudagraph:
+
                 self._decode_wrappers_cudagraph[key] = decode_wrapper
             elif smallq_mode != -1:
                 self._decode_wrappers_smallq[smallq_mode] = decode_wrapper
@@ -1854,6 +1867,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         )
         self.paged_kv_last_page_len.copy_to_gpu(num_reqs)
         return paged_kv_indices
+
 
     # ---------------- VLLM_DRAFT_BOUNDED_PLAN (draft decode without seq_lens sync) ------------
     def _compute_flashinfer_kv_metadata_bounded(
@@ -2185,6 +2199,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             ev = wrapper._vllm_tsl_plan_event = torch.cuda.Event()
         ev.record()
 
+
     def build_for_cudagraph_capture(
         self, common_attn_metadata: CommonAttentionMetadata
     ) -> FlashInferMetadata:
@@ -2202,6 +2217,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         common_prefix_len: int,
         common_attn_metadata: CommonAttentionMetadata,
         fast_build: bool = False,
+
         workload_prefill_flags: list[bool] | None = None,
     ) -> FlashInferMetadata:
         num_reqs = common_attn_metadata.num_reqs
@@ -2710,13 +2726,16 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                     and pure_decode
                     and num_decode_tokens <= self._decode_cudagraph_max_bs
                 )
+
                 num_input_tokens = num_decode_tokens
+
 
                 # Spec-as-decode verify batches carry a uniform
                 # num_decode_tokens // num_decodes tokens per request; the wrapper's
                 # batch size and kv metadata are per request, not per token.
                 assert num_decode_tokens % num_decodes == 0
                 decode_q_len = num_decode_tokens // num_decodes
+
                 smallq_mode = -1
                 if self._workload_tile and decode_q_len in (4, 5):
                     query_lens = (
@@ -2747,6 +2766,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 # use FP8 o_data_type so the wrapper matches the
                 # FP8 output buffer allocated in forward().
                 o_dtype = FP8_DTYPE if self.nvfp4_trtllm else self.model_config.dtype
+
 
                 def _plan_decode(paged_kv_indices=paged_kv_indices):
                     # reads the CPU halves of the paged_kv buffers as they are now
@@ -2919,9 +2939,11 @@ class FlashInferImpl(AttentionImpl):
 
         # Allocated eagerly to stay out of CUDA-graph capture; DCP all-gathers
         # the decode query over heads.
+
         # Only the trtllm-gen/XQA calls (SM90+) take this buffer, so pre-SM90 skips
         # the allocation and keeps the KV memory budget.
         self._multi_ctas_kv_counter_buffer: torch.Tensor | None = None
+
         if vllm_config is not None and current_platform.has_device_capability(90):
             _sched = vllm_config.scheduler_config
             self._multi_ctas_kv_counter_buffer = _get_multi_ctas_kv_counter_buffer(
@@ -3733,11 +3755,13 @@ def fast_plan_decode(
     Part of the code get inspiration from the original plan from FlashInfer repo
     and the implementation of fast_decode_plan for FlashInfer in SGlang repo.
     """
+
     supports_uniform_multi_token = flashinfer_supports_uniform_multi_token_decode()
     if q_len_per_req > 1 and not supports_uniform_multi_token:
         raise RuntimeError(
             "The installed FlashInfer does not support uniform multi-token decode."
         )
+
     smallq_mode = getattr(self, "sm8x_smallq_mode", -1)
     planned_mode = getattr(self, "_sm8x_smallq_planned_mode", smallq_mode)
     if self.is_cuda_graph_enabled and planned_mode != smallq_mode:
@@ -3778,6 +3802,7 @@ def fast_plan_decode(
             seq_lens=seq_lens_cpu,
             fixed_split_size=fixed_split_size,
             disable_split_kv=disable_split_kv,
+
             # q_len_per_req is passed only when FlashInfer supports it.
             **uniform_decode_kwargs,
         )
@@ -3786,6 +3811,7 @@ def fast_plan_decode(
         return
 
     assert self.is_cuda_graph_enabled, "Should be cudagraph only here"
+
 
     # ================= FLASHINFER PLAN CACHE ==========
     # Skip the whole flashinfer call when the schedule provably cannot have changed.
@@ -3866,6 +3892,7 @@ def fast_plan_decode(
         non_blocking=non_blocking,
         fixed_split_size=fixed_split_size,
         disable_split_kv=disable_split_kv,
+
         # q_len_per_req is passed only when FlashInfer supports it.
         **uniform_decode_kwargs,
     )

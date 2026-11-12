@@ -365,7 +365,7 @@ class Qwen4ExpPLEFp8EmbeddingMethod(Qwen4ExpPLEEmbeddingMethod):
             weight_loader,
             scale_dtype=torch.float32,
         )
-        # a dummy load (--load-format dummy) must
+        # A dummy load (--load-format dummy) must
         # pass the positive-scale check below, not draw a random +-1e-3 scale.
         set_weight_attrs(weight_scale, {"dummy_weight_value": 1.0})
         layer.register_parameter("weight_scale", weight_scale)

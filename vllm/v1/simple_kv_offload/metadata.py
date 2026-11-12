@@ -54,6 +54,7 @@ class SimpleCPUOffloadMetadata(KVConnectorMetadata):
     acked_step: int = 0
 
 
+
     def load_transfer_list(self) -> list[tuple[int, list[int], list[int]]]:
         """Every load event of this step with its block lists."""
         if self.load_transfers:
@@ -74,7 +75,7 @@ class SimpleCPUOffloadWorkerMetadata(KVConnectorWorkerMetadata):
     """
 
     completed_store_events: dict[int, int]
-    # cumulative, keyed by global rank.
+    # Cumulative, keyed by global rank.
     census: dict[str, dict[str, float]] = field(default_factory=dict)
     # Preserve rank identity through aggregation.
     committed_steps: dict[int, int] = field(default_factory=dict)
@@ -83,7 +84,7 @@ class SimpleCPUOffloadWorkerMetadata(KVConnectorWorkerMetadata):
     # (host tier only): a demotion txn publishes once every rank acked it,
     # and a repeated report from one rank is idempotent.
     store_ack_ranks: dict[int, frozenset[int]] = field(default_factory=dict)
-    # per-rank transaction reports:
+    # Per-rank transaction reports:
     # (epoch, txn, batch) -> {rank: (success, quiescent)}. ``txn`` is the
     # store event / load event index. A failure is sticky and a rank counts
     # as quiescent only once its copies provably stopped; a transaction
@@ -108,9 +109,11 @@ class SimpleCPUOffloadWorkerMetadata(KVConnectorWorkerMetadata):
         steps = dict(self.committed_steps)
         for rank, step in other.committed_steps.items():
             steps[rank] = max(steps.get(rank, 0), step)
+
         ranks = dict(self.store_ack_ranks)
         for k, v in other.store_ack_ranks.items():
             ranks[k] = ranks.get(k, frozenset()) | v
+
         store_reports = _merge_reports(self.store_reports, other.store_reports)
         load_reports = _merge_reports(self.load_reports, other.load_reports)
         return SimpleCPUOffloadWorkerMetadata(

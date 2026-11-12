@@ -13,7 +13,9 @@ full. Two scheduler-side rules, default ON, implemented in
 Both take strict values (`0`/`1`, or a plain non-negative integer for the
 seconds), are runtime-only (an A/B flip reuses the AOT cache), and are no-ops
 unless the model has both attention and Mamba groups, prefix caching is on and
-no KV connector is configured. Miss parking also needs FCFS scheduling.
+prefix pins are enabled: with no KV connector, or with the Merlin host tier
+(the scheduler recognises its exact config and keeps pins). Any other KV
+connector keeps the stock rules. Miss parking also needs FCFS scheduling.
 
 Protected waiters are the pinned waiting requests a miss defers to: all of them,
 resident hits and cold waiters alike, whenever they arrived. Two pinned misses whose
@@ -25,8 +27,8 @@ the trimmed blocks include an anchor, the pin pairs with no grace any more and i
 boundary drops to 0: every cached block of its prompt outside the pin stays needed. The check runs at the admission gate before anything
 changes. It counts the blocks of the whole remaining prompt, since later chunks of an
 admitted request are not checked, and replays the pool's pop order on a shadow of the
-free queue: never-cached blocks first, a free FGPC junction when the head is a cached
-block, and the rest of a yielded session (un-hashed and moved to the front) right
+free queue: never-cached blocks first, then cached blocks in LRU order (a free FGPC
+junction ages like any other cached block), and the rest of a yielded session (un-hashed and moved to the front) right
 after any of its blocks is popped. A parked miss is logged as `park` with `why=hits`
 (it does not fit without a yield) or `why=evict` (it would un-hash a needed block);
 `why=budget` is a young miss that this step's token, alignment or encoder budget

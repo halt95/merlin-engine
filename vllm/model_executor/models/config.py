@@ -4,7 +4,7 @@
 import json
 from typing import TYPE_CHECKING
 
-from vllm import flashnext_family
+from vllm import flashnext_family, qwen35_family
 from vllm.logger import init_logger
 from vllm.utils.math_utils import round_up
 
@@ -1378,3 +1378,15 @@ MODELS_CONFIG_MAP: dict[str, type[VerifyAndUpdateConfig]] = {
     "VoyageQwen3BidirectionalEmbedModel": VoyageQwen3BidirectionalEmbedModelConfig,
     "XLMRobertaModel": JinaRobertaModelConfig,
 }
+# MERLIN_QWEN35_ARCH_ALIASES arch aliases; an
+# alias naming an architecture already in the map is refused.
+_QWEN35_CONFIG_ALIASES = qwen35_family.expand_by_suffix(
+    {
+        "ForCausalLM": Qwen3_5ForCausalLMConfig,
+        "ForConditionalGeneration": Qwen3_5ForConditionalGenerationConfig,
+    }
+)
+qwen35_family.refuse_registered(
+    _QWEN35_CONFIG_ALIASES, "MODELS_CONFIG_MAP", MODELS_CONFIG_MAP
+)
+MODELS_CONFIG_MAP.update(_QWEN35_CONFIG_ALIASES)

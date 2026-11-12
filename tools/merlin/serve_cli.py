@@ -98,11 +98,8 @@ class Plan:
 
 
 def _profiles_for(name: str, reg: dict[str, Any]) -> list[dict[str, Any]]:
-    if name == "flash-next":
-        return [p for p in reg["profiles"] if "checkpoint" not in p]
-    if name in reg.get("checkpoints", {}):  # a Flash-Next checkpoint row (Swift1.5, Huihui) serves its own rows
-        return [p for p in reg["profiles"] if p.get("checkpoint") == name]
-    return list(reg["profiles"])
+    # a Flash-Next checkpoint row (Swift1.5, Huihui) serves its own rows; preflight's automatic pick uses the same split
+    return R.profiles_for(reg, name)
 
 
 def _load(name: str) -> dict[str, Any]:
@@ -481,8 +478,9 @@ def choose(
         have = sorted({f"{g.arch} {R.vram_class(pf._gib(g.vram_mib))} GB" for g in inv.gpus})
         reasons.append(f"--profile {profile} does not match this hardware: it needs {want['cards']} x "
                        f"{'/'.join(want['arch'])} {want['vram_gib']} GB; found {', '.join(have)}")
-    why = pf.evaluate(inv, reg, model=reg["model"]).no_profile_reason if not profile and tp is None else None
-    if why and not why.startswith("mixed GPUs"):  # the whole-host explanation; a pinned row's refusal is its own line above
+    why = pf.evaluate(inv, reg, model=reg["model"], checkpoint=name).no_profile_reason if not profile and tp is None else None
+    # the whole-host explanation; a pinned row's refusal (a blocked row's reason) is its own line above, not repeated
+    if why and not why.startswith("mixed GPUs") and not any(r.endswith(why) for r in reasons):
         reasons.append(why)
     reasons.append(f"run `merlin doctor --model {reg['model']}` for the full report")
     raise CliError(
@@ -624,6 +622,22 @@ def _default_port(reg: dict[str, Any]) -> int:
     return int(reg.get("launch", {}).get("port") or reg["base"].get("port", 8000))
 
 
+def _emulate_vram_class(inv: pf.Inventory, env_in: dict[str, str]) -> tuple[pf.Inventory, str | None]:
+    """MERLIN_EMULATE_VRAM_CLASS (test / emulation only, launch.emulated_vram_class): every card is matched as that class,
+    with the memory above it counted as used (a 24 GB card with 4 GiB of ballast reads as an idle 20 GB card). Hardware
+    matching only; the launcher strips the variable."""
+    try:
+        got = L.emulated_vram_class(env_in, [g.vram_mib for g in inv.gpus])
+    except L.LaunchError as e:
+        raise CliError(str(e), e.code) from None
+    if got is None:
+        return inv, None
+    mib = got[0] * 1024
+    gpus = [replace(g, vram_mib=mib, mem_used_mib=None if g.mem_used_mib is None else max(0, g.mem_used_mib - (g.vram_mib - mib)))
+            for g in inv.gpus]
+    return replace(inv, gpus=gpus), got[1]
+
+
 def resolve(
     name: str,
     path: str | None,
@@ -640,6 +654,7 @@ def resolve(
     except R.ProfileError as e:
         raise CliError(str(e)) from None
     ckpt = path or env_in.get("MERLIN_CHECKPOINT_DIR") or PLACEHOLDER
+    inv, emulation = _emulate_vram_class(inv, env_in)
     # the RAM gates count the KV host tier this launch asks for and the PLE table this checkpoint carries (INT6 g32)
     inv = replace(inv, kv_tier_gib=pf.kv_host_tier_gib(env_in), ple_table_gib=pf.ple_table_gib_of(ckpt, inv.ple_table_gib, env_in.get("PLE_STORE")))
     if not (repo / LAUNCHER).is_file():
@@ -648,7 +663,7 @@ def resolve(
     ids = [p["id"] for p in _profiles_for(name, reg)]
     if profile and profile not in ids:
         raise CliError(f"--profile {profile!r} does not belong to {name}; its profiles: {', '.join(ids)}")
-    notes: list[str] = []
+    notes: list[str] = [emulation] if emulation else []
     if sel is not None:
         # GPUS / CUDA_VISIBLE_DEVICES: exactly those cards (preflight checks the set it is given)
         picked = [g for g in inv.gpus if g.index in sel]
@@ -669,7 +684,7 @@ def resolve(
                 if rep.exit_code == 0:
                     break
         else:
-            rep = pf.evaluate(inv, reg, model=reg["model"], gpus=sel)
+            rep = pf.evaluate(inv, reg, model=reg["model"], gpus=sel, checkpoint=name)
             if rep.exit_code == 0 and rep.profile_id not in ids:
                 raise CliError(f"auto-selected {rep.profile_id} is not a {name} profile; pass --profile")
         if rep is None or rep.exit_code != 0 or not rep.profile_id:
@@ -747,7 +762,7 @@ def resolve(
         dfl = p["serve"].get("dflash2") if model == "flash-next" and (env_in.get("SPEC") or "mtp") == "dflash2" else None
         if dfl:  # the derivation is from the MTP pin: lower the DFlash2 pin by the same bytes, in its whole blocks
             lowered = p["serve"]["kv_cache_memory"] - pin
-            bpb = dfl["kv_cache_memory"] // dfl["kv_blocks"]
+            bpb = R.DFLASH2_KV_BLOCK_BYTES  # the pin is a round byte figure, not a whole number of blocks
             pin = max(0, (dfl["kv_cache_memory"] - lowered) // bpb * bpb)
             notes.append(f"SPEC=dflash2: the DFlash2 KV pin is lowered by the same {lowered:,} B for these cards, in whole "
                          f"blocks: KV_BYTES={pin} (in testing: DFlash2 is validated at the qualified pin only)")
@@ -932,6 +947,7 @@ def plan_instances(
         reg = R.with_kv_dtype(_load(name), env_in.get("KV_DTYPE"))
     except R.ProfileError as e:
         raise CliError(str(e)) from None
+    inv = _emulate_vram_class(inv, env_in)[0]  # each instance's resolve notes it
     # every instance gets the same KV host tier and PLE table (the checkpoint's: INT6 g32 with --ple int6)
     inv = replace(inv, kv_tier_gib=pf.kv_host_tier_gib(env_in), ple_table_gib=pf.ple_table_gib_of(path or env_in.get("MERLIN_CHECKPOINT_DIR"), inv.ple_table_gib, env_in.get("PLE_STORE")))
     if _gpu_selection(env_in) is not None:
@@ -1196,8 +1212,21 @@ def cmd_list(out: Any, repo: Path = REPO, checkpoint: str | None = None, arch: s
                 rep_launcher = p.get("recipe_launcher") or (f"tools/merlin/launchers/{R.launcher_name(p['id'])}" if p["id"] in reg.get("launchers", []) else None)
             rep_launcher = rep_launcher or f"(merlin serve {name} --profile {p['id']})"
             where = rep_launcher if rep_launcher.startswith("(") or (repo / rep_launcher).is_file() else f"{rep_launcher}  [MISSING in this tree]"
-            out.write(f"{name:<18} {p['id']:<36} {p['status']:<9} {hw:<30} {where}\n")
+            status = "blocked" if R.blocked_reason(p) else p["status"]  # listed, refused until a fit is proven
+            out.write(f"{name:<18} {p['id']:<36} {status:<9} {hw:<30} {where}\n")
     return 0
+
+
+def _prefill_runs_state(vllm: L.Plan) -> str:
+    """One line: whether the Flash-Next prefill runs are on for this launch, with their settings, or why not."""
+    env = vllm.env
+    if env.get(L.FN_PREFILL_RUNS) == "1":
+        return (f"prefill runs on: chunk {env.get('VLLM_MERLIN_PREFILL_RUNS_CHUNK_TOKENS')}, "
+                f"{env.get('VLLM_MERLIN_PREFILL_RUNS_CHUNKS') or '16'} chunks per run, "
+                f"decode-share scheduling target {env.get('VLLM_MERLIN_PREFILL_RUNS_DECODE_SHARE')} (PREFILL_RUNS=0 turns them off)")
+    if (vllm.caller_env.get("PREFILL_RUNS") or "").strip() == "0":
+        return "prefill runs off: PREFILL_RUNS=0"
+    return "prefill runs off: stepped aside (see the note above)"
 
 
 def _print_plan(plan: Plan, out: Any, label: str) -> None:
@@ -1210,9 +1239,14 @@ def _print_plan(plan: Plan, out: Any, label: str) -> None:
                 out.write(f"# NOTE {note}\n")
     for n in plan.notes:
         out.write(f"# NOTE {n}\n")
+    fn = plan.vllm is not None and plan.vllm.model == "flash-next"
     for n in (plan.vllm.notes if plan.vllm is not None else []):
-        if L.is_cap_note(n) or n.startswith("context:"):  # cap and context notes also print at boot
+        shown = n in (R.SM80_FP8_WARNING, R.SM80_27B_FP8_WARNING) or n.startswith("GUARD=")
+        # cap and context notes also print at boot; on the Flash-Next family every other launcher note does too
+        if L.is_cap_note(n) or n.startswith("context:") or (fn and not shown):
             out.write(f"# WARN {n.removeprefix('WARNING: ')}\n" if n.startswith("WARNING: ") else f"# NOTE {n.removeprefix('note: ')}\n")
+    if fn:
+        out.write(f"# NOTE {_prefill_runs_state(plan.vllm)}\n")
     for w in plan.warnings:
         out.write(f"# WARN {w}\n")
     for m in missing_resources(plan, os.environ):
@@ -1255,13 +1289,25 @@ def _identify(args: argparse.Namespace) -> tuple[str, str | None, list[str]]:
 
 
 # --spec: the drafter. mtp (the default everywhere) or dflash2, incoai's DFlash2 block-diffusion drafter for the
-# Flash-Next family on the rows with a qualified DFlash2 geometry (+5-18 % decode vs MTP on 4 x 3090; a 789,668-token
-# pool: 3 x 262K, not 6 x 131K). The launcher's SPEC=none (no drafter, a reference setting) is not offered here.
+# Flash-Next family on the rows with a qualified DFlash2 geometry (+5-18 % decode vs MTP on 4 x 3090; its pool, see
+# dflash2_why(): 3 x 262K, not 6 x 131K). The launcher's SPEC=none (no drafter, a reference setting) is not offered here.
 SPEC_CHOICES = ("mtp", "dflash2")
 DFLASH2_REPO = "incoai/Qwen3.8-Flash-Next-DFlash2"
 DFLASH2_DEFAULT_DIR = "~/models/flash-next-dflash2"  # setup.sh --spec dflash2 downloads it here
 DFLASH2_FILES = ("config.json", "model.safetensors")  # what serving reads (the checksum list's files)
-DFLASH2_WHY = "+5-18 % decode vs MTP on 4 x 3090; its 789,668-token pool holds 3 x 262K, not 6 x 131K"
+
+
+def dflash2_why(strict: bool = True) -> str:
+    """Why --spec dflash2, with the pool figure read from the profiles' measured serve.dflash2 pool_tokens on use
+    (never at import, so a broken Flash-Next profile cannot stop the other models). strict=False (help text only)
+    leaves the figure out when the profiles cannot give it; the notes printed for a DFlash2 launch use strict."""
+    try:
+        pool = f"{R.dflash2_pool_tokens():,}-token "
+    except (R.ProfileError, OSError, ValueError):
+        if strict:
+            raise
+        pool = ""
+    return f"+5-18 % decode vs MTP on 4 x 3090; its {pool}pool holds 3 x 262K, not 6 x 131K"
 
 
 def dflash2_dir(environ: dict[str, str] | None = None) -> Path:
@@ -1558,7 +1604,7 @@ def cmd_serve(args: argparse.Namespace, extra: list[str], out: Any) -> int:
                    f"{DFLASH2_REPO} there, or set DFLASH2_MODEL to your copy")
             if gone and not args.dry_run:
                 raise CliError(fix + ". Nothing started.")
-            plans[0].notes.append(f"--spec dflash2: drafter {d}; {DFLASH2_WHY}")
+            plans[0].notes.append(f"--spec dflash2: drafter {d}; {dflash2_why()}")
             if gone:
                 plans[0].warnings.append("dflash2: " + fix)
     except CliError as e:
@@ -1956,7 +2002,7 @@ def main(argv: list[str] | None = None, out: Any = None) -> int:
                    "disk (experimental: read from the checkpoint's own files, on NVMe; frees the table's host RAM, but first reads are much "
                    "slower; see docs/how-to-serve.md). Other storage warns and runs")
     s.add_argument("--spec", choices=SPEC_CHOICES, help="the drafter: mtp (default) or dflash2 (Flash-Next family, rows "
-                   f"with a DFlash2 geometry; {DFLASH2_WHY.replace(chr(37), chr(37) * 2)}; the drafter from DFLASH2_MODEL or {DFLASH2_DEFAULT_DIR})")
+                   f"with a DFlash2 geometry; {dflash2_why(strict=False).replace(chr(37), chr(37) * 2)}; the drafter from DFLASH2_MODEL or {DFLASH2_DEFAULT_DIR})")
     s.add_argument("--kv-ram-cache", metavar="SIZE", help="Flash-Next (experimental, MTP only), 27B (experimental) and Ornith 1.5: a host-RAM cache for prefix KV blocks the GPU pool evicts "
                    "(restored instead of recomputed; adds no context and does not change the session cap (--swarm does); RAM only, never disk; ~66K tokens/GiB on Flash-Next TP2xPP2; needs memlock: LimitMEMLOCK=infinity or ulimit -l unlimited). SIZE = host RAM per "
                    f"server (24g, 24gib or 24 = GiB; 0 = off), split over its TP x PP ranks into {KV_HOST_TIER_ENV} (rounded down to whole GiB per rank)")

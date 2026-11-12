@@ -37,7 +37,8 @@ warning and is untested. The lock holds one CUDA release: nvcc, crt, nvvm and nv
 Qualification status of this locked route (vLLM 0.33.0, torch 2.14.0, FlashInfer 0.7.2.post1): at the 3.0.2 release
 gate Flash-Next, Qwen3.8-27B (1, 2 and 4 GPUs), Nemotron 3.5 Super VL and Ornith 1.5 booted and served on it
 (2026-11-04), building their FlashInfer JIT modules on sm_86, and the live tile proof passed on the 27B TP2 boot; a
-fresh install from the release wheel has not been done. The ReplaySSM `checkpointing_ssu` module does not compile for sm_86 on any toolkit; it needs sm_90.
+fresh install from the 3.0.2 release wheel was not done; on 3.0.2.1 a fresh install from the release wheel passed on the
+reference host (2026-11-12: install, verify and identity checks). The ReplaySSM `checkpointing_ssu` module does not compile for sm_86 on any toolkit; it needs sm_90.
 For the previous route (vLLM 0.32.0, FlashInfer 0.7.0.post1), a CPU-only venv built from its lock with
 `--require-hashes` compiled the served configurations' FlashInfer JIT modules for sm_80, sm_86 and sm_89 (2026-10-17),
 and release-wheel installs were then served on it (2026-10-20).

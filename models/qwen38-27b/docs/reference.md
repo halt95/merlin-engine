@@ -40,8 +40,9 @@ and drafter, FP8 E4M3 KV, MTP with **K=4** draft tokens per step, fp16 SSM state
   95 % Newcombe CI **[−5.89, +1.61] pp**, within CI and not significantly worse.
 - 27B TP2 serves images up to 8 MP. With the vision-peak option on (`VLLM_MERLIN_VISION_PEAK=1`, the TP2 launcher default), the 50-item TP2 stress sweep's worst minimum free was 806 MiB per card (2026-10-15), above the 524 MiB floor. A separate knob OFF/ON identity check matched tokens and logprobs on 6/6 prompts. Flash-Next (902 MiB) meets the target. 27B TP4 left 690 MiB free on the retired RecoverSSM-off pin; at the shipped chunk 4096 with RecoverSSM on, the 2026-10-20 bench card measured 862 MiB lowest free (one 8 MP image, two at once, and four in one prompt; 2 cards: 886 MiB), above the 524 MiB floor.
 
-The release engine is **Merlin 3.0.2 on vLLM 0.33.0**. The
-[3.0.2 bench card](../benchmarks/2026-11-04/BENCH-CARD.md) holds the 3.0.2 results, the
+The release engine is **Merlin 3.0.2.1 on vLLM 0.33.0**. The
+[3.0.2.1 bench card](../benchmarks/2026-11-12/BENCH-CARD.md) holds the 3.0.2.1 results, the
+[3.0.2 bench card](../benchmarks/2026-11-04/BENCH-CARD.md) the 3.0.2 results, the
 [2026-11-02 bench card](../benchmarks/2026-11-02/BENCH-CARD.md) the 3.0.1 results and the
 [2026-10-20 bench card](../benchmarks/2026-10-20/BENCH-CARD.md) the 3.0.0 release results; the
 [2026-10-15 card](../benchmarks/2026-10-15/BENCH-CARD.md) distinguishes the 0.32 candidate tile run from the final release assembly.
@@ -155,7 +156,7 @@ See the [CUDA driver requirements](../../../release/install-0.33.md). On the 3.0
 | Tools | git, `sha256sum`, GNU `patch`, `flock` (util-linux) | |
 | Disk | about 17 GB (15.9 GiB) for the checkpoint, plus the venv and the engine source tree (`.vllm-v2.5.2`) | |
 | System RAM | **about 2.4 GiB more than a standard vLLM serve**: the token-embedding table lives in pinned host RAM, 1.18 GiB per GPU on dual card or 0.59 on quad card | 192 GB host (152 GiB to the serving environment) |
-| Interconnect | GPU peer-to-peer (P2P): `P2P=on`, the default, skips vLLM's P2P check and sets `NCCL_P2P_LEVEL=SYS`. Without P2P, `merlin serve 27b <dir> --tp 2` picks the no-P2P row, or set `P2P=off` (NCCL through host memory, `NCCL_P2P_DISABLE=1`). PCIe Gen4 x16 and P2P were used for every reference-host measurement | P2P-enabled driver |
+| Interconnect | GPU peer-to-peer (P2P): `P2P=on`, the default, skips vLLM's P2P check and sets `NCCL_P2P_LEVEL=SYS`. On `27b-tp2-3090` P2P=on also sets the measured TP2 levers: `NCCL_PROTO=Simple`, `VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC=1` (both owned by the P2P mode; an inherited value is not used), `VLLM_DRAFT_BOUNDED_PLAN=1`, `VLLM_GDN_DECODE_FASTPATH=1`, `VLLM_GDN_SHARED_ALIGN_INDEX=1` and `VLLM_TARGET_SEQ_LENS_ASYNC=1` (each can be overridden from the environment). Without P2P, `merlin serve 27b <dir> --tp 2` picks the no-P2P row, or set `P2P=off` (NCCL through host memory, `NCCL_P2P_DISABLE=1`). PCIe Gen4 x16 and P2P were used for every reference-host measurement | P2P-enabled driver |
 
 Not yet run on RTX 3090s without P2P on this release; the four-card no-P2P row was boot-checked with `--swarm` on
 2026-11-01. On the v1.3.0 engine, two cloud-hosted RTX 3090s without P2P ran the TP2
@@ -331,7 +332,7 @@ fix in item 6) with the 27B series 0001-0011 applied in order (`patches/merlin-e
    the MTP proposal (both on in `models/qwen38-27b/serve.sh`); bit-identical output, with a lower per-step cost for the commit on dual
    card. The guard fix in
    Merlin engine v2.5.2 (ex-series 0012): the engine's bounds-guard reader (default `warn`) stops copying its counters while the server is idle, so idle cards can
-   drop to P8 instead of holding P2. Thanks to the community
+   drop to P8 instead of holding P2. Thanks to [CoolShades](https://github.com/CoolShades)'s
    [Flash-Next idle-power report](https://github.com/halt95/merlin-engine/issues/2) and
    [contribution](https://github.com/halt95/qwen38-flash-next-3090s/pull/3), which led to this fix; the same implementation
    ships in Merlin engine v2.5.2 (Flash-Next v2.5.2). Before it parks it
@@ -363,7 +364,12 @@ fix in item 6) with the 27B series 0001-0011 applied in order (`patches/merlin-e
 8. **`--long-prefill-token-threshold 832`** (`LPT=832`, default) is meant to let other requests start while a long cold
    prefill runs; that long-prefill probe passed on v1.0.0 and was not re-run at this release check. `LPT=0` removes the flag.
 9. **`SPEC_K=4`** (default) drafts four tokens per step ([SPEC_K](#spec_k)). Capture sizes at K=4 are 1, 2, 4 and 8, then multiples of K+1 = 5
-   (`[1,2,4,5,8,10,15,20,25,30,35,40]`).
+   (`[1,2,4,5,8,10,15,20,25,30,35,40]`). The quad-card 3090 profile adds 80 and 120, the decode steps at 16 and 24 streams. On four
+   cards with these graphs in use, 16 streams decode at 1,218.3 tok/s and 24 streams at 1,332.6 tok/s (ThinkingCap: 1,202.7 and 1,321.5 tok/s). Outputs at 16 and 24
+   streams were compared with the previous capture list over repeated runs and showed no difference distinguishable from
+   run-to-run variation on four cards; byte-identical output under concurrency is not claimed. The 8 MP image floor is
+   796 MiB on every card of four, counted as total minus used and sampled every 100 ms on a fresh boot with no decode before the images (the 27B checkpoint and ThinkingCap, one run each); with decode run first, the readings at one-second sampling were 798 and 796 MiB. The dual-card 3090 profile adds 80, the decode step at
+   16 streams; its 8 MP image floor is 764 MiB on two cards, counted as total minus used.
 10. **Chat template:** froggeric's Qwen-Fixed-Chat-Templates v22.5, vendored unmodified under `templates/` and
     credited in `NOTICE` (repository root). `CHAT_TEMPLATE=` (empty) uses the checkpoint's own template.
 
@@ -377,7 +383,7 @@ Changes by version:
 
 ### Hardware
 
-![Qwen3.8-27B on RTX 3090s, Merlin 3.0.0: dual card (TP=2) and quad card (TP=4), the cards, the KV pools and the host-resident embedding table](images/qwen38-27b-merlin-3.0.0-layout.png)
+![Qwen3.8-27B on RTX 3090s, Merlin 3.0.2.1: dual card (TP=2) and quad card (TP=4), the cards, the KV pools and the host-resident embedding table](images/qwen38-27b-merlin-3.0.2.1-layout.png)
 
 | resource | reference host |
 |---|---|
@@ -504,9 +510,9 @@ All tables and plots below this point are **historical v1.3.x vLLM 0.30 results*
 Units: context depths are prompt targets (4K = 4,096; 32K = 32,768; 128K and 131K = 131,072; 250K = 250,000; the 255K
 rung targets 261,120 tokens, and its prompts as sent at the release check were 259,587 to 259,616 tokens; 262K = 262,144). GB = 10⁹ bytes, GiB = 2³⁰ bytes.
 
-![Qwen3.8-27B · Merlin 3.0.0 over context depth: cold prefill, single-stream decode and decode step time, dual and quad card](../benchmarks/merlin-3.0.0/qwen38-27b-merlin-3.0.0-ctx-pp-tg-itl.png)
+![Qwen3.8-27B · Merlin 3.0.2.1 over context depth, previous build: cold prefill, single-stream decode and decode step time, one, two and four cards](../benchmarks/merlin-3.0.2.1/qwen38-27b-merlin-3.0.2.1-ctx-pp-tg-itl.png)
 
-*The chart is the Merlin 3.0.0 chart (engine on vLLM 0.32.0); the tables below are the historical v1.3.0 / vLLM 0.30 results and are not redrawn in it.*
+*The chart is the Merlin 3.0.2.1 chart (vLLM 0.33.0, from the [2026-11-12 bench card](../benchmarks/2026-11-12/BENCH-CARD.md)); the tables below are the historical v1.3.0 / vLLM 0.30 results and are not redrawn in it.*
 
 ### v1.3.0 numbers
 
@@ -593,11 +599,11 @@ serve scripts. The release check measured the shipped K=4 profiles only; K=3 and
 - **v1.0.0 reference (previous engine):** [history](history.md#v100-quality).
 
 The ThinkingCap checkpoint's own results are in its section above and in the
-[ThinkingCap bench card](../../thinkingcap/benchmarks/2026-10-12/ThinkingCap-BENCH-CARD.md):
+[ThinkingCap bench card](../../thinkingcap/benchmarks/2026-11-12/BENCH-CARD.md):
 
-![ThinkingCap-Qwen3.8-27B · Merlin 3.0.0 over context depth: cold prefill, single-stream decode and decode step time, dual and quad card](../../thinkingcap/benchmarks/merlin-3.0.0/thinkingcap-merlin-3.0.0-ctx-pp-tg-itl.png)
+![ThinkingCap-Qwen3.8-27B · Merlin 3.0.2.1 over context depth, previous build (two-card 262K decode on the published wheel): cold prefill, single-stream decode and decode step time, two and four cards](../../thinkingcap/benchmarks/merlin-3.0.2.1/thinkingcap-merlin-3.0.2.1-ctx-pp-tg-itl.png)
 
-The quad-card (TP4) line in this chart is a preliminary measurement.
+The chart is from the [Merlin 3.0.2.1 bench card](../../thinkingcap/benchmarks/2026-11-12/BENCH-CARD.md) (2026-11-12).
 
 ## Known behaviours
 
@@ -651,7 +657,7 @@ architecture; the container route (dropped from v1.3.0, rebuilt and run on GPUs 
 - Chat template: froggeric's [Qwen-Fixed-Chat-Templates](https://huggingface.co/froggeric/Qwen-Fixed-Chat-Templates) v22.5
 - P2P on consumer Ampere: [aikitoria's open-kernel-module patch](https://github.com/aikitoria/open-gpu-kernel-modules)
 - Bench basis from 3.0.1: Zagitta's [gpu-unlock](https://github.com/Zagitta/gpu-unlock) kernel module (its NVIDIA firmware is personal-use and not shipped; [Sudzpel](https://github.com/Sudzpel), who proposed it with the first measurements on Merlin)
-- A community [Flash-Next idle-power report](https://github.com/halt95/merlin-engine/issues/2) and
+- [CoolShades](https://github.com/CoolShades)'s [Flash-Next idle-power report](https://github.com/halt95/merlin-engine/issues/2) and
   [contribution](https://github.com/halt95/qwen38-flash-next-3090s/pull/3), behind the guard fix in Merlin engine v2.5.2
 - ThinkingCap fine-tune: [bottlecapai/ThinkingCap-Qwen3.8-27B](https://huggingface.co/bottlecapai/ThinkingCap-Qwen3.8-27B)
   (BottleCap AI); the ThinkingCap profile serves a quantised derivative of it, not affiliated with or endorsed by BottleCap AI

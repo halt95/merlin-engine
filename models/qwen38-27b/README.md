@@ -32,6 +32,21 @@ not published, reviewed or endorsed by BottleCap AI or Qwen. Bare metal, sm_86 (
 Both checkpoints share the engine, port 8100, served name `qwen38-27b` and profile settings.
 The wrappers select the ThinkingCap checkpoint and forward the other variables; both checkpoints default to reasoning effort `medium`.
 
+## Merlin 3.0.2.1 bench card (2026-11-12)
+
+Maintainer measurements on 4× RTX 3090 (220 W, PCIe Gen4) with P2P (the aikitoria patched driver) and the Zagitta [gpu-unlock](https://github.com/Zagitta/gpu-unlock) kernel module, on vLLM 0.33.0, fresh `merlin serve` boots, 2026-11-10 and 2026-11-11, on the previous build of the 3.0.2.1 wheel (built on 2026-11-10, before the prefill runs change; not re-measured on the published wheel); method and every cell in the [bench card](benchmarks/2026-11-12/BENCH-CARD.md). Decode is one stream with thinking on at reasoning effort medium, the server default (tok/s after the first streamed token); prefill is one cold request. With thinking on, a 512-token agent follow-up may end inside the reasoning, and reasoning tokens count. Sessions held at once and the 8 MP image panels were not re-run; they stay on the earlier cards below.
+
+| Measurement | 2× RTX 3090 (TP2) | 4× RTX 3090 (TP4) | 1× RTX 3090 |
+|---|---|---|---|
+| Decode, 4K / 131K / 262K prompt | 248 / 197 / 160 tok/s | 262 / 258 / 233 tok/s | 131 / 102 / 75 tok/s |
+| Cold prefill, 10K / 100K / 262K prompt | 2,345 / 1,687 / 1,117 tok/s | 3,901 / 3,017 / 2,115 tok/s | 1,234 / 891 / 587 tok/s |
+| Agents at once (8 × 16K conversations), total, thinking on / off | 740 tok/s (overlap 3.73 s, short) / 677 tok/s | 970 tok/s (overlap 2.83 s, short) / 857 tok/s (overlap 4.50 s, short) | n/a |
+| GSM8K-200 (5-shot), correct of 200, thinking on at medium / thinking off | – / 194 | 198 / 195 | – / 194 |
+| Sessions held at once | Not re-measured on 3.0.2.1; 3.0.0 figures on the earlier cards below. | Not re-measured on 3.0.2.1; 3.0.0 figures on the earlier cards below. | Not re-measured on 3.0.2.1; 3.0.0 figures on the earlier cards below. |
+| 8 MP image (one card: 4 MP) | Not re-measured on 3.0.2.1; 3.0.0 figures on the earlier cards below. Measured on 3.0.2.1, previous build (not re-measured on the published wheel): the memory floor during the 8 MP rows with capture size 80, 764 MiB (total minus used). | Not re-measured on 3.0.2.1; 3.0.0 figures on the earlier cards below. Measured on 3.0.2.1, previous build (not re-measured on the published wheel): the memory floor during the 8 MP rows with capture sizes 80 and 120, 796 MiB on every card (total minus used), sampled every 100 ms on a fresh boot with no decode before the images (the 27B checkpoint and ThinkingCap, one run each); with decode run first, the readings at one-second sampling were 798 and 796 MiB. | 8 MP does not fit one card, which takes 4 MP; not re-measured on 3.0.2.1 (3.0.0 card, 2026-10-21). |
+| KV pool | 826,689 tokens | 2,012,105 tokens | 271,506 tokens |
+| Against 3.0.2 | decode +18 % / +7 % at 4K / 131K (the six two-card P2P launcher defaults) and +10 % at 262K, where the 128-token rate varies with the text sent; 262K prefill 0 %; 8 agents +9 % (short overlap window, read loosely) | within run-to-run spread: decode +2 % / +1 % at 4K / 131K; −7 % at 262K, where the 128-token rate varies with the text sent (sends 230.7–252.6 tok/s); 262K prefill 0 %; 8 agents +3 % (short overlap window, read loosely) | within run-to-run spread: decode 0 % / +2 % / −2 % at 4K / 131K / 262K; 262K prefill 0 % |
+
 ## Merlin 3.0.2 bench card (2026-11-04)
 
 Maintainer measurements on 4× RTX 3090 (220 W, PCIe Gen4) with P2P (the aikitoria patched driver) and the Zagitta [gpu-unlock](https://github.com/Zagitta/gpu-unlock) kernel module, on vLLM 0.33.0 with FlashInfer 0.7.2.post1, one fresh `merlin serve` boot per configuration, 2026-11-04; method and every cell in the [bench card](benchmarks/2026-11-04/BENCH-CARD.md). Decode is one stream with thinking on at reasoning effort medium, the server default (tok/s after the first streamed token); prefill is one cold request. With thinking on, a 512-token agent follow-up may end inside the reasoning, and reasoning tokens count. GSM8K-200 and the thinking-off agent figures are from the 3.0.1 run. Rows marked (3.0.1 run) were not re-run for 3.0.2 and are on the 3.0.1 card below.
@@ -227,7 +242,7 @@ Historical release notes for vLLM 0.30; the install and performance claims in th
 - **fp16 SSM state, unchanged.**
 - **Idle cards drop to P8.** The engine's bounds-guard reader parks with no device work while the server is idle, so
   idle cards can drop to P8 instead of holding P2. On vLLM 0.32 idle parking is built in and has no environment switch. Thanks to
-  the community [Flash-Next idle-power report](https://github.com/halt95/merlin-engine/issues/2)
+  [CoolShades](https://github.com/CoolShades)'s [Flash-Next idle-power report](https://github.com/halt95/merlin-engine/issues/2)
   and [contribution](https://github.com/halt95/qwen38-flash-next-3090s/pull/3), which led to this fix.
 - **Cached tokens in every response** (`--enable-prompt-tokens-details`), and a per-image pixel cap, `MAX_PIXELS`
   (v1.3.0 default 4,194,304 = 2048×2048; 3.0.0 release cap is 8,388,608 = 8 MP).
@@ -276,15 +291,18 @@ serve profiles at 262K with MTP K=3, and a container recipe. Its numbers: [docs/
   RTX 3090 no-P2P rows stay ⚫ until this release runs there (the four-card row was boot-checked with `--swarm` on
   2026-11-01). Other 24 GB-class sm_86 cards (RTX A5000, 3090 Ti)
   resolve to the same rows but
-  are reported untested / community-validated; cards reporting under 24 GiB (A10, A10G, L4 at 22.5 GiB; 12 and 20 GB
-  cards) are refused by preflight, because the launchers pin KV bytes for 24 GiB and the pool is not cut. See the
+  are reported untested / community-validated. Cards that report about 22.5 GiB (A10, A10G, L4) count as the 24 GiB
+  class: preflight lowers the KV pin by the shortfall (fewer sessions, same quality) and refuses a layout whose lowered
+  pool holds no 262K session (one card). 20 GB cards (RTX 3080 20GB, RTX A4500, RTX 4000 Ada) have ⚫ untested TP2 and
+  TP4 rows (`27b-tp2-sm86-20g`, `27b-tp2-sm89-20g`, `27b-tp4-sm86-20g`, `27b-tp4-sm89-20g`); one 20 GB card has no row.
+  12 GB and 16 GB cards are below every VRAM class and are refused. See the
   [hardware matrix](../../docs/merlin/hardware-matrix.md).
 - The container route returns in a later release.
 - Windows: WSL2 only, and untested (⚫). See [WSL2](../../docs/merlin/hardware-matrix.md#wsl2) for the settings it needs.
 - Switching the verify tile (`FLASHINFER_SM8X_FP8_SMALLQ`) or `SPEC_K`, or reusing prefix-cache blocks, can change output
   at near-tied tokens. The 0.30 check did not establish repeatability across fresh compile caches.
 - Changing `--limit-mm-per-prompt` needs a fresh compile cache (`VLLM_CACHE_ROOT`).
-- A same-day 0.32 tile-off GSM8K-200 remains pending.
+- A same-day 0.32 tile-off GSM8K-200 was not done.
 - JSON-schema structured output was not tested at the historical 0.30 base release check; no new long-soak result is claimed here.
 - The ThinkingCap token saving was measured on arithmetic word problems only.
 
@@ -302,7 +320,7 @@ and lucifer1004 ([uniform multi-token decode](https://github.com/vllm-project/vl
 froggeric ([Qwen-Fixed-Chat-Templates](https://huggingface.co/froggeric/Qwen-Fixed-Chat-Templates) v22.5),
 [aikitoria's open-kernel-module patch](https://github.com/aikitoria/open-gpu-kernel-modules) (P2P on consumer Ampere),
 Zagitta's [gpu-unlock](https://github.com/Zagitta/gpu-unlock) kernel module (the bench basis from 3.0.1; its NVIDIA firmware is personal-use and not shipped; [Sudzpel](https://github.com/Sudzpel), who proposed it with the first measurements on Merlin),
-and a community Flash-Next
+and [CoolShades](https://github.com/CoolShades)'s Flash-Next
 [idle-power report](https://github.com/halt95/merlin-engine/issues/2) and
 [contribution](https://github.com/halt95/qwen38-flash-next-3090s/pull/3), behind the guard fix in Merlin engine v2.5.2.
 Third-party notices are in the repository's `NOTICE`; the list with links per item: [Credit](docs/reference.md#credit).

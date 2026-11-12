@@ -206,7 +206,7 @@ class SingleTypeKVCacheManager(ABC):
         return (
             len(new_computed_blocks) > 0
             and num_local_computed_tokens % self.block_size != 0
-            # a null tail is a host-restore
+            # A null tail is a host-restore
             # placeholder: its destination is private, nothing to copy.
             and not new_computed_blocks[-1].is_null
         )
@@ -818,6 +818,7 @@ class SingleTypeKVCacheManager(ABC):
         req_blocks = self.req_to_blocks.pop(request_id, [])
         self.num_cached_block.pop(request_id, None)
         self._partial_hit_reqs.pop(request_id, None)
+
         self.restored_private_tails.pop(request_id, None)
         return trim_null_head(req_blocks)
 
@@ -1975,6 +1976,7 @@ class MambaManager(SingleTypeKVCacheManager):
             # connector; a request that finishes first hands off this table
             # source directly.
             self._producer_partial_tail_reqs: dict[str, tuple[KVCacheBlock, int]] = {}
+
         self._retain_checkpoint: bool = (
             self.mamba_cache_mode == "align"
             and self.enable_caching
@@ -2039,6 +2041,7 @@ class MambaManager(SingleTypeKVCacheManager):
                 retired = [entry for entry in retired if entry[1] is not newest[1]]
                 if held is not None:
                     # Superseded: it ages from here like any cached free block.
+
                     if census := getattr(self.block_pool.evict_groups, "census", None):
                         census.superseded(held[1])
                     retired.append(held)
@@ -2064,6 +2067,7 @@ class MambaManager(SingleTypeKVCacheManager):
         self.block_pool.touch([block])
         self._retained_checkpoints[request_id] = (position, block)
         if held is not None:
+
             if census := getattr(self.block_pool.evict_groups, "census", None):
                 census.superseded(held[1])
             self.block_pool.free_blocks([held[1]])

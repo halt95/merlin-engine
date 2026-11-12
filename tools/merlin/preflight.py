@@ -200,10 +200,13 @@ KNOWN_CARDS: dict[str, tuple[str, str, int, bool]] = {
     "3090": ("NVIDIA GeForce RTX 3090", "sm_86", 24576, True),
     "3090ti": ("NVIDIA GeForce RTX 3090 Ti", "sm_86", 24564, True),
     # Cloud / small-VRAM cards. MiB are what nvidia-smi reports: A10/A10G/L4 ~22.5 GiB (below the 24 GiB class, so the
-    # KV pin is lowered by the shortfall); the 12 and 20 GB cards fall outside every class and are refused.
+    # KV pin is lowered by the shortfall); the 12 GB cards fall outside every class and are refused. The 20 GB cards are
+    # the 20 GiB class: untested 27B TP2 / TP4 rows, and untested Flash-Next quad rows with the static cold-expert offload.
     "a10": ("NVIDIA A10", "sm_86", 23028, False),
     "a10g": ("NVIDIA A10G", "sm_86", 23028, False),
     "a4500": ("NVIDIA RTX A4500", "sm_86", 20470, True),
+    "3080-20g": ("NVIDIA GeForce RTX 3080", "sm_86", 20480, True),
+    "4000ada": ("NVIDIA RTX 4000 Ada Generation", "sm_89", 20475, False),
     "3080ti": ("NVIDIA GeForce RTX 3080 Ti", "sm_86", 12288, True),
     "3080-12g": ("NVIDIA GeForce RTX 3080", "sm_86", 12288, True),
     "l4": ("NVIDIA L4", "sm_89", 23034, False),
@@ -1043,8 +1046,8 @@ def explain_no_profile(
     if model == "27b":
         return (
             "the 27B profiles cover 1, 2 or 4 cards of 24 GB sm_86 (RTX 3090 class) and, untested, of 48 GB sm_86, 24 / 32 / 48 GB "
-            "sm_89 and 24 / 32 / 40 / 64 / 80 GB sm_80 (the series patches are gated to dense Qwen3.5 on sm_86; the other arches "
-            f"take the stock paths; merlin list 27b). Found {n} card(s), arch {arch}, VRAM class {vclass}."
+            "sm_89, 24 / 32 / 40 / 64 / 80 GB sm_80 and 2 or 4 cards of 20 GB sm_86 / sm_89 (the series patches are gated to "
+            f"dense Qwen3.5 on sm_86; the other arches take the stock paths; merlin list 27b). Found {n} card(s), arch {arch}, VRAM class {vclass}."
         )
     if n == 2 and vclass == 24:
         return (
@@ -1072,15 +1075,17 @@ def explain_no_profile(
         )
     return (
         f"no profile for {n} x {vclass or '?'} GB {arch or 'unknown-arch'}. Profiles cover: 4/8 x 24 GB sm_86, "
-        "2/4 x 48 GB, 4 x 24/32 GB sm_80/sm_89, A100 80 GB x1/2/4, CMP 170HX 32/40/64 GB rows (see --list)."
+        "2/4 x 48 GB, 4 x 24/32 GB sm_80/sm_89, A100 80 GB x1/2/4, CMP 170HX 32/40/64 GB rows, and 4 x 20 GB rows with the static "
+        "cold-expert offload (see --list)."
     )
 
 
 def _candidates(
-    reg: dict[str, Any], model: str, n: int, arch: str, vclass: int | None, p2p: str
+    reg: dict[str, Any], model: str, n: int, arch: str, vclass: int | None, p2p: str, checkpoint: str | None = None
 ) -> list[dict[str, Any]]:
     out = []
-    for p in reg["profiles"]:
+    # automatic selection never crosses checkpoints: the requested checkpoint's rows only (the split merlin serve uses)
+    for p in R.profiles_for(reg, checkpoint or model):
         m = p["match"]
         if arch not in m["arch"] or m["cards"] != n or m["vram_gib"] != vclass:
             continue
@@ -1185,23 +1190,29 @@ def adjusted_capacity(profile: dict[str, Any], pin_bytes: int) -> dict[str, Any]
 
 
 def explain_small_card(model: str, n: int, arch: str | None, gib: float) -> str | None:
-    """Why a card below the 24 GiB class (RTX 3080 Ti / 3080 12 GB, A4500 20 GB, 16 GB cards) is refused."""
+    """Why a card below the 24 GiB class is refused when no row of its class fits: a 20 GB card (RTX 3080 20GB, A4500,
+    RTX 4000 Ada) on a card count without a 20 GiB row, or a smaller card (RTX 3080 Ti / 3080 12 GB, 16 GB cards)."""
     if gib >= 24 * 0.93:
         return None
-    head = f"{n} x {gib:.1f} GiB {arch or 'unknown-arch'} does not fit: below the smallest VRAM class (24 GiB), so no profile applies."
     tail = " Nothing is squeezed (no pool cut, no lower quant, no offload) to make it fit."
+    if R.vram_class(gib) == 20:
+        head = f"{n} x {gib:.1f} GiB {arch or 'unknown-arch'} (the 20 GiB class) does not fit:"
+        if model == "27b":
+            return (head + " the 20 GiB class has 27B rows for 2 cards (TP2) and 4 cards (TP4) only, both untested; a single"
+                    " 20 GB card has no TP1 row (no run at that size)." + tail)
+        return (head + " the 20 GiB class has one Flash-Next layout, 4 cards TP2xPP2+EP (fn-quad-20g-sm86 / fn-quad-20g-sm89,"
+                " and the same rows for Swift1.5 and Swift1.5-Huihui),"
+                " untested, with the static cold-expert offload; no other card count of this class has a row." + tail)
+    if gib > 20 * 1.07:
+        head = f"{n} x {gib:.1f} GiB {arch or 'unknown-arch'} does not fit: between the 20 and 24 GiB VRAM classes, so no profile applies."
+    else:
+        head = f"{n} x {gib:.1f} GiB {arch or 'unknown-arch'} does not fit: below the smallest VRAM class (20 GiB), so no profile applies."
     if model == "27b":
-        return head + " The 27B launchers pin KV bytes for 24 GiB cards." + tail
+        return head + " The 27B launchers pin KV bytes for 20 GiB cards and up." + tail
     ledger = (
-        " Sizing (flash-next.json): the quad's binding stage needs ~17.4 GiB of weights + ~2.75 GiB overhead = ~20.2 GiB"
-        " before any KV, more than a 20 GB card holds; the octo's binding stage needs ~10 GiB + 2.75 GiB = ~12.75 GiB,"
-        " more than a 12 GB card holds."
+        " Sizing (flash-next.json): the octo's binding stage needs ~10 GiB of weights + 2.75 GiB overhead = ~12.75 GiB"
+        " before any KV, more than a 12 GB card holds."
     )
-    if n >= 8 and gib >= 19:
-        ledger += (
-            " 8 x 20 GB would leave a ~7 GiB pin by that arithmetic, but the registry has no 20 GB class and none is"
-            " added without a pool-only boot."
-        )
     return head + ledger + tail
 
 
@@ -1237,7 +1248,11 @@ def evaluate(
     gpus: list[int] | None = None,
     prefer_latency: bool = False,
     kv_dtype: str | None = None,
+    checkpoint: str | None = None,
 ) -> Report:
+    # checkpoint: a derived Flash-Next checkpoint (swift1.5, swift1.5-huihui) limits the automatic pick to its own rows;
+    # unset, the pick is over the model's own rows (the vanilla rows on the Flash-Next registry). A named
+    # want_profile is taken as given.
     rep = Report(model=model, inventory=inv)
     try:
         reg = R.with_kv_dtype(reg, kv_dtype)
@@ -1355,7 +1370,7 @@ def evaluate(
                 + "; ".join(mism),
             )
     else:
-        cands = _candidates(reg, model, n, arch, vclass, rep.effective_p2p)
+        cands = _candidates(reg, model, n, arch, vclass, rep.effective_p2p, checkpoint)
         if cands:
             def keyf(p: dict[str, Any]) -> tuple[Any, ...]:
                 exact = 0 if p["match"]["p2p"] == rep.effective_p2p else 1
@@ -1363,7 +1378,8 @@ def evaluate(
                 tested = 0 if p["status"] == "tested" else 1  # tested rows first
                 # a named alternative (auto_select false) runs by --profile
                 named = 0 if R.auto_selectable(p) else 1
-                return (named, lat, tested, p.get("rank", 9), exact)
+                blocked = 1 if R.blocked_reason(p) else 0  # a blocked row is picked only to say why it refuses
+                return (blocked, named, lat, tested, p.get("rank", 9), exact)
 
             cands.sort(key=keyf)
     if not cands:
@@ -1378,6 +1394,13 @@ def evaluate(
         return rep
 
     prof = cands[0]
+    blocked = R.blocked_reason(prof)
+    if blocked:  # the row matches the hardware but has no proven fit: refuse it instead of starting it to OOM
+        rep.no_profile_reason = f"{prof['id']} matches these cards but is blocked: {blocked}"
+        rep.add("FAIL", "blocked", rep.no_profile_reason)
+        rep.exit_code = 3
+        _host_checks(rep, inv, None)
+        return rep
 
     def compatible(p: dict[str, Any]) -> bool:
         return not (
@@ -1437,7 +1460,7 @@ def evaluate(
             f"{prof['id']} ran on {', '.join(run_on)} only; {' + '.join(other)} "
             "resolves to the same row but is untested / community-validated",
         )
-    # a tested/testing row's evidence covers
+    # A tested/testing row's evidence covers
     # only the P2P modes in match.status_p2p_modes; the other mode of a two-mode row is
     # untested (e.g. the CMP 170HX rows were measured P2P off only).
     covered = prof["match"].get("status_p2p_modes")
@@ -1945,6 +1968,9 @@ def report_dict(rep: Report) -> dict[str, Any]:
     }
 
 
+BLOCKED_TAG = "; BLOCKED, refused until a fit is proven"
+
+
 def render_list(reg: dict[str, Any]) -> str:
     rows = []
     for p in reg["profiles"]:
@@ -1957,7 +1983,7 @@ def render_list(reg: dict[str, Any]) -> str:
         )
         rows.append(
             f"{p['id']:28s} {m['cards']} x {m['vram_gib']:>2} GB  {'/'.join(m['arch']):12s} p2p={m['p2p']:3s} "
-            f"{shape:8s} {R.label_text(reg, p)}"
+            f"{shape:8s} {R.label_text(reg, p)}{BLOCKED_TAG if R.blocked_reason(p) else ''}"
         )
     return "\n".join(rows) + "\n"
 
@@ -1981,7 +2007,7 @@ def render_matrix(reg: dict[str, Any]) -> str:
         lines.append(
             f"| `{rid}` | {m['cards']} x {m['vram_gib']} GB | {'/'.join(m['arch'])} | {m['p2p']} | "
             f"{shape} | {srv['max_num_seqs']} | {kv} | {est}{cap['pool_tokens']:,} | {est}{cap['fit_262k']} / {cap['fit_131k']} | "
-            f"{R.label_text(reg, p)} |"
+            f"{R.label_text(reg, p)}{BLOCKED_TAG if R.blocked_reason(p) else ''} |"
         )
     return "\n".join(lines) + "\n"
 

@@ -84,6 +84,7 @@ def _host_wait(event, discard: threading.Event | None) -> bool:
 
 
 class DmaCopyBackend:
+
     """cuMemcpyBatchAsync copy backend (one background thread per direction).
 
     Loads and stores run on separate threads with separate FIFO queues: a copy
@@ -101,6 +102,7 @@ class DmaCopyBackend:
     """
 
     def __init__(self) -> None:
+
         # Set by the worker whenever the host tier is on (the copy-cost
         # metric); None for other connectors.
         self.store_census: dict | None = None
@@ -109,9 +111,11 @@ class DmaCopyBackend:
         self._load_params: BatchMemcpyParams | None = None
         self._load_stream: torch.cuda.Stream | None = None
         self._store_stream: torch.cuda.Stream | None = None
+
         self._queues: dict[bool, queue.SimpleQueue] = {}
         self._threads: list[threading.Thread] = []
         self._shutdown: bool = False
+
         self._chunk_blocks: int = 0
         # First exception raised on a copy thread; re-raised on the engine
         # thread (launch_copy / check_error / flush) instead of leaving the
@@ -137,8 +141,10 @@ class DmaCopyBackend:
         device: torch.device,
         load_stream: torch.cuda.Stream,
         store_stream: torch.cuda.Stream,
+
         chunk_blocks: int = 0,
     ) -> None:
+
         self._chunk_blocks = max(0, chunk_blocks)
         self._load_stream = load_stream
         self._store_stream = store_stream
@@ -146,6 +152,7 @@ class DmaCopyBackend:
             self._census_events = CensusEventPool(store_stream)
 
         # Stores read the live KV cache -> STREAM (paired with the compute-done
+
         # wait in get_finished); loads read stable host memory -> ANY.
         self._store_params = build_params(
             gpu_caches,
@@ -159,6 +166,7 @@ class DmaCopyBackend:
             load_stream,
             src_access_order=CU_MEMCPY_SRC_ACCESS_ORDER_ANY,
         )
+
 
         for is_store, stream in ((False, load_stream), (True, store_stream)):
             q: queue.SimpleQueue = queue.SimpleQueue()
@@ -185,10 +193,12 @@ class DmaCopyBackend:
         # of failing the copy thread: the worker reports the restore failed.
         failed_events: set[int] | None = None,
     ) -> None:
+
         if self._shutdown:
             raise RuntimeError("KV copy backend is shut down")
         self.check_error()
         params = self._store_params if is_store else self._load_params
+
         q = self._queues.get(is_store)
         assert params is not None and q is not None
         q.put(
@@ -196,12 +206,15 @@ class DmaCopyBackend:
                 src_blocks,
                 dst_blocks,
                 params,
+
                 event_idx,
                 events_list,
                 wait_event,
+
                 failed_events,
             )
         )
+
 
     def check_error(self) -> None:
         if self._error is not None:
@@ -223,6 +236,7 @@ class DmaCopyBackend:
             self._check_teardown()
             self._check_discard()
             return
+
         barriers: list[threading.Event] = []
         for q in self._queues.values():
             done = threading.Event()
@@ -235,6 +249,7 @@ class DmaCopyBackend:
         self.check_error()
         self._check_discard()
 
+
     def _check_teardown(self) -> None:
         if self._teardown_error is not None:
             raise RuntimeError(
@@ -242,12 +257,14 @@ class DmaCopyBackend:
                 "completion is not established"
             ) from self._teardown_error
 
+
     def _check_discard(self) -> None:
         if self._discard.is_set():
             raise RuntimeError(
                 "KV copy backend: shutdown discarded copies still in flight; "
                 "this flush cannot establish their completion"
             )
+
 
     def shutdown(self, timeout_s: float | None = None) -> None:
         """Issue the queued copies, drain both directions, report errors.
@@ -337,14 +354,17 @@ class DmaCopyBackend:
             self._lifecycle_lock.release()
         self.check_error()
 
+
     def _copy_loop(
+
         self,
         q: queue.SimpleQueue,
         device: torch.device,
+
         stream: torch.cuda.Stream,
         chunk_blocks: int = 0,
     ) -> None:
-        # a copy-thread failure is kept for check_error.
+        # A copy-thread failure is kept for check_error.
         try:
             # Timings only on census stores.
             census_kw = {}
@@ -353,6 +373,7 @@ class DmaCopyBackend:
                 census_kw["census_events"] = self._census_events
             self._run_copy_loop(
                 q, device, stream, chunk_blocks, self._discard,
+
                 **(
                     {"fault_kind": "store"}
                     if self._store_stream is not None
@@ -381,11 +402,15 @@ class DmaCopyBackend:
         device: torch.device,
         stream: torch.cuda.Stream,
         chunk_blocks: int = 0,
+
         discard: threading.Event | None = None,
+
         timings: dict | None = None,
+
         fault_kind: str = "load",
         census_events: CensusEventPool | None = None,
     ) -> None:
+
         from vllm.merlin.kv_host_tier_faults import (
             RestoreFailureInjector,
             StoreFailureInjector,
@@ -397,22 +422,25 @@ class DmaCopyBackend:
             item = q.get()
             if item is None:
                 return
+
             if isinstance(item, threading.Event):    # flush() barrier
                 # After a missed shutdown deadline the flush raises instead.
                 if discard is None or not discard.is_set():
                     stream.synchronize()
                 item.set()
                 continue
-            # discarded: never issued or published.
+            # Discarded: never issued or published.
             if discard is not None and discard.is_set():
                 continue
             (
                 src_blocks,
                 dst_blocks,
                 params,
+
                 event_idx,
                 events_list,
                 wait_event,
+
                 failed_events,
             ) = item
             # Wait for the compute prerequisite on
@@ -428,12 +456,14 @@ class DmaCopyBackend:
                 if not _host_wait(wait_event, discard):
                     continue
                 stream.wait_event(wait_event)  # complete: a no-op ordering edge
+
             step = chunk_blocks if chunk_blocks > 0 else max(1, len(src_blocks))
             # The timing start is recorded after
             # the compute wait, with no synchronize.
             start = pair = None
             submitted = time.monotonic()
             if timings is not None:
+
                 # The timing pair comes from the pool; no CUDA event is
                 # created here.
                 pair = census_take(census_events, timings)
@@ -459,7 +489,7 @@ class DmaCopyBackend:
             abandoned = False
             try:
                 for i in range(0, len(src_blocks), step):
-                    # a missed shutdown deadline
+                    # A missed shutdown deadline
                     # stops a transfer between chunks; its event is never
                     # published, so its partial bytes are never served.
                     if discard is not None and discard.is_set():
@@ -497,6 +527,7 @@ class DmaCopyBackend:
             # Retain the existing completion event.
             event = pair[1] if pair is not None else torch.cuda.Event()
             event.record(stream)
+
             if timings is not None:
                 timings[event_idx] = (start, event, len(src_blocks),
                                       1000 * (time.monotonic() - submitted))

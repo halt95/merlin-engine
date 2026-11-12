@@ -86,7 +86,7 @@ from vllm.v1.worker.worker_base import WorkerWrapperBase
 logger = init_logger(__name__)
 
 
-# parent-death signal, quiet shutdown and
+# Parent-death signal, quiet shutdown and
 # worker-death helpers
 _WORKER_PARENT_DEATH_SIGNAL = signal.SIGKILL
 _PR_SET_PDEATHSIG = 1
@@ -410,6 +410,7 @@ class MultiprocExecutor(Executor):
                         assert death_writer is not None
                         inherited_fds.append(death_writer.fileno())
                         inherited_fds.append(unready_worker_handle.ready_pipe.fileno())
+
                         inherited_fds.append(unready_worker_handle.fault_reader.fileno())
 
             # Workers must be created before wait_for_ready to avoid
@@ -675,6 +676,7 @@ class MultiprocExecutor(Executor):
             kwargs=kwargs,
             timeout=envs.VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS,
         )
+
 
     # This check bounds boot waits, not profiling time.
     def _check_profile_workers(self) -> None:
@@ -1679,7 +1681,7 @@ class WorkerProc:
             self._execute_worker_rpc(rpc_request)
             del rpc_request
 
-    # a cancelled queue on shutdown ends the worker
+    # A cancelled queue on shutdown ends the worker
     # quietly
     @staticmethod
     def _dequeue_worker_rpc(mq: MessageQueue):

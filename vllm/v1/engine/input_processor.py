@@ -505,6 +505,7 @@ class InputProcessor:
                 sampling_params.update_from_tokenizer(self.tokenizer)
             if sampling_params.trace_decode_token_ids:
                 self._normalize_trace_replay_params(sampling_params, prompt_len)
+
             # Check final counts, including generation-config EOS and tokenized variants.
             if self._use_v2_model_runner:
                 sampling_params._validate_sampler_caps()

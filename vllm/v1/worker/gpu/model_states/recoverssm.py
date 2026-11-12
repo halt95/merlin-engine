@@ -33,6 +33,7 @@ class DeferredRecoverSSMStep:
 class RecoverSSMState:
     """Coordinates RecoverSSM metadata between attention and postprocessing."""
 
+
     # ``snapshot_ring_depth`` sizes the PP-deferred commit snapshot ring (None: no
     # ring).
     def __init__(self, snapshot_ring_depth: int | None = None) -> None:
@@ -70,7 +71,7 @@ class RecoverSSMState:
         state_indices: torch.Tensor | None,
         num_accepted_tokens: torch.Tensor,
     ) -> None:
-        """
+        """#
         JIT/module-load the eager commit chain (plan, conv compact, fold, align
         postprocess) on this rank at boot, once per capture geometry, when the
         commit-graph capture did not (eager mode, or a step the planner rejects,
@@ -122,6 +123,7 @@ class RecoverSSMState:
         self._step = None
         self._step_is_deferred = False
         self._commit_graphs.reset()
+
         self._step_owner = None
         if self._snapshot_ring is not None:
             self._snapshot_ring.reset()
@@ -196,6 +198,7 @@ class RecoverSSMState:
                     num_accepted_tokens=num_accepted_tokens,
                 )
                 if not captured:
+
                     self._warm_eager_commit(
                         tuple(step),
                         state_indices=state_indices,
@@ -282,6 +285,7 @@ class RecoverSSMState:
             if postprocess_meta is None:
                 continue
             assert state_indices is not None
+
             # The launch reads idx_mapping, num_sampled, request_indices and
             # num_computed_tokens and writes state_indices[req] and
             # num_accepted_tokens[req]; no commit in this chain writes any of

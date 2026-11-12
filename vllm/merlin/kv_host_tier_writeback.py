@@ -239,6 +239,8 @@ class WritebackCounters:
 
     demoted: int = 0
     demoted_units: int = 0  # mirrors UnitCounters.units_host_registered
+    # ``room()`` calls (observational).
+    room_calls: int = 0
     demote_redemoted: int = 0  # mirrors TierBlockCounters.reclaimed_backed
     demote_missed_running: int = 0
     demote_missed_escape: int = 0
@@ -392,8 +394,8 @@ class WriteBack:
         # Host row bytes per rank (set by the runtime; 0 = rows only).
         self._row_bytes = 0
         # True once the restore direction keeps its own credit account
-        # (``plans.begin_tick`` no longer subtracts ``in_flight``; the planner
-        # sets it). Until then the D budget also subtracts restore DMA, as before.
+        # (``plans.begin_tick`` does not subtract ``in_flight``; the planner
+        # sets it). Until then the D budget also subtracts restore DMA.
         self.split_directions = False
         # The copy scheduler (``kv_host_tier_copyq.CopyQueue``), created by
         # ``bind`` with a unit table; offers flow only once ``bind_manager``
@@ -1487,8 +1489,8 @@ class WriteBack:
         self._last_head_need, self._head_need = self._head_need, 0
 
         # The demotion direction's own credits (rows, and
-        # bytes per rank when ``bytes_d`` is set); restore DMA no longer
-        # shares them.
+        # bytes per rank when ``bytes_d`` is set); restore DMA does not
+        # share them.
         budget = self._d_budget()
         gpu_free = self.gpu_pool.get_num_free_blocks()
         picked: list[KVCacheBlock] = []
@@ -1532,6 +1534,7 @@ class WriteBack:
             (host-full). The trade-off: an intermediate boundary may
             recompute on a host full of complete units; output identical."""
             nonlocal host_ok, fresh_ok, fresh_short
+            c.room_calls += 1
             want = host_used + n
             if want <= host_ok:
                 return True
@@ -1539,7 +1542,7 @@ class WriteBack:
                 host_ok = self.cpu_pool.get_num_free_blocks()
                 return want <= host_ok
             if not evict:
-                host_ok = len(self.units.idle_rows(want))
+                host_ok = self.units.idle_count(want)
                 return want <= host_ok
             prev = None
             if src is not None:
@@ -1547,7 +1550,8 @@ class WriteBack:
                 # with a published owner.
                 prev = self.units.lone_victims(True)
             try:
-                have = len(self.units.idle_rows(want))
+                # The idle check counts rows; it does not walk the queue.
+                have = self.units.idle_count(want)
                 if have < want:
                     plan = self.units.plan(
                         want, self.step, displace_published=displace,
@@ -1557,7 +1561,7 @@ class WriteBack:
                         self.units.apply(plan)
                         # The plan freed rows and un-keyed others: rescan.
                         fresh_ok, fresh_short = 0, None
-                    have = len(self.units.idle_rows(want))
+                    have = self.units.idle_count(want)
             finally:
                 if prev is not None:
                     self.units.lone_victims(prev)
@@ -1928,6 +1932,16 @@ class WriteBack:
                     # beyond one restore unit's worth, never evicting.
                     if lane1_left <= 0 or stopped:
                         continue
+                    # The byte cap
+                    # counts every copy, also those this walk picked before
+                    # this offer (issued only after the walk): lane 1's
+                    # allowance was read from the copies in flight alone.
+                    cap = lane1_left
+                    if self.bytes_d > 0 and self.row_bytes > 0:
+                        used = (len(self.in_flight) + len(picked_ids)) * self.row_bytes
+                        cap = min(cap, max(0, (self.bytes_d - used) // self.row_bytes))
+                    if cap <= 0:
+                        continue
                     members = [
                         b for b, g in zip(offer.blocks, offer.generations)
                         if b.block_id not in picked_ids
@@ -1936,11 +1950,12 @@ class WriteBack:
                         and tier.is_dirty(b) and tier.is_ready(b)
                         and b.ref_cnt > 0
                         and not self.units.unit_of_block(b)
-                    ][:lane1_left]
+                    ][:cap]
                     if not members:
                         continue
                     spare = self._hold_cap()
-                    idle = len(self.units.idle_rows(host_used + len(members) + spare))
+                    # The idle check is a count, not a queue walk.
+                    idle = self.units.idle_count(host_used + len(members) + spare)
                     fit = max(0, idle - host_used - spare)
                     members = members[:fit]
                     if not members:
@@ -2644,7 +2659,8 @@ class WriteBack:
         )):
             return False
         units = self.units
-        if units is not None and len(units.idle_rows(len(fresh))) < len(fresh):
+        # The idle check is a count, not a queue walk.
+        if units is not None and units.idle_count(len(fresh)) < len(fresh):
             # The rows would come from an eviction: probe it as the walk's
             # ``room`` would (the unit's own backing, its predecessor's
             # visible prefix included, protected while it reserves).
@@ -2709,7 +2725,7 @@ class WriteBack:
         ``fresh_room`` refuse."""
         if self._guarded_rows(1):
             return True
-        if self.units.idle_rows(1):
+        if self.units.idle_count(1):
             return False
         return self.units.can_reserve(1, self.step)
 

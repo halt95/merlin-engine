@@ -182,8 +182,12 @@ def process_weights_after_loading(
                 if isinstance(quant_method, (OnlineLinearBase, OnlineMoEMethodBase))
                 else nullcontext()
             )
-            with loading_context, timing_context:
-                quant_method.process_weights_after_loading(module)
+            # Optional per-module peak record
+            from vllm.merlin import load_peak_log
+
+            with load_peak_log.bracket(name or "<root>", target_device):
+                with loading_context, timing_context:
+                    quant_method.process_weights_after_loading(module)
             # process_weights_after_loading may swap in freshly-created
             # Parameters (e.g. FP8 requantization), which are stamped with the
             # global rank in BasevLLMParameter.__init__. Re-reconcile their TP
@@ -194,6 +198,10 @@ def process_weights_after_loading(
             # Repacking transients above can leave large amounts of memory in
             # the caching allocator, which starves the OS on UMA devices.
             release_device_memory_under_pressure(target_device)
+            # Bound the boot dip to the live peak
+            from vllm.merlin import repack_release
+
+            repack_release.release_after_repack(target_device)
 
     # Initialize post-load attention weights for any attention layer and MM
     # encoder. NOTE: Happens after other modules so we can easily decompress
@@ -205,9 +213,18 @@ def process_weights_after_loading(
             with device_loading_context(module, target_device):
                 module.process_weights_after_loading(model_config.dtype)
 
+    from vllm.merlin import load_peak_log
+
+    load_peak_log.report(target_device)
+
     # Model-level post-load hook, after the per-layer quant finalize.
     if hasattr(model, "process_weights_after_loading"):
         model.process_weights_after_loading()
+
+    # Split the profile's MoE layers
+    from vllm.merlin import cold_experts
+
+    cold_experts.attach(model, model_config.model)
 
     # Needed for torchao model reloading via model.reload_weights
     # @kylesayrs @jerryzh168 this can be removed if callers move to `reload_weights`
@@ -223,7 +240,8 @@ def device_loading_context(module: torch.nn.Module, target_device: torch.device)
         return
 
     cpu_params: set[str] = set()
-    uva_offloaded_parameters: list[str] = []
+    # Name -> UVA storage address
+    uva_offloaded_parameters: dict[str, int] = {}
 
     # Store which parameters are on CPU and move them to the GPU
     for name, p in module.named_parameters():
@@ -231,7 +249,7 @@ def device_loading_context(module: torch.nn.Module, target_device: torch.device)
             cpu_params.add(name)
             p.data = p.data.to(target_device)
         if getattr(p, "_vllm_is_uva_offloaded", False):
-            uva_offloaded_parameters.append(name)
+            uva_offloaded_parameters[name] = p.untyped_storage().data_ptr()
         # Parameters already on target device are not touched
 
     try:
@@ -251,8 +269,12 @@ def device_loading_context(module: torch.nn.Module, target_device: torch.device)
 
             # parameter is UVA offloaded, but was replaced with a new device tensor
             # re-offload it to CPU using UVA
-            if name in uva_offloaded_parameters and not getattr(
-                p, "_vllm_is_uva_offloaded", False
+            # replace_parameter keeps the
+            # parameter object and rebinds .data (vLLM #62326), so the UVA marker
+            # survives a replacement; a moved storage address shows it.
+            if name in uva_offloaded_parameters and (
+                not getattr(p, "_vllm_is_uva_offloaded", False)
+                or p.untyped_storage().data_ptr() != uva_offloaded_parameters[name]
             ):
                 cpu_data = torch.empty_like(
                     p.data, device="cpu", pin_memory=use_pin_memory

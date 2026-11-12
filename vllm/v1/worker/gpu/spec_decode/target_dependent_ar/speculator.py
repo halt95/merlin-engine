@@ -332,6 +332,7 @@ class TargetDependentARSpeculator(DraftModelSpeculator):
 
         self._prepare_eplb_forward(num_tokens)
 
+
         smallq_identity = ()
         if (
             self._workload_tile
@@ -350,6 +351,7 @@ class TargetDependentARSpeculator(DraftModelSpeculator):
         if prefill_batch_desc.cg_mode == CUDAGraphMode.FULL:
             # Replay the full graph for draft prefill.
             assert self.prefill_cudagraph_manager is not None
+
             self.prefill_cudagraph_manager.run_fullgraph(
                 prefill_batch_desc, identity=smallq_identity
             )

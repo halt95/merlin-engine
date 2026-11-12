@@ -71,6 +71,7 @@ class ServingTokenization(BaseServing):
 
         lora_request = self._maybe_get_adapters(request)
 
+
         # Reject media before chat preprocessing (template or Harmony) can
         # create fetch tasks.
         if isinstance(request, TokenizeChatRequest) and has_non_text_content(

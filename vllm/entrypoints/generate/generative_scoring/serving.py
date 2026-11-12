@@ -225,6 +225,7 @@ class ServingGenerativeScoring(BaseServing):
         # Check if engine is alive
         if self.engine_client.errored:
             raise self.engine_client.dead_error
+
         max_items = envs.MERLIN_GENERATIVE_SCORING_MAX_ITEMS
         if len(request.items) > max_items:
             return self.create_error_response(
@@ -393,17 +394,20 @@ class ServingGenerativeScoring(BaseServing):
             Tuple of (list of EngineInput, list of prompt token counts).
 
         """
+
         encode = make_async(tokenizer.encode, executor=self.renderer._executor)
         max_tokens = envs.MERLIN_GENERATIVE_SCORING_MAX_TOKENS
 
         # Tokenize query if it's a string
         if isinstance(request.query, str):
+
             query_token_ids = await encode(
                 request.query,
                 add_special_tokens=request.add_special_tokens,
             )
         else:
             query_token_ids = request.query
+
 
         # Count the repeated query and one output token per item before truncation.
         total_tokens = (len(query_token_ids) + 1) * len(request.items)
@@ -416,12 +420,14 @@ class ServingGenerativeScoring(BaseServing):
             # Tokenize item if it's a string
             if isinstance(item, str):
                 # Don't add special tokens for items to avoid duplicate BOS/EOS
+
                 item_token_ids = await encode(
                     item,
                     add_special_tokens=False,
                 )
             else:
                 item_token_ids = item
+
 
             total_tokens += len(item_token_ids)
             _check_scoring_tokens(total_tokens, max_tokens)

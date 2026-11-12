@@ -1,4 +1,4 @@
-NOTICE — Merlin 3.0.2
+NOTICE — Merlin 3.0.2.1
 Copyright 2026 halt95 (Merlin modifications)
 
 Upstream attribution
@@ -74,7 +74,7 @@ base and compare:
   git diff --name-status --no-renames 4ba787ec99 HEAD
   git diff 4ba787ec99 HEAD -- <path>
 
-For the published release, use the merlin-v3.0.2 tag in place of HEAD. Source
+For the published release, use the merlin-v3.0.2.1 tag in place of HEAD. Source
 files retain their applicable notices. Each modified upstream file, including
 CMakeLists.txt and the modified csrc/ files, carries the line "Modified by the Merlin
 project; see NOTICE." This central record supplements those notices.
@@ -92,15 +92,16 @@ Upstream ports and community contributions
 -------------------------------------------
 The fork builds on vLLM contributors' Apache-2.0 work. Earlier carried ports
 include work by eastwood-c, woosebastian, amittell, ArcheyChen, Prudctual,
-saichowdary007, Karl0007, semerandre and wzhao18, plus RecoverSSM by
+saichowdary007, Karl0007, semerandre and wzhao18, prefix-cache patches by ZeldaHuang,
+yewentao256, akshaver, tobymao and lucamotz, plus RecoverSSM by
 Jurgen Schmied and Zihua Wu. Several previous ports are now part
 of the upstream base. See upstream history for their original attribution.
 
 Additional credits: pondzikk (vLLM contributions); lucifer1004 (uniform multi-token FlashInfer decode on Ampere); brandon-nuttall
 (the YaRN past 262K report, the SEQS and MAXLEN launcher fix, LocalArgmaxMixin and the TP2 x PP4
 community rig); R-omk (the YaRN past 262K crash report and recipes); peakcrosser7 (Flash-Next
-model support and original PLE offload); a community idle-power report and
-community PR; Jon-Nielsen (TP4 x PP2 serving kit); mgabor3141 (Swift reports);
+model support and original PLE offload); CoolShades (the idle-power report and first fix behind the v2.5.2 engine fix); Jon-Nielsen (TP4 x PP2 serving kit); mgabor3141 (Swift reports and the club-3090
+discussion #1572 report); jbeemer1 (the KV RAM cache slowdown report, 3.0.2.1);
 aikitoria (consumer Ampere P2P driver work); Zagitta (gpu-unlock kernel module; its NVIDIA firmware is personal-use and not shipped); Sudzpel (the GPU unlock
 proposal and its first measurements on Merlin);
 incoai (the Qwen3.8-Flash-Next-DFlash2 drafter, Apache-2.0, downloaded by setup at a pinned revision and not shipped);

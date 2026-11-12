@@ -30,7 +30,8 @@ Three parts, all best-effort (a guard failure never masks the original error):
    instance on the same cache root) is never moved: the guard warns and
    leaves it. The check and the move run under ``<parent>/.merlin-guard.lock``,
    so ranks starting together see either the old dir with its marker or a
-   fresh one. Each dir is checked once per process.
+   fresh one. Each dir is checked once per process; a check that an
+   exception interrupts records nothing and keeps no lock.
 3. **AOT artifact digest.** ``rank_*/model`` gets a ``model.sha256`` sidecar;
    a mismatch on load is a load failure (recompile), a missing sidecar (older
    caches) is accepted.
@@ -177,6 +178,26 @@ def _guard_lock(parent: str) -> Iterator[None]:
         _close_lock(fd)
 
 
+@contextlib.contextmanager
+def _inuse_fd(key: str) -> Iterator[int]:
+    """The in-use lock descriptor of ``key``, closed once on the way out
+    unless the block recorded it in ``_inuse_fds`` and finished: an exception
+    undoes that record first, so no lock (an exclusive one blocks every peer)
+    outlives a check that did not finish."""
+    fd = _open_lock(_inuse_lock_path(key))
+    try:
+        yield fd
+    except BaseException:
+        with _state_lock:
+            if _inuse_fds.get(key) == fd:
+                del _inuse_fds[key]
+                _prepared.discard(key)
+        raise
+    finally:
+        if _inuse_fds.get(key) != fd:
+            _close_lock(fd)
+
+
 def _inuse_lock_path(path: str) -> str:
     parent, name = os.path.split(path)
     return os.path.join(parent, f"{INUSE_LOCK_PREFIX}{name}.lock")
@@ -251,7 +272,6 @@ def prepare_cache_dir(path: str, kind: str = "compile") -> str | None:
     with _state_lock:
         if key in _prepared:
             return None
-        _prepared.add(key)
         _registered.setdefault(key, {"kind": kind})
     if not locking_available():
         if os.path.isfile(os.path.join(key, MARKER_NAME)):
@@ -261,16 +281,23 @@ def prepare_cache_dir(path: str, kind: str = "compile") -> str | None:
                 "by hand if the restart crashes.",
                 key,
             )
+        _prepared.add(key)
         return None
     parent = os.path.dirname(key)
     try:
         os.makedirs(parent, exist_ok=True)
-        with _guard_lock(parent):
-            fd = _open_lock(_inuse_lock_path(key))
+        with _guard_lock(parent), _inuse_fd(key) as fd:
+            if key in _prepared:  # a concurrent call finished the check
+                return None
             dest = None
             if os.path.isfile(os.path.join(key, MARKER_NAME)):
                 if _flock(fd, exclusive=True, blocking=False):
-                    dest = _quarantine_locked(key, fd)
+                    try:
+                        dest = _quarantine_locked(key, fd)
+                    except OSError as e:  # used as it is, as before, held shared
+                        logger.warning(
+                            "compile cache guard: could not check %s: %s", key, e
+                        )
                 else:
                     logger.warning(
                         "Compile cache %s carries a CUDA-fault marker but "
@@ -284,9 +311,12 @@ def prepare_cache_dir(path: str, kind: str = "compile") -> str | None:
             _flock(fd, exclusive=False, blocking=True)
             with _state_lock:
                 _inuse_fds[key] = fd
+                _prepared.add(key)
             return dest
     except OSError as e:
         logger.warning("compile cache guard: could not check %s: %s", key, e)
+        with _state_lock:
+            _prepared.add(key)
         return None
 
 

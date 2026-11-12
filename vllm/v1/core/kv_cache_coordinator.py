@@ -205,6 +205,7 @@ class KVCacheCoordinator(ABC):
             self.retention_interval, self.scheduler_block_size, kv_cache_config
         )
 
+
     def find_longest_union_hit(
         self, block_hashes, max_cache_hit_length, host_pool, *, version, epoch
     ):
@@ -215,6 +216,7 @@ class KVCacheCoordinator(ABC):
             self, block_hashes, max_cache_hit_length, host_pool,
             version=version, epoch=epoch,
         )
+
 
     @property
     def drop_eagle_group_ids(self) -> set[int]:

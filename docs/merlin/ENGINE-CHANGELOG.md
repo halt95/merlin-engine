@@ -1,5 +1,178 @@
 # Changelog
 
+## Merlin 3.0.2.1
+
+The engine-side subset; the full 3.0.2.1 list is in the [main changelog](../CHANGELOG.md#merlin-3021).
+The engine stays on vLLM 0.33.0 (torch 2.14.0, Triton 3.8.0, FlashInfer 0.7.2.post1, Transformers 5.20.2), built for
+sm_80, sm_86 and sm_89 on CUDA 13.0. The wheel version is `0.33.0+merlin.c56eeed392`, and the dependency lock is unchanged.
+
+- **KV host tier, full-tier write-back planning** (halt95/merlin-engine#11): once the tier was full, every write-back
+  offer ran the eviction planner, whose candidate index was keyed on the GPU directory version. Every GPU block event
+  moved that version, so the whole index was rebuilt at least once per step, and the idle-row walk of the host free queue
+  ran several times per failed room check.
+  - **The structure is cached:** rows, owners, exclusive rows and their host keys, last use, publication, abandonment
+    and admission rank are cached on a structure version that GPU-directory events do not move.
+  - **It is updated in place:** each bump names what changed (a unit, its keys or host rows), and only the units those
+    reach are re-derived.
+  - **The orderings are cached:** the idle ownerless rows, a host row's keys and the lone-mode candidate view, each
+    re-validated on use.
+  - **The first pass skips settled candidates:** it no longer visits every candidate, and leased flags are re-read only
+    for units whose rows moved or whose protection changed.
+  - **Plans are the 3.0.2 plans, with one intended change:** the copy queue's pin census is now keyed on (walker step,
+    pin version) only. Every waiter pin take, trim, drop, CoW move and grace release moves the version. Before, a
+    same-size waiter swap inside one step left the census stale, so a duplicate's GPU twin could be classified from
+    stale pins. A seeded churn oracle runs the 3.0.2 planner beside the new one and finds 0 mismatches against that
+    fixed queue.
+  - **Planner cost counters** (`plancost_*`, observational) join the unit counters.
+- **KV host tier fixes:**
+  - **Cancel or reset during a plan restore:** when the scheduler cancels or resets a restore with nothing in flight
+    (between credit batches, or before the first batch), the restore now publishes a no-DMA receive notice. The worker
+    echoes it, the scheduler frees an aborted request's blocks, and a reset request recomputes. The notice is not a copy
+    failure, so the host rows it read stay keyed. Before, the load state was dropped silently: the request and its GPU
+    blocks leaked, or a reset request waited forever.
+  - **Ownerless rows stay reclaimable:**
+    - every physical copy of a marked key has its ownership memo refreshed (duplicate host copies of a key are legal);
+    - a row re-keyed by a partial supersede leaves its host eviction group, and the listener marks the row
+      (`on_host_rekeyed`).
+
+    Both cases had left rows grouped or marked owned, and never idle until a reset.
+  - **Supersede across a page boundary:** an older unit is now superseded when each non-endpoint key it holds, and the
+    new unit lacks, is a full-attention key on the new request's own hash chain below its boundary. Sliding-window keys
+    still need exact containment.
+  - **The kept predecessor:** the deepest on-chain prefix (the immediate predecessor) is kept until the turn after
+    supersedes it, so a retry, regenerate or fork still restores there. An exactly contained unit at the new boundary
+    (a retry of the last turn) no longer cancels that.
+    - **Victim order:** the order stays the 3.0.2 order (class, admission segment, last use, uid). A covered-first
+      variant was measured and rejected.
+    - **New counter:** `units_lost_covered_early` books the evicted kept predecessors among `units_lost`.
+  - **Protected-waiter forecast:** a mixed two-tier admission draws one private destination per host restore slot,
+    plus its private tails, before the chunk. `evicts_needed` now counts those draws, so a protected waiter's block
+    just past the old forecast is no longer reclaimed. Admissions without host restore slots are unchanged.
+  - **Auxiliary-output hit limit:** the plan route (`TierPlans.admit`) applies the auxiliary-output connector's
+    `max_cache_hit` to every resolve and to the plan-cache signature, as the ordinary lookup does.
+  - **Parked restores keep their room:** every new admission leaves the parked async loads the blocks they still need
+    to finish their prefill. Ordinary running requests reserve nothing, grow as before and are never preempted for a
+    reservation, and a restore beside running work copies when it did. A resumable (streaming-input) session also
+    leaves that room when it grows, and preempts itself when the reservation is all it lacks. A loaded prefix that
+    cannot take its next block while nothing can free one goes back to the prefix cache and is admitted again (one warning per request).
+  - **Smaller fixes:**
+    - refused preempt-grace hints are pruned, so a preempted request whose grace was refused (or never asked) no longer leaves its unit hint behind;
+    - with a demotion byte cap (`MERLIN_KV_HOST_TIER__COPY_BYTES_D_MIB`, default 0 = rows only), the RUNNING lane counts
+      this walk's GRACE / PREEMPT picks;
+    - a demotion transaction with a missing rank fail-stops past the transfer timeout (now covered by a test).
+  - **Census:**
+    - the restore-stall detector counts a stall only while restores are wanted (requested, lost to `host_evicted` /
+      `missed_copy` / `restore_cap_wait`, or in flight), and the line carries `restore_demand` and `restores_pending`;
+    - a returning turn inside the shared-prefix junction is no longer counted as a first turn.
+- **Shared-prefix checkpoints (FGPC):**
+  - **Default:** on in every generated Flash-Next-family launcher (`--enable-mamba-shared-prefix-checkpoint`). The 27B
+    launchers already passed it.
+  - **Junction ageing:** junction blocks age in the free queue like any cached block, and each sibling that resumes from
+    one touches it. `free_evictable()` / `take_evictable()` return nothing, so the real pop, the admission shadow walk
+    and the walker read one order.
+  - **Evidence:** the needle panel and output drift at a junction resume match a page-only prefix hit
+    (48 of 48 needles on junction, page-only and cold rows; drift 0.0162 / 0.0055 KL against 0.0159 / 0.0119 for a
+    page-only hit).
+- **`MERLIN_KV_TIER_DIAG=1` (default off, runtime-only):** logs debug lines for:
+  - FGPC junction publish, move, pop and reset;
+  - each first-turn admission outcome;
+  - each eviction plan that takes a host-only unit (victim class, age, stale/live, covered, rows, tokens, plus the
+    host-row split by idle-gate state).
+
+  It includes a read-only `live_over_covered` counterfactual. Results with it on and off are identical (tested).
+- **Flash-Next long-prefill threshold:** every Flash-Next-family row passes `--long-prefill-token-threshold 512`
+  (`LPT`; `LPT=0` = off).
+- **Prefill runs (`VLLM_MERLIN_PREFILL_RUNS`, off in the engine; on from every Flash-Next-family launcher row,
+  `PREFILL_RUNS=0` = off):** while a session decodes, a long prefill (more than one run of chunks left) advances in runs
+  of 16 full chunks, then waits for a decode-only window whose length comes from a decode share (0.30, divided among
+  the pending long prefills) and per-step cost constants, counted in scheduled decode rows. One long prefill runs at a
+  time; short prefills take whole steps ahead of it while a session slot is free, and are never resized. The window is
+  a configured scheduling target counted in decode rounds, not a measured share of time; the decisions depend only on
+  the scheduler-visible sequence of arrivals, completions and cache state, not on timers. A step's prefill never
+  exceeds the chunk; the launcher sets `--max-num-batched-tokens` to the chunk plus one verify row per session slot
+  (1,056 on `fn-quad-3090`). Without a decoding session the schedule is the one of a budget equal to the chunk. The
+  engine refuses `VLLM_MERLIN_DECODE_FIRST=1`, `--prefill-schedule-interval` above 1, data parallelism, a scheduled-
+  or batched-token budget without the headroom (naming `--max-num-scheduled-tokens` when that is the one short), a
+  chunk or a nonzero `--long-prefill-token-threshold` below 256 tokens, a chunk below the drafter's prefill lookahead
+  (K tokens for the multi-module MTP head), `--disable-chunked-mm-input`,
+  tick costs whose window overflows, and a chunk that does not tile the Mamba block. On the launcher, when `CHUNK` and
+  the block size do not tile (neither divides the other) or the block is below the hybrid-state floor, the default
+  switches the runs off with a note at start-up and an explicit `PREFILL_RUNS=1` refuses to start. Measured on
+  Flash-Next in four runs of the shipped setting on 4 x RTX 3090 with three sessions decoding through a cold prefill:
+  those sessions keep 31-38 % of their decode speed during a cold 64K-128K prefill (14-16 % with the 512-token slices
+  alone); the cold prompt's first token comes 17-19 % later at 64K, 12-14 % at 128K and 19-24 % at 262K; the p99 gap
+  between streamed tokens is 0.40 s in three of the four runs and 0.58 s in one (a client-side reading), against
+  0.23-0.35 s without the runs. With no session decoding, three cold 64K prompts sent together reach their first token
+  (p95) in 34.5-34.7 s against 28.3-28.9 s. A single session's output, with nothing else running, is token-identical
+  to the build without the runs.
+- **Static cold-expert offload (opt-in engine feature; on from the row on the 4 × 20 GB Flash-Next rows):**
+  - **What it does:** `MERLIN_COLD_EXPERTS=<profile.json>` keeps each named layer's hot routed experts (by routing
+    frequency, from a per-checkpoint profile) on the GPU. The full packed master moves to pinned host RAM behind its UVA
+    view; shapes, E, block size and workspaces are unchanged.
+  - **Kernel path:** `fused_marlin_moe` runs a split layer as two GEMM pairs into one row buffer, then the caller's
+    `moe_sum`.
+  - **Knobs:** `MERLIN_COLD_EXPERTS_LAYERS` and `MERLIN_COLD_EXPERTS_HOT_FRAC` override the profile's defaults. All
+    three are runtime-only (not compile factors), and the MTP drafter's experts stay resident.
+  - **Every launcher** checks the profile's format, layers, hot fraction and checkpoint `config.json` hash before boot.
+  - **The shipped profile:** `tools/merlin/profiles/expert_hot/flash-next-quad-20g.json`, layers 11, 12, 19, 20 and 37,
+    hot fraction 0.5. `tools/merlin/cold_expert_profile.py` builds a profile from a routing capture.
+  - **Off switch:** unset, blank or `0` is off in the engine; with it off, `MERLIN_COLD_EXPERTS_LAYERS` and
+    `MERLIN_COLD_EXPERTS_HOT_FRAC` are ignored with a warning.
+- **Compile-cache guard lock:** a failed move of a faulted compile cache warns that it could not check the cache and
+  serves the directory under a shared lock, so other ranks and engines start; an interrupted check releases its lock
+  and runs again on the next try.
+- **Boot memory on 20 GB cards:**
+  - the PP hidden-state and `pp_broadcast` communicators, and the TP PCIe-IPC all-reduce communicator, are created
+    before the profile run and KV sizing; their memory is logged;
+  - `MERLIN_REPACK_RELEASE` (default on; `0` = stock) synchronises and `empty_cache`s after a module's post-load
+    processing once at least 256 MiB is cached;
+  - the QSA top-k index buffer is shared across a stage's target layers (the MTP drafter keeps its own);
+  - `MERLIN_LOAD_PEAK_LOG=1` (default off) brackets model construction, weight loading and each module's post-load
+    processing with peak allocated, reserved and driver-free memory.
+
+  None of these changes weights or numerics.
+- **Automatic KV size:** with `--kv-cache-memory-bytes` unset, `determine_available_memory` now also subtracts what
+  `initialize_kv_cache` allocates besides the KV (eagerly allocated FlashInfer workspaces, block tables,
+  Mamba/RecoverSSM contexts), measured around the minimal-KV bootstrap. This applies when
+  `VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS` is on. The 27B launcher keeps that estimate on for `KV_BYTES=auto`.
+  Pinned KV sizes are unchanged.
+- **UVA re-offload:** `device_loading_context` also re-offloads a UVA parameter whose storage address moved.
+  vllm#62326 rebinds `.data` in `replace_parameter`, so the offload marker survived and the Marlin MoE repack output
+  stayed on the GPU.
+- **`--cpu-offload-params` by layer name:** `make_layers` records each layer's full name, and `UVAOffloader` matches
+  patterns against it. `layers.3.mlp.experts` selects layer 3 only, on the rank that builds it. Placement only.
+- **Persistent top-k tail lanes:** the vendored `persistent_topk.cuh` gates Phase 2 on `elem_idx < seq_len` (port of
+  vllm#62467), so the padded float4 tail lanes are never collected.
+- **Qwen3 parser (`qwen3` and the parsers built on it):**
+  - **Name gate (on when the request offers tools):** a `<function=NAME>` header that names a tool the request did not
+    offer stays text in its field and does not end reasoning.
+  - **Literal spans (`MERLIN_QWEN3_LITERAL_SPANS`, default on; `0` = off):**
+    - a CommonMark fence state with the trailing-run rule for an unclosed fence;
+    - a tool block in reasoning followed by `</think>` and more output is treated as quoted reasoning.
+  - **Unchanged:** `tool_choice="none"`.
+- **Launcher defaults:**
+  - `27b-tp2-3090` with `P2P=on` applies `NCCL_PROTO=Simple`, `VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC=1` (both owned by
+    the mode) and `VLLM_DRAFT_BOUNDED_PLAN`, `VLLM_GDN_DECODE_FASTPATH`, `VLLM_GDN_SHARED_ALIGN_INDEX`,
+    `VLLM_TARGET_SEQ_LENS_ASYNC` = 1 (a caller's value is kept);
+  - Super VL passes `--default-chat-template-kwargs '{"truncate_history_thinking":false}'`.
+- **Registry:**
+  - a 20 GiB VRAM class (classes 20/24/32/40/48/64/80, ±7 %, still disjoint);
+  - a row may carry `blocked: <reason>`: preflight then fails it, and no launcher is rendered;
+  - a Flash-Next row may carry `env` (engine exports and cold-expert defaults; a non-blank caller value wins);
+  - `MERLIN_EMULATE_VRAM_CLASS` (test only) is never exported to the engine.
+- **Environment registration:** `MERLIN_COLD_EXPERTS*`, `MERLIN_REPACK_RELEASE`, `MERLIN_LOAD_PEAK_LOG`,
+  `MERLIN_QWEN3_LITERAL_SPANS` and `MERLIN_KV_TIER_DIAG` are registered in `vllm/merlin/envs.py`, with the same parse as
+  their readers, as ignored compile factors.
+
+**Known limitations (open):**
+- **The 20 GB rows are evidenced by emulation only** (24 GB cards with 4 GiB held back).
+- **`tool_choice="auto"`:** an unfenced example block naming an offered tool, followed by the real call, is still read as
+  a call.
+- **Not re-run on the final 3.0.2.1 build:** the cold-expert bitwise test, which checks that a split layer equals the
+  resident output, passed on a pre-release build on 2026-11-06 (one RTX 3090, random and profile rankings: rows 8,
+  split 64, graph 2, and the negative control differed as expected). Identical outputs on the emulated boots are the
+  evidence on the final build.
+
 ## Merlin 3.0.2
 
 The engine-side subset; the full 3.0.2 list is in the [main changelog](../CHANGELOG.md#merlin-302). The engine moves to
@@ -44,8 +217,10 @@ CUDA 13.0; the wheel version is `0.33.0+merlin.665f43d2cf`.
   Temperature-0 output was token for token identical to `ram` (304 of 304 FP8 comparisons, 225 of 225 INT6). Against `ram`
   on 4 x RTX 3090 with one Gen4 NVMe, decode is +1.8 % (FP8) and +2.3 % (INT6) once the table is cached, +9 % and +11 % on
   the first send of a text whose rows are not cached yet, and with a 96g `--kv-ram-cache` the table never fully warms
-  (+10-11 % decode at 262K, +15-30 % first token). These figures were measured on the 0.32 tree; the 0.33 re-run
-  has not been done for 3.0.2. Other disks and layouts are untested. The server stops if a table
+  (+10-11 % decode at 262K, +15-30 % first token). These figures were measured on the 0.32 tree. On 0.33 the FP8
+  table was re-measured for 3.0.2 against `ram`: free memory 47.8 GiB higher, output identical, and decode, warm first
+  token and 262K unchanged within run-to-run noise; with the warm-up read off, the first request after a cold start waits
+  longer for its first token (+51 % at 10K). Other disks and layouts are untested. The server stops if a table
   file is written, touched, `chmod`ed, linked, moved or removed while it runs. Full figures and limits:
   [How to serve](../how-to-serve.md#the-ple-table-on-nvme-experimental).
 - A generation failure the engine marks as transient now returns HTTP 503 instead of 500: a multimodal cache
@@ -98,8 +273,10 @@ The engine-side subset; the full 3.0.1 list is in the [main changelog](../CHANGE
 - **DFlash2:** `merlin serve <model> <dir> --spec dflash2` or `./setup.sh --spec dflash2`
   selects the drafter on the three Flash-Next-family 4 x 3090 P2P rows with qualified geometry.
   Setup downloads and verifies it; serving takes `DFLASH2_MODEL` or `~/models/flash-next-dflash2`.
-  Decode measured +5–18 % versus MTP, but the 789,668-token GPU KV pool holds 3 x 262K sessions,
-  not 6 x 131K. Other rows and the 27B, Super VL and Ornith families refuse it. MTP remains the default.
+  Decode measured +5–18 % versus MTP. At introduction, the DFlash2 pin was 3,468,165,120 B and the pool was
+  789,668 tokens. Since Merlin 3.0.2.1, the pin is 3,630,000,000 B and the measured pool with prefill runs on
+  is 815,203 tokens (FP32 GDN state, align-mode prefix caching); the engine fits 3 x 262K or 5 x 131K
+  sessions, not 6 x 131K. Other rows and the 27B, Super VL and Ornith families refuse it. MTP remains the default.
 - **Host-RAM KV cache:** `--kv-ram-cache SIZE` on setup or serve restores evicted prefix KV blocks
   from RAM instead of recomputing them. It adds no GPU context or simultaneous-session capacity.
   SIZE is GiB per server, split into whole GiB per TP x PP rank, in addition to the server's host-RAM

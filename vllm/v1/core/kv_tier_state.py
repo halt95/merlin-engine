@@ -128,6 +128,10 @@ class TierBlockListener(Protocol):
     def on_gpu_reset(self) -> None:
         """``reset_prefix_cache`` dropped every GPU key."""
 
+    # Optional (looked up by name): a host row lost some of its keys and kept
+    # the rest (``supersede_host_copies``).
+    # def on_host_rekeyed(self, block: KVCacheBlock) -> None: ...
+
 
 @dataclass
 class TierBlockCounters:
@@ -342,6 +346,12 @@ class BlockTierState:
             else:
                 host_pool.cached_block_hashes_by_block.pop(other.block_id, None)
             host_pool._emit_block_removed_events(sorted(contested, key=repr))
+            # The row stays keyed but its owners changed: the units reading
+            # it re-derive (a whole-row eviction is heard through the host
+            # pool's unkey hook instead).
+            on_rekeyed = getattr(self.listener, "on_host_rekeyed", None)
+            if on_rekeyed is not None:
+                on_rekeyed(other)
         self.counters.host_superseded += len(stale)
         return len(stale)
 

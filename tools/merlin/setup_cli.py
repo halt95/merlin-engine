@@ -190,7 +190,8 @@ def release_version(repo: Path = REPO) -> str:
     if env:
         return env
     for line in (repo / "docs" / "CHANGELOG.md").read_text(encoding="utf-8").splitlines():
-        m = re.match(r"^## Merlin (\d+\.\d+\.\d+)", line)
+        # Three or four parts (3.0.2, 3.0.2.1); a longer or dotted tail is no release line.
+        m = re.match(r"^## Merlin (\d+(?:\.\d+){2,3})(?![\d.])", line)
         if m:
             return m[1]
     raise SetupError("docs/CHANGELOG.md names no `## Merlin <version>` release; set MERLIN_RELEASE_VERSION")
@@ -558,7 +559,7 @@ def build_parser() -> argparse.ArgumentParser:
                     "qualified at (48g per server): without --kv-ram-cache the cache is set to that size, a smaller one is refused. Asked once, "
                     "default no, on rows that have a swarm cap; --no-swarm turns a saved one off. An exported SEQS still wins over every cap")
     ap.add_argument("--spec", choices=S.SPEC_CHOICES, help="Flash-Next: the drafter, mtp (default; bigger pool: 6 x 131K or "
-                    f"3 x 262K) or dflash2 ({S.DFLASH2_WHY.replace(chr(37), chr(37) * 2)}; downloads {S.DFLASH2_REPO})")
+                    f"3 x 262K) or dflash2 ({S.dflash2_why(strict=False).replace(chr(37), chr(37) * 2)}; downloads {S.DFLASH2_REPO})")
     ap.add_argument("--from-source", action="store_true", help="compile the engine instead of taking the release wheel")
     ap.add_argument("--no-start", action="store_true", help="install and download, then stop before `merlin serve`")
     ap.add_argument("--dry-run", action="store_true", help="print checks, answers, download plan and serve command; download and write nothing")
@@ -2548,7 +2549,7 @@ def _main(argv: list[str], inp: Any, out: Any, run: Callable[[list[str]], str | 
             notes.append(S.KV_TIER_UNTESTED[FAMILY[a.model]])
     notes += [n.removeprefix("note: ") for n in cap_said if n.startswith("note: ")]
     if fn_family(a.model) and a.spec == "dflash2":
-        notes.append(f"--spec dflash2: drafter {S.DFLASH2_REPO} -> {drafter_dir()}; {S.DFLASH2_WHY}")
+        notes.append(f"--spec dflash2: drafter {S.DFLASH2_REPO} -> {drafter_dir()}; {S.dflash2_why()}")
     if notes:
         ui.gap()
     for n in notes:

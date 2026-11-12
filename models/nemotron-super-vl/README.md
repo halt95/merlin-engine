@@ -8,9 +8,11 @@ The Qwen recipes' Froggeric template does not apply to this launcher.
 **Serve NVIDIA's Nemotron 3.5 Super VL (our W4A16 build with an INT4 MTP head) at its native 1M context on four RTX 3090s: TP2×PP2 with expert
 parallelism, Mamba-2 RecoverSSM, MTP speculative decoding and prefix caching, behind one OpenAI-compatible endpoint.**
 
+![Nemotron 3.5 Super VL on 4× RTX 3090, Merlin 3.0.2.1 at a glance: KV pool, decode, cold prefill and GSM8K-200 from the 2026-11-12 bench card, other rows carried from an earlier card](docs/images/svl-merlin-3.0.2.1-summary.png)
+
 > **Status: tested on the reference host (registry profile `svl-quad-3090`).** The 3.0.0 release bench card passed this
 > recipe on the reference host (2026-10-20; its agents, GSM8K and needle results are from a 2026-10-17 pre-release build), and the 3.0.1 card re-measured decode,
-> prefill, agents and GSM8K (2026-11-02); the 3.0.2 card re-measured them on vLLM 0.33. The KV pin below has not had a sustained-load test yet.
+> prefill, agents and GSM8K (2026-11-02); the 3.0.2 card re-measured decode and prefill on vLLM 0.33, and agents and GSM8K were re-measured for 3.0.2.1. The KV pin below has not had a sustained-load test yet.
 
 ```bash
 MODEL=~/models/nemotron-super-vl PORT=8100 bash models/nemotron-super-vl/serve.sh
@@ -23,6 +25,19 @@ Extra arguments go to `vllm serve` after the launcher's own flags (later flags w
 
 Token embeddings: with `VLLM_HOST_EMBED_TABLE` unset, the target and MTP `embed_tokens` tables sit in pinned host RAM (V2 model
 runner; about 1 GiB of bf16 per full table, split across tensor-parallel ranks). `VLLM_HOST_EMBED_TABLE=0` keeps them on the GPU.
+
+## Merlin 3.0.2.1 bench card (2026-11-12)
+
+Maintainer measurements on 4× RTX 3090 (220 W, PCIe Gen4) with P2P (the aikitoria patched driver) and the Zagitta [gpu-unlock](https://github.com/Zagitta/gpu-unlock) kernel module, on vLLM 0.33.0, fresh `merlin serve` boots, 2026-11-10 and 2026-11-11, on the previous build of the 3.0.2.1 wheel (built on 2026-11-10, before the prefill runs change; not re-measured on the published wheel); method and every cell in the [bench card](benchmarks/2026-11-12/BENCH-CARD.md). Decode is one stream with thinking on (this template has no effort levels) (tok/s after the first streamed token); prefill is one cold request. With thinking on, a 512-token agent follow-up may end inside the reasoning, and reasoning tokens count. Sessions held at once and the 8 MP image panels were not re-run; they stay on the earlier cards below.
+
+| Measurement | Super VL |
+|---|---|
+| Decode, 4K / 131K / 262K prompt | 105 / 102 / 101 tok/s |
+| Cold prefill, 10K / 100K / 262K prompt | 4,874 / 5,082 / 4,193 tok/s |
+| Agents at once (8 × 16K conversations), total, thinking on / off | 444 / 417 tok/s |
+| GSM8K-200 (5-shot), correct of 200, thinking on / thinking off | 196 / 194 |
+| KV pool | 1,856,367 tokens |
+| Against 3.0.2 | decode +4 % / +1 % / −4 % at 4K / 131K / 262K (the 3.0.2 card is one run; these cells move with the tokens produced per step, which depend on the text sent: the time per event stayed at 34.5–35.8 ms on every 4K and 131K send across two runs of 3.0.2.1), cold prefill −1 %, against the 3.0.1-run agents figure +3 %. Sessions held at once and the 8 MP image were not re-measured; see the earlier cards. |
 
 ## Merlin 3.0.2 bench card (2026-11-04)
 
@@ -55,6 +70,8 @@ Maintainer measurements on 4× RTX 3090 (220 W, PCIe Gen4) with P2P (the aikitor
 
 ## The recipe
 
+![Nemotron 3.5 Super VL on four RTX 3090s, Merlin 3.0.2.1: TP2 x PP2 + EP, 46 and 42 layers per pipeline stage, MTP K=3 with RecoverSSM, 1,856,367-token FP8 KV pool at the 1M default](docs/images/svl-merlin-3.0.2.1-layout.png)
+
 | Setting | Value | Why |
 |---|---|---|
 | Layout | TP2 × PP2 + expert parallel | four 24 GB cards, 120B weights at W4A16 |
@@ -62,7 +79,8 @@ Maintainer measurements on 4× RTX 3090 (220 W, PCIe Gen4) with P2P (the aikitor
 | State space | RecoverSSM: `--use-replayssm --mamba-backend triton`, Model Runner V2 | the engine selects RecoverSSM for NemotronH and requires the Triton Mamba backend |
 | Speculation | MTP, 3 draft tokens, INT4 head | |
 | Prefix cache | `--enable-prefix-caching --mamba-cache-mode align`, `--block-size 64 --prefix-match-unit 64` | block-size A/B on the reference host kept 64; `--mamba-cache-mode` is deprecated on vLLM 0.33 and has no effect (prefix caching follows `--enable-prefix-caching`), and the launcher still passes it |
-| Chunk | `--max-num-batched-tokens 1024` | the Flash-Next default |
+| Chat history | `--default-chat-template-kwargs '{"truncate_history_thinking":false}'` | the template strips earlier turns' thinking by default, so each new user turn re-renders the history and misses the cached prefix after the last user message; a request's own `chat_template_kwargs` still overrides it |
+| Chunk | `--max-num-batched-tokens 1024` | the same 1,024-token prefill chunk as Flash-Next, whose step budget adds decode headroom (1,056 by default) |
 | KV | FP8, `--kv-cache-memory-bytes 2684354560` (2.50 GiB per card; no sustained-load test yet) | byte-pinned, never a utilisation fraction; at the 1M default the pool is 1,856,367 tokens: one 1M session (residency-proven) or 5 × 262K |
 | Tools | `--enable-auto-tool-choice --tool-call-parser qwen3_coder` | the checkpoint card's vLLM recipe; the reasoning parser stays `nemotron_v3` |
 | Images | `--limit-mm-per-prompt '{"image":1,"video":0}'`, `--mm-processor-cache-gb 0` | video off: the startup profiling item is sized to the whole context |

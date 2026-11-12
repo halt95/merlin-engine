@@ -183,6 +183,7 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
         valid &= (physical_page >= 0) & (physical_page < num_cache_blocks)
         # physical_page * block stride can overflow int32 for large caches.
         safe_page = tl.maximum(physical_page, 0).to(tl.int64)
+
         if KV_DTYPE == 0:
             keys = tl.load(
                 k_cache_ptr
@@ -244,6 +245,7 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
         probabilities = tl.where(
             valid[None, :], tl.math.exp2(scores - next_max[:, None]), 0.0
         )
+
         if KV_DTYPE == 1:
             value_bytes = tl.load(
                 v_cache_ptr

@@ -18,7 +18,9 @@ the final platform decision and the vllm flags instead of starting the server (t
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
+import io
 import json
 import os
 import platform
@@ -86,6 +88,20 @@ FN_KV_TIER_EXPERIMENTAL = ("WARNING: KV RAM cache on Flash-Next is experimental:
 KV_TIER_EXPERIMENTAL_27B = ("WARNING: KV RAM cache on the 27B is experimental: a session evicted under heavy "
                             "concurrent prefill may recompute (output identical)")
 FN_MARLIN_MOE_CFG = "MERLIN_MARLIN_MOE_CFG"  # per-shape Marlin MoE kernel choice; the engine parses it (vllm/merlin/marlin_moe_cfg.py)
+FN_LPT_DEFAULT = "512"  # Flash-Next --long-prefill-token-threshold default; LPT=0 = off
+# Flash-Next prefill runs (vllm/merlin/prefill_runs.py), on by default; PREFILL_RUNS=0 = off. The decode share and the
+# per-step cost constants were measured on fn-quad-3090 (box A/B 2026-11-11); the other rows use the same values.
+FN_PREFILL_RUNS = "VLLM_MERLIN_PREFILL_RUNS"
+FN_PREFILL_RUNS_SHARE = "0.30"
+FN_PREFILL_RUNS_LAUNCHER = (FN_PREFILL_RUNS, "VLLM_MERLIN_PREFILL_RUNS_CHUNK_TOKENS")  # set by the launcher only
+FN_PREFILL_RUNS_TUNABLES = ("VLLM_MERLIN_PREFILL_RUNS_DECODE_SHARE", "VLLM_MERLIN_PREFILL_RUNS_CHUNKS",
+                            "VLLM_MERLIN_PREFILL_RUNS_TICK_COSTS")  # an exported value passes through, with a note
+# Static cold-expert offload: profile path + optional layer / hot-fraction overrides; vllm/merlin/cold_experts_plan.py
+FN_COLD_EXPERTS = ("MERLIN_COLD_EXPERTS", "MERLIN_COLD_EXPERTS_LAYERS", "MERLIN_COLD_EXPERTS_HOT_FRAC")
+# MERLIN_COLD_EXPERTS values that mean off: the engine's OFF_VALUES (cold_experts_plan.py), held here so turning the
+# offload off never needs the engine's sources; a CPU test keeps the two equal.
+COLD_EXPERTS_OFF = ("", "0")
+QWEN3_LITERAL_SPANS = "MERLIN_QWEN3_LITERAL_SPANS"  # Qwen3 parser literal spans (default on); the parser reads it
 # DEBUG ONLY host-tier fault injection: fail the first N restore / demotion transfers per rank so a fault-injection
 # test can drive the failed-transfer path (vllm/merlin/kv_host_tier_faults.py). Never for serving: passed only when nonzero and
 # only with the tier on, with a loud note.
@@ -101,9 +117,11 @@ FN_KV_HOST_TIER_GATES = ("MERLIN_KV_HOST_TIER__COPY_CREDITS", "MERLIN_KV_HOST_TI
                          "MERLIN_KV_HOST_TIER__COPY_BYTES_D_MIB",
                          # Opt-in cap on distinct copy-source blocks (0 = off).
                          "MERLIN_KV_HOST_TIER__MAX_PENDING_STORE_BLOCKS",
-                         # switch, exactly 0 or 1 (0 = off).
+                         # The fallback-boundary switch: exactly 0 or 1 (0 = off).
                          "MERLIN_KV_HOST_TIER__FALLBACK_BOUNDARY")
 FN_KV_HOST_TIER_CENSUS = "MERLIN_KV_HOST_TIER_CENSUS"
+# Debug diagnosis log lines of the KV tiers (FGPC junctions, first turns, host eviction victims): passed through when 1.
+FN_KV_TIER_DIAG = "MERLIN_KV_TIER_DIAG"
 FN_WORKLOAD_TILE = "MERLIN_FLASHINFER_WORKLOAD_TILE"  # the opt-in FlashInfer prefill tile; not used on Flash-Next
 # Every knob that is refused unless the tier is on: a layout pass that plans with the tier off leaves them out.
 FN_KV_HOST_TIER_NEEDS_ON = (*FN_KV_HOST_TIER_FAULTS, *FN_KV_HOST_TIER_GATES, FN_KV_HOST_TIER_CENSUS)
@@ -302,7 +320,15 @@ def _restore_unit_gate(model: str, p: dict[str, Any], tier_gib: int) -> None:
 
 def _kv_tier_census(environ_in: dict[str, str], env: dict[str, str]) -> str | None:
     """The debug census, the same on every family: 0 or blank is not exported, 1 needs the tier on (``FN_KV_HOST_TIER`` already
-    resolved into ``env``), anything else is refused. Returns the note for an active census."""
+    resolved into ``env``), anything else is refused. Returns the note for an active census. The diagnosis lines knob
+    (``FN_KV_TIER_DIAG``) rides along: 1 is exported (tier on or off), 0 or blank is not, anything else is refused."""
+    diag = (environ_in.get(FN_KV_TIER_DIAG) or "").strip()
+    if diag not in ("", "0", "1"):
+        raise LaunchError(f"{FN_KV_TIER_DIAG} must be 0 or 1 (got {diag!r})", 1)
+    if diag == "1":
+        env[FN_KV_TIER_DIAG] = "1"
+    else:
+        env.pop(FN_KV_TIER_DIAG, None)
     census = (environ_in.get(FN_KV_HOST_TIER_CENSUS) or "").strip()
     if census not in ("", "0", "1"):
         raise LaunchError(f"{FN_KV_HOST_TIER_CENSUS} must be 0 or 1 (got {census!r})", 1)
@@ -319,6 +345,150 @@ def warn_retired(env: dict[str, str]) -> None:
     for k, why in RETIRED_KNOBS.items():
         if k in env:
             print(f"note: {k}={env[k]!r} is a retired knob and is ignored ({why})", file=sys.stderr)
+
+
+# --------------------------------------------------------------------------------------------
+# Checkpoint-owned chat template, sampling defaults and parsers (Qwen 4 day one, docs/merlin/qwen4-27b-day-one.md)
+# --------------------------------------------------------------------------------------------
+QWEN4_DOC = "docs/merlin/qwen4-27b-day-one.md"
+QWEN4_ROUTES = ("27b", "flash-next")  # QWEN4_ROUTE values: the recipe an unrecognised Qwen 4 checkpoint is served with
+
+
+def _config_names(cfg: dict[str, Any]) -> str:
+    return str(cfg.get("model_type", "")) + " " + " ".join(cfg.get("architectures") or [])
+
+
+# The Flash-Next (Qwen4Exp) family's exact names (vllm/flashnext_family.py): a substring match would also take a renamed
+# Qwen 4 class such as Qwen4ExperimentalForConditionalGeneration away from QWEN4_ROUTE.
+FN_ARCHS = frozenset({"Qwen4ExpForCausalLM", "Qwen4ExpForConditionalGeneration", "Qwen4ExpMTP"})
+FN_MODEL_TYPES = frozenset({"qwen4_exp", "qwen4_exp_text", "qwen4_exp_mtp"})
+
+
+def is_flash_next_config(cfg: dict[str, Any]) -> bool:
+    """Qwen4Exp lineage (Flash-Next family) by config.json's exact model_type / architectures (or its text config's
+    model_type)."""
+    text = cfg.get("text_config")
+    types = {cfg.get("model_type"), text.get("model_type") if isinstance(text, dict) else None}
+    return bool(types & FN_MODEL_TYPES) or any(a in FN_ARCHS for a in (cfg.get("architectures") or []))
+
+
+def is_unrecognised_qwen4(cfg: dict[str, Any]) -> bool:
+    """A Qwen-4-named config.json (model_type or architectures) outside the Flash-Next (qwen4_exp) lineage: no recipe
+    in this release was qualified on it, so neither its lineage nor its template is known."""
+    return "qwen4" in _config_names(cfg).lower() and not is_flash_next_config(cfg)
+
+
+def _read_config(ckpt: str) -> dict[str, Any] | None:
+    try:
+        with open(Path(ckpt) / "config.json", encoding="utf-8") as f:
+            cfg = json.load(f)
+    except (OSError, ValueError):
+        return None
+    return cfg if isinstance(cfg, dict) else None
+
+
+def _json_has_template(path: Path) -> bool:
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return False
+    return isinstance(data, dict) and bool(data.get("chat_template"))
+
+
+def has_ckpt_template(ckpt: str) -> bool:
+    """The checkpoint ships a chat template: chat_template.jinja, a chat_template.json, or a ``chat_template`` entry in
+    tokenizer_config.json / processor_config.json."""
+    d = Path(ckpt)
+    if (d / "chat_template.jinja").is_file():
+        return True
+    return any(_json_has_template(d / f) for f in ("chat_template.json", "tokenizer_config.json", "processor_config.json"))
+
+
+def _use_ckpt_template(env: dict[str, str], ckpt: str, notes: list[str]) -> bool:
+    """USE_CKPT_TEMPLATE=1: serve the checkpoint's own chat template and generation_config instead of the recipe's
+    (Froggeric v22.5 + the Qwen3.8 sampling). Unset, it is on only for an unrecognised Qwen 4 checkpoint that ships a
+    chat template, with a note (one without keeps the recipe's, with a note); USE_CKPT_TEMPLATE=0 keeps the recipe's.
+    USE_CKPT_TEMPLATE=1 on a checkpoint without a template is honoured with a warning (chat requests then fail). An
+    explicit CHAT_TEMPLATE / GENERATION_OVERRIDE still wins either way."""
+    v = env.get("USE_CKPT_TEMPLATE", "")
+    if v not in ("", "0", "1"):
+        raise LaunchError(f"USE_CKPT_TEMPLATE must be 1 or 0 (got '{v}')", 2)
+    if v:
+        if v == "1" and not has_ckpt_template(ckpt) and not env.get("CHAT_TEMPLATE"):
+            notes.append(f"warning: USE_CKPT_TEMPLATE=1 but {ckpt} ships no chat template (chat_template.jinja / .json, or "
+                         "chat_template in tokenizer_config.json / processor_config.json): chat requests will fail "
+                         "unless CHAT_TEMPLATE=<path> is set")
+        return v == "1"
+    cfg = _read_config(ckpt)
+    if cfg is None or not is_unrecognised_qwen4(cfg):
+        return False
+    if not has_ckpt_template(ckpt):
+        notes.append(f"note: {ckpt} is a Qwen 4 checkpoint this release does not recognise ({_config_names(cfg).strip()}) "
+                     "but it ships no chat template: keeping the recipe's chat template and sampling defaults "
+                     f"(USE_CKPT_TEMPLATE=1 forces the checkpoint's; see {QWEN4_DOC})")
+        return False
+    notes.append(f"note: {ckpt} is a Qwen 4 checkpoint this release does not recognise ({_config_names(cfg).strip()}): "
+                 "serving its own chat template and generation_config (USE_CKPT_TEMPLATE=0 keeps the recipe's); "
+                 "the reasoning/tool parsers stay the recipe's unless REASONING_PARSER / TOOL_CALL_PARSER are set "
+                 f"(see {QWEN4_DOC})")
+    return True
+
+
+# The parser and sampling knobs below read an empty value as unset (the recipe's default), so a variable a wrapper
+# exports empty never turns a feature off; turning one off takes the explicit value ``none``. The notes state only what
+# the launcher itself did with the recipe's flags; they do not predict what the server makes of the final argv.
+# CHAT_TEMPLATE= is the exception that predates them: its empty value has always meant the checkpoint's own template.
+KNOB_OFF = "none"
+
+
+def _empty_note(env: dict[str, str], name: str, notes: list[str]) -> None:
+    if env.get(name) == "":
+        notes.append(f"note: {name} is empty: treated as unset")
+
+
+def _generation_override(env: dict[str, str], default: str, notes: list[str]) -> list[str]:
+    """GENERATION_OVERRIDE: unset or empty = the recipe's sampling defaults (``default``), ``none`` = the launcher
+    passes no --override-generation-config, else a JSON object passed to --override-generation-config."""
+    _empty_note(env, "GENERATION_OVERRIDE", notes)
+    gen = _knob(env, "GENERATION_OVERRIDE", default, True)
+    if gen == KNOB_OFF:
+        if default:
+            notes.append("note: GENERATION_OVERRIDE=none: the launcher left out the recipe's "
+                         "--override-generation-config")
+        return []
+    if gen == "":
+        return []
+    try:
+        ok = isinstance(json.loads(gen), dict)
+    except ValueError:
+        ok = False
+    if not ok:
+        raise LaunchError(f"GENERATION_OVERRIDE must be {KNOB_OFF} or a JSON object (got '{gen}')", 2)
+    return ["--override-generation-config", gen]
+
+
+_PARSER_NAME = re.compile(r"[A-Za-z0-9_.-]+")
+
+
+def _parsers(env: dict[str, str], reasoning: str, tool: str, notes: list[str]) -> tuple[list[str], list[str]]:
+    """REASONING_PARSER / TOOL_CALL_PARSER: unset or empty = the recipe's parser, ``none`` = no parser
+    (TOOL_CALL_PARSER=none also drops --enable-auto-tool-choice), else that vLLM parser name (``hf`` reads the
+    checkpoint's own response_template). Returns (reasoning flags, tool flags)."""
+    for name in ("REASONING_PARSER", "TOOL_CALL_PARSER"):
+        _empty_note(env, name, notes)
+    r = _knob(env, "REASONING_PARSER", reasoning, True)
+    t = _knob(env, "TOOL_CALL_PARSER", tool, True)
+    for name, v in (("REASONING_PARSER", r), ("TOOL_CALL_PARSER", t)):
+        if not _PARSER_NAME.fullmatch(v):
+            raise LaunchError(f"{name} must be {KNOB_OFF} or a vLLM parser name (got '{v}')", 2)
+    if r == KNOB_OFF:
+        notes.append("note: REASONING_PARSER=none: the launcher left out the recipe's --reasoning-parser")
+    if t == KNOB_OFF:
+        notes.append("note: TOOL_CALL_PARSER=none: the launcher left out the recipe's --tool-call-parser and "
+                     "--enable-auto-tool-choice")
+    r, t = ("" if v == KNOB_OFF else v for v in (r, t))
+    return (["--reasoning-parser", r] if r else []), (["--enable-auto-tool-choice", "--tool-call-parser", t] if t else [])
 
 
 def _knob(env: dict[str, str], name: str, default: str, assign: bool, keep_empty: bool = False) -> str:
@@ -403,20 +573,25 @@ def build(
     merlin serve evaluated on the actual cards (``untested`` for a tested row on other names or without P2P); the
     registry row's own status otherwise.
 
-    Pure apart from the directory-existence reads behind the Flash-Next VENV / CACHE_ROOT fallbacks; nothing is
-    executed and nothing is written. The host checks (tree, venv, toolchain, topology, files) run in ``run``.
+    Pure apart from the directory-existence reads behind the Flash-Next VENV / CACHE_ROOT fallbacks and the read of the
+    checkpoint's config.json (an unrecognised Qwen 4 checkpoint serves its own template, see _use_ckpt_template);
+    nothing is executed and nothing is written. The host checks (tree, venv, toolchain, topology, files) run in ``run``.
     """
     repo = Path(repo or REPO)
     try:
         reg, p = load_profile(model, profile_id, kv, environ.get("KV_DTYPE"))
     except R.ProfileError as e:
         raise LaunchError(str(e), 2) from None
+    blocked = R.blocked_reason(p)
+    if blocked:
+        raise LaunchError(f"profile {p.get('variant_of') or p['id']} is blocked and does not start: {blocked}", 2)
     checkpoint = checkpoint or default_checkpoint(model, p)
     if checkpoint not in CHECKPOINTS or CHECKPOINTS[checkpoint][0] != model:
         raise LaunchError(f"checkpoint {checkpoint!r} does not belong to the {model} registry", 2)
     if model == "flash-next" and (p.get("checkpoint") or "flash-next") != checkpoint:
         raise LaunchError(f"profile {profile_id} serves {p.get('checkpoint') or 'flash-next'}, not {checkpoint}", 2)
     env = dict(environ)
+    env.pop(EMULATE_VRAM_CLASS, None)  # merlin serve's hardware matching only: never reaches the engine
     extra = list(extra or [])
     for arg in extra:
         flag = arg.split("=", 1)[0].replace("_", "-")
@@ -427,6 +602,14 @@ def build(
                                   "to validate prompt token IDs; remove this flag from the extra arguments", 2)
     # --swarm (SWARM=1): checked before any builder runs, on every family; sets the KV RAM cache when unset
     swarm_note = _swarm_prepare(p, env) if swarm_requested(env) else None
+    # The other families pass the caller's MERLIN_ exports to the engine as they are, the cold-expert knobs included:
+    # read them with the Flash-Next rules (off = unset, blank or 0, with leftover overrides ignored and noted; a profile
+    # must parse and match this checkpoint's config.json) so a Flash-Next profile fails here, not at weight load.
+    ce_notes: list[str] = []
+    if model != "flash-next":
+        _cold_experts_env(environ, env, ce_notes, ckpt, repo)
+        if env.get(FN_COLD_EXPERTS[0]):
+            ce_notes.append(f"{FN_COLD_EXPERTS[0]}: static cold-expert offload has not been measured on the {model} lane")
     if model == "flash-next":
         plan = _build_flash_next(reg, p, checkpoint, ckpt, env, extra, repo)
     elif model == "27b":
@@ -435,7 +618,7 @@ def build(
         plan = _build_ornith(reg, p, checkpoint, ckpt, env, extra, repo)
     else:
         plan = _build_svl(reg, p, checkpoint, ckpt, env, extra, repo)
-    # vllm's dev routers sit outside the API-key prefixes
+    # vLLM's dev routers sit outside the API-key prefixes
     plan.env.pop("VLLM_SERVER_DEV_MODE", None)
     plan.env.pop(DEV_MODE_OPT_IN, None)
     dev_mode = environ.get("VLLM_SERVER_DEV_MODE")  # read from the caller: Flash-Next strips every MERLIN_ export
@@ -455,8 +638,10 @@ def build(
         )
     if swarm_note:
         plan.notes.append(swarm_note)
+    plan.notes.extend(ce_notes)
     plan.env.pop(SWARM_ENV, None)  # a launcher knob, not the engine's
     _merge_speculative_config(plan)
+    _fn_prefill_runs_final(plan)  # after the merge: the speculative config the engine will read
     plan.args += ["--sse-keep-alive-interval", str(SSE_KEEP_ALIVE_S)]
     try:
         default_length = p["serve"].get("max_model_len") or (reg.get("base") or reg.get("launch", {})).get("max_model_len", 0)
@@ -924,6 +1109,396 @@ def _flash_next_min_block(tp: int, fp8: bool, k: int) -> int:
     return 16 * ((max(gdn, ple) + 16 * token_bytes - 1) // (16 * token_bytes))
 
 
+def _fn_prefill_runs(env: dict[str, str], environ_in: dict[str, str], extra: list[str], chunk: str, block: str,
+                     floor: int, notes: list[str], lpt: str | None = None) -> bool:
+    """Whether the Flash-Next prefill runs are on (PREFILL_RUNS: unset or blank = 1, the default; 0 = off).
+
+    A long cold prompt alternates with the running sessions in runs of full CHUNK-token steps and decode-only windows
+    instead of sharing every step. The default steps aside, with a note, when the chunk cannot tile the block (an
+    explicit BLOCK_SIZE that CHUNK does not divide, or one below the hybrid floor that the engine raises); PREFILL_RUNS=1
+    refuses those instead. Combinations the engine refuses fail here first, naming the knob to change."""
+    knob = (env.get("PREFILL_RUNS") or "").strip()
+    if knob not in ("", "0", "1"):
+        raise LaunchError(f"PREFILL_RUNS must be 1 (on, the default) or 0 (off), got '{knob}'", 1)
+    if knob == "0":
+        return False
+    b, q = int(block), int(chunk)
+    why = fix = None
+    if b < floor:
+        why = f"BLOCK_SIZE={block} is below the hybrid-state floor {floor} (the engine picks the block)"
+        fix = f"set BLOCK_SIZE to at least {floor}, with CHUNK dividing it or a whole multiple of it"
+    elif b % q and q % b:
+        why = f"CHUNK={chunk} does not tile the {block}-token block"
+        fix = "use a CHUNK that divides BLOCK_SIZE or is a whole multiple of it"
+    if why:
+        if knob == "1":
+            raise LaunchError(f"PREFILL_RUNS=1: {why}; {fix}, or PREFILL_RUNS=0", 1)
+        sliced = f"long prompts are sliced at {lpt} tokens (LPT)" if lpt else "long prompts are not sliced (LPT=0)"
+        notes.append(f"note: prefill runs off: {why}; {sliced} (PREFILL_RUNS=0 silences this)")
+        return False
+    if (environ_in.get("VLLM_MERLIN_DECODE_FIRST") or "").strip() == "1":
+        raise LaunchError("VLLM_MERLIN_DECODE_FIRST=1 cannot be combined with the prefill runs, on by default on "
+                          "Flash-Next: set PREFILL_RUNS=0 to use it (experimental), or unset "
+                          "VLLM_MERLIN_DECODE_FIRST", 1)
+    interval = _flag_values(extra).get("--prefill-schedule-interval")
+    if interval not in (None, "1"):
+        raise LaunchError(f"--prefill-schedule-interval {interval} cannot be combined with the prefill runs, on by "
+                          "default on Flash-Next: set PREFILL_RUNS=0 to use the interval, or drop the flag", 1)
+    return True
+
+
+def _engine_int(value: str, readable: bool) -> int | None:
+    """``value`` as the engine's argument parser reads it, or None where the parser refuses it: ``int()`` for
+    --max-num-seqs (so ``+12`` is 12), and for the token budgets also the ``k/m/g/t`` (x1000) and ``K/M/G/T`` (x1024)
+    suffixes of ``human_readable_int`` (vllm/utils/argparse_utils.py; ``1K`` is 1024)."""
+    try:
+        v = value.strip()
+        m = re.fullmatch(r"(\d+(?:\.\d+)?)([kKmMgGtT])", v) if readable else None
+        if m is None:
+            return int(v)
+        number, suffix = m.groups()
+        if suffix.islower():
+            return int(float(number) * 10 ** (3 * ("kmgt".index(suffix) + 1)))
+        return int(number) * 2 ** (10 * ("KMGT".index(suffix) + 1))
+    except (ValueError, OverflowError):
+        return None
+
+
+# Smallest per-request prefill cap the prefill runs accept (CHUNK and a nonzero LPT); the engine's own floor is
+# vllm/merlin/prefill_runs.py MIN_PREFILL_TOKENS (a test keeps the two equal).
+FN_PREFILL_RUNS_MIN_TOKENS = 256
+# Every engine setting the prefill runs' start-up check reads: flag -> (argparse dest, how the engine parses it).
+FN_PREFILL_RUNS_FLAGS = {
+    "--max-num-batched-tokens": ("max_num_batched_tokens", "tokens"),
+    "--max-num-scheduled-tokens": ("max_num_scheduled_tokens", "tokens"),
+    "--max-num-seqs": ("max_num_seqs", "int"),
+    "--prefill-schedule-interval": ("prefill_schedule_interval", "int"),
+    "--data-parallel-size": ("data_parallel_size", "int"),
+    "--long-prefill-token-threshold": ("long_prefill_token_threshold", "int"),
+    "--long-prefill-token-threshold-adaptive": ("long_prefill_token_threshold_adaptive", "bool"),
+    "--enable-chunked-prefill": ("enable_chunked_prefill", "bool"),
+    "--disable-chunked-mm-input": ("disable_chunked_mm_input", "bool"),
+    "--block-size": ("block_size", "int"),
+    "--mamba-block-size": ("mamba_block_size", "int"),
+    "--speculative-config": ("speculative_config", "spec"),
+}
+FN_PREFILL_RUNS_ADVICE = ("drop the extra flag and set CHUNK (the prefill chunk), SEQS / --swarm (the sequence slots) or "
+                          "LPT instead, or PREFILL_RUNS=0 to turn the prefill runs off")
+_SERVE_PARSER: list = []  # [(parser, defaults) or None], built on first use
+
+
+def _engine_serve_parser():
+    """vLLM's own ``vllm serve`` argument parser and its defaults, or None where the engine does not import (the
+    launcher then resolves the flags itself and refuses every spelling it cannot resolve)."""
+    if not _SERVE_PARSER:
+        try:
+            from vllm.entrypoints.common.cli_args import make_arg_parser
+            from vllm.utils.argparse_utils import FlexibleArgumentParser
+            parser = FlexibleArgumentParser()
+            serve = parser.add_subparsers(dest="subparser").add_parser("serve")
+            make_arg_parser(serve)
+            _SERVE_PARSER.append((serve, vars(serve.parse_args([]))))
+        except Exception:  # noqa: BLE001 - any import or construction failure: the launcher's own resolution
+            _SERVE_PARSER.append(None)
+    return _SERVE_PARSER[0]
+
+
+def _fn_prefill_runs_extra(extra: list[str]) -> dict[str, object]:
+    """The settings of FN_PREFILL_RUNS_FLAGS the extra flags change, by argparse dest, as the engine reads them."""
+    if any(a == "--config" or a.startswith("--config=") for a in extra):
+        raise LaunchError("extra --config: a config file can set the step budgets and cadence the prefill runs are "
+                          f"sized from, which the launcher does not read; pass those flags on the command line, "
+                          f"{FN_PREFILL_RUNS_ADVICE}", 1)
+    dests = {d for d, _ in FN_PREFILL_RUNS_FLAGS.values()}
+    engine = _engine_serve_parser()
+    if engine is not None:
+        parser, defaults = engine
+        try:
+            with contextlib.redirect_stderr(io.StringIO()):
+                parsed = vars(parser.parse_args(list(extra)))
+        except SystemExit:
+            parsed = None  # the engine refuses these flags at start-up anyway; resolve the runs' flags below
+        if parsed is not None:
+            return {d: v for d, v in parsed.items() if d in dests and v != defaults.get(d)}
+    # No engine here (or flags its parser refuses): resolve exact spellings (underscores, =, the short forms) and
+    # refuse anything argparse could expand to one of these flags (an abbreviation).
+    names = set(FN_PREFILL_RUNS_FLAGS) | {"--no-" + f[2:] for f, (_, kind) in FN_PREFILL_RUNS_FLAGS.items()
+                                           if kind == "bool"}
+    for arg in extra:
+        head = arg.partition("=")[0]
+        if head.startswith("--"):
+            name = head.partition(".")[0].replace("_", "-")
+            if len(name) > 2 and name not in names and any(f.startswith(name) for f in names):
+                raise LaunchError(f"extra {head}: an abbreviation of {', '.join(sorted(f for f in names if f.startswith(name)))}, "
+                                  f"which the prefill runs are sized from; spell the flag out, {FN_PREFILL_RUNS_ADVICE}", 1)
+    out: dict[str, object] = {}
+    given = _flag_values(extra)
+    for flag, (dest, kind) in FN_PREFILL_RUNS_FLAGS.items():
+        if flag not in given:
+            continue
+        raw = given[flag]
+        if kind == "bool":
+            value: object = {"on": True, "off": False}.get(raw)
+        elif kind == "spec":
+            value = raw
+        else:
+            value = _engine_int(raw, kind == "tokens")
+        if value is None:
+            raise LaunchError(f"extra {flag} {raw!r}: not a value the engine accepts; {FN_PREFILL_RUNS_ADVICE}", 1)
+        out[dest] = value
+    return out
+
+
+def _speculative_config_alias(arg: str) -> bool:
+    """An abbreviation argparse would expand to --speculative-config (never the exact spelling or its forms)."""
+    if not arg.startswith("--") or _speculative_config_arg(arg) is not None:
+        return False
+    name = arg.partition("=")[0].partition(".")[0].replace("_", "-")
+    return len(name) > 2 and "--speculative-config".startswith(name)
+
+
+def _extra_speculative_config(extra: list[str]) -> dict | None:
+    """The speculative config the exact extra spellings give, as vLLM combines them (JSON objects in order, then the
+    dotted keys), or None when there are none."""
+    objects: list[str] = []
+    dotted: dict[str, Any] = {}
+    seen = False
+    i = 0
+    while i < len(extra):
+        parsed = _speculative_config_arg(extra[i])
+        i += 1
+        if parsed is None:
+            continue
+        seen = True
+        path, raw = parsed
+        if raw is None:
+            raw = extra[i] if i < len(extra) else ""
+            i += 1
+        if not path:
+            objects.append(raw)
+            continue
+        value: Any = raw.split(",") if path.endswith("+") else _dotted_value(raw)
+        node = dotted
+        keys = path.rstrip("+").split(".")
+        for key in keys[:-1]:
+            if not isinstance(node.get(key), dict):
+                node[key] = {}
+            node = node[key]
+        node[keys[-1]] = value
+    if not seen:
+        return None
+    spec: dict[str, Any] = {}
+    for raw in objects:
+        try:
+            obj = json.loads(raw)
+        except ValueError:
+            obj = None
+        if not isinstance(obj, dict):
+            raise LaunchError(f"extra --speculative-config {raw!r} is not a JSON object: the prefill runs' step budget "
+                              f"cannot be sized from it; {FN_PREFILL_RUNS_ADVICE}", 1)
+        spec.update(obj)
+    spec.update(dotted)
+    return spec
+
+
+def _fn_prefill_runs_final(plan: Plan) -> None:
+    """With the prefill runs on: validate the settings the engine will read, after the extra flags and the
+    speculative-config merge, against the runs' start-up check (vllm/merlin/prefill_runs.py ``refusals``). Raises the
+    budget by the drafting slots when the merged speculative config drafts in parallel. Refuses, naming the knob and
+    PREFILL_RUNS=0, what the engine would refuse."""
+    if plan.env.get(FN_PREFILL_RUNS) != "1":
+        return
+    advice = FN_PREFILL_RUNS_ADVICE
+    chunk = int(plan.env["VLLM_MERLIN_PREFILL_RUNS_CHUNK_TOKENS"])
+    floor = FN_PREFILL_RUNS_MIN_TOKENS
+    if chunk < floor:
+        raise LaunchError(f"CHUNK={chunk} is below the prefill runs' {floor}-token floor for the per-step prefill cap: "
+                          f"raise CHUNK, or PREFILL_RUNS=0", 1)
+    user = _fn_prefill_runs_extra(plan.extra)
+    # Exact spellings were merged into the recipe's config (or, with no recipe config, pass through and are resolved
+    # here); only an abbreviation of the flag escapes both.
+    user_spec = _extra_speculative_config(plan.extra)
+    alias = [a.partition("=")[0] for a in plan.extra if _speculative_config_alias(a)]
+    if alias or ("speculative_config" in user and user_spec is None):
+        raise LaunchError(f"extra {alias[0] if alias else 'flag'}: an abbreviation the engine reads as "
+                          "--speculative-config, which the launcher does not merge or check; spell it "
+                          f"--speculative-config, or {advice}", 1)
+    recipe = _flag_values(plan.args)
+    interval = user.get("prefill_schedule_interval", 1)
+    if interval != 1:
+        raise LaunchError(f"--prefill-schedule-interval {interval} (from the extra flags) cannot be combined with the "
+                          "prefill runs, on by default on Flash-Next: set PREFILL_RUNS=0 to use the interval, or drop "
+                          "the flag", 1)
+    for dest, bad, why in (("data_parallel_size", lambda v: v > 1, "data parallelism"),
+                           ("enable_chunked_prefill", lambda v: v is False, "chunked prefill off"),
+                           ("disable_chunked_mm_input", lambda v: v is True, "--disable-chunked-mm-input")):
+        if dest in user and bad(user[dest]):
+            raise LaunchError(f"{why} (from the extra flags) cannot be combined with the prefill runs; {advice}", 1)
+    lpt = user.get("long_prefill_token_threshold", int(recipe.get("--long-prefill-token-threshold", "0")))
+    if 0 < lpt < floor:
+        raise LaunchError(f"LPT / --long-prefill-token-threshold {lpt} is below the prefill runs' {floor}-token floor "
+                          f"for a per-request prefill cap: set LPT={floor} or more, LPT=0, or PREFILL_RUNS=0", 1)
+    block = user.get("mamba_block_size") or user.get("block_size") or int(recipe["--block-size"])
+    if block % chunk and chunk % block:
+        raise LaunchError(f"the block size {block} (from the extra flags) does not tile CHUNK={chunk}: set BLOCK_SIZE "
+                          f"instead, or PREFILL_RUNS=0", 1)
+    # The speculative config the engine reads: the recipe's with the extra spellings merged in, or (no recipe config,
+    # SPEC=none) the extra spellings themselves, which pass through to the engine.
+    spec = json.loads(recipe["--speculative-config"]) if "--speculative-config" in recipe else (user_spec or {})
+    if spec and not isinstance(spec.get("num_speculative_tokens"), int):
+        raise LaunchError("an extra --speculative-config without a whole num_speculative_tokens: the prefill runs' "
+                          f"step budget cannot be sized from it; give num_speculative_tokens, or {advice}", 1)
+    k = int(spec.get("num_speculative_tokens", 0))
+    # Every method verifies 1 + K tokens per decode row (the formula below). Drafting slots per row
+    # (SpeculativeConfig.max_num_new_slots_for_drafting): 0 for MTP, EAGLE, n-gram and DFlash; parallel drafting
+    # K - 1; a draft model 1, or K with parallel drafting. The prefill lookahead is 0 for n-gram, 1 for EAGLE-family
+    # drafters, K for multi-module MTP: always at most K, far below the 256-token chunk floor.
+    method, parallel = spec.get("method"), bool(spec.get("parallel_drafting"))
+    if method in ("dflash", "dspark") or not k:
+        drafting = 0
+    elif method == "draft_model":
+        drafting = k if parallel else 1
+    else:
+        drafting = k - 1 if parallel else 0
+    seqs = int(recipe["--max-num-seqs"])
+    budget = int(recipe["--max-num-batched-tokens"])
+    sized = chunk + seqs * (1 + k) + (seqs + 1) * drafting
+    if sized > budget:
+        budget = sized
+        pos = plan.args.index("--max-num-batched-tokens") + 1
+        plan.notes.append(f"note: the speculative config ({k} tokens, {drafting} drafting slots per row) sizes the "
+                          f"prefill runs' step budget to {budget}")
+        plan.args[pos] = str(budget)
+    n = user.get("max_num_seqs", seqs)
+    batched = user.get("max_num_batched_tokens", budget)
+    scheduled = user.get("max_num_scheduled_tokens") or batched
+    if min(n, batched, scheduled) < 1:
+        raise LaunchError(f"extra step budget or sequence slots below 1; {advice}", 1)
+    need = chunk + n * (1 + k)
+    need_input = need + (n + 1) * drafting
+    if scheduled < need or batched < need_input:
+        raise LaunchError(
+            f"the prefill runs need --max-num-batched-tokens of at least {need_input} and --max-num-scheduled-tokens "
+            f"of at least {need} tokens (CHUNK {chunk} + {n} sequence slots x {1 + k}"
+            + (f" + {n + 1} x {drafting} drafting slots" if drafting else "")
+            + f"); after the extra flags they are {batched} and {scheduled}: {advice}", 1)
+
+
+def _fn_prefill_runs_env(env: dict[str, str], environ_in: dict[str, str], extra: list[str], runs: bool, chunk: str,
+                         seqs: str, k: int, notes: list[str]) -> str:
+    """The engine's step budget (--max-num-batched-tokens) and the prefill runs exports.
+
+    On: CHUNK stays the prefill chunk and the budget gains one verify row per sequence (seqs x (1 + k) tokens), so
+    decode rows never shrink a chunk (1024 + 8 x 4 = 1056 on fn-quad-3090). Off: the budget is CHUNK and none of the
+    prefill runs variables reach the engine, as before the runs existed."""
+    for name in FN_PREFILL_RUNS_LAUNCHER:
+        mine = environ_in.get(name)
+        if mine is not None and (not runs or mine != {FN_PREFILL_RUNS: "1"}.get(name, chunk)):
+            notes.append(f"note: {name}={mine!r} from your environment dropped: PREFILL_RUNS and CHUNK set it")
+        env.pop(name, None)
+    if not runs:
+        for name in FN_PREFILL_RUNS_TUNABLES:
+            env.pop(name, None)
+        return chunk
+    budget = str(int(chunk) + int(seqs) * (1 + k))
+    env[FN_PREFILL_RUNS] = "1"
+    env["VLLM_MERLIN_PREFILL_RUNS_CHUNK_TOKENS"] = chunk
+    for name in FN_PREFILL_RUNS_TUNABLES:
+        mine = (environ_in.get(name) or "").strip()
+        if mine:
+            notes.append(f"note: {name}={mine!r} from your environment overrides the prefill runs' default")
+            env[name] = mine
+        else:
+            env.pop(name, None)
+    env.setdefault("VLLM_MERLIN_PREFILL_RUNS_DECODE_SHARE", FN_PREFILL_RUNS_SHARE)
+    return budget
+
+
+# Test / emulation only: merlin serve matches every card as this VRAM class (GiB), e.g. 20 on 24 GB cards holding 4 GiB of
+# ballast for the shipped-row gate. Down only; selection only: nothing in the engine argv or env changes (the gate passes
+# its own --gpu-memory-utilization). Unset or blank = off.
+EMULATE_VRAM_CLASS = "MERLIN_EMULATE_VRAM_CLASS"
+
+
+def emulated_vram_class(environ: dict, vram_mibs: list[int]) -> tuple[int, str] | None:
+    """(class GiB, loud note) when MERLIN_EMULATE_VRAM_CLASS is set, None when off. A value that is not one of the VRAM
+    classes, or above a card's own class (emulating up), is a LaunchError."""
+    raw = (environ.get(EMULATE_VRAM_CLASS) or "").strip()
+    if not raw:
+        return None
+    if not (raw.isascii() and raw.isdigit()) or int(raw) not in R.VRAM_CLASSES:
+        raise LaunchError(f"{EMULATE_VRAM_CLASS}={raw!r}: use one of the VRAM classes "
+                          f"{', '.join(map(str, R.VRAM_CLASSES))} (GiB), or unset it", 2)
+    cls = int(raw)
+    real = [R.vram_class(m / 1024) or m / 1024 for m in vram_mibs]
+    if not real:
+        raise LaunchError(f"{EMULATE_VRAM_CLASS}={cls}: no GPU to emulate", 2)
+    if any(cls > r for r in real):
+        raise LaunchError(f"{EMULATE_VRAM_CLASS}={cls}: emulation goes down only; these cards are "
+                          f"{', '.join(sorted({f'{r:g}' for r in real}))} GiB", 2)
+    sizes = " + ".join(sorted({f"{r:g}" for r in real}))
+    return cls, (f"EMULATION: treating {len(real)} x {sizes} GiB cards as {cls} GiB class ({EMULATE_VRAM_CLASS}={cls}) - "
+                 "not a supported configuration")
+
+
+def _row_cold_experts(p: dict, environ_in: dict, repo: Path) -> tuple[dict, str | None]:
+    """The cold-expert knobs for ``_cold_experts_env``: the caller's, over the row's ``env`` defaults (the row's profile
+    is relative to the repo). A caller's MERLIN_COLD_EXPERTS replaces the row's profile, and blank or 0 turns the offload
+    off; a caller's non-blank layer / hot-fraction value replaces the row's. Returns (knobs, origin note or None)."""
+    row = {k: v for k, v in R.row_env(p).items() if k in FN_COLD_EXPERTS}
+    if not row.get(FN_COLD_EXPERTS[0]) or FN_COLD_EXPERTS[0] in environ_in:
+        return environ_in, None  # no row default, or the caller decides (a path, or blank / 0 = off)
+    knobs = {FN_COLD_EXPERTS[0]: str(Path(repo) / row[FN_COLD_EXPERTS[0]])}
+    for k in FN_COLD_EXPERTS[1:]:
+        knobs[k] = (environ_in.get(k) or "").strip() or row.get(k, "")
+    return knobs, (f"{FN_COLD_EXPERTS[0]}: the {p['id']} row's default (export {FN_COLD_EXPERTS[0]}=0 to turn the offload "
+                   "off, or a profile path to replace it)")
+
+
+def _cold_experts_plan_module(repo: Path):
+    """The engine's own cold-expert profile module (standard library only), for a profile that is on: the launcher
+    validates it exactly as the engine will. Read from ``repo``, else from this checkout."""
+    import importlib.util
+    path = Path(repo) / "vllm/merlin/cold_experts_plan.py"
+    if not path.is_file():
+        path = REPO / "vllm/merlin/cold_experts_plan.py"
+    try:
+        spec = importlib.util.spec_from_file_location("_merlin_cold_experts_plan", path)
+        plan_mod = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = plan_mod  # dataclasses resolve annotations through sys.modules
+        spec.loader.exec_module(plan_mod)
+    except OSError as e:
+        raise LaunchError(f"{FN_COLD_EXPERTS[0]}: cannot read the profile checker {path} ({e})", 2) from None
+    return plan_mod
+
+
+def _cold_experts_env(environ_in: dict, env: dict, notes: list, ckpt, repo: Path) -> None:
+    """Off (unset, blank or 0, the engine's reading) needs nothing but this module: the knobs are not exported, and an
+    override left set while off is ignored with a note. A profile is validated with the engine's module."""
+    prof, layers, frac = ((environ_in.get(k) or "").strip() for k in FN_COLD_EXPERTS)
+    if prof in COLD_EXPERTS_OFF:
+        for k in FN_COLD_EXPERTS:
+            env.pop(k, None)
+        ignored = [k for k, v in zip(FN_COLD_EXPERTS[1:], (layers, frac)) if v]
+        if ignored:
+            notes.append(f"note: {' and '.join(ignored)} set but {FN_COLD_EXPERTS[0]} is off (unset, blank or 0): "
+                         "ignored and not exported")
+        return
+    plan_mod = _cold_experts_plan_module(repo)
+    path = str(Path(prof).expanduser().resolve())
+    probe = {FN_COLD_EXPERTS[0]: path, FN_COLD_EXPERTS[1]: layers, FN_COLD_EXPERTS[2]: frac}
+    try:
+        st = plan_mod.settings_from_env(probe)
+        status = plan_mod.check_checkpoint(st.profile, str(ckpt) if ckpt else None)
+    except plan_mod.ProfileError as e:
+        raise LaunchError(f"{FN_COLD_EXPERTS[0]}: {e}", 2) from None
+    for k, v in probe.items():
+        if v:
+            env[k] = v
+    notes.append(f"{FN_COLD_EXPERTS[0]}: static cold-expert offload, layers {','.join(map(str, st.layers))}, "
+                 f"hot_frac {st.hot_frac:g}, profile {path} ({status})")
+
+
 def _build_flash_next(reg, p, checkpoint, ckpt, env, extra, repo: Path) -> Plan:
     environ_in = dict(env)
     base = dict(reg["base"])
@@ -939,7 +1514,7 @@ def _build_flash_next(reg, p, checkpoint, ckpt, env, extra, repo: Path) -> Plan:
     # its defaults; KV_BYTES / CHUNK / PP_PARTITION still override.
     dfl = (srv.get("dflash2") or None) if (env.get("SPEC") or "mtp") == "dflash2" else None
     if (env.get("SPEC") or "mtp") == "dflash2" and dfl is None:
-        # the MTP pin is too high for the DFlash2 drafter (3.47e9 vs 4.1e9 B on 4 x 3090): no boot on the MTP geometry
+        # the MTP pin is too high for the DFlash2 drafter (3.63e9 vs 4.1e9 B on 4 x 3090): no boot on the MTP geometry
         raise LaunchError(f"SPEC=dflash2: {p['id']} ({srv['kv_cache_dtype']} KV) has no "
                           f"qualified DFlash2 geometry (its KV pin is the MTP one); DFlash2 rows: {', '.join(dflash2_rows(reg))}. "
                           "Use SPEC=mtp (the default) here", 1)
@@ -992,7 +1567,14 @@ def _build_flash_next(reg, p, checkpoint, ckpt, env, extra, repo: Path) -> Plan:
             notes.append(f"note: BLOCK_SIZE={block} is below {minimum}, the estimated hybrid-state floor for Flash-Next "
                          f"({srv['kv_cache_dtype']} KV, TP{lay['tp']}, SPEC={spec_method}); the engine raises it to fit "
                          "if needed. Unset BLOCK_SIZE for the shipped default.")
-    lpt = _int_knob(env, "LPT", False, None, 1)
+    # Flash-Next long-prefill cap: 512 by default (GitHub #6 item 1): a long cold
+    # prefill does not hold back new turns and live decoders. LPT=0 turns the cap off.
+    lpt = _int_knob(env, "LPT", False, FN_LPT_DEFAULT, 1)
+    if lpt == "0":
+        lpt = None
+    runs = _fn_prefill_runs(env, environ_in, extra, chunk, block,
+                            _flash_next_min_block(lay["tp"], fp8, 0 if spec_method == "none" else R.MTP_K), notes,
+                            lpt)
     seqs, maxlen = _shape_knobs(env, _session_cap(p, environ_in, notes), str(base["max_model_len"]), 1, notes)
     # topology mode (the selector itself runs in the host phase)
     auto_topo = env.get("AUTO_TOPO", "0")
@@ -1076,11 +1658,28 @@ def _build_flash_next(reg, p, checkpoint, ckpt, env, extra, repo: Path) -> Plan:
     moe_cfg = (environ_in.get(FN_MARLIN_MOE_CFG) or "").strip()
     if moe_cfg:
         env[FN_MARLIN_MOE_CFG] = moe_cfg
+    # The Qwen3 parser literal spans (default on) are a deliberate MERLIN_ knob too: 0 or 1 passes through,
+    # blank is not exported (the parser default, on), anything else fails before the boot (stripped silently, a
+    # user's 0 would serve on).
+    spans = (environ_in.get(QWEN3_LITERAL_SPANS) or "").strip()
+    if spans not in ("", "0", "1"):
+        raise LaunchError(f"{QWEN3_LITERAL_SPANS}={spans!r}: use 1 (on, the default) or 0 (off)", 2)
+    if spans:
+        env[QWEN3_LITERAL_SPANS] = spans
     # The dense Marlin config is forwarded only when a table is given.
     dense_cfg = (environ_in.get("MERLIN_MARLIN_DENSE_CFG") or "").strip()
     if dense_cfg:
         env["MERLIN_MARLIN_DENSE_CFG"] = dense_cfg
         notes.append("MERLIN_MARLIN_DENSE_CFG: experimental per-shape table active")
+    # Static cold-expert offload is a deliberate MERLIN_ knob too: the profile is validated here (format, layers,
+    # hot fraction, checkpoint config.json hash when the profile names one) so a typo fails before the boot, and the
+    # absolute path is exported. Unset, blank or 0 = off (the engine's reading); an override left set while off is
+    # ignored with a note.
+    # A row with an ``env`` cold-expert default (the 4 x 20 GB rows) serves it unless the caller sets MERLIN_COLD_EXPERTS.
+    ce_knobs, ce_note = _row_cold_experts(p, environ_in, repo)
+    _cold_experts_env(ce_knobs, env, notes, ckpt, repo)
+    if ce_note and env.get(FN_COLD_EXPERTS[0]):
+        notes.append(ce_note)
     # Debug-only exception: the host-tier fault-injection knobs pass through so a fault-injection test
     # reaches the engine. Same rule as the engine (plain non-negative integer; nonzero needs the tier
     # on), checked here so a typo fails before the boot; blank or 0 = off and not exported; a loud note when active.
@@ -1119,10 +1718,13 @@ def _build_flash_next(reg, p, checkpoint, ckpt, env, extra, repo: Path) -> Plan:
     # Froggeric v22.5 on every Qwen profile: it accepts non-leading system messages, so /v1/messages
     # keeps a coding agent's per-turn notes in place (the checkpoint template refuses them and vLLM merges them into the
     # leading prompt, which breaks the prefix cache). CHAT_TEMPLATE overrides; empty serves the checkpoint's own template.
-    tpl = _knob(env, "CHAT_TEMPLATE", f"{root}/{FN_CHAT_TEMPLATE}", True, keep_empty=True)
+    # USE_CKPT_TEMPLATE=1 (default for an unrecognised Qwen 4 checkpoint) serves its own template and sampling defaults.
+    ckpt_tpl = _use_ckpt_template(environ_in, ckpt, notes)
+    tpl = _knob(env, "CHAT_TEMPLATE", "" if ckpt_tpl else f"{root}/{FN_CHAT_TEMPLATE}", True, keep_empty=True)
     template_args = ["--chat-template", tpl] if tpl else []
     if tpl:
         files.append((tpl, f"chat template missing: {tpl} (CHAT_TEMPLATE=<path>, or CHAT_TEMPLATE= for the checkpoint's own)"))
+    reasoning_args, tool_args = _parsers(env, "qwen3", "qwen3_coder", notes)
     if fp8:
         # SCALES wins; then the checkpoint's own sidecar (a variant ships its scales with its weights); then the recipe's
         own = Path(ckpt) / CKPT_SCALES
@@ -1169,6 +1771,15 @@ def _build_flash_next(reg, p, checkpoint, ckpt, env, extra, repo: Path) -> Plan:
     if env.get("COUNTERS", "0") == "1":
         env["MERLIN_TOPK_EXACT_COUNTERS_LOG"] = "30"
         env["VLLM_QSA_KV_CLIP_COUNT"] = "300"
+    # The row's own engine exports (``env``, e.g. the 4 x 20 GB rows' 64 MiB logits caps, NCCL buffer and allocator
+    # settings) replace the launcher defaults above; a non-blank value in the caller's environment still wins.
+    for k, v in R.row_env(p).items():
+        if k in FN_COLD_EXPERTS:
+            continue
+        mine = (environ_in.get(k) or "").strip()
+        if mine and mine != v:
+            notes.append(f"note: {k}={mine!r} from your environment overrides the {p['id']} row's {k}={v}")
+        env[k] = mine or v
     env.pop("VLLM_DRAFT_VOCAB_FILE", None)
     env.pop("VLLM_DRAFT_VOCAB_SHA256", None)
     names = (env.get("MODEL_NAME") or base["served_names"]).split()
@@ -1185,6 +1796,8 @@ def _build_flash_next(reg, p, checkpoint, ckpt, env, extra, repo: Path) -> Plan:
     else:
         spec = f'{{"method":"mtp","num_speculative_tokens":{R.MTP_K},"draft_sample_method":"probabilistic"{draft_spec}}}'
     capture = _seqs_capture(srv["capture_sizes"], seqs, str(srv["max_num_seqs"]), 0 if spec is None else R.MTP_K)
+    # SPEC=none keeps the MTP lane's budget (the reference boots the same step size); DFlash2 verifies K tokens too
+    budget = _fn_prefill_runs_env(env, environ_in, extra, runs, chunk, seqs, R.MTP_K, notes)
     args = [
         "--served-model-name", *names,
         "--host", env.get("HOST") or "127.0.0.1", "--port", env.get("PORT") or str(base.get("port", 8000)),
@@ -1198,7 +1811,7 @@ def _build_flash_next(reg, p, checkpoint, ckpt, env, extra, repo: Path) -> Plan:
         args += ["--speculative-config", spec]
     args += [
         "--max-model-len", maxlen, "--max-num-seqs", seqs,
-        "--max-num-batched-tokens", chunk,
+        "--max-num-batched-tokens", budget,
         "--gpu-memory-utilization", str(base["gpu_memory_utilization"]),
         "--kv-cache-memory-bytes", kv_bytes, "--kv-cache-dtype", srv["kv_cache_dtype"],
         "--limit-mm-per-prompt", '{"image":42,"video":0}', "--mm-processor-cache-gb", "0",
@@ -1211,8 +1824,8 @@ def _build_flash_next(reg, p, checkpoint, ckpt, env, extra, repo: Path) -> Plan:
         args += ["--long-prefill-token-threshold", lpt]
     args += [
         "--no-enable-flashinfer-autotune",
-        "--enable-auto-tool-choice", "--tool-call-parser", "qwen3_coder", "--reasoning-parser", "qwen3",
-        "--override-generation-config", FN_GENERATION,
+        *tool_args, *reasoning_args,
+        *_generation_override(env, "" if ckpt_tpl else FN_GENERATION, notes),
         *warm_args,
         *template_args,
         "--default-chat-template-kwargs",
@@ -1220,6 +1833,8 @@ def _build_flash_next(reg, p, checkpoint, ckpt, env, extra, repo: Path) -> Plan:
         "--shutdown-timeout", "60",
         "--block-size", block, "--use-replayssm",
         "--prefix-match-unit", "64",
+        # FGPC: a sibling session's first turn resumes from the shared-prefix junction behind a shared system prompt.
+        "--enable-mamba-shared-prefix-checkpoint",
     ]
     # The GDN recurrent state dtype comes from the checkpoint's mamba_ssm_dtype alone; without it vLLM falls back to the
     # model dtype (bf16). Every served Flash-Next checkpoint declares float32: hold a new one to that.
@@ -1278,14 +1893,21 @@ def _build_27b(reg, p, checkpoint, ckpt, env, extra, repo: Path) -> Plan:
         )
         env["MERLIN_SHARE_DRAFT_WORKSPACE"] = _knob(env, "MERLIN_SHARE_DRAFT_WORKSPACE", "1", True)
         env["VLLM_MERLIN_VISION_ROTARY_INPLACE"] = _knob(env, "VLLM_MERLIN_VISION_ROTARY_INPLACE", "1", True)
-    chat_template = _knob(env, "CHAT_TEMPLATE", f"{here}/{L['chat_template']}", True, keep_empty=True)
+    # USE_CKPT_TEMPLATE=1 (default for an unrecognised Qwen 4 checkpoint): its own chat template and sampling defaults
+    notes: list[str] = []
+    ckpt_tpl = _use_ckpt_template(env, ckpt, notes)
+    chat_template = _knob(env, "CHAT_TEMPLATE", "" if ckpt_tpl else f"{here}/{L['chat_template']}", True, keep_empty=True)
+    reasoning_args, tool_args = _parsers(env, "qwen3", "qwen3_coder", notes)
     thinking = _knob(env, "THINKING", ck["thinking"], True)
     if ck.get("export_thinking"):  # the ThinkingCap wrappers export THINKING before forwarding
         env["THINKING"] = thinking
     env["CUDA_VISIBLE_DEVICES"] = gpus
     env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
     env["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-    env["VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS"] = "0"
+    # A pinned KV size needs no CUDA-graph estimate. KV_BYTES=auto sizes the pool from the memory profile, which
+    # must then count the graphs' memory, or the pool takes the graphs' share and the KV allocation runs out.
+    if kv_bytes != "auto":
+        env["VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS"] = "0"
     p2p_mode = None
     dropped_disable = None
     comm_note = None
@@ -1302,7 +1924,13 @@ def _build_27b(reg, p, checkpoint, ckpt, env, extra, repo: Path) -> Plan:
             env["NCCL_P2P_DISABLE"] = "1"
         else:
             raise LaunchError(f"P2P must be on or off (got '{p2p_mode}')", 2)
-        # The note below still names NCCL_P2P_DISABLE on P2P=on
+        if p2p_mode == "on":
+            # The row's measured P2P=on settings (27b-tp2-3090: the P2P decode settings). Set after the clear,
+            # so the interconnect pair is the mode's own; the engine knobs keep a caller's value.
+            for var, val in p.get("p2p_on_env", {}).items():
+                env[var] = val if var in P2P_COMM_VARS else _knob(env, var, val, True)
+        # On P2P=on the general note skips NCCL_P2P_DISABLE; the
+        # dropped-value note further down names it.
         comm_note = _comm_note(comm_inherited, env, p2p_mode, skip=("NCCL_P2P_DISABLE",) if p2p_mode == "on" else ())
     smallq = _knob(env, "FLASHINFER_SM8X_FP8_SMALLQ", "cta32", True, keep_empty=True)
     env["FLASHINFER_SM8X_FP8_SMALLQ"] = smallq
@@ -1376,7 +2004,6 @@ def _build_27b(reg, p, checkpoint, ckpt, env, extra, repo: Path) -> Plan:
     kvf = [] if kv_bytes == "auto" else ["--kv-cache-memory-bytes", kv_bytes]
     chunk = _int_knob(env, "CHUNK", True, str(srv["max_num_batched_tokens"]), 2)
     block = _int_knob(env, "BLOCK_SIZE", True, str(srv["block_size"]) if "block_size" in srv else None, 2)
-    notes: list[str] = []
     seqs, maxlen = _shape_knobs(env, _session_cap(p, environ_in, notes), str(L["max_model_len"]), 2, notes)
     capture = _seqs_capture(capture, seqs, str(srv["max_num_seqs"]), int(spec_k))
     args = [
@@ -1397,9 +2024,9 @@ def _build_27b(reg, p, checkpoint, ckpt, env, extra, repo: Path) -> Plan:
         "--compilation-config",
         '{"cudagraph_mode":"FULL_AND_PIECEWISE","cudagraph_capture_sizes":[' + ",".join(map(str, capture))
         + '],"inductor_compile_config":' + B27_INDUCTOR + "}",
-        "--override-generation-config", B27_GENERATION,
+        *_generation_override(env, "" if ckpt_tpl else B27_GENERATION, notes),
         "--default-chat-template-kwargs", thinking,
-        "--reasoning-parser", "qwen3", "--enable-auto-tool-choice", "--tool-call-parser", "qwen3_coder",
+        *reasoning_args, *tool_args,
     ]
     if shape.get("cpu_offload_visual_gb"):
         args += ["--cpu-offload-gb", str(shape["cpu_offload_visual_gb"]), "--cpu-offload-params", "visual"]
@@ -1504,6 +2131,8 @@ def _build_svl(reg, p, checkpoint, ckpt, env, extra, repo: Path) -> Plan:
     if tree:
         env["PYTHONPATH"] = tree + (":" + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
     lpt_flags = [] if lpt is None else ["--long-prefill-token-threshold", lpt]
+    parser_notes: list[str] = []
+    reasoning_args, tool_args = _parsers(env, "nemotron_v3", "qwen3_coder", parser_notes)
     args = [
         "--served-model-name", served, "--trust-remote-code",
         "--tensor-parallel-size", str(p["layout"]["tp"]), "--pipeline-parallel-size", str(p["layout"]["pp"]),
@@ -1515,13 +2144,18 @@ def _build_svl(reg, p, checkpoint, ckpt, env, extra, repo: Path) -> Plan:
         "--block-size", block, "--enable-prefix-caching", "--prefix-match-unit", blk, "--mamba-cache-mode", "align",
         "--use-replayssm", "--mamba-backend", "triton",
         "--speculative-config", f'{{"method":"mtp","num_speculative_tokens":{srv["spec_k"]}}}',
-        "--reasoning-parser", "nemotron_v3", "--enable-prompt-tokens-details",
-        "--enable-auto-tool-choice", "--tool-call-parser", "qwen3_coder",  # the checkpoint card's vLLM recipe
+        *reasoning_args, "--enable-prompt-tokens-details",
+        # The template strips past turns' thinking by default (truncate_history_thinking=True), so every new user turn
+        # re-renders the history and forks the cached prefix (34.2 % of the reusable prefix lost per new turn vs 6.9 %
+        # with it off). Keep history thinking; a request's chat_template_kwargs still overrides it.
+        "--default-chat-template-kwargs", '{"truncate_history_thinking":false}',
+        *tool_args,  # the checkpoint card's vLLM recipe: nemotron_v3 / qwen3_coder
         "--limit-mm-per-prompt", '{"image":1,"video":0}', "--mm-processor-cache-gb", "0",
         *p2p_args, "--host", host, "--port", port,
     ]
     plan = Plan("svl", checkpoint, p, ckpt, env, args, extra, repo, venv, tree, cache_root, R.label_text(reg, p), p2p_mode)
     plan.caller_env = environ_in
+    plan.notes.extend(parser_notes)
     comm_note = _comm_note(svl_comm_inherited, env, p2p_mode)
     if comm_note:
         plan.notes.append(comm_note)
@@ -1639,6 +2273,7 @@ def _build_ornith(reg, p, checkpoint, ckpt, env, extra, repo: Path) -> Plan:
     if tree:  # launcher convention (as for Super VL): the tree goes first, an inherited PYTHONPATH stays behind it
         env["PYTHONPATH"] = tree + (":" + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
     lpt_flags = [] if lpt is None else ["--long-prefill-token-threshold", lpt]
+    reasoning_args, tool_args = _parsers(env, "qwen3", "qwen3_coder", notes)
     args = [
         "--served-model-name", served,
         "--tensor-parallel-size", str(p["layout"]["tp"]), "--pipeline-parallel-size", str(p["layout"]["pp"]),
@@ -1650,8 +2285,8 @@ def _build_ornith(reg, p, checkpoint, ckpt, env, extra, repo: Path) -> Plan:
         "--mm-processor-kwargs", f'{{"size":{{"longest_edge":{max_pixels},"shortest_edge":65536}}}}',
         "--enable-prefix-caching", "--mamba-cache-mode", "align", "--prefix-match-unit", str(srv["prefix_match_unit"]),
         "--enable-prompt-tokens-details", "--no-enable-flashinfer-autotune",
-        "--enable-auto-tool-choice", "--tool-call-parser", "qwen3_coder", "--reasoning-parser", "qwen3",
-        "--override-generation-config", ORN_GENERATION, "--kernel-config", ORN_KERNEL_CONFIG,
+        *tool_args, *reasoning_args,
+        *_generation_override(env, ORN_GENERATION, notes), "--kernel-config", ORN_KERNEL_CONFIG,
         "--mamba-backend", "triton", "--shutdown-timeout", "60",
     ]
     if p["layout"].get("ep"):
@@ -2170,7 +2805,7 @@ def _check_recipe_scales(plan: Plan) -> None:
         return
     cfg = d / "config.json"
     if cfg.is_file() and lst.get("config.json") == _sha256_file(cfg):
-        # a matching config.json does not identify the weights;
+        # A matching config.json does not identify the weights;
         # refuse rather than serve another checkpoint's calibration unannounced
         raise LaunchError(
             f"unverified: {d} has {name}'s config.json but its weights are not verified as {name} (no release scales "
@@ -2601,13 +3236,20 @@ def _sha_list(repo: Path, name: str) -> dict[str, str]:
     return out
 
 
-def identify_checkpoint(ckpt: str, repo: Path | None = None) -> tuple[str, list[str]]:
+def identify_checkpoint(
+    ckpt: str, repo: Path | None = None, environ: dict[str, str] | None = None,
+) -> tuple[str, list[str]]:
     """Name the checkpoint in ``ckpt`` from config.json and the recipes' checkpoint.sha256 lists.
 
     Returns (name, notes). Small listed files are hashed to tell apart recipes whose config.json agrees; no safetensors
     shard is ever hashed. Raises LaunchError when the directory is not a Merlin checkpoint or stays ambiguous.
+
+    A Qwen-4-named config.json outside the Flash-Next (qwen4_exp) lineage is never guessed: QWEN4_ROUTE=27b (dense,
+    Qwen3.5 lineage) or QWEN4_ROUTE=flash-next (Qwen4Exp lineage) names the recipe, else this refuses
+    (docs/merlin/qwen4-27b-day-one.md). Passing the checkpoint name instead of a directory skips this.
     """
     repo = Path(repo or REPO)
+    environ = os.environ if environ is None else environ
     d = Path(ckpt)
     notes: list[str] = []
     try:  # an INT6 PLE overlay (tools/merlin/ple_pack.py) names its model: its config.json and index are generated
@@ -2644,6 +3286,19 @@ def identify_checkpoint(ckpt: str, repo: Path | None = None) -> tuple[str, list[
                           "models/ornith1.5/checkpoint.sha256); pass the checkpoint name to serve it with that recipe (merlin list)", 2)
     if names & {"qwen4_exp", "qwen4_exp_text", "qwen4expforcausallm", "qwen4expforconditionalgeneration"}:
         family = "flash-next"
+    elif is_unrecognised_qwen4(cfg):
+        route = environ.get("QWEN4_ROUTE", "").strip()
+        if route not in QWEN4_ROUTES:
+            why = f"QWEN4_ROUTE='{route}' is not one of {', '.join(QWEN4_ROUTES)}" if route else "QWEN4_ROUTE is unset"
+            raise LaunchError(
+                f"{ckpt}: unknown model family (model_type {cfg.get('model_type')!r}, architectures "
+                f"{cfg.get('architectures')!r}): a Qwen 4 checkpoint this release does not recognise, no Merlin recipe yet, "
+                f"and {why}: set QWEN4_ROUTE=27b (dense, Qwen3.5 lineage: the 27B recipes) or QWEN4_ROUTE=flash-next "
+                "(Qwen4Exp lineage), or pass the checkpoint name, or pass --profile/--model explicitly (merlin list); see "
+                f"{QWEN4_DOC}", 2)
+        notes.append(f"note: QWEN4_ROUTE={route}: serving the unrecognised Qwen 4 checkpoint with the {route} recipe "
+                     f"(not qualified on it; see {QWEN4_DOC})")
+        return route, notes
     elif any(n.startswith("qwen3_5") for n in names):
         family = "27b"
     else:

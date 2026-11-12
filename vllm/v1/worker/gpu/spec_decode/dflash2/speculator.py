@@ -59,6 +59,7 @@ def _selector_walk_kernel(
             scores,
             candidates,
             mask & valid,
+
             # The draw is keyed by the request seed and position.
             seed,
             sample_pos,

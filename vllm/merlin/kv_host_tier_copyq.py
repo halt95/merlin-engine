@@ -113,6 +113,7 @@ class CopyQueue:
     # -- binding ------------------------------------------------------------
     def bind_manager(self, kv_cache_manager: Any) -> None:
         self.manager = kv_cache_manager
+        self._pin_version += 1  # another manager's pins
 
     @property
     def _units(self):
@@ -137,6 +138,8 @@ class CopyQueue:
         pin list object, still in ``_grace_pins`` until the release pops it)
         is ignored, so a caller that reports a release and then calls
         ``release_grace_pin`` (which reports it too) counts it once."""
+        # Before the repeat check: the pin census moves either way.
+        self._pin_version += 1
         m = self.manager
         pins = getattr(m, "_grace_pins", None) if m is not None else None
         ident = id(pins.get(request_id)) if pins is not None else None
@@ -150,7 +153,6 @@ class CopyQueue:
                 r: i for r, i in self._released.items()
                 if id(live.get(r)) == i
             }
-        self._pin_version += 1
         if reason in ("yield", "overflow"):
             self.note_grace_yield(request_id)
         self._yield_wait.pop(request_id, None)
@@ -190,6 +192,9 @@ class CopyQueue:
         rid = request.request_id
         if manifest is not None and manifest.uid is not None:
             self._uid_of[rid] = manifest.uid
+            # Bounded as ``finished`` bounds it: a preemption whose grace is
+            # refused (or never asked) leaves a hint no grace will release.
+            self._prune_uid_of(rid)
         if self.manager is None or wb.gpu_pool is None or rid in self._preempt:
             return
         seen: set[int] = set()
@@ -219,6 +224,13 @@ class CopyQueue:
         )
         c.preempt_grace_taken += 1
 
+    def holds_preempt_grace(self) -> bool:
+        """Whether a preempt grace holds blocks it will give back: at its
+        deadline (``PREEMPT_GRACE_STEPS``), when its unit completes, or at a
+        sweep that finds the free pool below the floor (the waiting head's
+        need). Pin yields never release one."""
+        return bool(self._preempt)
+
     def running_ready(
         self, request: "Request", blocks: Sequence["KVCacheBlock"], step: int
     ) -> None:
@@ -244,8 +256,9 @@ class CopyQueue:
         return headroom + max(wb._head_need, wb._last_head_need)
 
     def note_pins_changed(self) -> None:
-        """A grace or waiter pin moved to another block (CoW) or changed
-        outside the lifecycle hooks: invalidate the ``twin_kind`` cache."""
+        """A grace or waiter pin moved to another block (CoW), or a waiter
+        pin was taken, trimmed or dropped: invalidate the ``twin_kind``
+        cache."""
         self._pin_version += 1
 
     def sweep(self, step: int) -> None:
@@ -376,7 +389,7 @@ class CopyQueue:
     def pick_overflow_victim(self, candidates: list[str]) -> str | None:
         """Grace overflow (``KVCacheManager._take_grace_pin``): the oldest
         host-complete grace among ``candidates`` (oldest first); None = the
-        oldest, as before (no host-complete grace, or the tier is unbound)."""
+        oldest (no host-complete grace, or the tier is unbound)."""
         if self.manager is None or self._units is None:
             return None
         for rid in candidates:
@@ -388,18 +401,13 @@ class CopyQueue:
     def _pin_counts(self) -> dict[int, int]:
         """id(block) -> refs held by grace pins, waiter pins and preempt
         graces (not by a running request's block table). Cached on the
-        walker step and the pin version (bumped by every grace take/release,
-        preempt grace change and CoW pin move, ``note_pins_changed``), plus
-        the waiter-pin count and block total (waiter pins are taken and
-        dropped by admission without a hook)."""
+        walker step and the pin version, which every pin change moves: grace
+        take and release, preempt grace change, CoW pin move, manager
+        binding, and every waiter pin take, trim and drop (``SessionYield``
+        -> ``note_pins_changed``). Exact: an answer never depends on when the
+        cache was filled."""
         m = self.manager
-        hits = getattr(m, "_pinned_hits", {}) if m is not None else {}
-        key = (
-            self.wb.step,
-            self._pin_version,
-            len(hits),
-            sum(len(v) for v in hits.values()),
-        )
+        key = (self.wb.step, self._pin_version)
         cached = self._pins_cache
         if cached is not None and cached[0] == key:
             return cached[1]

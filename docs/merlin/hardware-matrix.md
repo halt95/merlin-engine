@@ -1,6 +1,6 @@
 # Merlin engine hardware matrix (v3)
 
-Applies to Flash-Next and the other recipes on the Merlin engine (Merlin 3.0.2, vLLM 0.33 base).
+Applies to Flash-Next and the other recipes on the Merlin engine (Merlin 3.0.2.1, vLLM 0.33 base).
 
 This page says, for every GPU platform the v3 engine is meant to run on: the layout to use, the concurrency cap, how much
 context fits, whether peer-to-peer (P2P) is needed, and **how much evidence there is**. Every row carries one of four labels:
@@ -34,6 +34,7 @@ A leading `~` in a number means an **estimate** (see "Where the numbers come fro
 | 4 x NVIDIA L4 22.5 GiB (sm_89; AWS g6.12xlarge, GCP g2-standard-48) | Flash-Next | the sm_89 quad (`fn-quad-24g-sm89`), fp8 KV default, bf16 selectable; preflight lowers the pin to 2.31 GiB (estimate at 22.49 GiB reported VRAM; registry profile pin 3.82 GiB) | 8 | estimate at 22.49 GiB reported VRAM: ~560K pool, ~1 x 262K / ~3 x 131K (untested); registry profile pool ~924,993 (~3 / 6) | off by default | untested / community-validated |
 | 4 x RTX A5000 / RTX 3090 Ti / other sm_86 24 GB (24,564 MiB) | Flash-Next, 27B, Super VL, Ornith 1.5 | the 3090 rows (`fn-quad-3090`, `27b-tp2-3090`, `27b-tp4-3090`, `svl-quad-3090`, `ornith-quad-3090`); matching is by arch + VRAM class + P2P, not by name | as the 3090 rows | as the 3090 rows | needed for the tested numbers | **untested / community-validated** (the "tested on the reference host" label applies to the RTX 3090 only) |
 | 4 x RTX 4090 24 GB (sm_89) | Flash-Next | the quad layout, **fp8 KV default**, bf16 selectable (`fn-quad-24g-sm89`, the default); PP4 x TP1 as the named no-P2P prefill alternative (`--profile fn-quad-24g-sm89-pp4`, 2.5e9 pin; ~3x c1 prefill on cloud-hosted RTX 4090s) | 8 (bf16: 3; PP4: 32) | ~3 x 262K / ~6 x 131K (bf16: ~1 / ~3; PP4: ~1 / ~3); the cloud-hosted cards booted the fp8 pin to 924,993 tokens | 4090: off by default | fp8: 🟡 testing (cloud-hosted 4 x RTX 4090, 2026-10-18; at chunk 1024); bf16 and PP4: untested / community-validated |
+| 4 x 20 GB sm_86 / sm_89 (RTX 3080 20GB, RTX A4500; RTX 4000 Ada) | Flash-Next | the quad layout, TP2xPP2+EP, partition 25,23, chunk 1024, with a 1 x 262K KV pin and static cold-expert offload of MoE layers 11, 12, 19, 20, 37 at half the experts (`fn-quad-20g-sm86`, `fn-quad-20g-sm89`) | 8 | ~1 x 262K / ~2 x 131K (~265,888) | any | untested / community-validated. Measured only in a 20 GB emulation (4 x RTX 3090 holding 4,096 MiB of ballast each, sm_86, 2026-11-06; none on sm_89): fits with 363-769 MiB free per card including the boot, c1 7.01 ms per output token, c8 61.9 tok/s aggregate, 262K prefill 56.2 s, tokens and logprobs identical to the 24 GB row (six-layer set; the shipped five-layer set fits three boots with 317-377 MiB free and prefilled 262K 6 % faster than the six-layer set in the same 2026-11-07 run, 55.0 s against 58.5 s; the 3.0.2.1 bench card's 20 GB row, five-layer set on the previous build, reads 57.5 s). The offload pins ~8 GiB more host RAM (`MERLIN_COLD_EXPERTS=0` turns it off) |
 | 4 x A30 24 GB (sm_80) | Flash-Next | the quad layout, **BF16 KV default**; FP8 opt-in via `KV_DTYPE=fp8` (`fn-quad-24g-sm80`; byte decoder) | 3 | BF16: ~1 x 262K / ~3 x 131K; FP8 engine-fit estimate: ~921,248-token pool, ~3 / ~6 (not measured) | off by default; on if the driver reports P2P | BF16: untested / community-validated; FP8: ⚫ untested |
 | 2 / 4 x 48 GB Ada (RTX 6000 Ada, L40S) | Flash-Next | PP2 x TP1 (`fn-2x48g-pp2-sm89`); TP2xPP2+EP (`fn-4x48g-tp2pp2-sm89`); fp8 KV default, bf16 selectable | 9 / 32 (bf16: 4 / 8) | ~5 / ~9 and ~25 / ~46 (bf16: ~2 / ~4 and ~13 / ~24) | off by default | untested / community-validated |
 | 4 x 32 GB Ada (modified RTX 4080 Super) | Flash-Next | TP2xPP2+EP, fp8 KV default, bf16 selectable (`fn-quad-32g-sm89`) | 19 (bf16: 8) | ~10 / ~19 (bf16: ~5 / ~10) | off by default | untested / community-validated |
@@ -43,23 +44,30 @@ A leading `~` in a number means an **estimate** (see "Where the numbers come fro
 | 1 x RTX 3090 24 GB | 27B | TP1 with vision (`27b-tp1-3090`) | 2 | 1 x 262K or 2 x 131K (271,506; measured at the row's release check, 2026-10-21); 4 MP images with the single-card memory settings (558-563 MiB free at 4 MP, 2026-10-21); 8 MP does not fit on one card | n/a | **tested on the reference host** (2026-10-21) |
 | 2 x RTX 3090 24 GB | 27B | TP2 (`27b-tp2-3090`) | 16 | 3 x 262K or 6 x 131K (826,689) | needed for the tested numbers | **tested on the reference host** |
 | 4 x RTX 3090 24 GB | 27B | TP4 (`27b-tp4-3090`), RecoverSSM on, block 1024, chunk 4096 | 24 | 7 x 262K or 14 x 131K (2,012,105) | needed for the tested numbers | **tested on the reference host** |
+| 2 x 20 GB sm_86 / sm_89 (RTX 3080 20GB, RTX A4500; RTX 4000 Ada) | 27B | TP2 (`27b-tp2-sm86-20g`, `27b-tp2-sm89-20g`): the `27b-tp2-3090` launch shape with the earlier capture list (without size 80) and the KV pin reduced (561 blocks, 9,375,252,480 B) | 16 | ~2 x 262K / ~3 x 131K (525,224) | any | untested / community-validated; the pin booted and served a 262K prefill, 8 x 32K and c1 on 3090s emulating 20 GB (1,617 MiB minimum free). Text-only maximum measured, not the default: 605 blocks, 4 x 131K, 897 MiB free (too little for the 8 MP image headroom); the 2.4 x pin ran out of memory |
+| 4 x 20 GB sm_86 / sm_89 (RTX 3080 20GB, RTX A4500; RTX 4000 Ada) | 27B | TP4 (`27b-tp4-sm86-20g`, `27b-tp4-sm89-20g`): the `27b-tp4-3090` launch shape with the earlier capture list (without sizes 80 and 120) and the KV pin reduced (1,311 blocks, 11,684,806,656 B) | 24 | ~5 x 262K / ~9 x 131K (1,311,720) | any | untested / community-validated; the pin booted and served a 262K prefill, 8 x 32K and c1 on 3090s emulating 20 GB (2,595 MiB minimum free; c1 decode 195.9 tok/s at 4K on the 3090s, a real 20 GB card decodes slower). Text-only maximum measured, not the default: 1,573 blocks, 6 x 262K, 395 MiB free (too little for the 8 MP image headroom); the 6.4 x pin ran out of memory |
 | 1 x RTX 4090 24 GB (sm_89) | 27B | TP1 (`27b-tp1-sm89-24g`) | 2 | ~1 x 262K / ~2 x 131K (registry estimate, ~271,506; same per-card KV pin as the 3090 row, extra VRAM is headroom) | n/a | untested / community-validated |
 | 2 x RTX 4090 24 GB (sm_89) | 27B | TP2 (`27b-tp2-sm89-24g`) | 16 | ~3 x 262K / ~6 x 131K (826,689; same per-card KV pin as the 3090 row, extra VRAM is headroom; the cloud-hosted cards booted the same pool) | off (consumer Ada has no peer access by default; the launcher takes `P2P=on\|off`) | 🟡 testing (cloud-hosted 4 x RTX 4090, 2026-10-18) |
 | 1 x modified RTX 4080 32 GB (sm_89) | 27B | TP1 (`27b-tp1-sm89-32g`) | 2 | ~1 x 262K / ~2 x 131K (registry estimate, ~271,506; same per-card KV pin as the 3090 row, extra VRAM is headroom) | n/a | untested / community-validated |
 | 2 x modified RTX 4080 32 GB (sm_89) | 27B | TP2 (`27b-tp2-sm89-32g`) | 16 | ~3 x 262K / ~6 x 131K (registry estimate, 826,689; same per-card KV pin as the 3090 row, extra VRAM is headroom) | off (consumer Ada has no peer access by default; the launcher takes `P2P=on\|off`) | untested / community-validated |
 | 1 x modified RTX 4090 48 GB (sm_89) | 27B | TP1 (`27b-tp1-sm89-48g`) | 2 | ~1 x 262K / ~2 x 131K (registry estimate, ~271,506; same per-card KV pin as the 3090 row, extra VRAM is headroom) | n/a | untested / community-validated |
-| 4 x RTX 3090 24 GB | Nemotron Super VL | TP2xPP2+EP, RecoverSSM, MTP K=3, layer partition 46,42 (`svl-quad-3090`) | 9 | 1 x 1M or 5 x 262K (1,856,367 at the PROVISIONAL 2.50 GiB pin with the shipped 1M default; 1M residency proven by an identical 1,048,052-token re-send served from cache); 8 MP images accepted, downscaled by the model processor to ~3.4 MP | needed for the tested numbers | **tested on the reference host** (release bench card) |
+| 4 x RTX 3090 24 GB | Nemotron Super VL | TP2xPP2+EP, RecoverSSM, MTP K=3, layer partition 46,42 (`svl-quad-3090`) | 9 | 1 x 1M or 5 x 262K (1,856,367 at the 2.50 GiB pin, the shipped registry pin measured on the reference host, with the shipped 1M default; 1M residency proven by an identical 1,048,052-token re-send served from cache); 8 MP images accepted, downscaled by the model processor to ~3.4 MP | needed for the tested numbers | **tested on the reference host** (release bench card) |
 | 4 x RTX 3090 24 GB | Ornith 1.5 | TP2xPP2+EP, RecoverSSM, MTP K=3 + uniform verify, layer partition 25,23 (`ornith-quad-3090`) | 8 | 3 x 262K (894,618 at the 3,556,769,792-byte pin) | needed for the tested numbers | **tested on the reference host** |
 | 4 x RTX 3090, no P2P | Ornith 1.5 | the same recipe without P2P (`ornith-quad-3090-nop2p`) | 8 | 3 x 262K (977,838 at the 3,892,314,112-byte pin) | off | tested on a 4 x RTX 3090 host without P2P (PCIe x8, 2026-10-21) |
 
-**Does not fit (the preflight says so instead of failing at boot):** Flash-Next on 12 GB cards (RTX 3080 Ti, RTX 3080 12 GB: the octo binding stage needs ~10 GiB of weights + ~2.75 GiB overhead = ~12.75 GiB before any KV) and on 20 GB cards (RTX A4500: the quad needs ~17.4 + ~2.75 = ~20.2 GiB before any KV; an 8 x 20 GB octo would leave a ~7 GiB pin by that arithmetic but the registry has no 20 GB class and none is added without a pool-only boot); 8 x 24 GB sm_89 (8 x L4, g6.48xlarge, g2-standard-96: the octo rows are sm_86 only; use `--gpus` to take four cards for the sm_89 quad); and, as before: Flash-Next on 2 x 24 GB (it would need a host-RAM expert tier, which is not
+**Does not fit (the preflight says so instead of failing at boot):** Flash-Next on 12 GB cards (RTX 3080 Ti, RTX 3080 12 GB: the octo binding stage needs ~10 GiB of weights + ~2.75 GiB overhead = ~12.75 GiB before any KV) and on 20 GB cards in any count but four (RTX 3080 20GB, RTX A4500, RTX 4000 Ada: the 20 GiB class has only the 4-card quad rows, with static cold-expert offload); 8 x 24 GB sm_89 (8 x L4, g6.48xlarge, g2-standard-96: the octo rows are sm_86 only; use `--gpus` to take four cards for the sm_89 quad); and, as before: Flash-Next on 2 x 24 GB (it would need a host-RAM expert tier, which is not
+
+**Test / emulation only:** `MERLIN_EMULATE_VRAM_CLASS=<GiB>` (e.g. `20`) makes `merlin serve` match every card as that smaller VRAM class (memory above it counts as used), for emulating 20 GB cards on 24 GB cards with ballast; it changes nothing in the engine argv or environment, refuses a class above the cards' own and prints an `EMULATION:` note. Not a supported configuration.
+
 implemented); on any single card below 80 GB; on 2 x 40 GB (no 262K session in the registry capacity model); on 3 x 24 GB; on hosts whose cards form no homogeneous set with a row (same-class mixes such as RTX 3090 + RTX 3090 Ti are one class; other mixes get the largest homogeneous subset); on sm_90 or newer (out of
 the v3 target).
 
-Swift1.5 and Swift1.5-Huihui use the same quad layout with separate checkpoint profiles.
+Swift1.5 and Swift1.5-Huihui use the same quad layout with separate checkpoint profiles. On 4 x 20 GB cards they have
+copies of the two Flash-Next rows (`fn-swift1.5-quad-20g-sm86`, `fn-swift1.5-quad-20g-sm89`, `fn-swift1.5-huihui-quad-20g-sm86`, `fn-swift1.5-huihui-quad-20g-sm89`): the same layout, pin, env and cold-expert
+profile, untested; the 20 GB figures above were measured on the Flash-Next checkpoint only.
 Their canonical launchers are `models/swift1.5/serve.sh` and `models/swift1.5-huihui/serve.sh` (generated from the registry; see the commands below).
 Both retain checkpoint-specific KV scales and full-vocabulary MTP K=3, and serve `medium` reasoning by default like every checkpoint; these are registry settings.
-FGPC is off for all generated Flash-Next-family launchers; the default image cap is 8,388,608 pixels.
+FGPC is on for all generated Flash-Next-family launchers; the default image cap is 8,388,608 pixels.
 The two checkpoint pools are the quad's 924,993 tokens; the launcher qualification measured 924,993 tokens on both generated launchers on 2026-10-16. Their 3 x 262K / 6 x 131K residency in the table below is the inherited quad target, not a separate measurement.
 
 Regenerate the canonical recipes from the repository root:
@@ -108,6 +116,8 @@ Generated from `tools/merlin/profiles/flash-next.json` by `python tools/merlin/p
 | `fn-quad-24g-sm89` | 4 x 24 GB | sm_89 | any | TP2xPP2+EP | 8 | fp8 | ~924,993 | ~3 / 6 | 🟡 testing: full-model runs passed on cloud-hosted hardware; kernel parity qualification still to run |
 | `fn-quad-24g-sm89 kv-bf16` | 4 x 24 GB | sm_89 | any | TP2xPP2+EP | 3 | bf16 | ~486,838 | ~1 / 3 | untested / community-validated |
 | `fn-quad-24g-sm89-pp4` | 4 x 24 GB | sm_89 | off | TP1xPP4 | 32 | fp8 | ~506,083 | ~1 / 3 | untested / community-validated |
+| `fn-quad-20g-sm86` | 4 x 20 GB | sm_86 | any | TP2xPP2+EP | 8 | fp8 | ~265,888 | ~1 / 2 | untested / community-validated |
+| `fn-quad-20g-sm89` | 4 x 20 GB | sm_89 | any | TP2xPP2+EP | 8 | fp8 | ~265,888 | ~1 / 2 | untested / community-validated |
 | `fn-quad-24g-sm80` | 4 x 24 GB | sm_80 | any | TP2xPP2+EP | 3 | bf16 | ~486,838 | ~1 / 3 | untested / community-validated |
 | `fn-2x48g-pp2-sm89` | 2 x 48 GB | sm_89 | any | TP1xPP2 | 9 | fp8 | ~1,419,322 | ~5 / 9 | untested / community-validated |
 | `fn-2x48g-pp2-sm89 kv-bf16` | 2 x 48 GB | sm_89 | any | TP1xPP2 | 4 | bf16 | ~726,513 | ~2 / 4 | untested / community-validated |
@@ -138,6 +148,8 @@ Generated from `tools/merlin/profiles/flash-next.json` by `python tools/merlin/p
 | `fn-swift1.5-huihui-4x48g-tp2pp2-sm89` | 4 x 48 GB | sm_89 | any | TP2xPP2+EP | 32 | fp8 | ~6,767,060 | ~25 / 46 | untested / community-validated |
 | `fn-swift1.5-2x48g-pp2-sm86` | 2 x 48 GB | sm_86 | any | TP1xPP2 | 9 | fp8 | ~1,419,322 | ~5 / 9 | untested / community-validated |
 | `fn-swift1.5-4x48g-tp2pp2-sm86` | 4 x 48 GB | sm_86 | any | TP2xPP2+EP | 32 | fp8 | ~6,767,060 | ~25 / 46 | untested / community-validated |
+| `fn-swift1.5-quad-20g-sm86` | 4 x 20 GB | sm_86 | any | TP2xPP2+EP | 8 | fp8 | ~265,888 | ~1 / 2 | untested / community-validated |
+| `fn-swift1.5-quad-20g-sm89` | 4 x 20 GB | sm_89 | any | TP2xPP2+EP | 8 | fp8 | ~265,888 | ~1 / 2 | untested / community-validated |
 | `fn-swift1.5-quad-24g-sm80` | 4 x 24 GB | sm_80 | any | TP2xPP2+EP | 3 | bf16 | ~486,838 | ~1 / 3 | untested / community-validated |
 | `fn-swift1.5-sm80-80g-x1` | 1 x 80 GB | sm_80 | any | TP1xPP1 | 2 | bf16 | ~344,532 | ~1 / 2 | untested / community-validated |
 | `fn-swift1.5-sm80-80g-x2-tp2` | 2 x 80 GB | sm_80 | on | TP2xPP1+EP | 20 | bf16 | ~2,980,951 | ~11 / 20 | untested / community-validated |
@@ -149,6 +161,8 @@ Generated from `tools/merlin/profiles/flash-next.json` by `python tools/merlin/p
 | `fn-swift1.5-sm80-40g-x4-pp4` | 4 x 40 GB | sm_80 | any | TP1xPP4 | 14 | bf16 | ~2,122,638 | ~7 / 14 | untested / community-validated |
 | `fn-swift1.5-huihui-2x48g-pp2-sm86` | 2 x 48 GB | sm_86 | any | TP1xPP2 | 9 | fp8 | ~1,419,322 | ~5 / 9 | untested / community-validated |
 | `fn-swift1.5-huihui-4x48g-tp2pp2-sm86` | 4 x 48 GB | sm_86 | any | TP2xPP2+EP | 32 | fp8 | ~6,767,060 | ~25 / 46 | untested / community-validated |
+| `fn-swift1.5-huihui-quad-20g-sm86` | 4 x 20 GB | sm_86 | any | TP2xPP2+EP | 8 | fp8 | ~265,888 | ~1 / 2 | untested / community-validated |
+| `fn-swift1.5-huihui-quad-20g-sm89` | 4 x 20 GB | sm_89 | any | TP2xPP2+EP | 8 | fp8 | ~265,888 | ~1 / 2 | untested / community-validated |
 | `fn-swift1.5-huihui-quad-24g-sm80` | 4 x 24 GB | sm_80 | any | TP2xPP2+EP | 3 | bf16 | ~486,838 | ~1 / 3 | untested / community-validated |
 | `fn-swift1.5-huihui-sm80-80g-x1` | 1 x 80 GB | sm_80 | any | TP1xPP1 | 2 | bf16 | ~344,532 | ~1 / 2 | untested / community-validated |
 | `fn-swift1.5-huihui-sm80-80g-x2-tp2` | 2 x 80 GB | sm_80 | on | TP2xPP1+EP | 20 | bf16 | ~2,980,951 | ~11 / 20 | untested / community-validated |
@@ -495,6 +509,11 @@ check of `config.json`, the `vllm/` shadow refusal, the host-RAM / `/dev/shm` wa
 selector (four-card P2P-on Flash-Next-family rows), a port-free check, and `SERVE_PRINT_ENV_AND_EXIT=1` (prints the platform
 decision and the vllm flags instead of starting). The Flash-Next family runs the full set as the v3.0.0 recipe did; the
 27B and Super VL families run the `CUDA_HOME` default only (their recipes never checked build products or the toolchain,
-and the tested launch commands must stay identical). `CHUNK` (`--max-num-batched-tokens`), `BLOCK_SIZE` (`--block-size`) and `LPT`
-(`--long-prefill-token-threshold`) are knobs on every profile; the defaults are today's values.
+and the tested launch commands must stay identical). `CHUNK` (the prefill chunk, `--max-num-batched-tokens`; the Flash-Next family adds decode headroom, below), `BLOCK_SIZE` (`--block-size`) and `LPT`
+(`--long-prefill-token-threshold`) are knobs on every profile; the defaults are today's values (Flash-Next family:
+LPT 512 since 3.0.2.1, `LPT=0` turns it off). On the Flash-Next family `PREFILL_RUNS` (on since 3.0.2.1, `0` turns it
+off) adds the prefill runs: `CHUNK` stays the prefill chunk and `--max-num-batched-tokens` becomes `CHUNK` + one
+verify row per session slot (1,056 on `fn-quad-3090`). When `CHUNK` and `BLOCK_SIZE` do not tile (neither divides the
+other) or `BLOCK_SIZE` is below the hybrid-state floor, the default switches the runs off with a note at start-up;
+`PREFILL_RUNS=1` refuses to start instead.
 

@@ -1177,7 +1177,7 @@ def generate_scheduler_kv_cache_config(
     # Copy the resolved worker decision.
     # Workers share scheduler geometry and the resolved zeroing requirement.
     cfg = copy.deepcopy(kv_cache_configs[0])
-    # a group is a draft group if it
+    # A group is a draft group if it
     # is one on any stage: a PP worker without the drafter's layers projects it
     # unflagged, and worker 0 must not hand the scheduler the flag-all fallback.
     for gid, group in enumerate(cfg.kv_cache_groups):

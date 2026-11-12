@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1280" height="1466" viewBox="0 0 1280 1466" role="img" aria-labelledby="ttl dsc">
 <title id="ttl">Decode speed at 4K, 131K and the full 262K context</title>
-<desc id="dsc">One stream, thinking on, median of 3. Merlin 3.0.2, RTX 3090s at 220 W. Flash-Next 4× 3090: 172 at 4K, 189 at 131K, 207 at 262K; Swift1.5 4× 3090: 181 at 4K, 187 at 131K, 186 at 262K; Swift1.5-Huihui 4× 3090: 180 at 4K, 189 at 131K, 193 at 262K; Qwen3.8-27B 1× 3090: 131 at 4K, 100 at 131K, 77 at 262K; Qwen3.8-27B 2× 3090: 211 at 4K, 184 at 131K, 146 at 262K; Qwen3.8-27B 4× 3090: 258 at 4K, 255 at 131K, 250 at 262K; ThinkingCap 2× 3090: 205 at 4K, 169 at 131K, 160 at 262K; ThinkingCap 4× 3090: 238 at 4K, 235 at 131K, 223 at 262K; Nemotron 3.5 Super VL 4× 3090: 101 at 4K, 101 at 131K, 106 at 262K; Ornith 1.5 4× 3090: 145 at 4K, 122 at 131K, 111 at 262K (tok/s).</desc>
+<desc id="dsc">One stream, thinking on, median of 3 (ThinkingCap 2× at 262K: median of 12). Merlin 3.0.2.1, RTX 3090s at 220 W. Flash-Next 4× 3090: 174 at 4K, 188 at 131K, 192 at 262K; Swift1.5 4× 3090: 180 at 4K, 185 at 131K, 182 at 262K; Swift1.5-Huihui 4× 3090: 178 at 4K, 190 at 131K, 203 at 262K; Qwen3.8-27B 1× 3090: 131 at 4K, 102 at 131K, 75 at 262K; Qwen3.8-27B 2× 3090: 248 at 4K, 197 at 131K, 160 at 262K; Qwen3.8-27B 4× 3090: 262 at 4K, 258 at 131K, 233 at 262K; ThinkingCap 2× 3090: 244 at 4K, 179 at 131K, 163 at 262K; ThinkingCap 4× 3090: 240 at 4K, 238 at 131K, 233 at 262K; Nemotron 3.5 Super VL 4× 3090: 105 at 4K, 102 at 131K, 101 at 262K; Ornith 1.5 4× 3090: 149 at 4K, 122 at 131K, 107 at 262K (tok/s).</desc>
 <defs>
 <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#0a0f24"/><stop offset="0.55" stop-color="#121638"/><stop offset="1" stop-color="#1d1145"/></linearGradient>
 <radialGradient id="glow" cx="0.9" cy="0.05" r="0.5"><stop offset="0" stop-color="#5b6cff" stop-opacity="0.22"/><stop offset="1" stop-color="#5b6cff" stop-opacity="0"/></radialGradient>
@@ -11,7 +11,7 @@
 <rect width="1280" height="1466" fill="url(#bg)"/>
 <rect width="1280" height="1466" fill="url(#glow)"/>
 <text x="56" y="76" font-size="36" font-weight="700" fill="#ffffff">Decode speed at 4K, 131K and the full 262K context</text>
-<text x="56" y="114" font-size="22" fill="#9aa4bf">One stream, thinking on, median of 3. Merlin 3.0.2, RTX 3090s at 220 W.</text>
+<text x="56" y="114" font-size="22" fill="#9aa4bf">One stream, thinking on, median of 3 (ThinkingCap 2× at 262K: median of 12). Merlin 3.0.2.1, RTX 3090s at 220 W.</text>
 <rect x="56" y="142" width="20" height="20" rx="5" fill="#3f4fa8"/>
 <text x="86" y="159" font-size="20" fill="#c9d1e6">4K prompt</text>
 <rect x="222.79999999999998" y="142" width="20" height="20" rx="5" fill="#6f7fe8"/>
@@ -29,80 +29,80 @@
 <text x="1160.0" y="1440" font-size="18" fill="#7f88a6" text-anchor="end">tok/s</text>
 <text x="56" y="236" font-size="16" font-weight="700" fill="#7f88a6" letter-spacing="1.2">FLASH-NEXT FAMILY  ·  125B MOE</text>
 <text x="56" y="303.0" font-size="23" font-weight="600" fill="#eef1fb">Flash-Next<tspan font-weight="400" fill="#7f88a6" dx="10">4× 3090</tspan></text>
-<path d="M428.0,260.0 H842.7 Q847.7,260.0 847.7,265.0 V275.0 Q847.7,280.0 842.7,280.0 H428.0 Z" fill="#3f4fa8"/>
-<text x="857.7" y="277.0" font-size="19" font-weight="500" fill="#9aa4bf">172</text>
-<path d="M428.0,285.0 H884.2 Q889.2,285.0 889.2,290.0 V300.0 Q889.2,305.0 884.2,305.0 H428.0 Z" fill="#6f7fe8"/>
-<text x="899.2" y="302.0" font-size="19" font-weight="500" fill="#9aa4bf">189</text>
-<path d="M428.0,310.0 H928.1 Q933.1,310.0 933.1,315.0 V325.0 Q933.1,330.0 928.1,330.0 H428.0 Z" fill="#b9a4ff"/>
-<text x="943.1" y="327.0" font-size="21" font-weight="700" fill="#ffffff">207</text>
+<path d="M428.0,260.0 H847.6 Q852.6,260.0 852.6,265.0 V275.0 Q852.6,280.0 847.6,280.0 H428.0 Z" fill="#3f4fa8"/>
+<text x="862.6" y="277.0" font-size="19" font-weight="500" fill="#9aa4bf">174</text>
+<path d="M428.0,285.0 H881.7 Q886.7,285.0 886.7,290.0 V300.0 Q886.7,305.0 881.7,305.0 H428.0 Z" fill="#6f7fe8"/>
+<text x="896.7" y="302.0" font-size="19" font-weight="500" fill="#9aa4bf">188</text>
+<path d="M428.0,310.0 H891.5 Q896.5,310.0 896.5,315.0 V325.0 Q896.5,330.0 891.5,330.0 H428.0 Z" fill="#b9a4ff"/>
+<text x="906.5" y="327.0" font-size="21" font-weight="700" fill="#ffffff">192</text>
 <text x="56" y="401.0" font-size="23" font-weight="600" fill="#eef1fb">Swift1.5<tspan font-weight="400" fill="#7f88a6" dx="10">4× 3090</tspan></text>
-<path d="M428.0,358.0 H864.6 Q869.6,358.0 869.6,363.0 V373.0 Q869.6,378.0 864.6,378.0 H428.0 Z" fill="#3f4fa8"/>
-<text x="879.6" y="375.0" font-size="19" font-weight="500" fill="#9aa4bf">181</text>
-<path d="M428.0,383.0 H879.3 Q884.3,383.0 884.3,388.0 V398.0 Q884.3,403.0 879.3,403.0 H428.0 Z" fill="#6f7fe8"/>
-<text x="894.3" y="400.0" font-size="19" font-weight="500" fill="#9aa4bf">187</text>
-<path d="M428.0,408.0 H876.8 Q881.8,408.0 881.8,413.0 V423.0 Q881.8,428.0 876.8,428.0 H428.0 Z" fill="#b9a4ff"/>
-<text x="891.8" y="425.0" font-size="21" font-weight="700" fill="#ffffff">186</text>
+<path d="M428.0,358.0 H862.2 Q867.2,358.0 867.2,363.0 V373.0 Q867.2,378.0 862.2,378.0 H428.0 Z" fill="#3f4fa8"/>
+<text x="877.2" y="375.0" font-size="19" font-weight="500" fill="#9aa4bf">180</text>
+<path d="M428.0,383.0 H874.4 Q879.4,383.0 879.4,388.0 V398.0 Q879.4,403.0 874.4,403.0 H428.0 Z" fill="#6f7fe8"/>
+<text x="889.4" y="400.0" font-size="19" font-weight="500" fill="#9aa4bf">185</text>
+<path d="M428.0,408.0 H867.1 Q872.1,408.0 872.1,413.0 V423.0 Q872.1,428.0 867.1,428.0 H428.0 Z" fill="#b9a4ff"/>
+<text x="882.1" y="425.0" font-size="21" font-weight="700" fill="#ffffff">182</text>
 <text x="56" y="499.0" font-size="23" font-weight="600" fill="#eef1fb">Swift1.5-Huihui<tspan font-weight="400" fill="#7f88a6" dx="10">4× 3090</tspan></text>
-<path d="M428.0,456.0 H862.2 Q867.2,456.0 867.2,461.0 V471.0 Q867.2,476.0 862.2,476.0 H428.0 Z" fill="#3f4fa8"/>
-<text x="877.2" y="473.0" font-size="19" font-weight="500" fill="#9aa4bf">180</text>
-<path d="M428.0,481.0 H884.2 Q889.2,481.0 889.2,486.0 V496.0 Q889.2,501.0 884.2,501.0 H428.0 Z" fill="#6f7fe8"/>
-<text x="899.2" y="498.0" font-size="19" font-weight="500" fill="#9aa4bf">189</text>
-<path d="M428.0,506.0 H893.9 Q898.9,506.0 898.9,511.0 V521.0 Q898.9,526.0 893.9,526.0 H428.0 Z" fill="#b9a4ff"/>
-<text x="908.9" y="523.0" font-size="21" font-weight="700" fill="#ffffff">193</text>
+<path d="M428.0,456.0 H857.3 Q862.3,456.0 862.3,461.0 V471.0 Q862.3,476.0 857.3,476.0 H428.0 Z" fill="#3f4fa8"/>
+<text x="872.3" y="473.0" font-size="19" font-weight="500" fill="#9aa4bf">178</text>
+<path d="M428.0,481.0 H886.6 Q891.6,481.0 891.6,486.0 V496.0 Q891.6,501.0 886.6,501.0 H428.0 Z" fill="#6f7fe8"/>
+<text x="901.6" y="498.0" font-size="19" font-weight="500" fill="#9aa4bf">190</text>
+<path d="M428.0,506.0 H918.3 Q923.3,506.0 923.3,511.0 V521.0 Q923.3,526.0 918.3,526.0 H428.0 Z" fill="#b9a4ff"/>
+<text x="933.3" y="523.0" font-size="21" font-weight="700" fill="#ffffff">203</text>
 <line x1="56" y1="544" x2="1224" y2="544" stroke="#ffffff" stroke-opacity="0.08"/>
 <text x="56" y="580" font-size="16" font-weight="700" fill="#7f88a6" letter-spacing="1.2">QWEN3.8-27B FAMILY  ·  DENSE</text>
 <text x="56" y="647.0" font-size="23" font-weight="600" fill="#eef1fb">Qwen3.8-27B<tspan font-weight="400" fill="#7f88a6" dx="10">1× 3090</tspan></text>
 <path d="M428.0,604.0 H742.6 Q747.6,604.0 747.6,609.0 V619.0 Q747.6,624.0 742.6,624.0 H428.0 Z" fill="#3f4fa8"/>
 <text x="757.6" y="621.0" font-size="19" font-weight="500" fill="#9aa4bf">131</text>
-<path d="M428.0,629.0 H667.0 Q672.0,629.0 672.0,634.0 V644.0 Q672.0,649.0 667.0,649.0 H428.0 Z" fill="#6f7fe8"/>
-<text x="682.0" y="646.0" font-size="19" font-weight="500" fill="#9aa4bf">100</text>
-<path d="M428.0,654.0 H610.9 Q615.9,654.0 615.9,659.0 V669.0 Q615.9,674.0 610.9,674.0 H428.0 Z" fill="#b9a4ff"/>
-<text x="625.9" y="671.0" font-size="21" font-weight="700" fill="#ffffff">77</text>
+<path d="M428.0,629.0 H671.9 Q676.9,629.0 676.9,634.0 V644.0 Q676.9,649.0 671.9,649.0 H428.0 Z" fill="#6f7fe8"/>
+<text x="686.9" y="646.0" font-size="19" font-weight="500" fill="#9aa4bf">102</text>
+<path d="M428.0,654.0 H606.0 Q611.0,654.0 611.0,659.0 V669.0 Q611.0,674.0 606.0,674.0 H428.0 Z" fill="#b9a4ff"/>
+<text x="621.0" y="671.0" font-size="21" font-weight="700" fill="#ffffff">75</text>
 <text x="56" y="745.0" font-size="23" font-weight="600" fill="#eef1fb">Qwen3.8-27B<tspan font-weight="400" fill="#7f88a6" dx="10">2× 3090</tspan></text>
-<path d="M428.0,702.0 H937.8 Q942.8,702.0 942.8,707.0 V717.0 Q942.8,722.0 937.8,722.0 H428.0 Z" fill="#3f4fa8"/>
-<text x="952.8" y="719.0" font-size="19" font-weight="500" fill="#9aa4bf">211</text>
-<path d="M428.0,727.0 H872.0 Q877.0,727.0 877.0,732.0 V742.0 Q877.0,747.0 872.0,747.0 H428.0 Z" fill="#6f7fe8"/>
-<text x="887.0" y="744.0" font-size="19" font-weight="500" fill="#9aa4bf">184</text>
-<path d="M428.0,752.0 H779.2 Q784.2,752.0 784.2,757.0 V767.0 Q784.2,772.0 779.2,772.0 H428.0 Z" fill="#b9a4ff"/>
-<text x="794.2" y="769.0" font-size="21" font-weight="700" fill="#ffffff">146</text>
+<path d="M428.0,702.0 H1028.1 Q1033.1,702.0 1033.1,707.0 V717.0 Q1033.1,722.0 1028.1,722.0 H428.0 Z" fill="#3f4fa8"/>
+<text x="1043.1" y="719.0" font-size="19" font-weight="500" fill="#9aa4bf">248</text>
+<path d="M428.0,727.0 H903.7 Q908.7,727.0 908.7,732.0 V742.0 Q908.7,747.0 903.7,747.0 H428.0 Z" fill="#6f7fe8"/>
+<text x="918.7" y="744.0" font-size="19" font-weight="500" fill="#9aa4bf">197</text>
+<path d="M428.0,752.0 H813.4 Q818.4,752.0 818.4,757.0 V767.0 Q818.4,772.0 813.4,772.0 H428.0 Z" fill="#b9a4ff"/>
+<text x="828.4" y="769.0" font-size="21" font-weight="700" fill="#ffffff">160</text>
 <text x="56" y="843.0" font-size="23" font-weight="600" fill="#eef1fb">Qwen3.8-27B<tspan font-weight="400" fill="#7f88a6" dx="10">4× 3090</tspan></text>
-<path d="M428.0,800.0 H1052.5 Q1057.5,800.0 1057.5,805.0 V815.0 Q1057.5,820.0 1052.5,820.0 H428.0 Z" fill="#3f4fa8"/>
-<text x="1067.5" y="817.0" font-size="19" font-weight="500" fill="#9aa4bf">258</text>
-<path d="M428.0,825.0 H1045.2 Q1050.2,825.0 1050.2,830.0 V840.0 Q1050.2,845.0 1045.2,845.0 H428.0 Z" fill="#6f7fe8"/>
-<text x="1060.2" y="842.0" font-size="19" font-weight="500" fill="#9aa4bf">255</text>
-<path d="M428.0,850.0 H1033.0 Q1038.0,850.0 1038.0,855.0 V865.0 Q1038.0,870.0 1033.0,870.0 H428.0 Z" fill="#b9a4ff"/>
-<text x="1048.0" y="867.0" font-size="21" font-weight="700" fill="#ffffff">250</text>
+<path d="M428.0,800.0 H1062.3 Q1067.3,800.0 1067.3,805.0 V815.0 Q1067.3,820.0 1062.3,820.0 H428.0 Z" fill="#3f4fa8"/>
+<text x="1077.3" y="817.0" font-size="19" font-weight="500" fill="#9aa4bf">262</text>
+<path d="M428.0,825.0 H1052.5 Q1057.5,825.0 1057.5,830.0 V840.0 Q1057.5,845.0 1052.5,845.0 H428.0 Z" fill="#6f7fe8"/>
+<text x="1067.5" y="842.0" font-size="19" font-weight="500" fill="#9aa4bf">258</text>
+<path d="M428.0,850.0 H991.5 Q996.5,850.0 996.5,855.0 V865.0 Q996.5,870.0 991.5,870.0 H428.0 Z" fill="#b9a4ff"/>
+<text x="1006.5" y="867.0" font-size="21" font-weight="700" fill="#ffffff">233</text>
 <text x="56" y="941.0" font-size="23" font-weight="600" fill="#eef1fb">ThinkingCap<tspan font-weight="400" fill="#7f88a6" dx="10">2× 3090</tspan></text>
-<path d="M428.0,898.0 H923.2 Q928.2,898.0 928.2,903.0 V913.0 Q928.2,918.0 923.2,918.0 H428.0 Z" fill="#3f4fa8"/>
-<text x="938.2" y="915.0" font-size="19" font-weight="500" fill="#9aa4bf">205</text>
-<path d="M428.0,923.0 H835.4 Q840.4,923.0 840.4,928.0 V938.0 Q840.4,943.0 835.4,943.0 H428.0 Z" fill="#6f7fe8"/>
-<text x="850.4" y="940.0" font-size="19" font-weight="500" fill="#9aa4bf">169</text>
-<path d="M428.0,948.0 H813.4 Q818.4,948.0 818.4,953.0 V963.0 Q818.4,968.0 813.4,968.0 H428.0 Z" fill="#b9a4ff"/>
-<text x="828.4" y="965.0" font-size="21" font-weight="700" fill="#ffffff">160</text>
+<path d="M428.0,898.0 H1018.4 Q1023.4,898.0 1023.4,903.0 V913.0 Q1023.4,918.0 1018.4,918.0 H428.0 Z" fill="#3f4fa8"/>
+<text x="1033.4" y="915.0" font-size="19" font-weight="500" fill="#9aa4bf">244</text>
+<path d="M428.0,923.0 H859.8 Q864.8,923.0 864.8,928.0 V938.0 Q864.8,943.0 859.8,943.0 H428.0 Z" fill="#6f7fe8"/>
+<text x="874.8" y="940.0" font-size="19" font-weight="500" fill="#9aa4bf">179</text>
+<path d="M428.0,948.0 H820.7 Q825.7,948.0 825.7,953.0 V963.0 Q825.7,968.0 820.7,968.0 H428.0 Z" fill="#b9a4ff"/>
+<text x="835.7" y="965.0" font-size="21" font-weight="700" fill="#ffffff">163</text>
 <text x="56" y="1039.0" font-size="23" font-weight="600" fill="#eef1fb">ThinkingCap<tspan font-weight="400" fill="#7f88a6" dx="10">4× 3090</tspan></text>
-<path d="M428.0,996.0 H1003.7 Q1008.7,996.0 1008.7,1001.0 V1011.0 Q1008.7,1016.0 1003.7,1016.0 H428.0 Z" fill="#3f4fa8"/>
-<text x="1018.7" y="1013.0" font-size="19" font-weight="500" fill="#9aa4bf">238</text>
-<path d="M428.0,1021.0 H996.4 Q1001.4,1021.0 1001.4,1026.0 V1036.0 Q1001.4,1041.0 996.4,1041.0 H428.0 Z" fill="#6f7fe8"/>
-<text x="1011.4" y="1038.0" font-size="19" font-weight="500" fill="#9aa4bf">235</text>
-<path d="M428.0,1046.0 H967.1 Q972.1,1046.0 972.1,1051.0 V1061.0 Q972.1,1066.0 967.1,1066.0 H428.0 Z" fill="#b9a4ff"/>
-<text x="982.1" y="1063.0" font-size="21" font-weight="700" fill="#ffffff">223</text>
+<path d="M428.0,996.0 H1008.6 Q1013.6,996.0 1013.6,1001.0 V1011.0 Q1013.6,1016.0 1008.6,1016.0 H428.0 Z" fill="#3f4fa8"/>
+<text x="1023.6" y="1013.0" font-size="19" font-weight="500" fill="#9aa4bf">240</text>
+<path d="M428.0,1021.0 H1003.7 Q1008.7,1021.0 1008.7,1026.0 V1036.0 Q1008.7,1041.0 1003.7,1041.0 H428.0 Z" fill="#6f7fe8"/>
+<text x="1018.7" y="1038.0" font-size="19" font-weight="500" fill="#9aa4bf">238</text>
+<path d="M428.0,1046.0 H991.5 Q996.5,1046.0 996.5,1051.0 V1061.0 Q996.5,1066.0 991.5,1066.0 H428.0 Z" fill="#b9a4ff"/>
+<text x="1006.5" y="1063.0" font-size="21" font-weight="700" fill="#ffffff">233</text>
 <line x1="56" y1="1084" x2="1224" y2="1084" stroke="#ffffff" stroke-opacity="0.08"/>
 <text x="56" y="1120" font-size="16" font-weight="700" fill="#7f88a6" letter-spacing="1.2">NEMOTRON  ·  120B-A12B MOE</text>
 <text x="56" y="1187.0" font-size="23" font-weight="600" fill="#eef1fb">Nemotron 3.5 Super VL<tspan font-weight="400" fill="#7f88a6" dx="10">4× 3090</tspan></text>
-<path d="M428.0,1144.0 H669.4 Q674.4,1144.0 674.4,1149.0 V1159.0 Q674.4,1164.0 669.4,1164.0 H428.0 Z" fill="#3f4fa8"/>
-<text x="684.4" y="1161.0" font-size="19" font-weight="500" fill="#9aa4bf">101</text>
-<path d="M428.0,1169.0 H669.4 Q674.4,1169.0 674.4,1174.0 V1184.0 Q674.4,1189.0 669.4,1189.0 H428.0 Z" fill="#6f7fe8"/>
-<text x="684.4" y="1186.0" font-size="19" font-weight="500" fill="#9aa4bf">101</text>
-<path d="M428.0,1194.0 H681.6 Q686.6,1194.0 686.6,1199.0 V1209.0 Q686.6,1214.0 681.6,1214.0 H428.0 Z" fill="#b9a4ff"/>
-<text x="696.6" y="1211.0" font-size="21" font-weight="700" fill="#ffffff">106</text>
+<path d="M428.0,1144.0 H679.2 Q684.2,1144.0 684.2,1149.0 V1159.0 Q684.2,1164.0 679.2,1164.0 H428.0 Z" fill="#3f4fa8"/>
+<text x="694.2" y="1161.0" font-size="19" font-weight="500" fill="#9aa4bf">105</text>
+<path d="M428.0,1169.0 H671.9 Q676.9,1169.0 676.9,1174.0 V1184.0 Q676.9,1189.0 671.9,1189.0 H428.0 Z" fill="#6f7fe8"/>
+<text x="686.9" y="1186.0" font-size="19" font-weight="500" fill="#9aa4bf">102</text>
+<path d="M428.0,1194.0 H669.4 Q674.4,1194.0 674.4,1199.0 V1209.0 Q674.4,1214.0 669.4,1214.0 H428.0 Z" fill="#b9a4ff"/>
+<text x="684.4" y="1211.0" font-size="21" font-weight="700" fill="#ffffff">101</text>
 <line x1="56" y1="1232" x2="1224" y2="1232" stroke="#ffffff" stroke-opacity="0.08"/>
 <text x="56" y="1268" font-size="16" font-weight="700" fill="#7f88a6" letter-spacing="1.2">ORNITH 1.5  ·  122B-A10B MOE</text>
 <text x="56" y="1335.0" font-size="23" font-weight="600" fill="#eef1fb">Ornith 1.5<tspan font-weight="400" fill="#7f88a6" dx="10">4× 3090</tspan></text>
-<path d="M428.0,1292.0 H776.8 Q781.8,1292.0 781.8,1297.0 V1307.0 Q781.8,1312.0 776.8,1312.0 H428.0 Z" fill="#3f4fa8"/>
-<text x="791.8" y="1309.0" font-size="19" font-weight="500" fill="#9aa4bf">145</text>
+<path d="M428.0,1292.0 H786.6 Q791.6,1292.0 791.6,1297.0 V1307.0 Q791.6,1312.0 786.6,1312.0 H428.0 Z" fill="#3f4fa8"/>
+<text x="801.6" y="1309.0" font-size="19" font-weight="500" fill="#9aa4bf">149</text>
 <path d="M428.0,1317.0 H720.7 Q725.7,1317.0 725.7,1322.0 V1332.0 Q725.7,1337.0 720.7,1337.0 H428.0 Z" fill="#6f7fe8"/>
 <text x="735.7" y="1334.0" font-size="19" font-weight="500" fill="#9aa4bf">122</text>
-<path d="M428.0,1342.0 H693.8 Q698.8,1342.0 698.8,1347.0 V1357.0 Q698.8,1362.0 693.8,1362.0 H428.0 Z" fill="#b9a4ff"/>
-<text x="708.8" y="1359.0" font-size="21" font-weight="700" fill="#ffffff">111</text>
+<path d="M428.0,1342.0 H684.1 Q689.1,1342.0 689.1,1347.0 V1357.0 Q689.1,1362.0 684.1,1362.0 H428.0 Z" fill="#b9a4ff"/>
+<text x="699.1" y="1359.0" font-size="21" font-weight="700" fill="#ffffff">107</text>
 </g>
 </svg>

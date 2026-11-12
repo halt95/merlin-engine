@@ -996,6 +996,7 @@ _TRITON_SPLIT_CACHE: dict[torch.device, dict[str, torch.Tensor]] = {}
 # top-p (#61996) is not taken: it may change the reduction order.
 def _topp_split_count(batch_size: int, num_sm: int) -> int:
     splits = 1
+
     while splits < _SPLIT_MAX_SPLITS and splits * 2 * batch_size <= num_sm:
         splits *= 2
     return splits
@@ -1082,6 +1083,7 @@ def _topp_split_stats(
     num_sm: int,
 ) -> DispatchSpec:
     batch_size, vocab_size = logits.shape
+
     splits = _topp_split_count(batch_size, num_sm)
     return (logits.shape[0] * splits,), dict(
         K=k if k is not None else logits,
@@ -1376,6 +1378,7 @@ def _topp_split_step(
     num_sm: int,
 ) -> DispatchSpec:
     batch_size, vocab_size = logits.shape
+
     splits = _topp_split_count(batch_size, num_sm)
     return (logits.shape[0] * splits,), dict(
         K=k if k is not None else logits,
@@ -1553,6 +1556,7 @@ def _topp_split_mask(
     num_sm: int,
 ) -> DispatchSpec:
     batch_size, vocab_size = logits.shape
+
     splits = _topp_split_count(batch_size, num_sm)
     return (logits.shape[0] * splits,), dict(
         K=k if k is not None else logits,
@@ -1617,6 +1621,7 @@ def apply_top_k_top_p_triton(
     k: torch.Tensor | None,
     p: torch.Tensor | None,
     mask_value: float = float("-inf"),
+
 ) -> torch.Tensor:
     """Apply combined top-k and top-p masking using Triton.
 
@@ -1713,6 +1718,7 @@ def apply_top_k_top_p_triton(
         mask_value,
         num_sm,
     )
+
     if use_split:
         _apply_topp_split(logits, k_ptr, p_ptr, mask_value, num_sm)
 

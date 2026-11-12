@@ -309,6 +309,7 @@ class Sampler:
             seq_lens_upper_bound_np,
             skip_top_k_top_p=True,
         )
+
         top_k, top_p = self.sampling_states.get_top_k_top_p(
             expanded_idx_mapping, idx_mapping_np
         )
@@ -332,6 +333,7 @@ class Sampler:
             pos,
             top_k,
             top_p,
+
             use_fused_sampler,
         )
 
@@ -343,6 +345,7 @@ class Sampler:
         pos: torch.Tensor,
         top_k: torch.Tensor | None,
         top_p: torch.Tensor | None,
+
         use_fused_sampler: bool,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if use_fused_sampler:
@@ -353,6 +356,7 @@ class Sampler:
             else:  # Use XPU sampler
                 sampled, _ = xpu_sample(processed_logits, top_k, top_p)
         else:
+
             processed_logits = apply_top_k_top_p(processed_logits, top_k, top_p)
             sampled = gumbel_sample(
                 processed_logits,

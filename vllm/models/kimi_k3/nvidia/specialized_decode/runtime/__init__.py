@@ -120,6 +120,7 @@ def unsupported(vllm_config) -> str | None:
         ),
         (
             vllm_config.cache_config.use_replayssm
+
             or vllm_config.cache_config.use_recoverssm,
             "ReplaySSM / RecoverSSM (--use-replayssm)",
         ),

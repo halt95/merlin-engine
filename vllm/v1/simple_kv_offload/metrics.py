@@ -40,7 +40,7 @@ OUTCOME_TO_FIELD = {
     "dropped_not_hashed": "dropped_not_hashed",
     "skipped_already_cached": "skipped_already_cached",
     "skipped_in_flight": "skipped_in_flight",
-    # a hand-off for a group the tier never offloads.
+    # A hand-off for a group the tier never offloads.
     "dropped_skipped_group": "dropped_skipped_group",
 }
 

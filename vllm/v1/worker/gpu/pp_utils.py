@@ -36,9 +36,11 @@ class PendingRecv:
     # detect requests aborted since then.
     gen_at_receive_np: np.ndarray  # [num_reqs]
     draft_tokens: torch.Tensor | None = None  # [num_reqs, num_speculative_steps]
+
     # Model-state data the step's postprocess needs once the sampled tokens
     # arrive (RecoverSSM: the snapshot of the step's deferred commits).
     deferred_state: object | None = None
+
     commit_ack: DeferredCommitAck | None = None
     # Recorded after the token and count
     # broadcasts, before the draft broadcast (`event` covers all three). None:
@@ -110,6 +112,11 @@ class PPHandler:
         # Read once, before any step.
         self.split_recv_events = bool(envs.VLLM_RECOVERSSM_PP_SPLIT_RECV)
         self.aux_hidden_state_relay_keys: tuple[str, ...] = ()
+        # Create the PP communicators before
+        # the memory profile and the KV cache, not lazily at the first step.
+        from vllm.merlin.pp_comm_eager import warm_pp_communicators
+
+        warm_pp_communicators(self.broadcast_group, self.last_rank, device)
 
     def on_req_idx_freed(self, req_idx: int) -> None:
         self.req_idx_gen_np[req_idx] += 1
@@ -187,8 +194,11 @@ class PPHandler:
             num_rejected=slot.num_rejected,
             idx_mapping=idx_mapping,
             draft_tokens=slot.draft_tokens,
+
             deferred_state=slot.deferred_state,
+
             commit_ack=slot.commit_ack,
+
             drafts_event=drafts_event,
         )
 
@@ -257,13 +267,14 @@ class PPHandler:
                 combined, src=self.last_rank, group=self.broadcast_group
             )
             draft_tokens = None
-            # counts-only receive event (None unless
+            # Counts-only receive event (None unless
             # split receives are on)
             counts_event = None
             if recv_drafts:
                 # Record the counts event before the
                 # draft receive
                 if self.split_recv_events:
+
                     counts_event = self.broadcast_stream.record_event()
                 draft_tokens = sampled_tokens.new_empty(
                     num_reqs, self.num_speculative_steps

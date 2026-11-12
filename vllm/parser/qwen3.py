@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import functools
 import json
+import os
 from collections.abc import Callable, Sequence
 from typing import TYPE_CHECKING
 
@@ -38,6 +39,7 @@ from vllm.parser.engine.token_id_scanner import (
     DROP_TERMINAL,
     PreLexedTerminal,
 )
+from vllm.tool_parsers.utils import find_tool_name
 
 if TYPE_CHECKING:
     from vllm.entrypoints.openai.chat_completion.protocol import (
@@ -84,7 +86,7 @@ def _trim_wrapping_newlines(value: str) -> str:
 
 def _qwen3_arg_converter(raw_args: str, partial: bool) -> str:
     params: dict[str, object] = {}
-    # a value ends at the
+    # A value ends at the
     # first ``</parameter>`` followed by the next opener or the body end, so
     # literal ``</parameter>`` text (and ``<parameter=`` text next to it, as in
     # quoted XML) inside a value is kept.
@@ -297,7 +299,7 @@ def _anchored_value_extender(raw_args: str, anchored: str) -> ArgValueExtender |
     return _anchored_extender(raw)
 
 
-# a ``</parameter>`` and the whitespace after it.
+# A ``</parameter>`` and the whitespace after it.
 _PARAM_CLOSE_WS_RE = re.compile(r"<\s*/\s*parameter\s*>\s*")
 _PARAM_CLOSE_END_RE = re.compile(r"<\s*/\s*parameter\s*>\s*$")
 
@@ -368,7 +370,7 @@ def _anchored_extender(raw: str) -> ArgValueExtender:
     return extend
 
 
-# upstream's partial conversion (the
+# Upstream's partial conversion (the
 # reading ``_param_value_extender`` streams), kept to fence the extender off
 # values that hold literal tags: there the anchored converter reads a different
 # open value, and a delta streamed into the wrong one breaks the JSON.
@@ -563,12 +565,34 @@ class Qwen3StreamingParserEngine(StreamingParserEngine):
     }
     # what may follow a real call-ending ``</function>`` (after whitespace)
     _CALL_FOLLOWERS = frozenset({"TOOL_END", "TOOL_START", "FUNC_PREFIX"})
-    # Set per request, vllm/merlin/tool_none.py
+    # Set per request (vllm/merlin/tool_none.py).
     literal_tool_markup = False
     keep_think_tags = False
+    # The tool-name gate: the request's tools when it may
+    # get calls (set per request, vllm/merlin/tool_none.py); None leaves the gate off.
+    offered_tools: list | None = None
+    # Literal-span rules, default on
+    # (MERLIN_QWEN3_LITERAL_SPANS=0 turns them off): fenced spans and
+    # tool blocks quoted in closed reasoning stay text.
+    literal_spans = os.environ.get("MERLIN_QWEN3_LITERAL_SPANS", "1") != "0"
+    _HEADER_MAX = 512  # a header longer than this is not a name to judge
 
     def reset(self, initial_state: ParserState | None = None) -> None:
         super().reset(initial_state=initial_state)
+        # Items of an opener held until the
+        # function name is complete; ("term", terminal, value, tokens) or
+        # ("text", text, None, tokens) like ``_defer``.
+        self._gate: list[tuple[str, str, str | None, int]] = []
+        self._quote: list[tuple[str, str, str | None, int]] = []
+        self._quote_closed = False  # a ``</think>`` is the last held terminal
+        self._fence_items: list[tuple[str, str, str | None, int]] = []
+        self._bypass = {"gate": 0, "quote": 0, "fence": 0}
+        self._line_start, self._indent = True, 0
+        self._run_char: str | None = None
+        self._run_len, self._run_at_start = 0, False
+        self._fence_char: str | None = None
+        self._fence_len = 0
+        self._close_pending = False
         self._held_terminal: str | None = None
         self._held: list[tuple[str, int]] = []
         # Deferred ``</function>``: items ("term", terminal, value, tokens) or
@@ -694,7 +718,7 @@ class Qwen3StreamingParserEngine(StreamingParserEngine):
             and (terminal != "THINK_START" or self._wrote_text)
         )
 
-    # a special token returned as text counts
+    # A special token returned as text counts
     # as one token; the base loop passes none for it, which auto keeps.
     def _process_scanner_items(self, items) -> list[SemanticEvent]:
         if not self.literal_tool_markup:
@@ -735,12 +759,248 @@ class Qwen3StreamingParserEngine(StreamingParserEngine):
                 self._after_spelled_start = True
         return events
 
+
+    @property
+    def holding_opener(self) -> bool:
+        """A ``<tool_call>`` seen in reasoning has not been settled yet."""
+        return self._held_terminal == "TOOL_START" or bool(
+            self._gate or self._quote or self._fence_items
+        )
+
+    def _opens_call(self, terminal: str) -> bool:
+        transition = self.config.transitions.get((self.state, terminal))
+        return (
+            transition is not None
+            and self.state not in self._TOOL_STATES
+            and transition.next_state in self._TOOL_STATES
+        )
+
+    @functools.cached_property
+    def _header_re(self) -> re.Pattern:
+        start = re.escape(self.config.terminals["TOOL_START"])
+        prefix = re.escape(self.config.terminals["FUNC_PREFIX"])
+        return re.compile(rf"(?:{start}\s*)?{prefix}(?P<name>[^<>\n]*)>")
+
+    def _replay_items(self, items: list, layer: str, literal: bool) -> list[SemanticEvent]:
+        """Feed held items back in order, past ``layer``; with ``literal`` an
+        opener (and so the call it would start) is text."""
+        events: list[SemanticEvent] = []
+        self._bypass[layer] += 1
+        try:
+            for kind, a, b, token_count in items:
+                if kind == "text":
+                    events.extend(self._emit_for_state(a, token_count))
+                elif literal and self._opens_call(a):
+                    events.extend(self._emit_for_state(b, token_count))
+                else:
+                    replayed = self._on_terminal(a, b, token_count)
+                    if a == "TOOL_START" and any(
+                        e.type == EventType.REASONING_END for e in replayed
+                    ):
+                        # A held opener ended reasoning: the tool pass needs its
+                        # ids from the opener on (Qwen3Parser._feed).
+                        self.opened_held_call = True
+                    events.extend(replayed)
+        finally:
+            self._bypass[layer] -= 1
+        return events
+
+    def _gate_add(self, item: tuple) -> list[SemanticEvent]:
+        """Hold an opener until its ``<function=NAME>`` is complete. A complete
+        header naming a tool the request did not offer stays text where it was
+        written; anything else takes the path it took before."""
+        self._gate.append(item)
+        raw = "".join(b if kind == "term" else a for kind, a, b, _ in self._gate)
+        complete = self._header_re.match(raw)
+        if complete is None and len(raw) <= self._HEADER_MAX:
+            if self._header_re.fullmatch(raw, partial=True) is not None:
+                return []
+        items, self._gate = self._gate, []
+        literal = complete is not None and not find_tool_name(
+            self.offered_tools, complete.group("name").strip()
+        )
+        return self._replay_items(items, "gate", literal)
+
+    def _hold_quote(self, item: tuple) -> list[SemanticEvent]:
+        """A tool block opened in reasoning is held: an explicit ``</think>``
+        followed by more output makes it quoted reasoning; the end of output
+        (after nothing but whitespace) keeps it a call (implicit end)."""
+        kind, a, b, token_count = item
+        more = a.strip() if kind == "text" else a in self.config.terminals
+        if self._quote_closed and more:  # a turn-end marker is not more output
+            items, self._quote, self._quote_closed = self._quote, [], False
+            k = next(
+                i for i, it in enumerate(items) if it[0] == "term" and it[1] == "THINK_END"
+            )
+            events = self._replay_items(items[:k], "quote", literal=True)
+            events.extend(self._replay_items(items[k:], "quote", literal=False))
+            events.extend(
+                self._emit_for_state(a, token_count)
+                if kind == "text"
+                else self._on_terminal(a, b, token_count)
+            )
+            return events
+        self._quote.append(item)
+        if kind == "term" and a == "THINK_END":
+            self._quote_closed = True
+        return []
+
+    def _track(self, text: str) -> None:
+        """Follow CommonMark code fences (a line-start run of 3+ backticks or
+        tildes, closed by a run of the same character at least as long with
+        only whitespace after it on its line)."""
+        for ch in text:
+            if self._run_char is not None:
+                if ch == self._run_char:
+                    self._run_len += 1
+                    continue
+                self._end_run()
+            if ch == "\n":
+                if self._close_pending:
+                    self._fence_char, self._fence_len = None, 0
+                self._close_pending = False
+                self._line_start, self._indent = True, 0
+                continue
+            if self._close_pending and ch not in " \t\r":
+                self._close_pending = False
+            if self._line_start and ch in "`~":
+                self._run_char, self._run_len, self._run_at_start = ch, 1, True
+                continue
+            if self._line_start and ch == " " and self._indent < 3:
+                self._indent += 1
+                continue
+            self._line_start = False
+
+    def _end_run(self) -> None:
+        char, length, at_start = self._run_char, self._run_len, self._run_at_start
+        self._run_char, self._run_len, self._line_start = None, 0, False
+        if length < 3 or not at_start:
+            return
+        if self._fence_char is None:
+            self._fence_char, self._fence_len = char, length
+        elif char == self._fence_char and length >= self._fence_len:
+            self._close_pending = True
+
+    def _fence_open(self) -> bool:
+        if self._run_char is not None:
+            self._end_run()
+        return self._fence_char is not None
+
+    def _hold_in_fence(self, item: tuple, tracked: bool = False) -> list[SemanticEvent]:
+        """Hold an opener written inside an open fence, and what follows, until
+        the fence closes (all text) or the output ends (trailing-run rule)."""
+        kind, a, b, token_count = item
+        if kind == "term" and a == "THINK_END" and self.state == ParserState.REASONING:
+            items, self._fence_items = self._fence_items, []
+            self._fence_char, self._fence_len, self._close_pending = None, 0, False
+            events = self._replay_items(items, "fence", literal=True)
+            return events + self._on_terminal(a, b, token_count)
+        self._fence_items.append(item)
+        if not tracked:
+            self._track(a if kind == "text" else b)
+        if self._fence_char is None:
+            items, self._fence_items = self._fence_items, []
+            return self._replay_items(items, "fence", literal=True)
+        return []
+
+    def _flush_fence(self) -> list[SemanticEvent]:
+        items, self._fence_items = self._fence_items, []
+        if self._run_char is not None:
+            self._end_run()
+        if self._close_pending:  # closed on the output's last line
+            return self._replay_items(items, "fence", literal=True)
+        # Trailing-run rule: complete or truncated ``<tool_call>``
+        # blocks that end the output, with only whitespace between them, are
+        # calls; anything before them in the fence is text.
+        start, inside = None, False
+        for i, (kind, a, b, _) in enumerate(items):
+            if kind == "term" and a == "TOOL_START" and not inside:
+                start = i if start is None else start
+                inside = True
+            elif kind == "term" and a == "TOOL_END":
+                inside = False
+            elif not inside and kind == "text" and a.strip():
+                # Text after a block (markers such as a turn end do not count).
+                start = None
+        if start is None:
+            return self._replay_items(items, "fence", literal=True)
+        events = self._replay_items(items[:start], "fence", literal=True)
+        events.extend(self._replay_items(items[start:], "fence", literal=False))
+        return events
+
+    def _flush_spans(self) -> list[SemanticEvent]:
+        events: list[SemanticEvent] = []
+        while self._fence_items or self._quote or self._gate:
+            if self._fence_items:
+                events.extend(self._flush_fence())
+            elif self._quote:
+                items, self._quote, self._quote_closed = self._quote, [], False
+                events.extend(self._replay_items(items, "quote", literal=False))
+            else:
+                items, self._gate = self._gate, []
+                events.extend(self._replay_items(items, "gate", literal=False))
+        return events
+
+    def _capture(self, item: tuple) -> list[SemanticEvent] | None:
+        """Route an item into a pending hold; None when nothing is held."""
+        if self._fence_items and not self._bypass["fence"]:
+            return self._hold_in_fence(item)
+        if self._quote and not self._bypass["quote"]:
+            return self._hold_quote(item)
+        if self._gate and not self._bypass["gate"]:
+            return self._gate_add(item)
+        return None
+
+    def _start_hold(self, terminal: str, value: str, token_count: int) -> list[SemanticEvent] | None:
+        """Start a hold at a call opener; None when no hold applies."""
+        if self._defer or self._held_terminal is not None or not self._opens_call(terminal):
+            return None
+        in_reasoning_pass = self.skip_tool_parsing and self.state != ParserState.REASONING
+        if in_reasoning_pass and self.config.initial_state == ParserState.REASONING:
+            # The reasoning pass after ``</think>``: the tool pass decides.
+            return None
+        item = ("term", terminal, value, token_count)
+        if (
+            self.literal_spans
+            and not self._bypass["fence"]
+            and self.state in self._PLAIN_STATES
+            and self._fence_open()
+        ):
+            return self._hold_in_fence(item, tracked=True)
+        if (
+            self.offered_tools is not None
+            and self.config.validate_tool_names
+            and not self._bypass["gate"]
+            and not in_reasoning_pass
+        ):
+            return self._gate_add(item)
+        if (
+            self.literal_spans
+            and not self._bypass["quote"]
+            and terminal == "TOOL_START"
+            and self.state == ParserState.REASONING
+        ):
+            return self._hold_quote(item)
+        return None
+
     def _on_terminal(
         self, terminal: str, value: str, token_count: int = 0
     ) -> list[SemanticEvent]:
         self._after_spelled_start = False
         if self.literal_tool_markup and self._stays_text(terminal):
             return self._emit_for_state(value, token_count)
+        held = self._capture(("term", terminal, value, token_count))
+        if held is not None:
+            return held
+        if (
+            self.literal_spans
+            and not self._bypass["fence"]
+            and self.state in self._PLAIN_STATES
+        ):
+            self._track(value)
+        held = self._start_hold(terminal, value, token_count)
+        if held is not None:
+            return held
         if self._defer:
             return self._defer_terminal(terminal, value, token_count)
         held = self._held_terminal
@@ -772,6 +1032,15 @@ class Qwen3StreamingParserEngine(StreamingParserEngine):
         return events
 
     def _emit_for_state(self, text: str, token_count: int = 0) -> list[SemanticEvent]:
+        held = self._capture(("text", text, None, token_count))
+        if held is not None:
+            return held
+        if (
+            self.literal_spans
+            and not self._bypass["fence"]
+            and self.state in self._PLAIN_STATES
+        ):
+            self._track(text)
         self._wrote_text = self._wrote_text or bool(text.strip())
         if text.strip():
             self._after_spelled_start = False
@@ -793,7 +1062,7 @@ class Qwen3StreamingParserEngine(StreamingParserEngine):
     def finish(self) -> list[SemanticEvent]:
         self._finishing = True
         pending = self._scanner.flush_pending()
-        # a marker still deferred here never
+        # A marker still deferred here never
         # lined up with text. Its text, if any, is already in the pending text, so
         # returning it as text as well would write what the model did not.
         if self.literal_tool_markup:
@@ -801,6 +1070,7 @@ class Qwen3StreamingParserEngine(StreamingParserEngine):
         events = self._process_scanner_items(pending)
         events.extend(self._process_lex_tokens(self._lexer.flush()))
         self._finishing = False
+        events.extend(self._flush_spans())
         if self._held_terminal is not None:
             events.extend(self._release(structural=True))
         while self._defer:
@@ -859,7 +1129,7 @@ class Qwen3Parser(ParserEngine):
             **kwargs,
         )
 
-    # a held ``<tool_call>`` can end
+    # A held ``<tool_call>`` can end
     # reasoning one or more deltas after its token. The DelegatingParser hands
     # the tool parser only the confirming delta's ids, so prepend the ids from
     # the ``<tool_call>`` token on; without them the tag reads as plain text.
@@ -869,11 +1139,12 @@ class Qwen3Parser(ParserEngine):
         delta_token_ids: Sequence[int],
     ) -> list[SemanticEvent]:
         engine = self._engine
-        held_ids = self._held_call_ids if engine._held_terminal == "TOOL_START" else []
+        # Any hold of an opener counts.
+        held_ids = self._held_call_ids if engine.holding_opener else []
         events = super()._feed(delta_text, delta_token_ids)
         self._content_ids_prefix = held_ids if engine.opened_held_call else []
         engine.opened_held_call = False
-        if engine._held_terminal != "TOOL_START":
+        if not engine.holding_opener:
             self._held_call_ids = []
         elif held_ids:
             # In place: a long run of whitespace deltas stays linear.
@@ -892,7 +1163,7 @@ class Qwen3Parser(ParserEngine):
         slot = self._tool_slots[event.tool_index]
         slot.name = slot.name.strip()
 
-    # a rejected call leaves no index gap.
+    # A rejected call leaves no index gap.
     def _events_to_delta(self, events, finished=False):
         events = _merge_arg_chunks(events)
         delta = super()._events_to_delta(events, finished=finished)

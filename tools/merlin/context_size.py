@@ -142,7 +142,12 @@ def pool_note(plan, size: int, flags: dict) -> str:
     pin = vllm_size(pin)
     # Round down to whole reference blocks where the registry records them.
     blocks = cap.get("kv_blocks")
-    if blocks:
+    if dfl:
+        # The DFlash2 pin is a round byte figure, not whole blocks: the engine keeps pin // block bytes blocks, and
+        # its pool follows from the block count (the registry's measured formula, prefill runs on).
+        import registry as R
+        pool = R._dflash2_pool(pin // R.DFLASH2_KV_BLOCK_BYTES)
+    elif blocks:
         resolved_blocks = pin * blocks // reference
         pool = pool * resolved_blocks // blocks
     else:

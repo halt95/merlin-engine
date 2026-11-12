@@ -30,6 +30,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStat
 from vllm.logger import init_logger
 from vllm.merlin import decode_first
 from vllm.merlin import kv_host_tier
+from vllm.merlin import prefill_runs
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
 from vllm.multimodal.encoder_budget import MultiModalBudget
 from vllm.multimodal.inputs import MultiModalKwargsItem
@@ -239,7 +240,7 @@ class Scheduler(SchedulerInterface):
 
             self.requires_kv_delivery = self.connector.requires_kv_delivery
 
-        # prefix-cache pins stay on with the
+        # Prefix-cache pins stay on with the
         # host-RAM KV tier (kv_host_tier.keeps_prefix_pins), off with any
         # other connector.
         self.prefix_pins = self.connector is None or kv_host_tier.keeps_prefix_pins(
@@ -571,6 +572,10 @@ class Scheduler(SchedulerInterface):
             self.mamba_partial_cache_hit
             and self.kv_cache_manager.mamba_shared_prefix_checkpoint
         )
+        # VLLM_MERLIN_PREFILL_RUNS: a long prefill
+        # advances in runs of full chunks between decode-only windows (None =
+        # off, the default; refuses inconsistent settings here).
+        self.prefill_runs = prefill_runs.state(self)
 
         # Counts of non-empty steps scheduled / processed. update_from_output
         # is called once per scheduled step in FIFO order, so these stay in sync.
@@ -598,8 +603,12 @@ class Scheduler(SchedulerInterface):
         self._pause_state: PauseState = PauseState.UNPAUSED
 
         # In-flight requests still prefilling (prefill chunks + in-progress
-        # async KV loads). Their remaining-block reservation gates async loads.
+        # async KV loads). Their remaining-block reservation
+        # gates admissions and the growth of resumable sessions.
         self._inflight_prefills: set[Request] = set()
+        # Per landed load, the blocks
+        # its failed next chunk needed beyond its estimated remainder.
+        self._parked_extra: dict[Request, int] = {}
 
         # Requests with an async KV load, by stage (KV_FETCH_STAGES).
         # None when not tracked (stats disabled or no KV connector).
@@ -723,6 +732,9 @@ class Scheduler(SchedulerInterface):
             long_prefill_threshold = self.scheduler_config.long_prefill_token_threshold
             if long_prefill_threshold > 0:
                 max_prefill_tokens = min(max_prefill_tokens, long_prefill_threshold)
+            runs = getattr(self, "prefill_runs", None)
+            if runs is not None:
+                max_prefill_tokens = min(max_prefill_tokens, runs.cfg.chunk)
             aligned_end = end // block_size * block_size
             if aligned_end > start or block_size <= max_prefill_tokens:
                 end = aligned_end
@@ -807,7 +819,7 @@ class Scheduler(SchedulerInterface):
             or manager.num_pinned_waiters >= manager.MAX_PINNED_WAITERS
         ):
             return
-        # a bounded front of the queue.
+        # A bounded front of the queue.
         limit = getattr(manager, "MAX_INSPECTED_WAITERS", None)
         if max_requests is not None:
             limit = max_requests if limit is None else min(limit, max_requests)
@@ -847,7 +859,14 @@ class Scheduler(SchedulerInterface):
         assert plans is not None
         if plans.use_cold(request):
             return self.kv_cache_manager.empty_kv_cache_blocks, 0, 0, False, 0
-        hit = plans.admit(request)
+        # The auxiliary-output history
+        # limits the union hit as it limits the ordinary lookup.
+        hit = plans.admit(
+            request,
+            self.aux_output_connector.max_cache_hit(request)
+            if self.aux_output_connector is not None
+            else None,
+        )
         if hit is None:
             return None
         return (
@@ -958,6 +977,21 @@ class Scheduler(SchedulerInterface):
             long_prefill_token_threshold = max(
                 long_prefill_token_threshold, input_budget // num_eligible_reqs
             )
+        runs_step = (  # per-step prefill cap and runs
+            self.prefill_runs.begin_step(self) if self.prefill_runs is not None else None
+        )
+        if runs_step is not None and runs_step.active:
+            # The runs replace the long-prefill threshold while they are active.
+            long_prefill_token_threshold = 0
+        elif runs_step is not None and long_prefill_token_threshold > 0:
+            # The adaptive floor is a share of the step's prefill, which is the
+            # chunk here (the budget above it is decode headroom).
+            long_prefill_token_threshold = self.scheduler_config.long_prefill_token_threshold
+            if self.adaptive_long_prefill_threshold:
+                long_prefill_token_threshold = max(
+                    long_prefill_token_threshold,
+                    min(input_budget, self.prefill_runs.cfg.chunk) // num_eligible_reqs,
+                )
 
         # Local prefill cadence: hold prefill until the interval since the last
         # prefill-carrying step has elapsed, so decode runs in longer
@@ -988,6 +1022,16 @@ class Scheduler(SchedulerInterface):
             decode_first.reservations(self, decode_cap, long_prefill_token_threshold)
             if self.decode_first is not None
             else None
+        )
+
+        # A running request that can
+        # park holding its blocks (a resumable session) leaves parked async
+        # loads (in flight or landed) the blocks they still need: parked, it
+        # would hold them until its client acts. Any other running request
+        # grows as before and frees its blocks when it finishes. The parked
+        # set does not change during the running loop.
+        parked_reserved_blocks = self._inflight_prefill_reserved_blocks(
+            parked_only=True
         )
 
         # First, schedule the RUNNING requests.
@@ -1035,6 +1079,15 @@ class Scheduler(SchedulerInterface):
                 # cadence-aligned step; decodes still run to fill this step.
                 req_index += 1
                 continue
+            if (  # a long prefill waits whole steps
+                runs_step is not None
+                and request.is_prefill_chunk
+                and self.prefill_runs.defers(
+                    runs_step, request, min(token_budget, input_budget - draft_slots)
+                )
+            ):
+                req_index += 1
+                continue
 
             if (
                 self.ec_connector is not None
@@ -1066,6 +1119,8 @@ class Scheduler(SchedulerInterface):
                 - request.num_computed_tokens
                 - self.num_sampled_tokens_per_step,
             )
+            if runs_step is not None and request.is_prefill_chunk:
+                num_new_tokens = min(num_new_tokens, runs_step.prefill_budget)
             if decode_reserve and request.is_prefill_chunk:
                 num_new_tokens = decode_first.cap_prefill(
                     self, decode_reserve, req_index, request, num_new_tokens,
@@ -1124,6 +1179,8 @@ class Scheduler(SchedulerInterface):
                 req_index += 1
                 continue
 
+            growth_reserved_blocks = parked_reserved_blocks if request.resumable else 0
+            reservation_self_preempt = False
             # Schedule newly needed KV blocks for the request.
             with record_function_or_nullcontext("schedule: allocate_slots"):
                 while True:
@@ -1131,6 +1188,7 @@ class Scheduler(SchedulerInterface):
                         request,
                         num_new_tokens,
                         num_lookahead_tokens=self.num_lookahead_tokens,
+                        reserved_blocks=growth_reserved_blocks,
                     )
 
                     if new_blocks is not None:
@@ -1192,12 +1250,24 @@ class Scheduler(SchedulerInterface):
                     # Preempting cannot help a request that would not fit even
                     # with every other block back (in-flight steps may still
                     # free its own, so only once none is in flight).
+                    # Judged without the
+                    # parked loads' reservations, which they give back.
                     if not request.num_in_flight_tokens and self._kv_dead_end(
-                        request
+                        request, reserved_blocks=growth_reserved_blocks
                     ):
                         break
+                    # A session short
+                    # only by a parked load's reservation preempts itself:
+                    # another runner is never the victim of that reservation.
+                    reservation_self_preempt = (
+                        0
+                        < self.kv_cache_manager.last_alloc_shortfall
+                        <= growth_reserved_blocks
+                    )
                     # Preempt the lowest-priority request.
-                    if self.policy == SchedulingPolicy.PRIORITY:
+                    if reservation_self_preempt:
+                        preempted_req = request
+                    elif self.policy == SchedulingPolicy.PRIORITY:
                         preempted_req = max(
                             self.running,
                             key=lambda r: (r.priority, r.arrival_time),
@@ -1209,7 +1279,11 @@ class Scheduler(SchedulerInterface):
                     if not self._request_blocks_can_be_freed(preempted_req):
                         break
 
-                    if self.policy == SchedulingPolicy.PRIORITY:
+                    # Removed by index.
+                    if (
+                        self.policy == SchedulingPolicy.PRIORITY
+                        or reservation_self_preempt
+                    ):
                         victim_index = self.running.index(preempted_req)
                         del self.running[victim_index]
                         if victim_index < req_index:
@@ -1226,6 +1300,12 @@ class Scheduler(SchedulerInterface):
                             scheduled_running_reqs.remove(preempted_req)
                             num_decodes_scheduled -= not preempted_req.is_prefill_chunk
                             restored = num_scheduled_tokens.pop(preempted_req_id)
+                            if runs_step is not None:
+                                runs_step.note(
+                                    preempted_req,
+                                    -restored,
+                                    preempted_req.is_prefill_chunk,
+                                )
                             token_budget += restored
                             input_budget += restored + draft_slots
                             req_to_new_blocks.pop(preempted_req_id)
@@ -1244,6 +1324,8 @@ class Scheduler(SchedulerInterface):
                     else:
                         preempted_req = self.running.pop()
 
+                    if reservation_self_preempt:
+                        self._note_reservation_preemption(preempted_req)
                     self._preempt_request(
                         preempted_req,
                         scheduled_timestamp,
@@ -1257,8 +1339,10 @@ class Scheduler(SchedulerInterface):
             if new_blocks is None:
                 if (
                     self.policy == SchedulingPolicy.PRIORITY
-                    and request.status == RequestStatus.PREEMPTED
-                ):
+                    # Also after a session
+                    # preempted itself for a reservation.
+                    or reservation_self_preempt
+                ) and request.status == RequestStatus.PREEMPTED:
                     # The request was the lowest-priority running request and
                     # preempted itself. The requests after it have higher
                     # priority and may still fit (it just freed its blocks);
@@ -1272,6 +1356,8 @@ class Scheduler(SchedulerInterface):
             scheduled_running_reqs.append(request)
             prefill_scheduled |= request.is_prefill_chunk
             num_decodes_scheduled += not request.is_prefill_chunk
+            if runs_step is not None:
+                runs_step.note(request, num_new_tokens, request.is_prefill_chunk)
             request_id = request.request_id
             req_to_new_blocks[request_id] = new_blocks
             num_scheduled_tokens[request_id] = num_new_tokens
@@ -1343,6 +1429,12 @@ class Scheduler(SchedulerInterface):
                 if not request_queue and self._pause_state == PauseState.UNPAUSED:
                     request_queue = self.waiting
                 if not request_queue or input_budget <= draft_slots:
+                    break
+                if (  # inactive: as a budget of Q
+                    runs_step is not None
+                    and not runs_step.active
+                    and runs_step.prefill_budget <= 0
+                ):
                     break
                 # Paused streaming sessions (WAITING_FOR_STREAMING_REQ) are not
                 # in `running` but still hold a model-runner request slot.
@@ -1608,6 +1700,14 @@ class Scheduler(SchedulerInterface):
                     # Or a plan's host slots.
                     assert num_external_computed_tokens > 0 or plan_hit is not None
                     num_new_tokens = 0
+                elif runs_step is not None and self.prefill_runs.defers_admission(
+                    runs_step,
+                    request,
+                    request.num_tokens - num_computed_tokens,
+                    min(token_budget, input_budget - draft_slots),
+                ):
+                    skip_request(request_queue)
+                    continue
                 elif defer_prefills and num_computed_tokens < request.num_tokens - 1:
                     # DP prefill balancing: defer this step's local prefill
                     # compute to a cadence-aligned step.
@@ -1625,6 +1725,12 @@ class Scheduler(SchedulerInterface):
                     # `request.num_prompt_tokens` to consider the resumed
                     # requests, which have output tokens.
                     num_new_tokens = request.num_tokens - num_computed_tokens
+                    if runs_step is not None and num_new_tokens > 1:
+                        # A prefill admission takes the step's prefill cap; one
+                        # token left is a decode row on the decode headroom.
+                        request_token_budget = min(
+                            request_token_budget, runs_step.prefill_budget
+                        )
 
                     # Pad new decode requests to uniform spec decoding size to
                     # preserve full cudagraph for this step.
@@ -1768,17 +1874,61 @@ class Scheduler(SchedulerInterface):
                         for i in encoder_inputs_to_schedule
                     )
 
-                reserved_blocks = 0
+                # An admission leaves
+                # parked loads the blocks they still need. A landed load's own
+                # next chunk reserves nothing for the others: it then runs and
+                # frees its blocks like any running request, so an older load
+                # it overtakes waits for it, never for a client. Not a
+                # resumable session's: it could finish its turn and park on
+                # what it took.
+                if (
+                    not load_kv_async
+                    and request in self._inflight_prefills
+                    and self._is_parked_load(request)
+                    and not request.resumable
+                ):
+                    reserved_blocks = 0
+                else:
+                    reserved_blocks = self._inflight_prefill_reserved_blocks(
+                        exclude=request, parked_only=not load_kv_async
+                    )
+                # The part of the reservation other requests hold claim to.
+                others_reserved_blocks = reserved_blocks
+                full_sequence_reserved_blocks = None
+                full_sequence_lookahead_tokens = None
                 if load_kv_async:
                     # An async load holds its blocks for the whole transfer with
                     # no forward progress and isn't preemptible here. Admit it
                     # only if it fits in (free - other in-flight reservations)
                     # plus its own spec decode step blocks, to avoid deadlock and
                     # predictable preemptions.
-                    reserved_blocks = (
-                        self._inflight_prefill_reserved_blocks()
-                        + self._spec_decode_step_blocks
-                    )
+                    reserved_blocks += self._spec_decode_step_blocks
+                    # The others' remainders gate its first draw only, as
+                    # before, so its copy starts when it did. When no block
+                    # can come back (nothing running or scheduled, no free
+                    # pending, and under FCFS no older load to run and free
+                    # first), its whole sequence must fit with the lookahead
+                    # slots it is admitted without, counted as its first step
+                    # after landing draws them (prompt + lookahead), else the
+                    # load lands and can never take its last chunk.
+                    full_sequence_reserved_blocks = 0
+                    if (
+                        self.num_lookahead_tokens
+                        and not self.running
+                        and not num_scheduled_tokens
+                        and not self._blocks_will_return(request)
+                        and (
+                            self.policy == SchedulingPolicy.PRIORITY
+                            or not self._num_parked_loads(exclude=request)
+                        )
+                    ):
+                        full_sequence_lookahead_tokens = self.num_lookahead_tokens
+                # Async loads need room
+                # for their full prompt even when scheduler_reserve_full_isl
+                # is off.
+                full_sequence_must_fit = (
+                    self.scheduler_reserve_full_isl or load_kv_async
+                )
 
                 # Replayed tokens are already counted in the adopted hit; a
                 # chunk that ends inside the replayed range needs no new slots.
@@ -1797,8 +1947,10 @@ class Scheduler(SchedulerInterface):
                         else ()
                     ),
                     num_encoder_tokens=num_encoder_tokens,
-                    full_sequence_must_fit=self.scheduler_reserve_full_isl,
+                    full_sequence_must_fit=full_sequence_must_fit,
                     reserved_blocks=reserved_blocks,
+                    full_sequence_reserved_blocks=full_sequence_reserved_blocks,
+                    full_sequence_lookahead_tokens=full_sequence_lookahead_tokens,
                     has_scheduled_reqs=bool(self.running),
                     evicts_needed=(
                         self.thrash.eviction_check(request, protected)
@@ -1835,8 +1987,14 @@ class Scheduler(SchedulerInterface):
                             num_external_computed_tokens=num_external_computed_tokens,
                             delay_cache_blocks=load_kv_async,
                             num_encoder_tokens=num_encoder_tokens,
-                            full_sequence_must_fit=self.scheduler_reserve_full_isl,
+                            full_sequence_must_fit=full_sequence_must_fit,
                             reserved_blocks=reserved_blocks,
+                            full_sequence_reserved_blocks=(
+                                full_sequence_reserved_blocks
+                            ),
+                            full_sequence_lookahead_tokens=(
+                                full_sequence_lookahead_tokens
+                            ),
                             has_scheduled_reqs=bool(self.running),
                         )
                     yield_for_head = new_blocks is None and (
@@ -1863,8 +2021,14 @@ class Scheduler(SchedulerInterface):
                             num_external_computed_tokens=num_external_computed_tokens,
                             delay_cache_blocks=load_kv_async,
                             num_encoder_tokens=num_encoder_tokens,
-                            full_sequence_must_fit=self.scheduler_reserve_full_isl,
+                            full_sequence_must_fit=full_sequence_must_fit,
                             reserved_blocks=reserved_blocks,
+                            full_sequence_reserved_blocks=(
+                                full_sequence_reserved_blocks
+                            ),
+                            full_sequence_lookahead_tokens=(
+                                full_sequence_lookahead_tokens
+                            ),
                             has_scheduled_reqs=bool(self.running),
                         )
                 if (
@@ -1886,8 +2050,14 @@ class Scheduler(SchedulerInterface):
                             num_external_computed_tokens=num_external_computed_tokens,
                             delay_cache_blocks=load_kv_async,
                             num_encoder_tokens=num_encoder_tokens,
-                            full_sequence_must_fit=self.scheduler_reserve_full_isl,
+                            full_sequence_must_fit=full_sequence_must_fit,
                             reserved_blocks=reserved_blocks,
+                            full_sequence_reserved_blocks=(
+                                full_sequence_reserved_blocks
+                            ),
+                            full_sequence_lookahead_tokens=(
+                                full_sequence_lookahead_tokens
+                            ),
                             has_scheduled_reqs=bool(self.running),
                         ),
                     )
@@ -1910,20 +2080,39 @@ class Scheduler(SchedulerInterface):
                         num_external_computed_tokens=num_external_computed_tokens,
                         delay_cache_blocks=load_kv_async,
                         num_encoder_tokens=num_encoder_tokens,
-                        full_sequence_must_fit=self.scheduler_reserve_full_isl,
+                        full_sequence_must_fit=full_sequence_must_fit,
                         reserved_blocks=reserved_blocks,
+                        full_sequence_reserved_blocks=full_sequence_reserved_blocks,
+                        full_sequence_lookahead_tokens=(
+                            full_sequence_lookahead_tokens
+                        ),
                         has_scheduled_reqs=bool(self.running),
                     )
 
                 if new_blocks is None:
                     # The request cannot be scheduled.
-                    # a plan that waiting cannot
+                    # A plan that waiting cannot
                     # fit lowers its boundary next pass, never stalls.
                     if plan_hit is not None and kv_cache_manager.last_alloc_shortfall:
+                        # Parked loads
+                        # will run and free their blocks as running requests
+                        # do, and the plan's own need is measured without
+                        # their reservations: a reservation alone never
+                        # lowers a plan.
                         self.tier_plans.note_unfit(
                             request,
-                            shortfall=kv_cache_manager.last_alloc_shortfall,
-                            num_running=len(self.running),
+                            shortfall=self._own_shortfall(others_reserved_blocks),
+                            num_running=len(self.running)
+                            + self._num_parked_loads(exclude=request)
+                            # A parked streaming session frees nothing until
+                            # its client acts, so it is no progress.
+                            + any(
+                                other is not request
+                                and other.status
+                                != RequestStatus.WAITING_FOR_STREAMING_REQ
+                                and self._holds_kv_blocks(other)
+                                for other in self.requests.values()
+                            ),
                         )
                     # Nothing runs or was scheduled, so no free is coming: a
                     # request short by more than every other block held would
@@ -1931,8 +2120,16 @@ class Scheduler(SchedulerInterface):
                     if (
                         not self.running
                         and not num_scheduled_tokens
-                        and not load_kv_async
-                        and self._kv_dead_end(request)
+                        # An async load
+                        # with no host-tier plan (that path lowers the plan
+                        # instead) errors when it can never fit, as it did
+                        # after its load before.
+                        and (not load_kv_async or plan_hit is None)
+                        and self._kv_dead_end(
+                            request,
+                            reserved_blocks=kv_cache_manager.last_alloc_shortfall
+                            - self._own_shortfall(others_reserved_blocks),
+                        )
                     ):
                         if request.has_encoder_inputs:
                             self.encoder_cache_manager.free(request)
@@ -1943,6 +2140,33 @@ class Scheduler(SchedulerInterface):
                     # manager
                     if request.has_encoder_inputs:
                         self.encoder_cache_manager.free(request)
+                    # A landed load short
+                    # of more than its estimated remainder keeps the
+                    # difference reserved until it runs, so later admissions
+                    # cannot take it either.
+                    if (
+                        not load_kv_async
+                        and request in self._inflight_prefills
+                        and self._is_parked_load(request)
+                        and kv_cache_manager.last_alloc_shortfall > 0
+                        and not kv_cache_manager.last_alloc_demotion_wait
+                    ):
+                        self._note_parked_shortfall(
+                            request, others_reserved_blocks
+                        )
+                    # A landed load that cannot take its next chunk while
+                    # nothing can free a block would hold the queue for ever:
+                    # give its blocks back to the prefix cache and admit it
+                    # again from there.
+                    if (
+                        not self.running
+                        and not num_scheduled_tokens
+                        and not load_kv_async
+                        and self._landed_load_cannot_progress(request)
+                    ):
+                        self._release_landed_load(request)
+                        skip_request(request_queue)
+                        continue
                     if young_miss:
                         # A young miss that does not fit, or that the eviction
                         # check vetoed, does not hold the head of the line.
@@ -2075,9 +2299,12 @@ class Scheduler(SchedulerInterface):
                 num_scheduled_tokens[request_id] = num_new_tokens
                 token_budget -= num_new_tokens
                 input_budget -= num_new_tokens + draft_slots
+                if runs_step is not None:
+                    runs_step.note_admitted(request, num_new_tokens, num_computed_tokens)
                 request.status = RequestStatus.RUNNING
                 request.num_computed_tokens = num_computed_tokens
                 self._set_kv_fetch_stage(request, None)
+                self._parked_extra.pop(request, None)
                 drafts_needed = drafts_needed or not self._drafts_unused(
                     request, num_computed_tokens, num_new_tokens
                 )
@@ -2139,6 +2366,8 @@ class Scheduler(SchedulerInterface):
         # whether a new admission or a running chunk.
         if self.local_prefill_interval > 1 and (prefill_scheduled or prefill_admitted):
             self.last_prefill_step = self.num_executed_steps
+        if runs_step is not None:
+            self.prefill_runs.end_step(self, runs_step)
 
         assert token_budget >= 0
         assert input_budget >= 0
@@ -2363,7 +2592,7 @@ class Scheduler(SchedulerInterface):
         )
         if self.aux_output_connector is not None:
             self.aux_output_connector.request_finished(request)
-        # a preempted prefix is a restore unit,
+        # A preempted prefix is a restore unit,
         # recorded before its blocks are freed.
         record_preempted = getattr(self.connector, "record_preempted", None)
         if record_preempted is not None:
@@ -3718,6 +3947,7 @@ class Scheduler(SchedulerInterface):
         if self.aux_output_connector is not None:
             self.aux_output_connector.request_finished(request)
         self._inflight_prefills.discard(request)
+        self._parked_extra.pop(request, None)
         self._set_kv_fetch_stage(request, None)
         connector_delay_free_blocks, kv_xfer_params = self._connector_finished(request)
 
@@ -3756,7 +3986,7 @@ class Scheduler(SchedulerInterface):
         logger.info("setting pause state to %s", pause_state.name)
         self._pause_state = pause_state
 
-    def _kv_dead_end(self, request: Request) -> bool:
+    def _kv_dead_end(self, request: Request, reserved_blocks: int = 0) -> bool:
         """Whether ``request``'s last failed ``allocate_slots`` can never pass,
         and if so mark it to finish with FINISHED_ERROR (not resumable).
 
@@ -3767,11 +3997,15 @@ class Scheduler(SchedulerInterface):
         (decode growth, spec-decode lookahead, Mamba checkpoint or CoW blocks)
         preempts itself, pins its own hit and waits forever with the engine
         idle and no error.
+
+        ``reserved_blocks``: the other requests' reservation the failed
+        allocation left free. Their holders give those blocks back, so they
+        are not part of the request's own shortfall.
         """
         manager = self.kv_cache_manager
         pool = manager.block_pool
         usable = pool.num_gpu_blocks - 1  # the null block
-        shortfall = manager.last_alloc_shortfall
+        shortfall = manager.last_alloc_shortfall - reserved_blocks
         # 0: refused by a check other than capacity. (The Mamba same-step-hit
         # sentinel cannot reach here: a running request adopts no hit, and the
         # waiting caller requires an empty step, so no block was cached in it.)
@@ -3971,7 +4205,7 @@ class Scheduler(SchedulerInterface):
                 if block.block_hash is not None
             })
         reset_successful = self.kv_cache_manager.reset_prefix_cache()
-        # in-flight leases drain asynchronously.
+        # In-flight leases drain asynchronously.
         if reset_running_requests and not reset_successful and not tier_reset:
             raise RuntimeError(
                 "Failed to reset KV cache even when all the running requests are "
@@ -4194,11 +4428,179 @@ class Scheduler(SchedulerInterface):
                 kv_fetch_stages[request] = stage
                 self._kv_fetch_counts[stage] += 1
 
-    def _inflight_prefill_reserved_blocks(self) -> int:
-        """Num blocks in-flight prefills still need to finish (their reservation)."""
-        return sum(
-            self._request_remaining_blocks(req) for req in self._inflight_prefills
+    def _is_parked_load(self, request: Request) -> bool:
+        """An in-flight prefill that is not running and holds KV blocks: an
+        async KV load in flight, or landed and waiting for its next chunk. It
+        cannot be preempted and its blocks free only when it runs."""
+        return request.status != RequestStatus.RUNNING and self._holds_kv_blocks(
+            request
         )
+
+    def _num_parked_loads(self, exclude: Request | None = None) -> int:
+        parked = [r for r in self._inflight_prefills if self._is_parked_load(r)]
+        return len(parked) - (exclude in parked)
+
+    def _landed_load_cannot_progress(self, request: Request) -> bool:
+        """Whether ``request``, a landed async load whose next chunk just did
+        not fit, can never get the blocks: nothing runs or was scheduled (the
+        caller checks), no load is in flight, and no deferred free, in-flight
+        step or connector transfer will return a block. Admissions and session
+        growth leave parked loads their reservation and other running work
+        frees its blocks when it ends, so this is reached only when the
+        estimated remainder fell short of the load's real need."""
+        if (
+            request not in self._inflight_prefills
+            or not self._is_parked_load(request)
+            or self.kv_cache_manager.last_alloc_shortfall <= 0
+            or self._blocks_will_return(request)
+        ):
+            return False
+        # A load whose receive arrived is not in flight: it waits to be
+        # promoted by a scan this head stops.
+        return not any(
+            other.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+            and other.request_id not in self.finished_recving_kv_req_ids
+            for other in self.requests.values()
+            if other is not request
+        )
+
+    def _blocks_will_return(self, request: Request) -> bool:
+        """Whether a block will come back without any request running: a
+        deferred free, another request's in-flight step, a connector transfer
+        that frees blocks, or a host-tier preempt grace (a bounded hold that
+        ends within a few steps; pin yields never release it)."""
+        return bool(
+            self.deferred_frees
+            or (
+                self.connector is not None
+                and self.connector.has_pending_block_frees()
+            )
+            or any(
+                other.num_in_flight_tokens
+                for other in self.requests.values()
+                if other is not request
+            )
+            or self._tier_holds_preempt_grace()
+        )
+
+    def _own_shortfall(self, others_reserved_blocks: int) -> int:
+        """The last failed allocation's shortfall net of other requests'
+        reservations: the largest over the checks that failed, each net of
+        the part of ``others_reserved_blocks`` that check carried."""
+        manager = self.kv_cache_manager
+        if manager.last_alloc_shortfall <= 0:
+            return 0
+        own = max(
+            (
+                shortfall - min(others_reserved_blocks, carried)
+                for shortfall, carried in manager.last_alloc_checks
+            ),
+            default=manager.last_alloc_shortfall,
+        )
+        return max(own, 0)
+
+    def _tier_holds_preempt_grace(self) -> bool:
+        writeback = getattr(
+            getattr(self.connector, "scheduler_manager", None), "writeback", None
+        )
+        copyq = getattr(writeback, "copyq", None)
+        return copyq is not None and copyq.holds_preempt_grace()
+
+    def _release_landed_load(self, request: Request) -> None:
+        """Give a landed load's blocks back and requeue it from computed 0.
+        Its loaded blocks were cached when it landed, so its next admission
+        hits them (or their host copies) again: nothing is lost, nothing is
+        recomputed that a hit can serve."""
+        logger.warning(
+            "Request %s: its loaded prefix cannot take the next %d KV cache "
+            "block(s) and nothing can free one; its blocks go back to the "
+            "prefix cache and it is admitted again from there.",
+            request.request_id,
+            self.kv_cache_manager.last_alloc_shortfall,
+        )
+        # As a preemption releases it:
+        # the tier records the released prefix and its preempt grace, so the
+        # next admission is booked as a resumed prefix, not a second restore.
+        if self.aux_output_connector is not None:
+            self.aux_output_connector.request_finished(request)
+        record_preempted = getattr(self.connector, "record_preempted", None)
+        if record_preempted is not None:
+            record_preempted(request)
+        tier_preempted = getattr(
+            getattr(self.connector, "scheduler_manager", None),
+            "tier_preempted",
+            None,
+        )
+        if tier_preempted is not None:
+            tier_preempted(request)
+        self._free_request_blocks(request)
+        self._pending_encoder_input_ids.pop(request.request_id, None)
+        self._inflight_prefills.discard(request)
+        self._parked_extra.pop(request, None)
+        self._set_kv_fetch_stage(request, None)
+        request.num_computed_tokens = 0
+        counters = self._tier_plan_counters()
+        if counters is not None:
+            counters.restore_released += 1
+
+    def _inflight_prefill_reserved_blocks(
+        self, exclude: Request | None = None, *, parked_only: bool = False
+    ) -> int:
+        """Blocks in-flight prefills still need to finish (their reservation).
+
+        ``parked_only``: only the parked loads' (``_is_parked_load``), which
+        new admissions and resumable-session growth must leave free; a running prefill can be preempted,
+        so only async loads keep room for it too. A prefill that holds no
+        blocks (a failed load, freed) reserves nothing: it is admitted afresh.
+        """
+        if parked_only and self.kv_cache_config.hisparse_host_num_blocks is not None:
+            # HiSparse loads can return the host-pool admission sentinel; like
+            # their host pages, they gate async loads only.
+            return 0
+        reserving = [
+            req
+            for req in self._inflight_prefills
+            if req is not exclude
+            and (
+                self._is_parked_load(req)
+                or (not parked_only and req.status == RequestStatus.RUNNING)
+            )
+        ]
+        return sum(
+            self._request_remaining_blocks(req) + self._parked_extra.get(req, 0)
+            for req in reserving
+        )
+
+    def _note_parked_shortfall(self, request: Request, reserved_blocks: int) -> None:
+        """A landed load's next chunk just failed for room, leaving
+        ``reserved_blocks`` to the other parked loads (none for a chat load,
+        their remainders for a resumable one): remember what it needed beyond
+        its estimated remainder, which estimator drift (a Mamba state or
+        checkpoint block at promotion) can leave short. The others' share is
+        theirs, not this load's need."""
+        need = (
+            self.kv_cache_manager.last_alloc_shortfall
+            + self.kv_cache_manager.block_pool.get_num_free_blocks()
+            - reserved_blocks
+        )
+        extra = need - self._request_remaining_blocks(request)
+        if extra > 0:
+            self._parked_extra[request] = extra
+        else:
+            self._parked_extra.pop(request, None)
+
+    def _tier_plan_counters(self):
+        return self.tier_plans.counters if self.tier_plans is not None else None
+
+    def _note_reservation_preemption(self, request: Request) -> None:
+        """A resumable session's growth fell short only by a parked load's
+        reservation and ``request`` is preempted for it."""
+        counters = self._tier_plan_counters()
+        if counters is not None:
+            counters.reservation_preemptions += 1
+            counters.reservation_preempt_tokens += max(
+                request.num_computed_tokens - request.num_in_flight_tokens, 0
+            )
 
     def _load_restores_replay_window(self, request: Request) -> bool:
         """Whether the KV connector's load for ``request`` restores every DSV41

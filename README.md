@@ -37,8 +37,8 @@ talking to the server, serving on your network, picking GPUs and switching model
 
 ```bash
 git clone https://github.com/halt95/merlin-engine.git && cd merlin-engine
-curl -LO https://github.com/halt95/merlin-engine/releases/download/merlin-v3.0.2/vllm-0.33.0+merlin.665f43d2cf-cp313-cp313-linux_x86_64.whl
-MERLIN_WHEEL="$PWD/vllm-0.33.0+merlin.665f43d2cf-cp313-cp313-linux_x86_64.whl" bash release/install-env.sh ./venv
+curl -LO https://github.com/halt95/merlin-engine/releases/download/merlin-v3.0.2.1/vllm-0.33.0+merlin.c56eeed392-cp313-cp313-linux_x86_64.whl
+MERLIN_WHEEL="$PWD/vllm-0.33.0+merlin.c56eeed392-cp313-cp313-linux_x86_64.whl" bash release/install-env.sh ./venv
 
 venv/bin/hf download halt95/Qwen3.8-Flash-Next-W4A16-Merlin --local-dir ~/models/flash-next
 (cd ~/models/flash-next && sha256sum -c "$OLDPWD/models/flash-next/checkpoint.sha256")
@@ -53,20 +53,19 @@ from source, which takes about 1.5 hours on 8 cores. The first start compiles ke
 
 ## Models
 
-| Model | Type | GPUs | KV pool, tokens | Decode at 262K | 8 agents, thinking on | 8 agents, thinking off (3.0.1 run) | GSM8K-200, thinking on | GSM8K-200, thinking off (3.0.1 run) |
+| Model | Type | GPUs | KV pool, tokens | Decode at 262K | 8 agents, thinking on | 8 agents, thinking off | GSM8K-200, thinking on | GSM8K-200, thinking off |
 |---|---|---|---|---|---|---|---|---|
-| [Flash-Next](https://huggingface.co/halt95/Qwen3.8-Flash-Next-W4A16-Merlin) | 125B MoE | 4 | 924,993 | 207 tok/s | 654 tok/s | 664 tok/s | 197 (3.0.1 run) | 199 |
-| [Swift1.5](https://huggingface.co/halt95/Swift1.5-Qwen3.8-Flash-Next-W4A16-Merlin) | Flash-Next fine-tune | 4 | 924,993 | 186 tok/s | 659 tok/s | 650 tok/s | 199 | 197 |
-| [Swift1.5-Huihui](https://huggingface.co/halt95/Swift1.5-Huihui-Qwen3.8-Flash-Next-W4A16-Merlin) | Swift1.5, abliterated | 4 | 924,993 | 193 tok/s | 718 tok/s | 681 tok/s | 198 | 198 |
-| [Qwen3.8-27B](https://huggingface.co/halt95/Qwen3.8-27B-W4A16-Merlin) | 27B dense | 1 / 2 / 4 | 271,506 / 826,689 / 2,012,105 | 77 / 146 / 250 tok/s | – / 682 / 940 tok/s | – / 615 / 854 tok/s | 198 (4 GPUs; 3.0.1 run) | 195 / 194 / 197 |
-| [ThinkingCap](https://huggingface.co/halt95/ThinkingCap-Qwen3.8-27B-W4A16-Merlin) | 27B fine-tune | 2 / 4 | 826,689 / 2,012,105 | 160 / 223 tok/s | 708 / 939 tok/s | 633 / 832 tok/s | 198 (4 GPUs) | 193 / 195 |
-| [Nemotron 3.5 Super VL](https://huggingface.co/halt95/Nemotron-3.5-Super-VL-120B-A12B-W4A16-Merlin) | 120B MoE, 1M context | 4 | 1,856,367 | 106 tok/s | 432 tok/s (3.0.1 run) | 432 tok/s | 197 (3.0.1 run) | 195 |
-| [Ornith 1.5](https://huggingface.co/halt95/Ornith-1.5-122B-A10B-W4A16-Merlin) | 122B MoE | 4 | 894,618 | 111 tok/s | 528 tok/s (3.0.1 run) | 486 tok/s | 196 (3.0.1 run) | 190 |
+| [Flash-Next](https://huggingface.co/halt95/Qwen3.8-Flash-Next-W4A16-Merlin) | 125B MoE | 4 | 924,993 | 192 tok/s | 640 tok/s | 641 tok/s † | 197 | 198 |
+| [Swift1.5](https://huggingface.co/halt95/Swift1.5-Qwen3.8-Flash-Next-W4A16-Merlin) | Flash-Next fine-tune | 4 | 924,993 | 182 tok/s | 688 tok/s | 661 tok/s | 199 | 198 |
+| [Swift1.5-Huihui](https://huggingface.co/halt95/Swift1.5-Huihui-Qwen3.8-Flash-Next-W4A16-Merlin) | Swift1.5, abliterated | 4 | 924,993 | 203 tok/s | 719 tok/s | 668 tok/s † | 198 | 197 |
+| [Qwen3.8-27B](https://huggingface.co/halt95/Qwen3.8-27B-W4A16-Merlin) † | 27B dense | 1 / 2 / 4 | 271,506 / 826,689 / 2,012,105 | 75 / 160 / 233 tok/s | – / 740 / 970 tok/s | – / 677 / 857 tok/s | 198 (4 GPUs) | 194 / 194 / 195 |
+| [ThinkingCap](https://huggingface.co/halt95/ThinkingCap-Qwen3.8-27B-W4A16-Merlin) † | 27B fine-tune | 2 / 4 | 826,689 / 2,012,105 | 163 / 233 tok/s | 731 / 974 tok/s | 663 / 856 tok/s | 196 (4 GPUs) | 195 / 193 |
+| [Nemotron 3.5 Super VL](https://huggingface.co/halt95/Nemotron-3.5-Super-VL-120B-A12B-W4A16-Merlin) † | 120B MoE, 1M context | 4 | 1,856,367 | 101 tok/s | 444 tok/s | 417 tok/s | 196 | 194 |
+| [Ornith 1.5](https://huggingface.co/halt95/Ornith-1.5-122B-A10B-W4A16-Merlin) † | 122B MoE | 4 | 894,618 | 107 tok/s | 516 tok/s | 484 tok/s | 195 | 191 |
 
-<sub>Merlin 3.0.2. Measured on 4 x RTX 3090 at 220 W with P2P enabled (aikitoria's open-gpu-kernel-modules P2P driver) and Zagitta's gpu-unlock. Decode is one stream with thinking on (reasoning effort medium where the checkpoint has one; the Nemotron 3.5 Super VL and Ornith 1.5 templates have no effort levels), at the full
-262,144-token context. 8 agents is total throughput for eight simultaneous follow-ups on 16K conversations; with thinking on (effort medium) a 512-token follow-up may end inside the reasoning, and reasoning tokens count. GSM8K-200 is correct answers out
-of 200. GSM8K-200 follows the 3.0.1 card's protocol: thinking on at effort medium on four cards, re-run on 3.0.2 for Swift1.5, Swift1.5-Huihui and ThinkingCap; thinking off is from the 3.0.0 run, as the weights are unchanged. On the full GSM8K test set (1,319 problems, 5-shot, thinking off, temperature 0, 512 tokens) Flash-Next on 3.0.2 scored 1,281 (97.1 %), against 1,276 and 1,275 (96.7 %) for 3.0.1 in two runs of the same session. (3.0.1 run): figure from Merlin 3.0.1 on vLLM 0.32, not re-run for 3.0.2. All models use an FP8 KV cache and MTP speculative decoding. The bench cards
-have the full figures and method.</sub>
+<sub>Merlin 3.0.2.1 · 4 x RTX 3090 at 220 W, P2P on ([aikitoria's driver](https://github.com/aikitoria/open-gpu-kernel-modules)) and [Zagitta's gpu-unlock](https://github.com/Zagitta/gpu-unlock) · 2026-11-10 to 2026-11-12.<br>
+Decode: one stream, thinking on, full 262K context · 8 agents: total throughput on 16K conversations · GSM8K-200: correct out of 200.<br>
+Build of each cell, ranges and method: the [bench cards](benchmarks/2026-11-12/README.md); † previous build (ThinkingCap's two-card 262K decode excepted), see cards.</sub>
 
 ## Features
 
@@ -74,24 +73,26 @@ have the full figures and method.</sub>
   Flash-Next keeps three full 262K conversations in memory on four 3090s.
 - **FP8 KV cache on Ampere,** with our own kernels for cards that lack native FP8.
 - **Faster prefill.** Up to 33 % faster at 262K in Merlin 3.0.1 than in 3.0.0, with the optional gpu-unlock host upgrade;
-  3.0.2 against 3.0.1: unchanged within run-to-run spread, except Nemotron 3.5 Super VL +8 %.
+  3.0.2 against 3.0.1: unchanged within run-to-run spread, except Nemotron 3.5 Super VL +8 %; 3.0.2.1 against 3.0.2:
+  unchanged within run-to-run spread.
 - **On vLLM 0.33.** torch 2.14, Triton 3.8 and FlashInfer 0.7.2.post1, with the sm_86 FP8 patches carried over.
 - **Built for agents.** Follow-up turns resume from cache, even when more conversations are open than the cache can
   hold.
 - **KV RAM cache (experimental).** `--kv-ram-cache 24g` keeps conversation prefixes the GPU evicts in host RAM and
   restores them with identical output: on Flash-Next a 262K restore takes 1.2–1.4 s instead of about 45 s to recompute (Merlin 3.0.1, vLLM 0.32).
+  Since 3.0.2.1 it keeps its speed once full ([details](docs/CHANGELOG.md#highlights)).
 - **Swarm mode (experimental).** `--swarm` raises the session cap on four RTX 3090s, from 8 to 24 on the Flash-Next
   family and from 24 to 32 on the 27B family, with a 48 GB KV RAM cache. Tested on Flash-Next and the 27B with P2P (Merlin 3.0.1, vLLM 0.32).
-- **PLE table on NVMe (experimental).** `--ple-store disk` reads the Flash-Next family's embedding table from the model
-  files on NVMe instead of holding it in host RAM: free memory rises by 47.7–47.8 GiB (38.8–38.9 GiB with `--ple int6`),
-  and output matched RAM token for token. It costs about 2 % of decode speed once the table is cached, 9–11 % on text
-  whose rows are not cached yet, and the first token of a cold 262K prompt takes 7–53 % longer; cached, it is unchanged.
-  With a large `--kv-ram-cache` the table never fully warms (+10–11 % decode at 262K with 96g). Measured on 4 x RTX 3090
-  with one Gen4 NVMe; other disks and layouts are untested ⚫. The figures are from the 0.32 tree; the 0.33 re-run has not been run for 3.0.2. `ram` stays the default. [Costs and limits](docs/how-to-serve.md#the-ple-table-on-nvme-experimental).
+- **Flash-Next: shared prompts reused, long prompts take turns.** A first turn behind a shared system prompt resumes from
+  a cached checkpoint (FGPC), and a long cold prompt holds running sessions back less (prefill runs); both on since 3.0.2.1 ([details](docs/CHANGELOG.md#highlights)).
+- **Flash-Next, Swift1.5 and Swift1.5-Huihui on four 20 GB cards (untested ⚫).** One 262K session on RTX 3080 20GB,
+  RTX A4500 or RTX 4000 Ada cards, with static cold-expert offload (`MERLIN_COLD_EXPERTS`); emulated for Flash-Next only.
+- **PLE table on NVMe (experimental).** `--ple-store disk` reads the Flash-Next family's embedding table from NVMe
+  instead of host RAM, freeing about 47.7 GiB for about 2 % slower decode once cached; `ram` stays the default. [Costs and limits](docs/how-to-serve.md#the-ple-table-on-nvme-experimental).
 - **DFlash2 for the Flash-Next family.** `--spec dflash2` on four RTX 3090s with P2P decodes 5–18 % faster than MTP
   (Merlin 3.0.1, vLLM 0.32), which stays the default.
 - **Vision, reasoning and tool calling** on every model, with images up to 8 MP (Nemotron: its native ~3.4 MP; the 27B
-  on one card: 4 MP; not re-measured on Pillow 13).
+  on one card: 4 MP; not re-measured on Pillow 13). Quoted tool calls stay text (`MERLIN_QWEN3_LITERAL_SPANS`).
 - **Low idle power.** Four idle 3090s draw 110 W (Merlin 3.0.0, vLLM 0.32).
 - **One command.** `merlin serve <model>` picks the best layout for the GPUs it finds.
 - **A Ready line and a bug-report file.** `merlin serve` prints the URL, model, context length and key location once the
@@ -113,6 +114,11 @@ have the full figures and method.</sub>
   tile for 27B, so every checkpoint keeps an FP8 KV cache on cards with no native FP8.
 - **QSA indexer scratch reserve (opt-in).** `VLLM_MERLIN_QSA_SCRATCH=reserve|workspace` lets the KV sizing see
   Flash-Next's QSA indexer scratch; `off` stays the default, and KV capacity figures for the two modes have not been measured for 3.0.2.
+- **Static cold-expert offload.** `MERLIN_COLD_EXPERTS=<profile.json>` keeps each named MoE layer's hottest experts on
+  the GPU and reads the rest from pinned host RAM; output is identical. On by default on the 4 × 20 GB Flash-Next rows;
+  `MERLIN_COLD_EXPERTS_LAYERS`, `MERLIN_COLD_EXPERTS_HOT_FRAC` and `MERLIN_COLD_EXPERTS=0` ([flags](docs/CHANGELOG.md#new-flags-and-environment-variables)).
+- **Leaner boots.** `MERLIN_REPACK_RELEASE` (on) frees the allocator's cache after each weight repack, communicators
+  are created before the KV is sized, and `--cpu-offload-params` can name one layer (`layers.3.mlp.experts`).
 
 **Faster decode and prefill**
 
@@ -129,12 +135,14 @@ have the full figures and method.</sub>
   not yet measured; the A/B has not been run for 3.0.2.
 - **Decode-first step budget (experimental, off by default).** `VLLM_MERLIN_DECODE_FIRST=1` keeps running sessions
   decoding while a long cold prefill runs, instead of stalling until it ends. Temperature-0 output is not proven identical
-  with it on, so it stays off.
+  with it on, so it stays off. On Flash-Next it needs `PREFILL_RUNS=0`.
 - **DFlash2 drafter for the Flash-Next family.** `--spec dflash2` runs incoai's block-diffusion drafter on four RTX 3090s
   with P2P: decode 5–18 % faster than MTP (Merlin 3.0.1, vLLM 0.32), and the server holds three 262K sessions instead of
   six 131K ones. MTP stays the default.
 - **All-reduce tuned for PCIe P2P.** Flash-Next on P2P hosts uses a PCIe IPC all-reduce for decode-sized messages
   and NCCL's Simple protocol for prefill.
+- **Qwen3.8-27B on two RTX 3090s with P2P** sets six decode defaults (`NCCL_PROTO=Simple`, the PCIe-IPC all-reduce,
+  `VLLM_DRAFT_BOUNDED_PLAN`, `VLLM_GDN_DECODE_FASTPATH`, `VLLM_GDN_SHARED_ALIGN_INDEX`, `VLLM_TARGET_SEQ_LENS_ASYNC`; [results](docs/CHANGELOG.md#highlights)).
 - **Marlin W8A16** for Flash-Next's INT8 GDN projections.
 
 **Built for agents**
@@ -145,9 +153,14 @@ have the full figures and method.</sub>
 - **Cache-thrash protection, on by default.** Cost-aware admission and session-coherent yields keep follow-ups
   cached when more sessions are open than the pool holds: under 8 × 131K and 12 × 80K oversubscription, follow-up
   turns reused 74.7 % and 82.1 % of their prompt from cache (Merlin 3.0.0, vLLM 0.32).
+- **Shared-prefix checkpoints on every Flash-Next-family and 27B-family launcher.** A first turn behind a shared prompt
+  of at least one attention block resumes from the cached junction ([FGPC](docs/CHANGELOG.md#highlights); off:
+  `-- --no-enable-mamba-shared-prefix-checkpoint`).
+- **Long prompts in slices and runs (Flash-Next family).** 512-token slices (`LPT`, `--long-prefill-token-threshold`),
+  and prefill runs between decode-only windows while sessions decode (`PREFILL_RUNS=0` / `VLLM_MERLIN_PREFILL_RUNS`; [costs](docs/CHANGELOG.md#known-limits)).
 - **KV RAM cache (experimental).** `--kv-ram-cache SIZE` keeps prefixes the GPU evicts in host RAM and restores them
   instead of recomputing them, with exactly the same output as a GPU cache hit. Flash-Next family with MTP and
-  Qwen3.8-27B; off by default.
+  Qwen3.8-27B; off by default. [3.0.2.1 fixes](docs/CHANGELOG.md#highlights).
 - **Longer context (experimental).** `--context 512k` serves past 262K with YaRN built from the checkpoint's config,
   and refuses a size above the layout's KV pool. Most combinations are untested ⚫; see the
   [Flash-Next reference](models/flash-next/docs/reference.md#context-size-302).
@@ -157,38 +170,44 @@ have the full figures and method.</sub>
   (⚫, expected to work).
 - **A chat template that keeps the cache.** Every Flash-Next-family and Qwen3.8-27B-family recipe serves a fixed Qwen3.8 template that accepts system
   messages after the first turn, so coding agents' per-turn notes no longer break the prefix cache.
+  Nemotron 3.5 Super VL keeps earlier turns' thinking in the prompt (`truncate_history_thinking: true` opts out).
 - **Vision, reasoning and tool calling on every checkpoint,** with images up to 8 MP (Nemotron its native ~3.4 MP,
   one-card 27B 4 MP) and a per-image pixel cap (`MAX_PIXELS`).
-- **Forged control tokens stay text.** Chat messages, tools and documents that spell a control token such as `<|im_end|>`
-  are encoded as plain text (`--sanitize-control-tokens`, on by default; `--reject-mm-with-string-template`, off by
-  default, refuses multimodal input with a string-format template); Ornith 1.5 also covers its six FIM tokens
-  (`VLLM_MERLIN_EXTRA_CONTROL_TOKENS`). `tool_choice="none"` keeps tool-call markup the model wrote as text on the
-  Qwen-family parsers.
+- **Forged control tokens stay text.** Content that spells a control token such as `<|im_end|>` is encoded as text
+  (`--sanitize-control-tokens`, on; `--reject-mm-with-string-template`, off; Ornith's FIM tokens via
+  `VLLM_MERLIN_EXTRA_CONTROL_TOKENS`). `tool_choice="none"` and quoted or unoffered tool calls stay text (`MERLIN_QWEN3_LITERAL_SPANS`).
 
 **Steady in long runs**
 
-- **Repeatable greedy output and fault detection on any rank**, with faster shutdown.
+- **Fault detection on any rank**, with faster shutdown. Temperature-0 output repeats for one session on one install;
+  under concurrency it varies (see the bench cards).
 - **Idle cards drop to P8** with the runtime bounds guards on (Merlin 3.0.0, vLLM 0.32): 110 W idle on four RTX 3090s, against 446 W when the
   guard reader kept them awake.
 - **Compile-cache fault guard, on by default.** After a sticky CUDA fault the next start sets the used compile cache aside
   and recompiles once, and the compiled model file is checked against its SHA-256 at load.
   `VLLM_MERLIN_COMPILE_CACHE_GUARD=0` restores the 3.0.1 behaviour.
+- **Diagnostics on request.** `MERLIN_KV_TIER_DIAG=1` logs KV-tier decisions and `MERLIN_LOAD_PEAK_LOG=1` boot memory
+  peaks; both off by default.
 
 **One install, one command**
 
 - **`./setup.sh`** checks the host, recommends a checkpoint and layout for your GPUs, shows every download with its
-  size, installs the prebuilt engine (no compiling, nothing system-wide; about 1.5 minutes on 3.0.0, and the 3.0.2 fresh
-  install has not been timed) and starts the server.
+  size, installs the prebuilt engine (no compiling, nothing system-wide; about 1.5 minutes on 3.0.0; a 3.0.2 or 3.0.2.1
+  fresh install has not been timed) and starts the server.
 - **`merlin serve <checkpoint>`** recognises the checkpoint, picks the largest tested layout for the GPUs it finds,
   and starts the server; `merlin doctor` checks the host first. Every layout is a profile of `tools/merlin/launch.py`;
   every knob (`PORT`, `HOST`, `KV_BYTES`, `MAX_PIXELS`, ...) is an environment variable.
 - **`merlin serve --instances N`** now stays in the foreground and stops all N servers together.
+- **Parser and sampling switches.** `REASONING_PARSER`, `TOOL_CALL_PARSER` and `GENERATION_OVERRIDE` replace a recipe's
+  parsers or sampling (`none` turns one off); `USE_CKPT_TEMPLATE=1` serves the checkpoint's own template ([flags](docs/CHANGELOG.md#new-flags-and-environment-variables)).
 - **`P2P=ipc` (opt-in, untested):** a third interconnect mode on the Flash-Next rows with the PCIe-IPC all-reduce, for
   hosts where NCCL's P2P bootstrap hangs but CUDA peer access works.
 - **Container:** `MERLIN_WHEEL_URL` installs the release wheel into the image instead of compiling, and `MERLIN_PROFILE`
-  starts a chosen Flash-Next-family profile (thanks to brandon-nuttall); the 3.0.2 image is not yet requalified.
+  starts a chosen Flash-Next-family profile (thanks to brandon-nuttall); not requalified on a 3.0.2 or 3.0.2.1 image build.
 - **Profiles beyond the reference host:** RTX 3090 without P2P, eight RTX 3090s, RTX 4090 (24 and 48 GB),
-  RTX A6000 / A40, A100, A30 and CMP 170HX.
+  RTX A6000 / A40, A100, A30, CMP 170HX and, since 3.0.2.1, 20 GB cards (RTX 3080 20GB, RTX A4500, RTX 4000 Ada:
+  Qwen3.8-27B on two or four, Flash-Next, Swift1.5 and Swift1.5-Huihui on four). `--simulate 4x3080-20g` (or `4xa4500`, `4x4000ada`) plans for them without the
+  cards.
 - **One prebuilt wheel** for sm_80, sm_86 and sm_89, installed from a hash-locked requirements file.
 - **New variants just work.** A Flash-Next-family checkpoint that ships its own FP8 KV scales is served with them,
   with no repository update.
@@ -197,26 +216,26 @@ have the full figures and method.</sub>
 
 ## Performance
 
-<img src="docs/images/decode.svg" alt="Single-stream decode at 4K, 131K and 262K context for every model on Merlin 3.0.2 (vLLM 0.33)" width="100%">
+<img src="docs/images/decode.svg" alt="Single-stream decode at 4K, 131K and 262K context for every model on Merlin 3.0.2.1 (vLLM 0.33)" width="100%">
 
 <details>
 <summary><b>Prefill and time to first token at 262K</b></summary>
 
 | Model | GPUs | Prefill | Time to first token |
 |---|---|---|---|
-| Flash-Next | 4 | 6,782 tok/s | 38.6 s |
-| Swift1.5 | 4 | 6,762 tok/s | 38.7 s |
-| Swift1.5-Huihui | 4 | 6,830 tok/s | 38.3 s |
-| Qwen3.8-27B | 1 / 2 / 4 | 586 / 1,112 / 2,111 tok/s | 447.3 / 235.4 / 124.1 s |
-| ThinkingCap | 2 / 4 | 1,115 / 2,108 tok/s | 234.9 / 124.2 s |
-| Nemotron 3.5 Super VL | 4 | 4,217 tok/s | 62.1 s |
-| Ornith 1.5 | 4 | 2,288 tok/s | 114.5 s |
+| Flash-Next | 4 | 6,839 tok/s | 38.3 s |
+| Swift1.5 | 4 | 6,793 tok/s | 38.6 s |
+| Swift1.5-Huihui | 4 | 6,893 tok/s | 38.0 s |
+| Qwen3.8-27B † | 1 / 2 / 4 | 587 / 1,117 / 2,115 tok/s | 446.2 / 234.4 / 123.8 s |
+| ThinkingCap † | 2 / 4 | 1,116 / 2,115 tok/s | 234.6 / 123.8 s |
+| Nemotron 3.5 Super VL † | 4 | 4,193 tok/s | 62.5 s |
+| Ornith 1.5 † | 4 | 2,284 tok/s | 114.7 s |
 
-<sub>One stream, cold cache, 261,888-token prompt.</sub>
+<sub>One stream, cold cache, 261,888-token prompt. † previous build, see cards.</sub>
 
 </details>
 
-**Bench cards:** [Flash-Next](models/flash-next/benchmarks/2026-11-04/BENCH-CARD.md) · [Swift1.5](models/swift1.5/benchmarks/2026-11-05/BENCH-CARD.md) · [Swift1.5-Huihui](models/swift1.5-huihui/benchmarks/2026-11-05/BENCH-CARD.md) · [Qwen3.8-27B](models/qwen38-27b/benchmarks/2026-11-04/BENCH-CARD.md) · [ThinkingCap](models/thinkingcap/benchmarks/2026-11-05/BENCH-CARD.md) · [Nemotron 3.5 Super VL](models/nemotron-super-vl/benchmarks/2026-11-04/BENCH-CARD.md) · [Ornith 1.5](models/ornith1.5/benchmarks/2026-11-04/BENCH-CARD.md)
+**Bench cards:** [Flash-Next](models/flash-next/benchmarks/2026-11-12/BENCH-CARD.md) · [Swift1.5](models/swift1.5/benchmarks/2026-11-12/BENCH-CARD.md) · [Swift1.5-Huihui](models/swift1.5-huihui/benchmarks/2026-11-12/BENCH-CARD.md) · [Qwen3.8-27B](models/qwen38-27b/benchmarks/2026-11-12/BENCH-CARD.md) · [ThinkingCap](models/thinkingcap/benchmarks/2026-11-12/BENCH-CARD.md) · [Nemotron 3.5 Super VL](models/nemotron-super-vl/benchmarks/2026-11-12/BENCH-CARD.md) · [Ornith 1.5](models/ornith1.5/benchmarks/2026-11-12/BENCH-CARD.md)
 
 ## Hardware
 
@@ -227,12 +246,13 @@ have the full figures and method.</sub>
 | 4× RTX 4090 | 🟡 Testing on cloud-hosted cards, tuning in progress |
 | 2× or 4× CMP 170HX 64 GB | 🟡 Testing on cloud-hosted cards, tuning in progress |
 | 8× RTX 3090, RTX 4090 48 GB, A100, A30 | ⚫ Profile included, not yet tested by us |
+| 2× or 4× 20 GB (RTX 3080 20GB, RTX A4500, RTX 4000 Ada) | ⚫ Profiles included: Qwen3.8-27B on 2× or 4×; Flash-Next, Swift1.5 and Swift1.5-Huihui on 4× with cold-expert offload, one 262K session. Emulated for the 27B and Flash-Next; Swift not booted at 20 GB |
 
 Any NVIDIA sm_80, sm_86 or sm_89 card can run Merlin. The [How to serve](docs/how-to-serve.md#6-which-gpus-run-what)
 guide lists which models fit on which cards, and how many full-length conversations each setup holds.
 
 On RTX 3090s, PCIe P2P and Zagitta's [gpu-unlock](docs/merlin/hardware-matrix.md#optional-host-upgrade-gpu-unlock-geforce-ga102) are optional host upgrades: Merlin runs without
-them, and our bench numbers (3.0.1 and 3.0.2) are measured with both. In a stock-versus-unlocked A/B the unlock sped up prefill by
+them, and our bench numbers (3.0.1, 3.0.2 and 3.0.2.1) are measured with both. In a stock-versus-unlocked A/B the unlock sped up prefill by
 about 16–29 %; decode and output are unchanged.
 
 ## Requirements
@@ -255,16 +275,17 @@ about 16–29 %; decode and output are unchanged.
 [NVIDIA](https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-BF16) (Nemotron) · [ornith-ai](https://huggingface.co/ornith-ai/Ornith-1.5-122B) (Ornith 1.5, a fine-tune of Qwen's [Qwen3.5-122B-A10B](https://huggingface.co/Qwen/Qwen3.5-122B-A10B))
 
 **Quantisation:** [Intel](https://huggingface.co/Intel/Qwen3.8-Flash-Next-W4A16-AutoRound) (AutoRound) ·
-[RadixArk](https://huggingface.co/RadixArk/Qwen3.8-Flash-Next-NVFP4) (FP8 PLE table) · DominikBucko (MTP packing) ·
+[RadixArk](https://huggingface.co/RadixArk/Qwen3.8-Flash-Next-NVFP4) (FP8 PLE table) · [DominikBucko](https://github.com/DominikBucko/qwen38-flash-next-2x3090) (MTP packing) ·
 [philbert](https://huggingface.co/philbert440) (AWQ)
 
-**Engine:** [vLLM](https://github.com/vllm-project/vllm), FlashInfer, compressed-tensors and the vLLM community's
-PLE-offload work · [Sumandora](https://github.com/Sumandora/remove-refusals-with-transformers) (abliteration method) ·
+**Engine:** [vLLM](https://github.com/vllm-project/vllm), FlashInfer, compressed-tensors · [peakcrosser7](https://github.com/peakcrosser7/vllm/commits/release/qwen38next_offload)
+(Flash-Next model support, PLE offload) · RecoverSSM by Jurgen Schmied and Zihua Wu · [Sumandora](https://github.com/Sumandora/remove-refusals-with-transformers) (abliteration method) ·
 [froggeric](https://huggingface.co/froggeric/Qwen-Fixed-Chat-Templates) (chat template) · [aikitoria](https://github.com/aikitoria/open-gpu-kernel-modules)
 (P2P on consumer Ampere) · [Zagitta](https://github.com/Zagitta/gpu-unlock) (GPU unlock) · [incoai](https://huggingface.co/incoai/Qwen3.8-Flash-Next-DFlash2) (DFlash2 drafter) ·
 [club-3090](https://github.com/noonghunna/club-3090/discussions/1735) (sm_80 FP8 KV decoder port) · [Sudzpel](https://github.com/Sudzpel) (GPU unlock proposal and measurements) ·
 [brandon-nuttall](https://github.com/brandon-nuttall) (YaRN past 262K report, `SEQS`/`MAXLEN` launcher fix, `use_local_argmax_reduction`, TP2×PP4 community rig) · [R-omk](https://github.com/R-omk) (YaRN past 262K crash report and recipes) · [CoolShades](https://github.com/CoolShades) (idle-power report and first fix behind the v2.5.2 engine fix) ·
-[Neiko2002](https://huggingface.co/Neiko2002) · [Yarikdevcom](https://github.com/yarikdevcom) (independent work on the same hardware class)
+[jbeemer1](https://github.com/jbeemer1) (KV RAM cache report) · pondzikk · lucifer1004 · Jon-Nielsen · mgabor3141 ·
+[Neiko2002](https://huggingface.co/Neiko2002) · [Yarikdevcom](https://github.com/yarikdevcom) · noonghunna · tfriedel (independent work on the same hardware class)
 
 Upstream fixes are credited in the engine repository.
 

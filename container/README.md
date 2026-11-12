@@ -1,8 +1,8 @@
-# container/ — Merlin 3.0.2
+# container/ — Merlin 3.0.2.1
 
 > **Community-qualified on 8 x RTX 3090 at P2P=off (octo, TP4xPP2), on the 3.0.1 image, by
 > [brandon-nuttall](https://github.com/brandon-nuttall). Not qualified at P2P=on, on other layouts, on other cards or
-> models, or on a 3.0.2 image build.** Details under [Hardware qualification](#hardware-qualification).
+> models, or on a 3.0.2 or 3.0.2.1 image build.** Details under [Hardware qualification](#hardware-qualification).
 
 The image installs **this repository checkout**, built on vLLM **0.33.0**, through
 [release/install-env.sh](../release/install-env.sh). That shared installer owns the 0.33
@@ -17,7 +17,7 @@ install resolves. On the 3.0.0 release (vLLM 0.32) a fresh install (2026-10-21) 
 the container image itself is not yet qualified. The build context is the repository root;
 the image retains the checkout because the engine install is editable. The host's private `.git` directory is excluded.
 The build fetches source history from `SOURCE_URL` (default: the public repository)
-at `SOURCE_REF` (default: `merlin-v3.0.2`), checks that every copied tracked file matches
+at `SOURCE_REF` (default: `merlin-v3.0.2.1`), checks that every copied tracked file matches
 that ref, and lets the installer verify the checkout's commit and tree identity and its native-source pins. That fetched
 history stays in the image for subsequent source-identity verification.
 Build from the matching clean ref. Use a Docker-tag-safe published tag or full commit SHA as
@@ -67,7 +67,7 @@ MODEL_DIR=/absolute/path/to/Qwen3.8-Flash-Next-W4A16-Merlin \
   docker compose -f container/docker-compose.yml up --build -d
 ```
 
-The local image is named `merlin-engine:merlin-v3.0.2` by default, with its tag taken from
+The local image is named `merlin-engine:merlin-v3.0.2.1` by default, with its tag taken from
 `SOURCE_REF`. Compose builds from `..` using `container/Dockerfile` and reserves all NVIDIA GPUs.
 The default Flash-Next recipe
 uses four RTX 3090s. An A100 run must choose a compatible model and parallel
@@ -96,7 +96,7 @@ FlashInfer); the image installs the patch without enabling the tile globally. On
 For direct Docker use:
 
 ```bash
-SOURCE_REF=merlin-v3.0.2
+SOURCE_REF=merlin-v3.0.2.1
 docker build -f container/Dockerfile --build-arg SOURCE_REF="$SOURCE_REF" -t "merlin-engine:$SOURCE_REF" .
 docker run --gpus all --stop-timeout 70 --shm-size=8g --ulimit memlock=-1 \
   -p 127.0.0.1:8000:8000 -v /absolute/path/to/checkpoint:/models/checkpoint \
@@ -173,5 +173,5 @@ re-run it. **Scope, exactly:**
 | Use | served the rest of the day at the layout above |
 
 These are the contributor's own figures: no Merlin run, log or artifact backs them. The 3.0.2 image (vLLM 0.33.0, FlashInfer
-0.7.2.post1, the toolkit link-time stub and wheel path above) has not been built or requalified for 3.0.2.
+0.7.2.post1, the toolkit link-time stub and wheel path above) has not been built or requalified for 3.0.2 or 3.0.2.1.
 The build failure this fixed: with no driver in `docker build` and no `libcuda` in the pip CUDA distribution, CMake's CUDAToolkit module cannot create the `CUDA::cuda_driver` target, and the native configure fails on every target that links it (`cumem_allocator`, `_C_stable_libtorch`, `_moe_C_stable_libtorch`, `_vllm_fa2_C`, `_vllm_fa3_C`; "CMake Generate step failed"), as reported on the 3.0.1 image.

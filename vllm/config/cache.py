@@ -327,6 +327,7 @@ class CacheConfig:
     prefix caching yet. Mamba2 speculative decode requires FlashInfer. With
     prefix caching, flushes are most efficient when mamba_block_size is a
     multiple of replayssm_buffer_len, but this is not required."""
+
     use_recoverssm: bool = field(default=False, init=False)
     """Whether RecoverSSM speculative decode is used (Kimi-K3 KDA; Qwen4Exp GDN and PLE;
     dense Qwen3.5 GDN; NemotronH Mamba-2, which replaces the Mamba2 ReplaySSM ring and

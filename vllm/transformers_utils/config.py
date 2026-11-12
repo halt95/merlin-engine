@@ -28,8 +28,11 @@ from transformers.utils import CONFIG_NAME as HF_CONFIG_NAME
 
 from vllm import envs
 from vllm.logger import init_logger
-# model-type aliases for HF AutoConfig.
-from vllm.merlin.flashnext_config import register_config_aliases
+# Flash-Next / Qwen3.5 model-type aliases for HF AutoConfig.
+from vllm.merlin.flashnext_config import (
+    canonicalize_qwen35_model_types,
+    register_config_aliases,
+)
 from vllm.transformers_utils.repo_utils import is_mistral_model_repo
 from vllm.transformers_utils.utils import (
     parse_safetensors_file_metadata,
@@ -470,6 +473,8 @@ class HFConfigParser(ConfigParserBase):
                     raise RuntimeError(err_msg) from e
                 else:
                     raise e
+        # Aliased model_type -> canonical.
+        config = canonicalize_qwen35_model_types(config)
         config = _maybe_remap_hf_config_attrs(config)
         return config_dict, config
 
@@ -998,6 +1003,8 @@ def get_config(
     if hf_overrides_fn:
         logger.debug("Overriding HF config with %s", hf_overrides_fn)
         config = hf_overrides_fn(config)
+    # hf_overrides model_types are canonicalised too.
+    config = canonicalize_qwen35_model_types(config)
 
     # Exhaustively patch RoPE parameters everywhere they might be
     patch_rope_parameters(config)

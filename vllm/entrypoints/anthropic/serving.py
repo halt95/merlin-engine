@@ -594,6 +594,7 @@ class AnthropicServingMessages(OpenAIServingChat):
                         tool_reference.append(
                             {"type": "tool_reference", "name": ref_name}
                         )
+
             # The served chat templates raise on a structured tool_reference
             # part, so each reference is rendered as a text line in this tool
             # message instead of a second structured tool message. The

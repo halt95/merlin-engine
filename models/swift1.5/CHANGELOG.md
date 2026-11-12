@@ -7,6 +7,20 @@ Release notes, newest first. To install and run the current release, see the [RE
 (scripts, environment variables, capacity, known behaviours, measurement method) is in
 [docs/reference.md](docs/reference.md).
 
+## Merlin 3.0.2.1
+
+The Swift recipe runs on **vLLM 0.33.0** in Merlin 3.0.2.1; the recipe version stays 3.0.0. See the
+[engine changelog](../../docs/CHANGELOG.md#merlin-3021). The Swift1.5 and Swift1.5-Huihui results are in their [2026-11-12 bench cards](benchmarks/2026-11-12/BENCH-CARD.md) ([Huihui](../swift1.5-huihui/benchmarks/2026-11-12/BENCH-CARD.md)); the 2026-11-05 cards stay as the 3.0.2 comparators.
+
+- **Inherited from the Flash-Next launcher** for Swift1.5 and Swift1.5-Huihui:
+  - FGPC on (`-- --no-enable-mamba-shared-prefix-checkpoint` turns it off);
+  - `--long-prefill-token-threshold 512` (`LPT=0` turns it off);
+  - the prefill runs, a long cold prompt taking turns with the running sessions (`PREFILL_RUNS=0` turns them off);
+  - quoted tool calls kept as text (`MERLIN_QWEN3_LITERAL_SPANS=0` turns it off);
+  - the KV RAM cache fixes.
+
+  These defaults were measured on Flash-Next, not on the Swift checkpoints.
+
 ## Merlin 3.0.2
 
 The Swift recipe runs on **vLLM 0.33.0** in Merlin 3.0.2; the recipe version stays 3.0.0. See the

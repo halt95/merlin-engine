@@ -61,6 +61,7 @@ class _PendingCompletion:
 
 
 class PleProgressMonitor:
+
     """Bound compilation/submission separately from ordered GPU completion.
 
     Only a first-seen shape or explicit startup gets the host compile budget.
@@ -90,6 +91,7 @@ class PleProgressMonitor:
         self._condition = threading.Condition()
         self._submission: _Submission | None = None
         self._pending: deque[_PendingCompletion] = deque()
+
         self._seen_num_tokens: set[int] = set()
         self._sequence = 0
         self._stopping = False
@@ -171,6 +173,7 @@ class PleProgressMonitor:
                     depth=active.depth + 1,
                 )
             else:
+
                 # begin_forward receives num_tokens_after_padding: the eager
                 # input size, or the FULL graph's validated captured copy size
                 # (_prepare_ple_forward checks that equality). Keep exact sizes:
@@ -192,6 +195,7 @@ class PleProgressMonitor:
                     deadline=now + budget,
                     depth=1,
                 )
+
             # Admission consumes the one cold allowance (including dummy/capture
             # shapes). Host submissions are serialized and failures are fatal;
             # a later serving begin of this size follows its prior host submit.

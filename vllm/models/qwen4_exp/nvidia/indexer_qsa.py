@@ -183,7 +183,7 @@ class QSAIndexer(nn.Module):
             vllm_config=vllm_config,
         )
 
-        # a port of vllm#60490
+        # A port of vllm#60490
         from .ops.qsa_indexer import _prefill_workspace_bytes
 
         max_model_len = vllm_config.model_config.max_model_len
@@ -201,7 +201,7 @@ class QSAIndexer(nn.Module):
         )
         self._init_profile_scratch(vllm_config, spec, max_model_len)
 
-    # a port of vllm#60490
+    # A port of vllm#60490
     def _init_profile_scratch(
         self, vllm_config: VllmConfig, spec: Any, max_model_len: int
     ) -> None:
@@ -255,7 +255,7 @@ class QSAIndexer(nn.Module):
             )
         )
 
-    # a port of vllm#60490
+    # A port of vllm#60490
     def reserve_profile_scratch(self, device: torch.device) -> None:
         """Touch the selection-scratch peak in the profile (dummy) run.
 

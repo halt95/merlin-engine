@@ -734,6 +734,7 @@ class CudaPlatformBase(Platform):
             gelu_and_mul_sparse=["triton", "native"],
         )
 
+
     # PDL support is a plain class bool, not @cache. Kernel launches
     # inside torch.compile'd forwards read this (launch_pdl=...), and dynamo
     # cannot trace an lru_cache-wrapped classmethod (Dynamo graph break gb0177,
@@ -750,6 +751,7 @@ class CudaPlatformBase(Platform):
         except Exception:
             return False
         return major >= 9
+
 
     # Read the plain bool; probe without storing while dynamo traces (fullgraph cannot replay a class-attribute write).
     @classmethod

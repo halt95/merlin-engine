@@ -28,6 +28,7 @@ class RecoverSSMMetadata(abc.ABC):
     ) -> RecoverSSMPostprocessMetadata | None:
         raise NotImplementedError
 
+
     def has_recoverssm_commit(self) -> bool:
         """Whether this step's metadata carries a commit (any spec row)."""
         return getattr(self, "recoverssm_commit", None) is not None

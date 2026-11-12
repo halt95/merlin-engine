@@ -920,6 +920,7 @@ class SamplingParams(
             model_config, structured_outputs_config, tokenizer
         )
 
+
     def _validate_sampler_caps(self) -> None:
         """Validate V2 sampler limits after EOS merging and tokenization."""
         if (
@@ -975,7 +976,7 @@ class SamplingParams(
         max_logprobs = model_config.max_logprobs
         if max_logprobs == -1:
             max_logprobs = model_config.get_vocab_size()
-        # top-k counts are bounded by the
+        # Top-k counts are bounded by the
         # logits width; prompt_logprob_token_ids widths (a gather, where repeated
         # or padded ids may exceed the vocabulary) keep the operator limit.
         max_topk_logprobs = min(max_logprobs, model_config.get_vocab_size())

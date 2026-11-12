@@ -103,13 +103,16 @@ class SamplingStates:
             return
         apply_min_p(logits, expanded_idx_mapping, self.min_p.gpu)
 
+
     def get_top_k_top_p(
+
         self, expanded_idx_mapping: torch.Tensor, idx_mapping_np: np.ndarray
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         do_top_k = np.any(self.top_k.np[idx_mapping_np] != self.vocab_size)
         do_top_p = np.any(self.top_p.np[idx_mapping_np] != 1.0)
         top_k = self.top_k.gpu[expanded_idx_mapping] if do_top_k else None
         top_p = self.top_p.gpu[expanded_idx_mapping] if do_top_p else None
+
         return top_k, top_p
 
     def apply_top_k_top_p(
@@ -118,9 +121,11 @@ class SamplingStates:
         expanded_idx_mapping: torch.Tensor,
         idx_mapping_np: np.ndarray,
     ) -> torch.Tensor:
+
         top_k, top_p = self.get_top_k_top_p(expanded_idx_mapping, idx_mapping_np)
         if top_k is None and top_p is None:
             return logits
+
         return apply_top_k_top_p(logits, top_k, top_p)
 
     def any_greedy(self, idx_mapping_np: np.ndarray) -> bool:

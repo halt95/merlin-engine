@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, Any, Literal, Self, get_args
 
 from pydantic import Field, SkipValidation, field_validator, model_validator
 
-from vllm import flashnext_family
+from vllm import flashnext_family, qwen35_family
 from vllm.config import LoadConfig
 from vllm.config.cache import CacheDType
 from vllm.config.kernel import MoEBackend
@@ -477,6 +477,7 @@ class SpeculativeConfig:
     speculative methods. This is an experimental option for measuring the
     acceptance-rate impact of reusing that block. It does not disable the
     speculative drafter itself."""
+
     # Upstream #61589 defaults this to False. Here it is True, so the
     # prefix-hash format stays legacy (num_hash_lookahead_tokens == 0).
     disable_lookahead_block_hashes: bool = True
@@ -1016,16 +1017,12 @@ class SpeculativeConfig:
             hf_config.update(
                 {"n_predict": n_predict, "architectures": ["Exaone4_5_MTP"]}
             )
-        if hf_config.model_type in (
-            "qwen3_5",
-            "qwen3_5_moe",
-            "qwen3_5_text",
-            "qwen3_5_moe_text",
-        ):
+        # Qwen3.5-lineage model types.
+        if hf_config.model_type in qwen35_family.model_types():
             # Checkpoints that ship only the text config resolve to the
             # `qwen3_5_text` / `qwen3_5_moe_text` model types and carry the
             # same `mtp_num_hidden_layers` field as the multimodal ones.
-            is_moe = hf_config.model_type in ("qwen3_5_moe", "qwen3_5_moe_text")
+            is_moe = hf_config.model_type in qwen35_family.moe_model_types()
             hf_config.model_type = "qwen3_5_mtp"
             n_predict = getattr(hf_config, "mtp_num_hidden_layers", None)
             if n_predict is None:
@@ -2235,6 +2232,7 @@ class SpeculativeConfig:
 
     def use_eagle_block_drop(self) -> bool:
         """Whether the volatile trailing prefix-cache block should be dropped."""
+
         # Upstream #54163 is not taken: DFlash and DSpark still drop the
         # trailing block, so this keeps use_eagle() rather than upstream's
         # needs_eagle_block_drop().

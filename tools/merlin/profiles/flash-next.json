@@ -30,7 +30,9 @@
   "fn-quad-24g-sm80",
   "fn-4x48g-tp2pp2-sm89",
   "fn-sm80-64g-x2-pp2",
-  "fn-sm80-80g-x2-tp2"
+  "fn-sm80-80g-x2-tp2",
+  "fn-quad-20g-sm86",
+  "fn-quad-20g-sm89"
  ],
  "profiles": [
   {
@@ -106,10 +108,10 @@
       24
      ],
      "max_num_batched_tokens": 2048,
-     "kv_cache_memory": 3468165120,
-     "kv_blocks": 245,
-     "basis": "Measured 2026-10-22 on the reference host (DFlash2 pool-fit run): DFlash2 drafter, PP split 24/24, chunk 2048, 245 whole blocks of 14,155,776 B: engine pool 789,668 (3.01x 262K; 3 concurrent 254,734-token requests resident), 8 MP image during a cold 131K prefill min free 950 / 532 MiB (stage 0 / stage 1; floor 524). At the MTP geometry (25/23, 4.1e9) the drafter's KV blocks cost stage 0 and the 8 MP floor fails (202 MiB).",
-     "pool_tokens": 789668,
+     "kv_cache_memory": 3630000000,
+     "kv_blocks": 256,
+     "basis": "Measured 2026-11-12 UTC on the reference host: DFlash2 drafter, PP split 24/24, chunk 2048, prefill runs on (budget 2080), KV pin 3,630,000,000 B (256 whole blocks of 14,155,776 B), engine pool 815,203 tokens (3.11x at 262,144), engine fit 3 x 262K / 5 x 131K; boot, an 8 MP image alone and during a cold 131K prefill (both answered) and a cold 262K send (passed), lowest free memory over the boot 846 MiB on the tighter cards (total minus used; floor 524). With PREFILL_RUNS=0 the same pin gives 825,268 (derived, 81 blocks per request; not booted). History: qualified 2026-10-22 at 3,468,165,120 B (pool 789,668); the pin moved because the prefill runs' step budget costs the drafter's sliding-window layers one block per request (780,038 at the old pin with the runs on).",
+     "pool_tokens": 815203,
      "fit_262k": 3
     },
     "kv_tier_seqs": {
@@ -1159,6 +1161,255 @@
     "No --enable-expert-parallel (EP is a no-op at TP1)."
    ],
    "acceptance": "A no-P2P 4 x RTX 4090 run at a whole-block pin above 2.5e9 (pool boot + 262K needle + 8 MP image headroom), cold starts and token identity against the sm_86 row."
+  },
+  {
+   "id": "fn-quad-20g-sm86",
+   "title": "4 x 20 GB sm_86 (RTX 3080 20GB, RTX A4500), TP2xPP2+EP, fp8 KV, 1 x 262K pin, static cold-expert offload",
+   "status": "untested",
+   "rank": 1,
+   "latency": false,
+   "match": {
+    "arch": [
+     "sm_86"
+    ],
+    "cards": 4,
+    "vram_gib": 20,
+    "p2p": "any"
+   },
+   "layout": {
+    "tp": 2,
+    "pp": 2,
+    "ep": true,
+    "partition": [
+     25,
+     23
+    ]
+   },
+   "serve": {
+    "max_num_seqs": 8,
+    "max_num_batched_tokens": 1024,
+    "kv_cache_dtype": "fp8_e4m3",
+    "kv_cache_memory": 1200000000,
+    "capture_sizes": [
+     1,
+     2,
+     3,
+     4,
+     6,
+     8,
+     12,
+     16,
+     24,
+     32
+    ]
+   },
+   "interconnect": {
+    "modes": {
+     "on": {
+      "exports": {
+       "VLLM_SKIP_P2P_CHECK": "1",
+       "NCCL_P2P_LEVEL": "SYS",
+       "NCCL_PROTO": "Simple",
+       "VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC": "1"
+      },
+      "unset": [],
+      "disable_custom_all_reduce": true
+     },
+     "off": {
+      "exports": {
+       "VLLM_SKIP_P2P_CHECK": "1",
+       "NCCL_P2P_DISABLE": "1"
+      },
+      "unset": [
+       "NCCL_P2P_LEVEL",
+       "NCCL_PROTO",
+       "NCCL_ALGO",
+       "VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC"
+      ],
+      "disable_custom_all_reduce": true
+     },
+     "ipc": {
+      "exports": {
+       "VLLM_SKIP_P2P_CHECK": "1",
+       "NCCL_P2P_DISABLE": "1",
+       "VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC": "1"
+      },
+      "unset": [
+       "NCCL_P2P_LEVEL",
+       "NCCL_PROTO",
+       "NCCL_ALGO",
+       "NCCL_SHM_DISABLE"
+      ],
+      "disable_custom_all_reduce": true
+     }
+    },
+    "default": "on"
+   },
+   "cuda_visible_devices": "0,1,2,3",
+   "warm": 1,
+   "capacity": {
+    "estimate": true,
+    "basis": "Estimate (untested row): KV pin 1,200,000,000 B per card (1 x 262K = 2 x 131K = 4 x 65K = 8 x 32K); the engine sized it to a 265,888-token pool (72 blocks, 1.01 x 262K) in the 20 GB emulation on 4 x RTX 3090 (2026-11-06), which served a 262K prefill and the 8 MP image. Not measured on a 20 GB card.",
+    "pin_gib": 1.12,
+    "pool_tokens": 265888,
+    "fit_262k": 1,
+    "fit_131k": 2,
+    "bytes_per_block_mib": [
+     14,
+     15.8
+    ]
+   },
+   "evidence": [
+    "None on a 20 GB card. Emulated (2026-11-06, the six-layer set; the five-layer set re-measured 2026-11-07, below): 4 x RTX 3090 each holding 4,096 MiB of ballast so it looks like a 20 GB card, vLLM started with --gpu-memory-utilization 0.80 on the 24 GB cards (0.80 x 24,576 MiB = 19,661 MiB, the budget the shipped 0.96 gives a 20,480 MiB card), this row's layout, KV pin and env (static cold-expert offload of layers 11, 12, 19, 20 (PP0) and 37 (PP1) at hot_frac 0.5, 64 MiB prefill-logits caps, NCCL 512 KiB buffers on 1 channel, expandable segments; long-prefill threshold 512, repack release on). Fit: no OOM / CUDA / NCCL error; minimum free 363-769 MiB per card over every phase including the boot (50 ms samples; the 8 MP image phase dipped to 443 MiB on GPU 0); engine pool 265,888 tokens.",
+    "Speed (emulation, vs the same run's 24 GB stock fn-quad-3090 boot): c1 decode 7.013 ms / output token (6.468 stock, +8.4 %), c8 aggregate decode 61.87 tok/s (176.44 stock: the 1 x 262K pool holds one 262K session, eight 32K sessions share it), 262K prefill TTFT 56.23 s (38.17 stock), 8 MP image 9.29 s. MTP acceptance c1 0.557, c8 0.592.",
+    "Identity: T=0 tokens + logprobs + top-k SAME as the 24 GB stock boot on four identity probes and the exact 262K row (prompt 260,989 tokens, 512 tokens out).",
+    "Host RAM: ~9 GiB more than the 24 GB stock boot at READY (9.05 GiB MemAvailable drop: the cold experts' pinned host masters, read through UVA); locked memory (VmLck) stayed at 0.02 GiB.",
+    "Five-layer set (layers 11, 12, 19, 20, 37; 36 back on the GPU), emulated 2026-11-07 on three separate boots: fits every boot with 317-377 MiB minimum free per card including the boot (the second stage sets it, 317 MiB at KV allocation on the first boot), tokens and logprobs identical across the boots and to the six-layer set. Against the six-layer set in the same run: 262K prefill TTFT 55.0 s vs 58.5 s (-6 %), c1 decode 7.11 vs 7.20 ms / output token, c8 aggregate 61.9 vs 61.4 tok/s, ~1.5 GiB less pinned host RAM."
+   ],
+   "notes": [
+    "Matches RTX 3080 20GB, RTX A4500 (sm_86). The fn-quad-3090 layout (TP2xPP2+EP, partition 25/23, seqs 8, chunk 1024, the same capture sizes) with the KV pin cut to 1 x 262K; no KV variant, DFlash2 geometry or swarm cap, since none fits beside that pool on these cards.",
+    "Static cold-expert offload, on by default from the row's env: for MoE layers 11, 12, 19, 20 (PP0) and 37 (PP1) the hottest half of each rank's experts stay on the GPU and the full master moves to pinned host RAM, read through UVA (placement only: output identical). Profile tools/merlin/profiles/expert_hot/flash-next-quad-20g.json, bound to the published checkpoint's config.json (sha256 64f990cd...). MERLIN_COLD_EXPERTS=0 (or blank) turns it off (the 20 GB fit was measured with it on only); MERLIN_COLD_EXPERTS=<profile.json> replaces it.",
+    "Engine env from the row (a non-blank value in your environment overrides each): VLLM_SPARSE_INDEXER_MAX_LOGITS_MB=64 and VLLM_E2_QSA_LOGITS_GRANULE_MB=64 (the other rows use 256), NCCL_BUFFSIZE=524288, NCCL_MAX_NCHANNELS=1, PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True.",
+    "Host RAM: the cold experts pin ~8 GiB of host memory on top of the Flash-Next floor (9.05 GiB measured with six layers, ~1.5 GiB less with five); preflight's RAM check does not count it, so keep ~9 GiB above the qualified figure. It is CUDA-pinned memory, not mlock: the emulation's locked memory stayed at 0.02 GiB (run with memlock unlimited).",
+    "ECC must be off on the RTX A4500 / RTX 4000 Ada (it takes about 6 % of the memory; the RTX 3080 20GB has none); with ECC on, preflight lowers the KV pin by the shortfall.",
+    "Bandwidth (spec sheets, not measured): RTX 3080 20GB ~760 GB/s, RTX A4500 ~640 GB/s, RTX 4000 Ada ~360 GB/s, against 936 GB/s on the RTX 3090, so decode is slower than on the 24 GB rows."
+   ],
+   "acceptance": "A boot on real 4 x 20 GB cards with this row's env that holds 1 x 262K through warmup, a 262K prefill and the 8 MP image with identity SAME against the 24 GB rows; the row stays untested until such a qualification run.",
+   "env": {
+    "VLLM_SPARSE_INDEXER_MAX_LOGITS_MB": "64",
+    "VLLM_E2_QSA_LOGITS_GRANULE_MB": "64",
+    "NCCL_BUFFSIZE": "524288",
+    "NCCL_MAX_NCHANNELS": "1",
+    "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+    "MERLIN_COLD_EXPERTS": "tools/merlin/profiles/expert_hot/flash-next-quad-20g.json",
+    "MERLIN_COLD_EXPERTS_LAYERS": "11,12,19,20,37",
+    "MERLIN_COLD_EXPERTS_HOT_FRAC": "0.5"
+   }
+  },
+  {
+   "id": "fn-quad-20g-sm89",
+   "title": "4 x 20 GB sm_89 (RTX 4000 Ada 20GB), TP2xPP2+EP, fp8 KV, 1 x 262K pin, static cold-expert offload",
+   "status": "untested",
+   "rank": 1,
+   "latency": false,
+   "match": {
+    "arch": [
+     "sm_89"
+    ],
+    "cards": 4,
+    "vram_gib": 20,
+    "p2p": "any"
+   },
+   "layout": {
+    "tp": 2,
+    "pp": 2,
+    "ep": true,
+    "partition": [
+     25,
+     23
+    ]
+   },
+   "serve": {
+    "max_num_seqs": 8,
+    "max_num_batched_tokens": 1024,
+    "kv_cache_dtype": "fp8_e4m3",
+    "kv_cache_memory": 1200000000,
+    "capture_sizes": [
+     1,
+     2,
+     3,
+     4,
+     6,
+     8,
+     12,
+     16,
+     24,
+     32
+    ]
+   },
+   "interconnect": {
+    "modes": {
+     "on": {
+      "exports": {
+       "VLLM_SKIP_P2P_CHECK": "1",
+       "NCCL_P2P_LEVEL": "SYS",
+       "NCCL_PROTO": "Simple",
+       "VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC": "1"
+      },
+      "unset": [],
+      "disable_custom_all_reduce": true
+     },
+     "off": {
+      "exports": {
+       "VLLM_SKIP_P2P_CHECK": "1",
+       "NCCL_P2P_DISABLE": "1"
+      },
+      "unset": [
+       "NCCL_P2P_LEVEL",
+       "NCCL_PROTO",
+       "NCCL_ALGO",
+       "VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC"
+      ],
+      "disable_custom_all_reduce": true
+     },
+     "ipc": {
+      "exports": {
+       "VLLM_SKIP_P2P_CHECK": "1",
+       "NCCL_P2P_DISABLE": "1",
+       "VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC": "1"
+      },
+      "unset": [
+       "NCCL_P2P_LEVEL",
+       "NCCL_PROTO",
+       "NCCL_ALGO",
+       "NCCL_SHM_DISABLE"
+      ],
+      "disable_custom_all_reduce": true
+     }
+    },
+    "default": "off"
+   },
+   "cuda_visible_devices": "0,1,2,3",
+   "warm": 0,
+   "capacity": {
+    "estimate": true,
+    "basis": "Estimate (untested row): KV pin 1,200,000,000 B per card (1 x 262K = 2 x 131K = 4 x 65K = 8 x 32K); the engine sized it to a 265,888-token pool (72 blocks, 1.01 x 262K) in the 20 GB emulation on 4 x RTX 3090 (2026-11-06), which served a 262K prefill and the 8 MP image. Not measured on a 20 GB card.",
+    "pin_gib": 1.12,
+    "pool_tokens": 265888,
+    "fit_262k": 1,
+    "fit_131k": 2,
+    "bytes_per_block_mib": [
+     14,
+     15.8
+    ]
+   },
+   "evidence": [
+    "None on a 20 GB card (and none on sm_89: the emulation ran on sm_86 RTX 3090s; this row ships the same config unmeasured). Emulated (2026-11-06, the six-layer set; the five-layer set re-measured 2026-11-07, below): 4 x RTX 3090 each holding 4,096 MiB of ballast so it looks like a 20 GB card, vLLM started with --gpu-memory-utilization 0.80 on the 24 GB cards (0.80 x 24,576 MiB = 19,661 MiB, the budget the shipped 0.96 gives a 20,480 MiB card), this row's layout, KV pin and env (static cold-expert offload of layers 11, 12, 19, 20 (PP0) and 37 (PP1) at hot_frac 0.5, 64 MiB prefill-logits caps, NCCL 512 KiB buffers on 1 channel, expandable segments; long-prefill threshold 512, repack release on). Fit: no OOM / CUDA / NCCL error; minimum free 363-769 MiB per card over every phase including the boot (50 ms samples; the 8 MP image phase dipped to 443 MiB on GPU 0); engine pool 265,888 tokens.",
+    "Speed (emulation, vs the same run's 24 GB stock fn-quad-3090 boot): c1 decode 7.013 ms / output token (6.468 stock, +8.4 %), c8 aggregate decode 61.87 tok/s (176.44 stock: the 1 x 262K pool holds one 262K session, eight 32K sessions share it), 262K prefill TTFT 56.23 s (38.17 stock), 8 MP image 9.29 s. MTP acceptance c1 0.557, c8 0.592.",
+    "Identity: T=0 tokens + logprobs + top-k SAME as the 24 GB stock boot on four identity probes and the exact 262K row (prompt 260,989 tokens, 512 tokens out).",
+    "Host RAM: ~9 GiB more than the 24 GB stock boot at READY (9.05 GiB MemAvailable drop: the cold experts' pinned host masters, read through UVA); locked memory (VmLck) stayed at 0.02 GiB.",
+    "Five-layer set (layers 11, 12, 19, 20, 37; 36 back on the GPU), emulated 2026-11-07 on three separate boots: fits every boot with 317-377 MiB minimum free per card including the boot (the second stage sets it, 317 MiB at KV allocation on the first boot), tokens and logprobs identical across the boots and to the six-layer set. Against the six-layer set in the same run: 262K prefill TTFT 55.0 s vs 58.5 s (-6 %), c1 decode 7.11 vs 7.20 ms / output token, c8 aggregate 61.9 vs 61.4 tok/s, ~1.5 GiB less pinned host RAM."
+   ],
+   "notes": [
+    "Matches RTX 4000 Ada 20GB (sm_89). The fn-quad-24g-sm89 layout (TP2xPP2+EP, partition 25/23, seqs 8, the same capture sizes) with the 1024-token chunk the 20 GB config was measured with with the KV pin cut to 1 x 262K; no KV variant, DFlash2 geometry or swarm cap, since none fits beside that pool on these cards.",
+    "Static cold-expert offload, on by default from the row's env: for MoE layers 11, 12, 19, 20 (PP0) and 37 (PP1) the hottest half of each rank's experts stay on the GPU and the full master moves to pinned host RAM, read through UVA (placement only: output identical). Profile tools/merlin/profiles/expert_hot/flash-next-quad-20g.json, bound to the published checkpoint's config.json (sha256 64f990cd...). MERLIN_COLD_EXPERTS=0 (or blank) turns it off (the 20 GB fit was measured with it on only); MERLIN_COLD_EXPERTS=<profile.json> replaces it.",
+    "Engine env from the row (a non-blank value in your environment overrides each): VLLM_SPARSE_INDEXER_MAX_LOGITS_MB=64 and VLLM_E2_QSA_LOGITS_GRANULE_MB=64 (the other rows use 256), NCCL_BUFFSIZE=524288, NCCL_MAX_NCHANNELS=1, PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True.",
+    "Host RAM: the cold experts pin ~8 GiB of host memory on top of the Flash-Next floor (9.05 GiB measured with six layers, ~1.5 GiB less with five); preflight's RAM check does not count it, so keep ~9 GiB above the qualified figure. It is CUDA-pinned memory, not mlock: the emulation's locked memory stayed at 0.02 GiB (run with memlock unlimited).",
+    "ECC must be off on the RTX A4500 / RTX 4000 Ada (it takes about 6 % of the memory; the RTX 3080 20GB has none); with ECC on, preflight lowers the KV pin by the shortfall.",
+    "Bandwidth (spec sheets, not measured): RTX 3080 20GB ~760 GB/s, RTX A4500 ~640 GB/s, RTX 4000 Ada ~360 GB/s, against 936 GB/s on the RTX 3090, so decode is slower than on the 24 GB rows.",
+    "WARM defaults to 0 because the persisted Triton autotune is sm_86 only."
+   ],
+   "acceptance": "A boot on real 4 x 20 GB cards (sm_89) with this row's env that holds 1 x 262K through warmup, a 262K prefill and the 8 MP image with identity SAME against the 24 GB rows; the row stays untested until such a qualification run.",
+   "env": {
+    "VLLM_SPARSE_INDEXER_MAX_LOGITS_MB": "64",
+    "VLLM_E2_QSA_LOGITS_GRANULE_MB": "64",
+    "NCCL_BUFFSIZE": "524288",
+    "NCCL_MAX_NCHANNELS": "1",
+    "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+    "MERLIN_COLD_EXPERTS": "tools/merlin/profiles/expert_hot/flash-next-quad-20g.json",
+    "MERLIN_COLD_EXPERTS_LAYERS": "11,12,19,20,37",
+    "MERLIN_COLD_EXPERTS_HOT_FRAC": "0.5"
+   }
   },
   {
    "id": "fn-quad-24g-sm80",
@@ -2764,10 +3015,10 @@
       24
      ],
      "max_num_batched_tokens": 2048,
-     "kv_cache_memory": 3468165120,
-     "kv_blocks": 245,
-     "basis": "Qualified on this checkpoint on 2026-10-23: PP split 24/24, chunk 2048, KV pin 3,468,165,120 B, pool 789,668; 8 MP image >= 774 MiB free, 262K needle, 3 x 262K residency with a shared-prefix caveat.",
-     "pool_tokens": 789668,
+     "kv_cache_memory": 3630000000,
+     "kv_blocks": 256,
+     "basis": "KV pin 3,630,000,000 B and pool 815,203 tokens (prefill runs on, budget 2080) follow the shared DFlash2 geometry measured on the Flash-Next row on 2026-11-12 UTC (PP split 24/24, chunk 2048; engine fit 3 x 262K / 5 x 131K). Booted on this checkpoint at this pin on 2026-11-12 UTC: pool 815,203, an 8 MP image during a cold 131K prefill answered, lowest free memory 828 MiB on the tighter cards (total minus used; floor 524). History: Qualified on this checkpoint on 2026-10-23 at the previous pin 3,468,165,120 B (pool 789,668): 8 MP image, 262K needle, 3 x 262K residency with a shared-prefix caveat.",
+     "pool_tokens": 815203,
      "fit_262k": 3
     },
     "kv_tier_seqs": {
@@ -2828,10 +3079,10 @@
    ],
    "notes": [
     "Recipe launcher models/swift1.5/serve.sh is a shim for tools/merlin/launch.py --profile fn-swift1.5-quad-3090 (regenerate with preflight.py --emit launcher).",
-    "FGPC is off. The 8 MP cap, TP2xPP2+EP partition 25,23, 4.1e9-byte KV pin and target pool 924,993 are inherited from Flash-Next.",
+    "FGPC is on (since 3.0.2.1; `-- --no-enable-mamba-shared-prefix-checkpoint` turns it off). The 8 MP cap, TP2xPP2+EP partition 25,23, 4.1e9-byte KV pin and target pool 924,993 are inherited from Flash-Next.",
     "Full-vocabulary MTP head, K=3 (DRAFT_HEAD=bf16|int8|int4 sets its precision; default bf16). There is no reduced draft vocabulary; the launcher refuses REDUCED_DRAFT_VOCAB.",
     "Explicitly select this profile with --profile fn-swift1.5-quad-3090; automatic hardware selection continues to choose Flash-Next.",
-    "SPEC=dflash2 (with DFLASH2_MODEL=<DFlash2 drafter dir>) is an option: the DFlash2 drafter in place of the MTP head, with the serve.dflash2 geometry inherited from fn-quad-3090 (PP 24/24, chunk 2048, 245 KV blocks). MTP stays the default."
+    "SPEC=dflash2 (with DFLASH2_MODEL=<DFlash2 drafter dir>) is an option: the DFlash2 drafter in place of the MTP head, with the serve.dflash2 geometry inherited from fn-quad-3090 (PP 24/24, chunk 2048, 256 KV blocks). MTP stays the default."
    ],
    "acceptance": "Tested on the reference host: the generated launcher qualified on 2026-10-16 on the 4x RTX 3090 reference host (boot, pool, prefix-cache/MTP, 8 MP vision, GSM8K-20) and passed the Merlin 3.0.0 release bench card (2026-10-20), after the pre-release bench run (2026-10-17).",
    "checkpoint": "swift1.5",
@@ -2889,10 +3140,10 @@
       24
      ],
      "max_num_batched_tokens": 2048,
-     "kv_cache_memory": 3468165120,
-     "kv_blocks": 245,
-     "basis": "Qualified on this checkpoint on 2026-10-23: PP split 24/24, chunk 2048, KV pin 3,468,165,120 B, pool 789,668; 8 MP image >= 774 MiB free, 262K needle, 3 x 262K residency with a shared-prefix caveat.",
-     "pool_tokens": 789668,
+     "kv_cache_memory": 3630000000,
+     "kv_blocks": 256,
+     "basis": "KV pin 3,630,000,000 B and pool 815,203 tokens (prefill runs on, budget 2080) follow the shared DFlash2 geometry measured on the Flash-Next row on 2026-11-12 UTC (PP split 24/24, chunk 2048; engine fit 3 x 262K / 5 x 131K). Booted on this checkpoint at this pin on 2026-11-12 UTC: pool 815,203, an 8 MP image during a cold 131K prefill answered, lowest free memory 828 MiB on the tighter cards (total minus used; floor 524). History: Qualified on this checkpoint on 2026-10-23 at the previous pin 3,468,165,120 B (pool 789,668): 8 MP image, 262K needle, 3 x 262K residency with a shared-prefix caveat.",
+     "pool_tokens": 815203,
      "fit_262k": 3
     },
     "kv_tier_seqs": {
@@ -2953,10 +3204,10 @@
    ],
    "notes": [
     "Recipe launcher models/swift1.5-huihui/serve.sh is a shim for tools/merlin/launch.py --profile fn-swift1.5-huihui-quad-3090 (regenerate with preflight.py --emit launcher).",
-    "FGPC is off. The 8 MP cap, TP2xPP2+EP partition 25,23, 4.1e9-byte KV pin and target pool 924,993 are inherited from Flash-Next.",
+    "FGPC is on (since 3.0.2.1; `-- --no-enable-mamba-shared-prefix-checkpoint` turns it off). The 8 MP cap, TP2xPP2+EP partition 25,23, 4.1e9-byte KV pin and target pool 924,993 are inherited from Flash-Next.",
     "Full-vocabulary MTP head, K=3 (DRAFT_HEAD=bf16|int8|int4 sets its precision; default bf16). There is no reduced draft vocabulary; the launcher refuses REDUCED_DRAFT_VOCAB.",
     "Explicitly select this profile with --profile fn-swift1.5-huihui-quad-3090; automatic hardware selection continues to choose Flash-Next.",
-    "SPEC=dflash2 (with DFLASH2_MODEL=<DFlash2 drafter dir>) is an option: the DFlash2 drafter in place of the MTP head, with the serve.dflash2 geometry inherited from fn-quad-3090 (PP 24/24, chunk 2048, 245 KV blocks). MTP stays the default."
+    "SPEC=dflash2 (with DFLASH2_MODEL=<DFlash2 drafter dir>) is an option: the DFlash2 drafter in place of the MTP head, with the serve.dflash2 geometry inherited from fn-quad-3090 (PP 24/24, chunk 2048, 256 KV blocks). MTP stays the default."
    ],
    "acceptance": "Tested on the reference host: the generated launcher qualified on 2026-10-16 on the 4x RTX 3090 reference host (boot, pool, prefix-cache/MTP, 8 MP vision, GSM8K-20) and passed the Merlin 3.0.0 release bench card (2026-10-20).",
    "checkpoint": "swift1.5-huihui",
@@ -3047,7 +3298,7 @@
    ],
    "notes": [
     "Not a canonical recipe launcher: generate with preflight.py --emit launcher --profile fn-swift1.5-quad-3090-nop2p (or merlin serve swift1.5). Same TP/PP/EP layout, partition and per-card KV pin as fn-quad-3090-nop2p; fp8 KV only (no bf16 variant is offered for the checkpoint profiles).",
-    "FGPC is off. Full-vocabulary MTP head, K=3 (DRAFT_HEAD=bf16|int8|int4 sets its precision; default bf16). Select explicitly with --profile; automatic hardware selection continues to choose vanilla Flash-Next."
+    "FGPC is on (since 3.0.2.1; `-- --no-enable-mamba-shared-prefix-checkpoint` turns it off). Full-vocabulary MTP head, K=3 (DRAFT_HEAD=bf16|int8|int4 sets its precision; default bf16). Select explicitly with --profile; automatic hardware selection continues to choose vanilla Flash-Next."
    ],
    "acceptance": "Pending a pool-only boot, prefix-cache/MTP, 8 MP vision and quality checks with the swift1.5 checkpoint on this hardware.",
    "checkpoint": "swift1.5"
@@ -3163,7 +3414,7 @@
    ],
    "notes": [
     "Not a canonical recipe launcher: generate with preflight.py --emit launcher --profile fn-swift1.5-quad-24g-sm89 (or merlin serve swift1.5). Same TP/PP/EP layout, partition and per-card KV pin as fn-quad-24g-sm89; fp8 KV only (no bf16 variant is offered for the checkpoint profiles).",
-    "FGPC is off. Full-vocabulary MTP head, K=3 (DRAFT_HEAD=bf16|int8|int4 sets its precision; default bf16). Select explicitly with --profile; automatic hardware selection continues to choose vanilla Flash-Next."
+    "FGPC is on (since 3.0.2.1; `-- --no-enable-mamba-shared-prefix-checkpoint` turns it off). Full-vocabulary MTP head, K=3 (DRAFT_HEAD=bf16|int8|int4 sets its precision; default bf16). Select explicitly with --profile; automatic hardware selection continues to choose vanilla Flash-Next."
    ],
    "acceptance": "Pending a pool-only boot, prefix-cache/MTP, 8 MP vision and quality checks with the swift1.5 checkpoint on this hardware.",
    "checkpoint": "swift1.5"
@@ -3275,7 +3526,7 @@
    ],
    "notes": [
     "Not a canonical recipe launcher: generate with preflight.py --emit launcher --profile fn-swift1.5-quad-32g-sm89 (or merlin serve swift1.5). Same TP/PP/EP layout, partition and per-card KV pin as fn-quad-32g-sm89; fp8 KV only (no bf16 variant is offered for the checkpoint profiles).",
-    "FGPC is off. Full-vocabulary MTP head, K=3 (DRAFT_HEAD=bf16|int8|int4 sets its precision; default bf16). Select explicitly with --profile; automatic hardware selection continues to choose vanilla Flash-Next."
+    "FGPC is on (since 3.0.2.1; `-- --no-enable-mamba-shared-prefix-checkpoint` turns it off). Full-vocabulary MTP head, K=3 (DRAFT_HEAD=bf16|int8|int4 sets its precision; default bf16). Select explicitly with --profile; automatic hardware selection continues to choose vanilla Flash-Next."
    ],
    "acceptance": "Pending a pool-only boot, prefix-cache/MTP, 8 MP vision and quality checks with the swift1.5 checkpoint on this hardware.",
    "checkpoint": "swift1.5"
@@ -3370,7 +3621,7 @@
    ],
    "notes": [
     "Not a canonical recipe launcher: generate with preflight.py --emit launcher --profile fn-swift1.5-2x48g-pp2-sm89 (or merlin serve swift1.5). Same TP/PP/EP layout, partition and per-card KV pin as fn-2x48g-pp2-sm89; fp8 KV only (no bf16 variant is offered for the checkpoint profiles).",
-    "FGPC is off. Full-vocabulary MTP head, K=3 (DRAFT_HEAD=bf16|int8|int4 sets its precision; default bf16). Select explicitly with --profile; automatic hardware selection continues to choose vanilla Flash-Next."
+    "FGPC is on (since 3.0.2.1; `-- --no-enable-mamba-shared-prefix-checkpoint` turns it off). Full-vocabulary MTP head, K=3 (DRAFT_HEAD=bf16|int8|int4 sets its precision; default bf16). Select explicitly with --profile; automatic hardware selection continues to choose vanilla Flash-Next."
    ],
    "acceptance": "Pending a pool-only boot, prefix-cache/MTP, 8 MP vision and quality checks with the swift1.5 checkpoint on this hardware.",
    "checkpoint": "swift1.5"
@@ -3485,7 +3736,7 @@
    ],
    "notes": [
     "Not a canonical recipe launcher: generate with preflight.py --emit launcher --profile fn-swift1.5-4x48g-tp2pp2-sm89 (or merlin serve swift1.5). Same TP/PP/EP layout, partition and per-card KV pin as fn-4x48g-tp2pp2-sm89; fp8 KV only (no bf16 variant is offered for the checkpoint profiles).",
-    "FGPC is off. Full-vocabulary MTP head, K=3 (DRAFT_HEAD=bf16|int8|int4 sets its precision; default bf16). Select explicitly with --profile; automatic hardware selection continues to choose vanilla Flash-Next."
+    "FGPC is on (since 3.0.2.1; `-- --no-enable-mamba-shared-prefix-checkpoint` turns it off). Full-vocabulary MTP head, K=3 (DRAFT_HEAD=bf16|int8|int4 sets its precision; default bf16). Select explicitly with --profile; automatic hardware selection continues to choose vanilla Flash-Next."
    ],
    "acceptance": "Pending a pool-only boot, prefix-cache/MTP, 8 MP vision and quality checks with the swift1.5 checkpoint on this hardware.",
    "checkpoint": "swift1.5"
@@ -3575,7 +3826,7 @@
    ],
    "notes": [
     "Not a canonical recipe launcher: generate with preflight.py --emit launcher --profile fn-swift1.5-huihui-quad-3090-nop2p (or merlin serve swift1.5-huihui). Same TP/PP/EP layout, partition and per-card KV pin as fn-quad-3090-nop2p; fp8 KV only (no bf16 variant is offered for the checkpoint profiles).",
-    "FGPC is off. Full-vocabulary MTP head, K=3 (DRAFT_HEAD=bf16|int8|int4 sets its precision; default bf16). Select explicitly with --profile; automatic hardware selection continues to choose vanilla Flash-Next."
+    "FGPC is on (since 3.0.2.1; `-- --no-enable-mamba-shared-prefix-checkpoint` turns it off). Full-vocabulary MTP head, K=3 (DRAFT_HEAD=bf16|int8|int4 sets its precision; default bf16). Select explicitly with --profile; automatic hardware selection continues to choose vanilla Flash-Next."
    ],
    "acceptance": "Pending a pool-only boot, prefix-cache/MTP, 8 MP vision and quality checks with the swift1.5-huihui checkpoint on this hardware.",
    "checkpoint": "swift1.5-huihui"
@@ -3683,7 +3934,7 @@
    ],
    "notes": [
     "Not a canonical recipe launcher: generate with preflight.py --emit launcher --profile fn-swift1.5-huihui-quad-24g-sm89 (or merlin serve swift1.5-huihui). Same TP/PP/EP layout, partition and per-card KV pin as fn-quad-24g-sm89; fp8 KV only (no bf16 variant is offered for the checkpoint profiles).",
-    "FGPC is off. Full-vocabulary MTP head, K=3 (DRAFT_HEAD=bf16|int8|int4 sets its precision; default bf16). Select explicitly with --profile; automatic hardware selection continues to choose vanilla Flash-Next."
+    "FGPC is on (since 3.0.2.1; `-- --no-enable-mamba-shared-prefix-checkpoint` turns it off). Full-vocabulary MTP head, K=3 (DRAFT_HEAD=bf16|int8|int4 sets its precision; default bf16). Select explicitly with --profile; automatic hardware selection continues to choose vanilla Flash-Next."
    ],
    "acceptance": "Pending a pool-only boot, prefix-cache/MTP, 8 MP vision and quality checks with the swift1.5-huihui checkpoint on this hardware.",
    "checkpoint": "swift1.5-huihui"
@@ -3795,7 +4046,7 @@
    ],
    "notes": [
     "Not a canonical recipe launcher: generate with preflight.py --emit launcher --profile fn-swift1.5-huihui-quad-32g-sm89 (or merlin serve swift1.5-huihui). Same TP/PP/EP layout, partition and per-card KV pin as fn-quad-32g-sm89; fp8 KV only (no bf16 variant is offered for the checkpoint profiles).",
-    "FGPC is off. Full-vocabulary MTP head, K=3 (DRAFT_HEAD=bf16|int8|int4 sets its precision; default bf16). Select explicitly with --profile; automatic hardware selection continues to choose vanilla Flash-Next."
+    "FGPC is on (since 3.0.2.1; `-- --no-enable-mamba-shared-prefix-checkpoint` turns it off). Full-vocabulary MTP head, K=3 (DRAFT_HEAD=bf16|int8|int4 sets its precision; default bf16). Select explicitly with --profile; automatic hardware selection continues to choose vanilla Flash-Next."
    ],
    "acceptance": "Pending a pool-only boot, prefix-cache/MTP, 8 MP vision and quality checks with the swift1.5-huihui checkpoint on this hardware.",
    "checkpoint": "swift1.5-huihui"
@@ -3890,7 +4141,7 @@
    ],
    "notes": [
     "Not a canonical recipe launcher: generate with preflight.py --emit launcher --profile fn-swift1.5-huihui-2x48g-pp2-sm89 (or merlin serve swift1.5-huihui). Same TP/PP/EP layout, partition and per-card KV pin as fn-2x48g-pp2-sm89; fp8 KV only (no bf16 variant is offered for the checkpoint profiles).",
-    "FGPC is off. Full-vocabulary MTP head, K=3 (DRAFT_HEAD=bf16|int8|int4 sets its precision; default bf16). Select explicitly with --profile; automatic hardware selection continues to choose vanilla Flash-Next."
+    "FGPC is on (since 3.0.2.1; `-- --no-enable-mamba-shared-prefix-checkpoint` turns it off). Full-vocabulary MTP head, K=3 (DRAFT_HEAD=bf16|int8|int4 sets its precision; default bf16). Select explicitly with --profile; automatic hardware selection continues to choose vanilla Flash-Next."
    ],
    "acceptance": "Pending a pool-only boot, prefix-cache/MTP, 8 MP vision and quality checks with the swift1.5-huihui checkpoint on this hardware.",
    "checkpoint": "swift1.5-huihui"
@@ -4005,7 +4256,7 @@
    ],
    "notes": [
     "Not a canonical recipe launcher: generate with preflight.py --emit launcher --profile fn-swift1.5-huihui-4x48g-tp2pp2-sm89 (or merlin serve swift1.5-huihui). Same TP/PP/EP layout, partition and per-card KV pin as fn-4x48g-tp2pp2-sm89; fp8 KV only (no bf16 variant is offered for the checkpoint profiles).",
-    "FGPC is off. Full-vocabulary MTP head, K=3 (DRAFT_HEAD=bf16|int8|int4 sets its precision; default bf16). Select explicitly with --profile; automatic hardware selection continues to choose vanilla Flash-Next."
+    "FGPC is on (since 3.0.2.1; `-- --no-enable-mamba-shared-prefix-checkpoint` turns it off). Full-vocabulary MTP head, K=3 (DRAFT_HEAD=bf16|int8|int4 sets its precision; default bf16). Select explicitly with --profile; automatic hardware selection continues to choose vanilla Flash-Next."
    ],
    "acceptance": "Pending a pool-only boot, prefix-cache/MTP, 8 MP vision and quality checks with the swift1.5-huihui checkpoint on this hardware.",
    "checkpoint": "swift1.5-huihui"
@@ -4214,6 +4465,251 @@
    "notes": [
     "swift1.5 on the fn-4x48g-tp2pp2-sm86 layout: same pin, KV dtype and concurrency; its own scales and served names. Untested / community-validated."
    ],
+   "checkpoint": "swift1.5"
+  },
+  {
+   "id": "fn-swift1.5-quad-20g-sm86",
+   "title": "swift1.5: 4 x 20 GB sm_86 (RTX 3080 20GB, RTX A4500), TP2xPP2+EP, fp8 KV, 1 x 262K pin, static cold-expert offload",
+   "status": "untested",
+   "rank": 1,
+   "latency": false,
+   "match": {
+    "arch": [
+     "sm_86"
+    ],
+    "cards": 4,
+    "vram_gib": 20,
+    "p2p": "any"
+   },
+   "layout": {
+    "tp": 2,
+    "pp": 2,
+    "ep": true,
+    "partition": [
+     25,
+     23
+    ]
+   },
+   "serve": {
+    "max_num_seqs": 8,
+    "max_num_batched_tokens": 1024,
+    "kv_cache_dtype": "fp8_e4m3",
+    "kv_cache_memory": 1200000000,
+    "capture_sizes": [
+     1,
+     2,
+     3,
+     4,
+     6,
+     8,
+     12,
+     16,
+     24,
+     32
+    ]
+   },
+   "interconnect": {
+    "modes": {
+     "on": {
+      "exports": {
+       "VLLM_SKIP_P2P_CHECK": "1",
+       "NCCL_P2P_LEVEL": "SYS",
+       "NCCL_PROTO": "Simple",
+       "VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC": "1"
+      },
+      "unset": [],
+      "disable_custom_all_reduce": true
+     },
+     "off": {
+      "exports": {
+       "VLLM_SKIP_P2P_CHECK": "1",
+       "NCCL_P2P_DISABLE": "1"
+      },
+      "unset": [
+       "NCCL_P2P_LEVEL",
+       "NCCL_PROTO",
+       "NCCL_ALGO",
+       "VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC"
+      ],
+      "disable_custom_all_reduce": true
+     },
+     "ipc": {
+      "exports": {
+       "VLLM_SKIP_P2P_CHECK": "1",
+       "NCCL_P2P_DISABLE": "1",
+       "VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC": "1"
+      },
+      "unset": [
+       "NCCL_P2P_LEVEL",
+       "NCCL_PROTO",
+       "NCCL_ALGO",
+       "NCCL_SHM_DISABLE"
+      ],
+      "disable_custom_all_reduce": true
+     }
+    },
+    "default": "on"
+   },
+   "cuda_visible_devices": "0,1,2,3",
+   "warm": 1,
+   "capacity": {
+    "estimate": true,
+    "basis": "The fn-quad-20g-sm86 layout and pin; swift1.5 has the same weights shape. Estimate (untested row): KV pin 1,200,000,000 B per card (1 x 262K = 2 x 131K = 4 x 65K = 8 x 32K). The 265,888-token pool (72 blocks, 1.01 x 262K) was measured on the Flash-Next checkpoint in the 20 GB emulation on 4 x RTX 3090 (2026-11-06); nothing was booted on this checkpoint at 20 GB.",
+    "pin_gib": 1.12,
+    "pool_tokens": 265888,
+    "fit_262k": 1,
+    "fit_131k": 2,
+    "bytes_per_block_mib": [
+     14,
+     15.8
+    ]
+   },
+   "evidence": [
+    "None: swift1.5 has not run on 20 GB cards or in the 20 GB emulation. The vanilla row fn-quad-20g-sm86's fit, speed, identity and host-RAM figures were measured on the Flash-Next checkpoint in a 20 GB emulation on 4 x RTX 3090 (2026-11-06, re-measured 2026-11-07); see that row. They are not measurements of this checkpoint."
+   ],
+   "notes": [
+    "swift1.5 on the fn-quad-20g-sm86 layout: same pin, KV dtype, concurrency, engine env and cold-expert set; its own scales and served names. Untested / community-validated: nothing was booted on this checkpoint at 20 GB.",
+    "Matches RTX 3080 20GB, RTX A4500 (sm_86). The fn-quad-3090 layout (TP2xPP2+EP, partition 25/23, seqs 8, chunk 1024, the same capture sizes) with the KV pin cut to 1 x 262K; no KV variant, DFlash2 geometry or swarm cap, since none fits beside that pool on these cards.",
+    "Static cold-expert offload, on by default from the row's env: for MoE layers 11, 12, 19, 20 (PP0) and 37 (PP1) the hottest half of each rank's experts stay on the GPU and the full master moves to pinned host RAM, read through UVA (placement only: output identical). Profile tools/merlin/profiles/expert_hot/flash-next-quad-20g.json, bound to config.json sha256 64f990cd...: the published Flash-Next, Swift1.5 and Swift1.5-Huihui checkpoints have the same config.json, so the engine's checkpoint check passes on swift1.5. Which experts are hottest was measured on Flash-Next. MERLIN_COLD_EXPERTS=0 (or blank) turns it off (the 20 GB fit was measured, on Flash-Next, with it on only); MERLIN_COLD_EXPERTS=<profile.json> replaces it.",
+    "Engine env from the row (a non-blank value in your environment overrides each): VLLM_SPARSE_INDEXER_MAX_LOGITS_MB=64 and VLLM_E2_QSA_LOGITS_GRANULE_MB=64 (the other rows use 256), NCCL_BUFFSIZE=524288, NCCL_MAX_NCHANNELS=1, PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True.",
+    "Host RAM: the cold experts pin ~8 GiB of host memory on top of the Flash-Next floor (9.05 GiB measured on the Flash-Next checkpoint with six layers, ~1.5 GiB less with five); preflight's RAM check does not count it, so keep ~9 GiB above the qualified figure. It is CUDA-pinned memory, not mlock.",
+    "ECC must be off on the RTX A4500 / RTX 4000 Ada (it takes about 6 % of the memory; the RTX 3080 20GB has none); with ECC on, preflight lowers the KV pin by the shortfall.",
+    "Bandwidth (spec sheets, not measured): RTX 3080 20GB ~760 GB/s, RTX A4500 ~640 GB/s, RTX 4000 Ada ~360 GB/s, against 936 GB/s on the RTX 3090, so decode is slower than on the 24 GB rows."
+   ],
+   "acceptance": "A boot of swift1.5 on real 4 x 20 GB cards with this row's env that holds 1 x 262K through warmup, a 262K prefill and the 8 MP image with identity SAME against the swift1.5 24 GB row; the row stays untested until such a qualification run.",
+   "env": {
+    "VLLM_SPARSE_INDEXER_MAX_LOGITS_MB": "64",
+    "VLLM_E2_QSA_LOGITS_GRANULE_MB": "64",
+    "NCCL_BUFFSIZE": "524288",
+    "NCCL_MAX_NCHANNELS": "1",
+    "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+    "MERLIN_COLD_EXPERTS": "tools/merlin/profiles/expert_hot/flash-next-quad-20g.json",
+    "MERLIN_COLD_EXPERTS_LAYERS": "11,12,19,20,37",
+    "MERLIN_COLD_EXPERTS_HOT_FRAC": "0.5"
+   },
+   "checkpoint": "swift1.5"
+  },
+  {
+   "id": "fn-swift1.5-quad-20g-sm89",
+   "title": "swift1.5: 4 x 20 GB sm_89 (RTX 4000 Ada 20GB), TP2xPP2+EP, fp8 KV, 1 x 262K pin, static cold-expert offload",
+   "status": "untested",
+   "rank": 1,
+   "latency": false,
+   "match": {
+    "arch": [
+     "sm_89"
+    ],
+    "cards": 4,
+    "vram_gib": 20,
+    "p2p": "any"
+   },
+   "layout": {
+    "tp": 2,
+    "pp": 2,
+    "ep": true,
+    "partition": [
+     25,
+     23
+    ]
+   },
+   "serve": {
+    "max_num_seqs": 8,
+    "max_num_batched_tokens": 1024,
+    "kv_cache_dtype": "fp8_e4m3",
+    "kv_cache_memory": 1200000000,
+    "capture_sizes": [
+     1,
+     2,
+     3,
+     4,
+     6,
+     8,
+     12,
+     16,
+     24,
+     32
+    ]
+   },
+   "interconnect": {
+    "modes": {
+     "on": {
+      "exports": {
+       "VLLM_SKIP_P2P_CHECK": "1",
+       "NCCL_P2P_LEVEL": "SYS",
+       "NCCL_PROTO": "Simple",
+       "VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC": "1"
+      },
+      "unset": [],
+      "disable_custom_all_reduce": true
+     },
+     "off": {
+      "exports": {
+       "VLLM_SKIP_P2P_CHECK": "1",
+       "NCCL_P2P_DISABLE": "1"
+      },
+      "unset": [
+       "NCCL_P2P_LEVEL",
+       "NCCL_PROTO",
+       "NCCL_ALGO",
+       "VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC"
+      ],
+      "disable_custom_all_reduce": true
+     },
+     "ipc": {
+      "exports": {
+       "VLLM_SKIP_P2P_CHECK": "1",
+       "NCCL_P2P_DISABLE": "1",
+       "VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC": "1"
+      },
+      "unset": [
+       "NCCL_P2P_LEVEL",
+       "NCCL_PROTO",
+       "NCCL_ALGO",
+       "NCCL_SHM_DISABLE"
+      ],
+      "disable_custom_all_reduce": true
+     }
+    },
+    "default": "off"
+   },
+   "cuda_visible_devices": "0,1,2,3",
+   "warm": 0,
+   "capacity": {
+    "estimate": true,
+    "basis": "The fn-quad-20g-sm89 layout and pin; swift1.5 has the same weights shape. Estimate (untested row): KV pin 1,200,000,000 B per card (1 x 262K = 2 x 131K = 4 x 65K = 8 x 32K). The 265,888-token pool (72 blocks, 1.01 x 262K) was measured on the Flash-Next checkpoint in the 20 GB emulation on 4 x RTX 3090 (2026-11-06); nothing was booted on this checkpoint at 20 GB.",
+    "pin_gib": 1.12,
+    "pool_tokens": 265888,
+    "fit_262k": 1,
+    "fit_131k": 2,
+    "bytes_per_block_mib": [
+     14,
+     15.8
+    ]
+   },
+   "evidence": [
+    "None: swift1.5 has not run on 20 GB cards or in the 20 GB emulation (and none on sm_89: the emulation ran on sm_86 RTX 3090s). The vanilla row fn-quad-20g-sm89's fit, speed, identity and host-RAM figures were measured on the Flash-Next checkpoint in a 20 GB emulation on 4 x RTX 3090 (2026-11-06, re-measured 2026-11-07); see that row. They are not measurements of this checkpoint."
+   ],
+   "notes": [
+    "swift1.5 on the fn-quad-20g-sm89 layout: same pin, KV dtype, concurrency, engine env and cold-expert set; its own scales and served names. Untested / community-validated: nothing was booted on this checkpoint at 20 GB.",
+    "Matches RTX 4000 Ada 20GB (sm_89). The fn-quad-24g-sm89 layout (TP2xPP2+EP, partition 25/23, seqs 8, the same capture sizes) with the 1024-token chunk the 20 GB config was measured with with the KV pin cut to 1 x 262K; no KV variant, DFlash2 geometry or swarm cap, since none fits beside that pool on these cards.",
+    "Static cold-expert offload, on by default from the row's env: for MoE layers 11, 12, 19, 20 (PP0) and 37 (PP1) the hottest half of each rank's experts stay on the GPU and the full master moves to pinned host RAM, read through UVA (placement only: output identical). Profile tools/merlin/profiles/expert_hot/flash-next-quad-20g.json, bound to config.json sha256 64f990cd...: the published Flash-Next, Swift1.5 and Swift1.5-Huihui checkpoints have the same config.json, so the engine's checkpoint check passes on swift1.5. Which experts are hottest was measured on Flash-Next. MERLIN_COLD_EXPERTS=0 (or blank) turns it off (the 20 GB fit was measured, on Flash-Next, with it on only); MERLIN_COLD_EXPERTS=<profile.json> replaces it.",
+    "Engine env from the row (a non-blank value in your environment overrides each): VLLM_SPARSE_INDEXER_MAX_LOGITS_MB=64 and VLLM_E2_QSA_LOGITS_GRANULE_MB=64 (the other rows use 256), NCCL_BUFFSIZE=524288, NCCL_MAX_NCHANNELS=1, PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True.",
+    "Host RAM: the cold experts pin ~8 GiB of host memory on top of the Flash-Next floor (9.05 GiB measured on the Flash-Next checkpoint with six layers, ~1.5 GiB less with five); preflight's RAM check does not count it, so keep ~9 GiB above the qualified figure. It is CUDA-pinned memory, not mlock.",
+    "ECC must be off on the RTX A4500 / RTX 4000 Ada (it takes about 6 % of the memory; the RTX 3080 20GB has none); with ECC on, preflight lowers the KV pin by the shortfall.",
+    "Bandwidth (spec sheets, not measured): RTX 3080 20GB ~760 GB/s, RTX A4500 ~640 GB/s, RTX 4000 Ada ~360 GB/s, against 936 GB/s on the RTX 3090, so decode is slower than on the 24 GB rows.",
+    "WARM defaults to 0 because the persisted Triton autotune is sm_86 only."
+   ],
+   "acceptance": "A boot of swift1.5 on real 4 x 20 GB cards (sm_89) with this row's env that holds 1 x 262K through warmup, a 262K prefill and the 8 MP image with identity SAME against the swift1.5 24 GB row; the row stays untested until such a qualification run.",
+   "env": {
+    "VLLM_SPARSE_INDEXER_MAX_LOGITS_MB": "64",
+    "VLLM_E2_QSA_LOGITS_GRANULE_MB": "64",
+    "NCCL_BUFFSIZE": "524288",
+    "NCCL_MAX_NCHANNELS": "1",
+    "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+    "MERLIN_COLD_EXPERTS": "tools/merlin/profiles/expert_hot/flash-next-quad-20g.json",
+    "MERLIN_COLD_EXPERTS_LAYERS": "11,12,19,20,37",
+    "MERLIN_COLD_EXPERTS_HOT_FRAC": "0.5"
+   },
    "checkpoint": "swift1.5"
   },
   {
@@ -5401,6 +5897,251 @@
    "notes": [
     "swift1.5-huihui on the fn-4x48g-tp2pp2-sm86 layout: same pin, KV dtype and concurrency; its own scales and served names. Untested / community-validated."
    ],
+   "checkpoint": "swift1.5-huihui"
+  },
+  {
+   "id": "fn-swift1.5-huihui-quad-20g-sm86",
+   "title": "swift1.5-huihui: 4 x 20 GB sm_86 (RTX 3080 20GB, RTX A4500), TP2xPP2+EP, fp8 KV, 1 x 262K pin, static cold-expert offload",
+   "status": "untested",
+   "rank": 1,
+   "latency": false,
+   "match": {
+    "arch": [
+     "sm_86"
+    ],
+    "cards": 4,
+    "vram_gib": 20,
+    "p2p": "any"
+   },
+   "layout": {
+    "tp": 2,
+    "pp": 2,
+    "ep": true,
+    "partition": [
+     25,
+     23
+    ]
+   },
+   "serve": {
+    "max_num_seqs": 8,
+    "max_num_batched_tokens": 1024,
+    "kv_cache_dtype": "fp8_e4m3",
+    "kv_cache_memory": 1200000000,
+    "capture_sizes": [
+     1,
+     2,
+     3,
+     4,
+     6,
+     8,
+     12,
+     16,
+     24,
+     32
+    ]
+   },
+   "interconnect": {
+    "modes": {
+     "on": {
+      "exports": {
+       "VLLM_SKIP_P2P_CHECK": "1",
+       "NCCL_P2P_LEVEL": "SYS",
+       "NCCL_PROTO": "Simple",
+       "VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC": "1"
+      },
+      "unset": [],
+      "disable_custom_all_reduce": true
+     },
+     "off": {
+      "exports": {
+       "VLLM_SKIP_P2P_CHECK": "1",
+       "NCCL_P2P_DISABLE": "1"
+      },
+      "unset": [
+       "NCCL_P2P_LEVEL",
+       "NCCL_PROTO",
+       "NCCL_ALGO",
+       "VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC"
+      ],
+      "disable_custom_all_reduce": true
+     },
+     "ipc": {
+      "exports": {
+       "VLLM_SKIP_P2P_CHECK": "1",
+       "NCCL_P2P_DISABLE": "1",
+       "VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC": "1"
+      },
+      "unset": [
+       "NCCL_P2P_LEVEL",
+       "NCCL_PROTO",
+       "NCCL_ALGO",
+       "NCCL_SHM_DISABLE"
+      ],
+      "disable_custom_all_reduce": true
+     }
+    },
+    "default": "on"
+   },
+   "cuda_visible_devices": "0,1,2,3",
+   "warm": 1,
+   "capacity": {
+    "estimate": true,
+    "basis": "The fn-quad-20g-sm86 layout and pin; swift1.5-huihui has the same weights shape. Estimate (untested row): KV pin 1,200,000,000 B per card (1 x 262K = 2 x 131K = 4 x 65K = 8 x 32K). The 265,888-token pool (72 blocks, 1.01 x 262K) was measured on the Flash-Next checkpoint in the 20 GB emulation on 4 x RTX 3090 (2026-11-06); nothing was booted on this checkpoint at 20 GB.",
+    "pin_gib": 1.12,
+    "pool_tokens": 265888,
+    "fit_262k": 1,
+    "fit_131k": 2,
+    "bytes_per_block_mib": [
+     14,
+     15.8
+    ]
+   },
+   "evidence": [
+    "None: swift1.5-huihui has not run on 20 GB cards or in the 20 GB emulation. The vanilla row fn-quad-20g-sm86's fit, speed, identity and host-RAM figures were measured on the Flash-Next checkpoint in a 20 GB emulation on 4 x RTX 3090 (2026-11-06, re-measured 2026-11-07); see that row. They are not measurements of this checkpoint."
+   ],
+   "notes": [
+    "swift1.5-huihui on the fn-quad-20g-sm86 layout: same pin, KV dtype, concurrency, engine env and cold-expert set; its own scales and served names. Untested / community-validated: nothing was booted on this checkpoint at 20 GB.",
+    "Matches RTX 3080 20GB, RTX A4500 (sm_86). The fn-quad-3090 layout (TP2xPP2+EP, partition 25/23, seqs 8, chunk 1024, the same capture sizes) with the KV pin cut to 1 x 262K; no KV variant, DFlash2 geometry or swarm cap, since none fits beside that pool on these cards.",
+    "Static cold-expert offload, on by default from the row's env: for MoE layers 11, 12, 19, 20 (PP0) and 37 (PP1) the hottest half of each rank's experts stay on the GPU and the full master moves to pinned host RAM, read through UVA (placement only: output identical). Profile tools/merlin/profiles/expert_hot/flash-next-quad-20g.json, bound to config.json sha256 64f990cd...: the published Flash-Next, Swift1.5 and Swift1.5-Huihui checkpoints have the same config.json, so the engine's checkpoint check passes on swift1.5-huihui. Which experts are hottest was measured on Flash-Next. MERLIN_COLD_EXPERTS=0 (or blank) turns it off (the 20 GB fit was measured, on Flash-Next, with it on only); MERLIN_COLD_EXPERTS=<profile.json> replaces it.",
+    "Engine env from the row (a non-blank value in your environment overrides each): VLLM_SPARSE_INDEXER_MAX_LOGITS_MB=64 and VLLM_E2_QSA_LOGITS_GRANULE_MB=64 (the other rows use 256), NCCL_BUFFSIZE=524288, NCCL_MAX_NCHANNELS=1, PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True.",
+    "Host RAM: the cold experts pin ~8 GiB of host memory on top of the Flash-Next floor (9.05 GiB measured on the Flash-Next checkpoint with six layers, ~1.5 GiB less with five); preflight's RAM check does not count it, so keep ~9 GiB above the qualified figure. It is CUDA-pinned memory, not mlock.",
+    "ECC must be off on the RTX A4500 / RTX 4000 Ada (it takes about 6 % of the memory; the RTX 3080 20GB has none); with ECC on, preflight lowers the KV pin by the shortfall.",
+    "Bandwidth (spec sheets, not measured): RTX 3080 20GB ~760 GB/s, RTX A4500 ~640 GB/s, RTX 4000 Ada ~360 GB/s, against 936 GB/s on the RTX 3090, so decode is slower than on the 24 GB rows."
+   ],
+   "acceptance": "A boot of swift1.5-huihui on real 4 x 20 GB cards with this row's env that holds 1 x 262K through warmup, a 262K prefill and the 8 MP image with identity SAME against the swift1.5-huihui 24 GB row; the row stays untested until such a qualification run.",
+   "env": {
+    "VLLM_SPARSE_INDEXER_MAX_LOGITS_MB": "64",
+    "VLLM_E2_QSA_LOGITS_GRANULE_MB": "64",
+    "NCCL_BUFFSIZE": "524288",
+    "NCCL_MAX_NCHANNELS": "1",
+    "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+    "MERLIN_COLD_EXPERTS": "tools/merlin/profiles/expert_hot/flash-next-quad-20g.json",
+    "MERLIN_COLD_EXPERTS_LAYERS": "11,12,19,20,37",
+    "MERLIN_COLD_EXPERTS_HOT_FRAC": "0.5"
+   },
+   "checkpoint": "swift1.5-huihui"
+  },
+  {
+   "id": "fn-swift1.5-huihui-quad-20g-sm89",
+   "title": "swift1.5-huihui: 4 x 20 GB sm_89 (RTX 4000 Ada 20GB), TP2xPP2+EP, fp8 KV, 1 x 262K pin, static cold-expert offload",
+   "status": "untested",
+   "rank": 1,
+   "latency": false,
+   "match": {
+    "arch": [
+     "sm_89"
+    ],
+    "cards": 4,
+    "vram_gib": 20,
+    "p2p": "any"
+   },
+   "layout": {
+    "tp": 2,
+    "pp": 2,
+    "ep": true,
+    "partition": [
+     25,
+     23
+    ]
+   },
+   "serve": {
+    "max_num_seqs": 8,
+    "max_num_batched_tokens": 1024,
+    "kv_cache_dtype": "fp8_e4m3",
+    "kv_cache_memory": 1200000000,
+    "capture_sizes": [
+     1,
+     2,
+     3,
+     4,
+     6,
+     8,
+     12,
+     16,
+     24,
+     32
+    ]
+   },
+   "interconnect": {
+    "modes": {
+     "on": {
+      "exports": {
+       "VLLM_SKIP_P2P_CHECK": "1",
+       "NCCL_P2P_LEVEL": "SYS",
+       "NCCL_PROTO": "Simple",
+       "VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC": "1"
+      },
+      "unset": [],
+      "disable_custom_all_reduce": true
+     },
+     "off": {
+      "exports": {
+       "VLLM_SKIP_P2P_CHECK": "1",
+       "NCCL_P2P_DISABLE": "1"
+      },
+      "unset": [
+       "NCCL_P2P_LEVEL",
+       "NCCL_PROTO",
+       "NCCL_ALGO",
+       "VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC"
+      ],
+      "disable_custom_all_reduce": true
+     },
+     "ipc": {
+      "exports": {
+       "VLLM_SKIP_P2P_CHECK": "1",
+       "NCCL_P2P_DISABLE": "1",
+       "VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC": "1"
+      },
+      "unset": [
+       "NCCL_P2P_LEVEL",
+       "NCCL_PROTO",
+       "NCCL_ALGO",
+       "NCCL_SHM_DISABLE"
+      ],
+      "disable_custom_all_reduce": true
+     }
+    },
+    "default": "off"
+   },
+   "cuda_visible_devices": "0,1,2,3",
+   "warm": 0,
+   "capacity": {
+    "estimate": true,
+    "basis": "The fn-quad-20g-sm89 layout and pin; swift1.5-huihui has the same weights shape. Estimate (untested row): KV pin 1,200,000,000 B per card (1 x 262K = 2 x 131K = 4 x 65K = 8 x 32K). The 265,888-token pool (72 blocks, 1.01 x 262K) was measured on the Flash-Next checkpoint in the 20 GB emulation on 4 x RTX 3090 (2026-11-06); nothing was booted on this checkpoint at 20 GB.",
+    "pin_gib": 1.12,
+    "pool_tokens": 265888,
+    "fit_262k": 1,
+    "fit_131k": 2,
+    "bytes_per_block_mib": [
+     14,
+     15.8
+    ]
+   },
+   "evidence": [
+    "None: swift1.5-huihui has not run on 20 GB cards or in the 20 GB emulation (and none on sm_89: the emulation ran on sm_86 RTX 3090s). The vanilla row fn-quad-20g-sm89's fit, speed, identity and host-RAM figures were measured on the Flash-Next checkpoint in a 20 GB emulation on 4 x RTX 3090 (2026-11-06, re-measured 2026-11-07); see that row. They are not measurements of this checkpoint."
+   ],
+   "notes": [
+    "swift1.5-huihui on the fn-quad-20g-sm89 layout: same pin, KV dtype, concurrency, engine env and cold-expert set; its own scales and served names. Untested / community-validated: nothing was booted on this checkpoint at 20 GB.",
+    "Matches RTX 4000 Ada 20GB (sm_89). The fn-quad-24g-sm89 layout (TP2xPP2+EP, partition 25/23, seqs 8, the same capture sizes) with the 1024-token chunk the 20 GB config was measured with with the KV pin cut to 1 x 262K; no KV variant, DFlash2 geometry or swarm cap, since none fits beside that pool on these cards.",
+    "Static cold-expert offload, on by default from the row's env: for MoE layers 11, 12, 19, 20 (PP0) and 37 (PP1) the hottest half of each rank's experts stay on the GPU and the full master moves to pinned host RAM, read through UVA (placement only: output identical). Profile tools/merlin/profiles/expert_hot/flash-next-quad-20g.json, bound to config.json sha256 64f990cd...: the published Flash-Next, Swift1.5 and Swift1.5-Huihui checkpoints have the same config.json, so the engine's checkpoint check passes on swift1.5-huihui. Which experts are hottest was measured on Flash-Next. MERLIN_COLD_EXPERTS=0 (or blank) turns it off (the 20 GB fit was measured, on Flash-Next, with it on only); MERLIN_COLD_EXPERTS=<profile.json> replaces it.",
+    "Engine env from the row (a non-blank value in your environment overrides each): VLLM_SPARSE_INDEXER_MAX_LOGITS_MB=64 and VLLM_E2_QSA_LOGITS_GRANULE_MB=64 (the other rows use 256), NCCL_BUFFSIZE=524288, NCCL_MAX_NCHANNELS=1, PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True.",
+    "Host RAM: the cold experts pin ~8 GiB of host memory on top of the Flash-Next floor (9.05 GiB measured on the Flash-Next checkpoint with six layers, ~1.5 GiB less with five); preflight's RAM check does not count it, so keep ~9 GiB above the qualified figure. It is CUDA-pinned memory, not mlock.",
+    "ECC must be off on the RTX A4500 / RTX 4000 Ada (it takes about 6 % of the memory; the RTX 3080 20GB has none); with ECC on, preflight lowers the KV pin by the shortfall.",
+    "Bandwidth (spec sheets, not measured): RTX 3080 20GB ~760 GB/s, RTX A4500 ~640 GB/s, RTX 4000 Ada ~360 GB/s, against 936 GB/s on the RTX 3090, so decode is slower than on the 24 GB rows.",
+    "WARM defaults to 0 because the persisted Triton autotune is sm_86 only."
+   ],
+   "acceptance": "A boot of swift1.5-huihui on real 4 x 20 GB cards (sm_89) with this row's env that holds 1 x 262K through warmup, a 262K prefill and the 8 MP image with identity SAME against the swift1.5-huihui 24 GB row; the row stays untested until such a qualification run.",
+   "env": {
+    "VLLM_SPARSE_INDEXER_MAX_LOGITS_MB": "64",
+    "VLLM_E2_QSA_LOGITS_GRANULE_MB": "64",
+    "NCCL_BUFFSIZE": "524288",
+    "NCCL_MAX_NCHANNELS": "1",
+    "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+    "MERLIN_COLD_EXPERTS": "tools/merlin/profiles/expert_hot/flash-next-quad-20g.json",
+    "MERLIN_COLD_EXPERTS_LAYERS": "11,12,19,20,37",
+    "MERLIN_COLD_EXPERTS_HOT_FRAC": "0.5"
+   },
    "checkpoint": "swift1.5-huihui"
   },
   {
