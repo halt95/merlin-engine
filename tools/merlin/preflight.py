@@ -1639,7 +1639,11 @@ def _label_finding(rep: Report, prof: dict[str, Any]) -> None:
         )
     else:
         what = (prof.get("evidence") or ["none"])[0]
-        what = what if len(what) <= 150 else what[:147].rstrip() + "..."
+        if len(what) > 150:  # cut between words, never inside one or between a number and its unit
+            cut = what[:147].rsplit(None, 1)[0]
+            while cut[-1:].isdigit() and " " in cut:
+                cut = cut.rsplit(None, 1)[0]
+            what = cut.rstrip(" ,;:(") + " ..."
         rep.add(
             "WARN",
             "label",

@@ -926,7 +926,7 @@ def recommend(inv: pf.Inventory) -> tuple[str | None, str]:
         if fn is not None:
             why = f"{cards} fit Flash-Next ({fn.prof['id']}) but {ram_s} is below its qualified {pf.RAM_WARN_GIB:.0f} GiB"
         else:
-            why = f"{cards} hold no Flash-Next layout (it needs 4 x 24 GB or 2 x 48 GB)"
+            why = f"{cards} hold no Flash-Next layout (it needs 4 x 20 GB, 4 x 24 GB or 2 x 48 GB)"
         return "27b", f"{why}; 27B {b27.prof['id']} [{b27.rep.status}] fits, {ram_s}"
     if fn is not None:
         return "flash-next", (f"{cards} fit {fn.prof['id']} but {ram_s} is below the ~{pf.ram_floor_gib(len(fn.cards)):.0f} GiB "

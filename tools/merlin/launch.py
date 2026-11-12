@@ -1496,7 +1496,15 @@ def _cold_experts_env(environ_in: dict, env: dict, notes: list, ckpt, repo: Path
         if v:
             env[k] = v
     notes.append(f"{FN_COLD_EXPERTS[0]}: static cold-expert offload, layers {','.join(map(str, st.layers))}, "
-                 f"hot_frac {st.hot_frac:g}, profile {path} ({status})")
+                 f"hot_frac {st.hot_frac:g}, profile {path} ({_COLD_EXPERTS_STATUS.get(status, status)})")
+
+
+# what the note says for each result of the engine's checkpoint check of the hot-expert profile
+_COLD_EXPERTS_STATUS = {
+    "ok": "matches the checkpoint",
+    "placeholder": "not tied to a checkpoint",
+    "unknown": "checked against the checkpoint at boot: no local config.json to compare yet",
+}
 
 
 def _build_flash_next(reg, p, checkpoint, ckpt, env, extra, repo: Path) -> Plan:
