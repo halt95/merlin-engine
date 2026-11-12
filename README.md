@@ -284,8 +284,8 @@ about 16–29 %; decode and output are unchanged.
 (P2P on consumer Ampere) · [Zagitta](https://github.com/Zagitta/gpu-unlock) (GPU unlock) · [incoai](https://huggingface.co/incoai/Qwen3.8-Flash-Next-DFlash2) (DFlash2 drafter) ·
 [club-3090](https://github.com/noonghunna/club-3090/discussions/1735) (sm_80 FP8 KV decoder port) · [Sudzpel](https://github.com/Sudzpel) (GPU unlock proposal and measurements) ·
 [brandon-nuttall](https://github.com/brandon-nuttall) (YaRN past 262K report, `SEQS`/`MAXLEN` launcher fix, `use_local_argmax_reduction`, TP2×PP4 community rig) · [R-omk](https://github.com/R-omk) (YaRN past 262K crash report and recipes) · [CoolShades](https://github.com/CoolShades) (idle-power report and first fix behind the v2.5.2 engine fix) ·
-[jbeemer1](https://github.com/jbeemer1) (KV RAM cache report) · pondzikk · lucifer1004 · Jon-Nielsen · mgabor3141 ·
-[Neiko2002](https://huggingface.co/Neiko2002) · [Yarikdevcom](https://github.com/yarikdevcom) · noonghunna · tfriedel (independent work on the same hardware class)
+[jbeemer1](https://github.com/jbeemer1) (KV RAM cache report) · [pondzikk](https://github.com/pondzikk) · [lucifer1004](https://github.com/lucifer1004) · [Jon-Nielsen](https://github.com/Jon-Nielsen) · [mgabor3141](https://github.com/mgabor3141) ·
+[Neiko2002](https://huggingface.co/Neiko2002) · [Yarikdevcom](https://github.com/yarikdevcom) (independent work on the same hardware class)
 
 Upstream fixes are credited in the engine repository.
 
