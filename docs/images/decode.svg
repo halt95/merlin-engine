@@ -1,32 +1,32 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="1466" viewBox="0 0 1280 1466" role="img" aria-labelledby="ttl dsc">
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="1616" viewBox="0 0 1280 1616" role="img" aria-labelledby="ttl dsc">
 <title id="ttl">Decode speed at 4K, 131K and the full 262K context</title>
-<desc id="dsc">One stream, thinking on, median of 3 (ThinkingCap 2× at 262K: median of 12). Measured on Merlin 3.0.2.2 for the Qwen3.8-27B and ThinkingCap four-card rows and Ornith 1.5; the other rows are the 3.0.2.1 figures, carried forward after a 3.0.2.2 spot check. RTX 3090s at 220 W. Flash-Next 4× 3090 (3.0.2.1): 174 at 4K, 188 at 131K, 192 at 262K; Swift1.5 4× 3090 (3.0.2.1): 180 at 4K, 185 at 131K, 182 at 262K; Swift1.5-Huihui 4× 3090 (3.0.2.1): 178 at 4K, 190 at 131K, 203 at 262K; Qwen3.8-27B 1× 3090 (3.0.2.1): 131 at 4K, 102 at 131K, 75 at 262K; Qwen3.8-27B 2× 3090 (3.0.2.1): 248 at 4K, 197 at 131K, 160 at 262K; Qwen3.8-27B 4× 3090: 315 at 4K, 296 at 131K, 267 at 262K; ThinkingCap 2× 3090 (3.0.2.1): 244 at 4K, 179 at 131K, 163 at 262K; ThinkingCap 4× 3090: 287 at 4K, 277 at 131K, 274 at 262K; Nemotron 3.5 Super VL 4× 3090 (3.0.2.1): 105 at 4K, 102 at 131K, 101 at 262K; Ornith 1.5 4× 3090: 152 at 4K, 106 at 131K, 106 at 262K (tok/s).</desc>
+<desc id="dsc">One stream, thinking on, median of 3 (ThinkingCap 2× at 262K: median of 12). Measured on Merlin 3.0.2.2 for the Qwen3.8-27B and ThinkingCap four-card rows, Ornith 1.5 and Hy4 Flash; the other rows are the 3.0.2.1 figures, carried forward after a 3.0.2.2 spot check. RTX 3090s at 220 W. Flash-Next 4× 3090 (3.0.2.1): 174 at 4K, 188 at 131K, 192 at 262K; Swift1.5 4× 3090 (3.0.2.1): 180 at 4K, 185 at 131K, 182 at 262K; Swift1.5-Huihui 4× 3090 (3.0.2.1): 178 at 4K, 190 at 131K, 203 at 262K; Qwen3.8-27B 1× 3090 (3.0.2.1): 131 at 4K, 102 at 131K, 75 at 262K; Qwen3.8-27B 2× 3090 (3.0.2.1): 248 at 4K, 197 at 131K, 160 at 262K; Qwen3.8-27B 4× 3090: 315 at 4K, 296 at 131K, 267 at 262K; ThinkingCap 2× 3090 (3.0.2.1): 244 at 4K, 179 at 131K, 163 at 262K; ThinkingCap 4× 3090: 287 at 4K, 277 at 131K, 274 at 262K; Nemotron 3.5 Super VL 4× 3090 (3.0.2.1): 105 at 4K, 102 at 131K, 101 at 262K; Ornith 1.5 4× 3090: 152 at 4K, 106 at 131K, 106 at 262K; Hy4 Flash 4× 3090 (new, testing; thinking on at effort high, median of 3 sends): 75.7 at 4K (K=3, the shipped default), 67.1 at a 128K prompt (130,816 tokens, K=5), 89.3 at 262K (K=5) (tok/s).</desc>
 <defs>
 <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#0a0f24"/><stop offset="0.55" stop-color="#121638"/><stop offset="1" stop-color="#1d1145"/></linearGradient>
 <radialGradient id="glow" cx="0.9" cy="0.05" r="0.5"><stop offset="0" stop-color="#5b6cff" stop-opacity="0.22"/><stop offset="1" stop-color="#5b6cff" stop-opacity="0"/></radialGradient>
-<clipPath id="card"><rect width="1280" height="1466" rx="18"/></clipPath>
+<clipPath id="card"><rect width="1280" height="1616" rx="18"/></clipPath>
 </defs>
 <style>text{font-family:-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif;font-variant-numeric:tabular-nums}</style>
 <g clip-path="url(#card)">
-<rect width="1280" height="1466" fill="url(#bg)"/>
-<rect width="1280" height="1466" fill="url(#glow)"/>
+<rect width="1280" height="1616" fill="url(#bg)"/>
+<rect width="1280" height="1616" fill="url(#glow)"/>
 <text x="56" y="76" font-size="36" font-weight="700" fill="#ffffff">Decode speed at 4K, 131K and the full 262K context</text>
-<text x="56" y="114" font-size="22" fill="#9aa4bf">One stream, thinking on. Merlin 3.0.2.2: 27B and ThinkingCap 4×, Ornith; others 3.0.2.1. 3090s, 220 W.</text>
+<text x="56" y="114" font-size="22" fill="#9aa4bf">One stream, thinking on. Merlin 3.0.2.2: 27B and ThinkingCap 4×, Ornith, Hy4 Flash; others 3.0.2.1. 3090s, 220 W.</text>
 <rect x="56" y="142" width="20" height="20" rx="5" fill="#3f4fa8"/>
 <text x="86" y="159" font-size="20" fill="#c9d1e6">4K prompt</text>
 <rect x="222.79999999999998" y="142" width="20" height="20" rx="5" fill="#6f7fe8"/>
 <text x="252.79999999999998" y="159" font-size="20" fill="#c9d1e6">131K prompt</text>
 <rect x="401.5999999999999" y="142" width="20" height="20" rx="5" fill="#b9a4ff"/>
 <text x="431.5999999999999" y="159" font-size="20" fill="#c9d1e6">262K context (261,888 + 128)</text>
-<line x1="428.0" y1="216" x2="428.0" y2="1382" stroke="#ffffff" stroke-opacity="0.16"/>
-<text x="428.0" y="1412" font-size="18" fill="#7f88a6" text-anchor="middle">0</text>
-<line x1="637.1" y1="216" x2="637.1" y2="1382" stroke="#ffffff" stroke-opacity="0.06"/>
-<text x="637.1" y="1412" font-size="18" fill="#7f88a6" text-anchor="middle">100</text>
-<line x1="846.3" y1="216" x2="846.3" y2="1382" stroke="#ffffff" stroke-opacity="0.06"/>
-<text x="846.3" y="1412" font-size="18" fill="#7f88a6" text-anchor="middle">200</text>
-<line x1="1055.4" y1="216" x2="1055.4" y2="1382" stroke="#ffffff" stroke-opacity="0.06"/>
-<text x="1055.4" y="1412" font-size="18" fill="#7f88a6" text-anchor="middle">300</text>
-<text x="1160.0" y="1440" font-size="18" fill="#7f88a6" text-anchor="end">tok/s</text>
+<line x1="428.0" y1="216" x2="428.0" y2="1530" stroke="#ffffff" stroke-opacity="0.16"/>
+<text x="428.0" y="1560" font-size="18" fill="#7f88a6" text-anchor="middle">0</text>
+<line x1="637.1" y1="216" x2="637.1" y2="1530" stroke="#ffffff" stroke-opacity="0.06"/>
+<text x="637.1" y="1560" font-size="18" fill="#7f88a6" text-anchor="middle">100</text>
+<line x1="846.3" y1="216" x2="846.3" y2="1530" stroke="#ffffff" stroke-opacity="0.06"/>
+<text x="846.3" y="1560" font-size="18" fill="#7f88a6" text-anchor="middle">200</text>
+<line x1="1055.4" y1="216" x2="1055.4" y2="1530" stroke="#ffffff" stroke-opacity="0.06"/>
+<text x="1055.4" y="1560" font-size="18" fill="#7f88a6" text-anchor="middle">300</text>
+<text x="1160.0" y="1588" font-size="18" fill="#7f88a6" text-anchor="end">tok/s</text>
 <text x="56" y="236" font-size="16" font-weight="700" fill="#7f88a6" letter-spacing="1.2">FLASH-NEXT FAMILY  ·  125B MOE</text>
 <text x="56" y="303.0" font-size="23" font-weight="600" fill="#eef1fb">Flash-Next<tspan font-weight="400" fill="#7f88a6" dx="10">4× 3090</tspan></text>
 <path d="M428.0,260.0 H786.9 Q791.9,260.0 791.9,265.0 V275.0 Q791.9,280.0 786.9,280.0 H428.0 Z" fill="#3f4fa8"/>
@@ -104,5 +104,16 @@
 <text x="659.7" y="1334.0" font-size="19" font-weight="500" fill="#9aa4bf">106</text>
 <path d="M428.0,1342.0 H644.7 Q649.7,1342.0 649.7,1347.0 V1357.0 Q649.7,1362.0 644.7,1362.0 H428.0 Z" fill="#b9a4ff"/>
 <text x="659.7" y="1359.0" font-size="21" font-weight="700" fill="#ffffff">106</text>
+<line x1="56" y1="1380" x2="1224" y2="1380" stroke="#ffffff" stroke-opacity="0.08"/>
+<text x="56" y="1416" font-size="16" font-weight="700" fill="#7f88a6" letter-spacing="1.2">HY4 FLASH  ·  220B-A12B MOE (W4A16)</text>
+<text x="56" y="1483.0" font-size="23" font-weight="600" fill="#eef1fb">Hy4 Flash<tspan font-weight="400" fill="#7f88a6" dx="10">4× 3090 · testing</tspan></text>
+<path d="M428.0,1440.0 H581.3 Q586.3,1440.0 586.3,1445.0 V1455.0 Q586.3,1460.0 581.3,1460.0 H428.0 Z" fill="#3f4fa8"/>
+<text x="596.3" y="1457.0" font-size="19" font-weight="500" fill="#9aa4bf">76</text>
+<path d="M428.0,1465.0 H563.3 Q568.3,1465.0 568.3,1470.0 V1480.0 Q568.3,1485.0 563.3,1485.0 H428.0 Z" fill="#6f7fe8"/>
+<text x="578.3" y="1482.0" font-size="19" font-weight="500" fill="#9aa4bf">67 §</text>
+<text x="638.3" y="1482.0" font-size="17" fill="#7f88a6">128K prompt</text>
+<path d="M428.0,1490.0 H609.7 Q614.7,1490.0 614.7,1495.0 V1505.0 Q614.7,1510.0 609.7,1510.0 H428.0 Z" fill="#b9a4ff"/>
+<text x="624.7" y="1507.0" font-size="21" font-weight="700" fill="#ffffff">89 §</text>
+<text x="56" y="1588" font-size="17" fill="#7f88a6">Hy4 Flash: middle bar is a 128K prompt (130,816 tokens). § Measured at K=5, not the shipped K=3.</text>
 </g>
 </svg>

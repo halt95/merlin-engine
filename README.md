@@ -265,7 +265,7 @@ Every new flag and environment variable of this release is in the
 
 ## Performance
 
-<img src="docs/images/decode.svg" alt="Single-stream decode at 4K, 131K and 262K context for every model: Merlin 3.0.2.2 for the Qwen3.8-27B and ThinkingCap four-card rows and Ornith 1.5, 3.0.2.1 figures for the others (vLLM 0.33)" width="100%">
+<img src="docs/images/decode.svg" alt="Single-stream decode at 4K, 131K and 262K context for every model: Merlin 3.0.2.2 for the Qwen3.8-27B and ThinkingCap four-card rows, Ornith 1.5 and Hy4 Flash (new, testing: 4K, 128K and 262K prompts, the 128K and 262K bars at K=5), 3.0.2.1 figures for the others (vLLM 0.33)" width="100%">
 
 <details>
 <summary><b>Prefill and time to first token at 262K</b></summary>

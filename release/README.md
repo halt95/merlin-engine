@@ -68,7 +68,7 @@ checksum checks remain enabled. Unset the variable after repairing provenance
 or rebuilding in a usable Git checkout.
 
 A fresh install from the 3.0.0 release wheel on the 0.32 lock was verified on the reference host and on
-a second host with 4× RTX 4090 (2026-10-20); a fresh install from the 3.0.2.1 release wheel on this lock passed on the reference host (2026-11-12: install, verify and identity checks); a fresh install of the 3.0.2 or 3.0.2.2 wheel on this lock has not been done; the container image is not yet qualified. A tile
+a second host with 4× RTX 4090 (2026-10-20); a fresh install from the 3.0.2.1 release wheel on this lock passed on the reference host (2026-11-12: install, verify and identity checks); a fresh install from the 3.0.2.2 release wheel on this lock passed on a 4× RTX 3090 host (2026-11-21: clean clone of tag `merlin-v3.0.2.2`, setup with no Hugging Face token, ENVIRONMENT VERIFIED, boot and requests OK); a fresh install of the 3.0.2 wheel on this lock has not been done; the container image is not yet qualified. A tile
 hash check or import check does not replace a successful model request and the
 separate live tile proof. See [install-0.33.md](install-0.33.md) for the full
 procedure.

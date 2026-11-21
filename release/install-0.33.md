@@ -38,7 +38,9 @@ Qualification status of this locked route (vLLM 0.33.0, torch 2.14.0, FlashInfer
 gate Flash-Next, Qwen3.8-27B (1, 2 and 4 GPUs), Nemotron 3.5 Super VL and Ornith 1.5 booted and served on it
 (2026-11-04), building their FlashInfer JIT modules on sm_86, and the live tile proof passed on the 27B TP2 boot; a
 fresh install from the 3.0.2 release wheel was not done; on 3.0.2.1 a fresh install from the release wheel passed on the
-reference host (2026-11-12: install, verify and identity checks). The ReplaySSM `checkpointing_ssu` module does not compile for sm_86 on any toolkit; it needs sm_90.
+reference host (2026-11-12: install, verify and identity checks); on 3.0.2.2 a fresh install from the release wheel passed
+on a 4× RTX 3090 host (2026-11-21: clean clone of tag `merlin-v3.0.2.2`, setup with no Hugging Face token,
+ENVIRONMENT VERIFIED, boot and requests OK). The ReplaySSM `checkpointing_ssu` module does not compile for sm_86 on any toolkit; it needs sm_90.
 For the previous route (vLLM 0.32.0, FlashInfer 0.7.0.post1), a CPU-only venv built from its lock with
 `--require-hashes` compiled the served configurations' FlashInfer JIT modules for sm_80, sm_86 and sm_89 (2026-10-17),
 and release-wheel installs were then served on it (2026-10-20).
@@ -125,4 +127,4 @@ The proof checker requires one complete planner selection line per device in the
 current boot. This proves tile selection; it is not a numerical correctness test
 or proof that a kernel completed. Capture the log after a successful request.
 
-A fresh install from the 3.0.0 release wheel (vLLM 0.32.0) was verified on the reference host and on a second host with 4× RTX 4090 (2026-10-20); a fresh install of the vLLM 0.33.0 wheel has not been done; the container image is not yet qualified.
+A fresh install from the 3.0.0 release wheel (vLLM 0.32.0) was verified on the reference host and on a second host with 4× RTX 4090 (2026-10-20); on vLLM 0.33.0, fresh installs from the 3.0.2.1 and 3.0.2.2 release wheels passed (2026-11-12 and 2026-11-21) and the 3.0.2 wheel was not fresh-installed; the container image is not yet qualified.

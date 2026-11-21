@@ -544,8 +544,9 @@ Every row except Hy4 Flash is in the bench cards; the Hy4 Flash rows are in this
 
 ### Known limits
 
-- **A fresh install of the 3.0.2.2 wheel on the pinned lock has not been done.** The compiled code is the 3.0.2.1
-  build, whose fresh install on this lock passed on 2026-11-12 (install, verify and identity checks).
+- **A fresh install of the 3.0.2.2 wheel on the pinned lock passed** on 2026-11-21 on a 4× RTX 3090 host: a clean clone
+  of tag `merlin-v3.0.2.2`, setup with no Hugging Face token and the wheel from the GitHub release; the environment check
+  printed ENVIRONMENT VERIFIED, and the server booted and answered requests.
 - **Hy4 Flash is new in this release.** The four-card row (`hy4flash-quad-3090`) is testing: its full-model runs
   passed on our 4 x RTX 3090 host at the 1,600,000,000 B pin (the same tokens as the stock kernels on serial prompts,
   262K prefill and decode with no out-of-memory, 13.19 ms per output token at K=3, a 609,398-token pool; the
