@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Modified by the Merlin project; see NOTICE.
 import multiprocessing
+import time
 from collections.abc import Iterable, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import TYPE_CHECKING, NamedTuple
@@ -11,6 +12,10 @@ import numpy as np
 from vllm.config import VllmConfig
 from vllm.exceptions import VLLMValidationError
 from vllm.logger import init_logger
+from vllm.merlin import (
+    grammar_step_diag,
+    strict_stall_guard,
+)
 from vllm.parser.engine.adapters import ParserEngineReasoningAdapter
 from vllm.reasoning import ReasoningParserManager
 from vllm.tokenizers import cached_tokenizer_from_config
@@ -240,6 +245,10 @@ class StructuredOutputManager:
         assert self._grammar_bitmask is not None
         for grammar, index, apply_bitmask, masked_ids in batch:
             if apply_bitmask and not grammar.is_terminated():
+
+                if strict_stall_guard.on():
+                    strict_stall_guard.timed_fill(grammar, self._grammar_bitmask, index)
+                    continue
                 grammar.fill_bitmask(self._grammar_bitmask, index)
             else:
                 # Note that for thinking support, we will need to
@@ -393,6 +402,20 @@ class StructuredOutputManager:
         grammar-invalid token, if any (-1 padding stripped)."""
         if not request.use_structured_output:
             return spec_tokens
+
+        if grammar_step_diag.on():
+            start = time.perf_counter()
+            trimmed = self._trim_spec_tokens(request, spec_tokens)
+            grammar_step_diag.add(
+                "trim", request.request_id, time.perf_counter() - start
+            )
+            return trimmed
+        return self._trim_spec_tokens(request, spec_tokens)
+
+
+    def _trim_spec_tokens(
+        self, request: "Request", spec_tokens: list[int]
+    ) -> list[int]:
         spec_config = getattr(self.vllm_config, "speculative_config", None)
         if getattr(spec_config, "rejection_sample_method", None) == "synthetic":
             # Synthetic acceptance ignores the token, so a kept invalid draft
@@ -432,6 +455,7 @@ class StructuredOutputManager:
         # Prepare the structured output bitmask for this batch.
         if not structured_output_request_ids:
             return None
+        grammar_step_diag.mark("bitmask_start")
 
         # Covers both speculative decoding and diffusion LLMs (canvas_length).
         max_num_spec_tokens = self.vllm_config.num_speculative_tokens
@@ -525,8 +549,12 @@ class StructuredOutputManager:
                     apply_bitmask = not seen_padding and i >= constraint_start
                     reasoning = not seen_padding and i < constraint_start
                     row_masked = masked_ids if reasoning else ()
+                    start = time.perf_counter()
                     self._fill_bitmasks(
                         ((grammar, cumulative_index, apply_bitmask, row_masked),)
+                    )
+                    grammar_step_diag.add(
+                        "fill", req_id, time.perf_counter() - start, i
                     )
                     if token == -1:
                         seen_padding = True
@@ -553,8 +581,12 @@ class StructuredOutputManager:
                         )
                         bonus_reasoning = not seen_padding and not bonus_apply
                         bonus_masked = masked_ids if bonus_reasoning else ()
+                        start = time.perf_counter()
                         self._fill_bitmasks(
                             ((grammar, cumulative_index, bonus_apply, bonus_masked),)
+                        )
+                        grammar_step_diag.add(
+                            "fill", req_id, time.perf_counter() - start, len(req_tokens)
                         )
                     cumulative_index += 1
 
@@ -569,12 +601,28 @@ class StructuredOutputManager:
         # After finishing with the xgrammar operations, we convert to
         # np.ndarray, because that is much more efficient for serialization
         # and deserialization when sending this to the GPU workers.
+        grammar_step_diag.mark("bitmask_end")
+        if strict_stall_guard.on():
+            strict_stall_guard.end_step(requests, structured_output_request_ids)
         return bitmask_tensor.numpy()
 
     def accept_tokens(self, request: "Request", new_token_ids: list[int]) -> bool:
         """Advance grammar with accepted tokens. Returns False on rejection."""
         if not request.use_structured_output or not new_token_ids:
             return True
+
+        if grammar_step_diag.on():
+            start = time.perf_counter()
+            accepted = self._accept_tokens(request, new_token_ids)
+            grammar_step_diag.add(
+                "accept", request.request_id, time.perf_counter() - start
+            )
+            return accepted
+        return self._accept_tokens(request, new_token_ids)
+
+
+    def _accept_tokens(self, request: "Request", new_token_ids: list[int]) -> bool:
+        # accept_tokens without the step timing
 
         structured_req = request.structured_output_request
         if TYPE_CHECKING:

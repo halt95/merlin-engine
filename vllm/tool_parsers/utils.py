@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by the Merlin project; see NOTICE.
 
 import ast
 import json
@@ -242,6 +243,42 @@ def get_function_tools(
         elif isinstance(tool, (FunctionTool, ChatCompletionToolsParam)):
             function_tools.append(tool)
     return function_tools
+
+
+def find_aliased_tool_name(tools: Sequence[Tool] | None) -> str | None:
+    """Return a model-visible tool name that two different tools share.
+
+    Namespace functions are flattened to ``<namespace>__<name>``, so a plain
+    function ``a__b`` and the function ``b`` of namespace ``a`` reach the model
+    under one name and a call to one is reported as the other. The names
+    checked are the ones ``get_function_tools`` returns. Two entries with the
+    same identity (the same plain function, custom tool or namespace member
+    listed twice) are not an alias and are not reported.
+
+    Returns the first aliased name in request order, or ``None``.
+    """
+    seen: dict[str, tuple[str, ...]] = {}
+    for tool in tools or []:
+        identities: list[tuple[str, tuple[str, ...]]] = []
+        if isinstance(tool, NamespaceTool):
+            identities = [
+                (
+                    flat_namespace_tool_name(tool.name, member.name),
+                    ("namespace", tool.name, member.name),
+                )
+                for member in tool.tools
+                if member.type == "function"
+            ]
+        elif isinstance(tool, CustomTool):
+            identities = [(tool.name, ("custom", tool.name))]
+        elif isinstance(tool, FunctionTool):
+            identities = [(tool.name, ("function", tool.name))]
+        elif isinstance(tool, ChatCompletionToolsParam):
+            identities = [(tool.function.name, ("function", tool.function.name))]
+        for name, identity in identities:
+            if seen.setdefault(name, identity) != identity:
+                return name
+    return None
 
 
 def require_function_tools(
@@ -1150,6 +1187,41 @@ _TYPE_ALIASES: dict[str, str] = {
 }
 
 
+NOT_A_LITERAL: Any = object()
+
+
+def json_literal_of_type(value: str, json_type: str) -> Any:
+    """The value *value* spells in JSON if it is of *json_type*, else
+    ``NOT_A_LITERAL``.
+
+    Scalars must be spelled exactly as ``json.dumps`` writes them, so text
+    that only resembles a number, a boolean or null is not one. An object or
+    an array is any JSON text of that kind.
+    """
+    try:
+        parsed = json.loads(value)
+    except (json.JSONDecodeError, ValueError, TypeError, RecursionError):
+        return NOT_A_LITERAL
+    if not _is_json_finite(parsed):
+        return NOT_A_LITERAL
+    if json_type in ("object", "array"):
+        kind = dict if json_type == "object" else list
+        return parsed if isinstance(parsed, kind) else NOT_A_LITERAL
+    if isinstance(parsed, (dict, list)) or json.dumps(parsed) != value:
+        return NOT_A_LITERAL
+    if json_type == "null":
+        matches = parsed is None
+    elif json_type == "boolean":
+        matches = isinstance(parsed, bool)
+    elif json_type == "integer":
+        matches = isinstance(parsed, int) and not isinstance(parsed, bool)
+    elif json_type == "number":
+        matches = isinstance(parsed, (int, float)) and not isinstance(parsed, bool)
+    else:
+        matches = False
+    return parsed if matches else NOT_A_LITERAL
+
+
 def coerce_to_schema_type(value: str, schema_type: str | list[str]) -> Any:
     """Best-effort coercion of a raw string value to a JSON Schema type.
 
@@ -1184,6 +1256,15 @@ def coerce_to_schema_type(value: str, schema_type: str | list[str]) -> Any:
     for candidate_type in type_priority:
         if candidate_type not in normalized_types:
             continue
+
+        # A schema that also allows a string
+        # turns the text into another type only when it is that value's own
+        # JSON text; "0017", "+5", "NULL" or "1" for a boolean stay text.
+        if candidate_type != "string" and "string" in normalized_types:
+            literal = json_literal_of_type(value, candidate_type)
+            if literal is NOT_A_LITERAL:
+                continue
+            return literal
 
         if candidate_type == "null":
             if value.lower() == "null":

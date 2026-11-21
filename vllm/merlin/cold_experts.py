@@ -47,6 +47,7 @@ launches empty blocks); no host sync and no Python branch on routing.
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass
 
 import torch
@@ -59,6 +60,11 @@ WEIGHT_NAMES = ("w13_weight_packed", "w2_weight_packed")
 SCALE_NAMES = ("w13_weight_scale", "w2_weight_scale")
 # Per-expert tensors the split does not carry: a layer that has any is refused.
 EXTRA_MARKERS = ("zero_point", "bias", "global_scale")
+# Router-side parameters RoutedExperts registers as its
+# own (the aux-free routing bias the gate passes in, e.g. Hy4's expert_bias): read before
+# top-k, never by the expert GEMMs, so the split leaves them where they are. Mirrors the
+# non-expert names RoutedExperts keeps out of EPLB.
+ROUTER_SIDE = ("e_score_correction_bias",)
 
 _REG: dict[int, "ColdSplit"] = {}
 _ROWS: dict[tuple, torch.Tensor] = {}
@@ -91,6 +97,14 @@ class ColdSplit:
     hot_map: torch.Tensor  # int32 [global]
     cold_map: torch.Tensor  # int32 [global]
     expert_map_ptr: int | None
+    # Set when MERLIN_COLD_EXPERTS_ADAPTIVE=1:
+    # decode-window distinct-step counts per global expert, and each hot row's
+    # global id and master row (the maps' inverse), all fixed device tensors.
+    counts: torch.Tensor | None = None  # fp32 [global]
+    row_global: torch.Tensor | None = None  # int64 [hot rows]
+    row_local: torch.Tensor | None = None  # int64 [hot rows]
+    # Swaps applied so far (device int64 [1])
+    moved: torch.Tensor | None = None
 
     def _check(self, kw) -> None:
         if kw["w2"].data_ptr() != self.master_w2.data_ptr():
@@ -108,6 +122,8 @@ class ColdSplit:
             got = None if expert_map is None else expert_map.data_ptr()
             if got != self.expert_map_ptr:
                 raise RuntimeError(f"cold experts {self.name}: the expert map is not the layer's")
+            if self.counts is not None:
+                count_decode(self, topk_ids)
             hot = (align(topk_ids, block_size, num_experts, self.hot_map, *args, **kwargs)
                    if self.hot_w1 is not None else None)
             cold = align(topk_ids, block_size, num_experts, self.cold_map, *args, **kwargs)
@@ -175,6 +191,209 @@ def dispatch(w1, align, gemms):
     return s.align_fn(align), s.gemms_fn(gemms)
 
 
+# ---------------------------------------------------------------- adaptive hot set
+# MERLIN_COLD_EXPERTS_ADAPTIVE=1 (with the static
+# offload on): per registered layer, decode calls (rows <= MMAX, the graph's size
+# at capture) add their distinct routed experts to a window counter, inside the
+# captured graphs. Every PERIOD steps, between steps on the main stream, outside
+# every graph (adaptive_step, called from the runner's execute_model), each layer
+# swaps up to SWAPS of its hottest cold experts with its coldest hot rows when the
+# candidate's count beats the victim's by more than MARGIN: the candidate's
+# master bytes and scales are copied into the victim's hot row and the four map
+# entries are rewritten, all from device indices (no host sync). Counts halve
+# every WINDOW steps. Captured graphs read the maps and hot rows at fixed
+# addresses, and a hot row is a byte copy of the master, so every (token, k) row
+# is computed exactly as before: placement only, output unchanged.
+ADAPTIVE_ENV = "MERLIN_COLD_EXPERTS_ADAPTIVE"
+ADAPTIVE_DEFAULTS = {"PERIOD": 8, "SWAPS": 4, "WINDOW": 64, "MARGIN": 2, "MMAX": 32}
+_ADAPTIVE = {"steps": 0, "settings": "unset", "atexit": False}
+# The swap totals reach the host without a sync:
+# after each swap pass the per-layer totals are copied to pinned memory with an
+# event; the next pass logs them (INFO, only when a total changed) once the
+# event has completed. The shutdown report reads them after the runner's sync.
+_MOVED = {"host": None, "event": None, "logged": None, "step": 0, "reported": False}
+
+
+@dataclass(frozen=True)
+class AdaptiveSettings:
+    period: int
+    swaps: int
+    window: int
+    margin: float
+    mmax: int
+
+
+def adaptive_settings(environ=None) -> AdaptiveSettings | None:
+    """None when off. The ``MERLIN_COLD_EXPERTS_ADAPTIVE_PERIOD``, ``_SWAPS``,
+    ``_WINDOW``, ``_MARGIN`` and ``_MMAX`` knobs tune it (WINDOW 0 = never decay)."""
+    import os
+
+    cache = environ is None
+    if cache and _ADAPTIVE["settings"] != "unset":
+        return _ADAPTIVE["settings"]
+    env = os.environ if environ is None else environ
+    raw = (env.get(ADAPTIVE_ENV, "") or "").strip()
+    if raw not in ("", "0", "1"):
+        raise ValueError(f"{ADAPTIVE_ENV} must be 0 or 1 (got {raw!r})")
+    out = None
+    if raw == "1":
+        vals = {}
+        for key, default in ADAPTIVE_DEFAULTS.items():
+            text = (env.get(f"{ADAPTIVE_ENV}_{key}", "") or "").strip()
+            try:
+                vals[key] = float(text) if key == "MARGIN" and text else int(text) if text else default
+            except ValueError:
+                raise ValueError(f"{ADAPTIVE_ENV}_{key}={text!r} is not a number") from None
+            low = 0 if key in ("WINDOW", "MARGIN") else 1
+            if not math.isfinite(vals[key]):  # inf / nan refused
+                raise ValueError(f"{ADAPTIVE_ENV}_{key}={text!r} is not a finite number")
+            if vals[key] < low:
+                raise ValueError(f"{ADAPTIVE_ENV}_{key}={vals[key]} is below {low}")
+        out = AdaptiveSettings(vals["PERIOD"], vals["SWAPS"], vals["WINDOW"], float(vals["MARGIN"]),
+                               vals["MMAX"])
+    if cache:
+        _ADAPTIVE["settings"] = out
+    return out
+
+
+def count_decode(s: ColdSplit, topk_ids: torch.Tensor) -> None:
+    """Add a decode call's distinct routed experts to ``s.counts`` (device ops only;
+    the row-count branch is taken on the Python shape, i.e. at capture)."""
+    st = adaptive_settings()
+    if st is None or topk_ids.shape[0] > st.mmax:
+        return
+    ids = topk_ids.reshape(-1).long()
+    live = (ids >= 0) & (ids < s.counts.numel())
+    mark = torch.zeros_like(s.counts)
+    mark.index_put_((torch.where(live, ids, 0),), live.float(), accumulate=True)
+    s.counts.add_(mark.clamp_(max=1.0))
+
+
+def swap_round(s: ColdSplit, swaps: int, margin: float) -> torch.Tensor | None:
+    """One swap pass over one layer, from device values only. Returns the number
+    of swaps applied (a device scalar), or None when the layer cannot swap."""
+    n_hot = s.row_global.numel()
+    n_cold = s.plan.n_local - n_hot
+    k = min(swaps, n_hot, n_cold)
+    if k <= 0:
+        return None
+    cold_score = torch.where(s.cold_map >= 0, s.counts, torch.full_like(s.counts, -1.0))
+    cand_val, cand_g = cold_score.topk(k)
+    vic_val, vic_r = s.counts[s.row_global].topk(k, largest=False)
+    swap = cand_val > vic_val + margin
+    cand_l = s.cold_map[cand_g].long().clamp_min(0)
+    vic_g, vic_l = s.row_global[vic_r], s.row_local[vic_r]
+    # bytes first (the candidate's master row into the victim's hot row) ...
+    for hot, master in ((s.hot_w1, s.master_w1), (s.hot_w2, s.master_w2),
+                        (s.hot_s1, s.scale1), (s.hot_s2, s.scale2)):
+        shape = (k,) + (1,) * (hot.dim() - 1)
+        rows = torch.where(swap.view(shape), master.index_select(0, cand_l),
+                           hot.index_select(0, vic_r))
+        hot.index_copy_(0, vic_r, rows)
+    # ... then the maps (same stream: no forward sees one without the other)
+    hot_r = vic_r.to(s.hot_map.dtype)
+    s.hot_map[cand_g] = torch.where(swap, hot_r, s.hot_map[cand_g])
+    s.cold_map[cand_g] = torch.where(swap, torch.full_like(hot_r, -1), s.cold_map[cand_g])
+    s.hot_map[vic_g] = torch.where(swap, torch.full_like(hot_r, -1), s.hot_map[vic_g])
+    s.cold_map[vic_g] = torch.where(swap, vic_l.to(s.cold_map.dtype), s.cold_map[vic_g])
+    s.row_global[vic_r] = torch.where(swap, cand_g, vic_g)
+    s.row_local[vic_r] = torch.where(swap, cand_l, vic_l)
+    return swap.sum()
+
+
+def adaptive_step() -> None:
+    """Once per engine step on every rank (the runner's execute_model, outside
+    graphs): every PERIOD steps a swap pass, every WINDOW steps a decay."""
+    st = adaptive_settings()
+    if st is None or not _REG:
+        return
+    _ADAPTIVE["steps"] += 1
+    step = _ADAPTIVE["steps"]
+    if step % st.period == 0:
+        _log_moved(final=False)  # the last pass's totals
+        for s in _REG.values():
+            if s.counts is not None:
+                n = swap_round(s, st.swaps, st.margin)
+                if n is not None:
+                    if s.moved is None:
+                        s.moved = torch.zeros(1, dtype=torch.long, device=s.counts.device)
+                    s.moved.add_(n)
+        _post_moved(step)
+    if st.window and step % st.window == 0:
+        for s in _REG.values():
+            if s.counts is not None:
+                s.counts.mul_(0.5)
+
+
+def _adaptive_layers() -> list[ColdSplit]:
+    return [s for s in _REG.values() if s.counts is not None and s.moved is not None]
+
+
+def _post_moved(step: int) -> None:
+    """Copy the per-layer swap totals to pinned host memory, non-blocking."""
+    layers = _adaptive_layers()
+    if not layers:
+        return
+    dev = torch.stack([s.moved[0] for s in layers])
+    if dev.device.type != "cuda":  # CPU tensors (tests): nothing to wait for
+        _MOVED["host"], _MOVED["event"], _MOVED["step"] = dev.clone(), "ready", step
+        return
+    host = _MOVED["host"]
+    if host is None or host.numel() != dev.numel():
+        host = torch.zeros(dev.numel(), dtype=torch.long, pin_memory=True)
+        _MOVED["host"] = host
+    host.copy_(dev, non_blocking=True)
+    event = torch.cuda.Event()
+    event.record()
+    _MOVED["event"], _MOVED["step"] = event, step
+
+
+def _log_moved(final: bool) -> None:
+    """INFO line when a layer's swap total changed since the last line; never
+    waits (a pending copy is read at the next pass) unless ``final``."""
+    event = _MOVED["event"]
+    if event is None:
+        return
+    if event != "ready":
+        if final:
+            event.synchronize()
+        elif not event.query():
+            return
+    totals = _MOVED["host"].tolist()
+    if totals == _MOVED["logged"] and not final:
+        return
+    names = [s.name for s in _adaptive_layers()][: len(totals)]
+    previous = _MOVED["logged"] or [0] * len(totals)
+    _MOVED["logged"] = totals
+    logger.info("cold experts adaptive: step %d: swaps %d total (%s)", _MOVED["step"],
+                sum(totals), ", ".join(f"{n} {t} (+{t - p})"
+                                       for n, t, p in zip(names, totals, previous)))
+
+
+def adaptive_report(once: bool = False) -> list[tuple[str, int, int]]:
+    """(layer name, hot rows now holding an expert the static plan did not put
+    there, hot rows) per adaptive layer, plus the swap totals; logged once at
+    shutdown (the model runner's shutdown, after its device sync; atexit is the
+    fallback) as the GPU check's proof that swaps ran. Host reads: never call it
+    between steps. ``once``: the shutdown / atexit call, which logs at most once."""
+    if once and _MOVED["reported"]:
+        return []
+    out = []
+    for s in _REG.values():
+        if s.counts is None:
+            continue
+        now = s.row_local.to("cpu", copy=True).tolist()
+        out.append((s.name, sum(a != b for a, b in zip(now, s.plan.hot_local)), len(now)))
+    if out:
+        _MOVED["reported"] = _MOVED["reported"] or once
+        _log_moved(final=True)
+        swaps = sum(int(s.moved.item()) for s in _adaptive_layers())
+        logger.info("cold experts adaptive: %d steps, %d swaps; rows moved off the static "
+                       "plan: %s", _ADAPTIVE["steps"], swaps,
+                       ", ".join(f"{n} {m}/{h}" for n, m, h in out))
+    return out
+
+
 def registered() -> list[ColdSplit]:
     return list(_REG.values())
 
@@ -183,6 +402,9 @@ def clear() -> None:
     _REG.clear()
     _ROWS.clear()
     _STATE.update(hint_tokens=0, captured=False, ignored_warned=False)
+    _ADAPTIVE.update(steps=0, settings="unset")
+
+    _MOVED.update(host=None, event=None, logged=None, step=0, reported=False)
 
 
 # ---------------------------------------------------------------------------- attach
@@ -254,6 +476,18 @@ def split_layer(name: str, layer: int, params: dict, expert_map, global_experts:
     cold_map = torch.tensor(plan.cold_map, dtype=torch.int32, device=dev)
     s = ColdSplit(name, layer, plan, w13.data, w2.data, s13.data, s2.data, *hot, hot_map, cold_map,
                   None if expert_map is None else expert_map.data_ptr())
+    # The window counters and the hot rows' inverse maps
+    if adaptive_settings() is not None and plan.n_hot:
+        global_of = {loc: g for g, loc in enumerate(local_of) if loc >= 0}
+        s.counts = torch.zeros(global_experts, dtype=torch.float32, device=dev)
+        s.row_local = torch.tensor(plan.hot_local, dtype=torch.long, device=dev)
+        s.row_global = torch.tensor([global_of[r] for r in plan.hot_local], dtype=torch.long,
+                                    device=dev)
+        if not _ADAPTIVE["atexit"]:
+            import atexit
+
+            atexit.register(adaptive_report, True)
+            _ADAPTIVE["atexit"] = True
     _REG[s.master_w1.data_ptr()] = s
     return s
 
@@ -290,7 +524,8 @@ def attach(model: torch.nn.Module, checkpoint_dir: str | None = None, environ=No
             continue
         if getattr(own[WEIGHT_NAMES[0]], "_merlin_cold_split", False):
             continue  # a second post-load pass over the same weights
-        extra = [k for k in own if any(m in k for m in EXTRA_MARKERS)]
+        # Router-side names are not per-expert tensors
+        extra = [k for k in own if k not in ROUTER_SIDE and any(m in k for m in EXTRA_MARKERS)]
         if extra:
             raise RuntimeError(f"cold experts: {name} has {extra}, which the split does not carry")
         if not _marlin_kernel(mod):

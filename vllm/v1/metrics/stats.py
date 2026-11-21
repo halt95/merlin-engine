@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by the Merlin project; see NOTICE.
 
 import time
 from collections import defaultdict, deque
@@ -253,6 +254,8 @@ class SchedulerStats:
     cudagraph_stats: CUDAGraphStat | None = None
 
     perf_stats: PerfStats | None = None
+    # Per-interval deltas, bounded policy/events.
+    policy_counters: dict[str, dict[str, int]] = field(default_factory=dict)
 
 
 @dataclass

@@ -3,10 +3,11 @@
 Every Merlin release in one place, newest first. Until 3.0.0 each model shipped from its own repository with its own
 version numbers; here each sits under the engine release it ran on, with its original tag named. Figures under the 2.x
 releases were measured on vLLM 0.28-0.30 when they shipped and are kept as published; they are not re-measured on 3.0.0.
-Figures under 3.0.0 and 3.0.1 were measured on vLLM 0.32; the 3.0.2 figures are measured on 0.33 except those marked as carried over from 3.0.1. The 3.0.2.1 figures are measured on 0.33 on every row of its table; each bench card lists the earlier panels it carries over.
+Figures under 3.0.0 and 3.0.1 were measured on vLLM 0.32; the 3.0.2 figures are measured on 0.33 except those marked as carried over from 3.0.1. The 3.0.2.1 figures are measured on 0.33 on every row of its table; each bench card lists the earlier panels it carries over. 3.0.2.2 re-measured four lanes on 0.33 and carries the rest from 3.0.2.1 after a spot check (‡).
 
 | Release | Date | Engine | Models |
 |---|---|---|---|
+| [3.0.2.2](#merlin-3022) | 2026-11-21 | vLLM 0.33.0 | Flash-Next, Swift1.5, Swift1.5-Huihui, Qwen3.8-27B, ThinkingCap, Nemotron 3.5 Super VL, Ornith 1.5, Hy4 Flash |
 | [3.0.2.1](#merlin-3021) | 2026-11-12 | vLLM 0.33.0 | Flash-Next, Swift1.5, Swift1.5-Huihui, Qwen3.8-27B, ThinkingCap, Nemotron 3.5 Super VL, Ornith 1.5 |
 | [3.0.2](#merlin-302) | 2026-11-05 | vLLM 0.33.0 | Flash-Next, Swift1.5, Swift1.5-Huihui, Qwen3.8-27B, ThinkingCap, Nemotron 3.5 Super VL, Ornith 1.5 |
 | [3.0.1](#merlin-301) | 2026-11-02 | vLLM 0.32.0 | Flash-Next, Swift1.5, Swift1.5-Huihui, Qwen3.8-27B, ThinkingCap, Nemotron 3.5 Super VL, Ornith 1.5 |
@@ -18,6 +19,579 @@ Figures under 3.0.0 and 3.0.1 were measured on vLLM 0.32; the 3.0.2 figures are 
 | [2.0.1](#v201) | 2026-09-18 | vLLM pre-0.30 | Flash-Next |
 | [2](#v2) | 2026-09-17 | vLLM pre-0.30 | Flash-Next |
 | [1](#v1) | 2026-09 | vLLM 0.28.0 + patches | Flash-Next |
+
+## Merlin 3.0.2.2
+
+2026-11-21. Built on vLLM 0.33.0, like 3.0.2.1. The seven models of 3.0.2.1 keep their recipes (the VERSION files are
+unchanged), and Hy4 Flash is new, as a `tools/merlin/launch.py` lane on four RTX 3090s (testing: full-model runs passed, kernel parity
+qualification pending) and eight (untested on hardware). The compiled CUDA code is byte-identical to 3.0.2.1's and the Rust frontend is rebuilt only for the new
+version string; the Python side of the engine, the launchers and setup change. This release fixes a hang in the Qwen3
+parser at the end of an output, changes the whitespace a reply's content starts with and keeps the whitespace beside
+tool calls, opens a Qwen3 tool call only at a line start and never inside code, makes forced and strict tool calls on
+the Qwen tool parser reliable and bounds what a strict call can cost the server, changes four KV RAM cache defaults,
+turns on the 27B four-card P2P decode settings, returns KV-capacity failures as client errors, adds start-up checks
+that refuse an install they cannot verify, and adds Hy4 Flash with its decode speed-ups and a choice of FP8 or BF16 Engram packs.
+
+### Highlights
+
+- **The Qwen3 parser no longer loops at the end of an output when tools are offered.** This is the parser behind the
+  `qwen3` reasoning parser and the `qwen3_coder` tool-call parser, which Flash-Next, Swift1.5, Swift1.5-Huihui,
+  Qwen3.8-27B, ThinkingCap and Ornith 1.5 serve together, in streaming and non-streaming replies. (Nemotron 3.5 Super VL
+  uses the same tool-call parser with its own reasoning parser; the hang tests cover the `qwen3` pairing.)
+  - **The cause:** the parser holds back a possible `<tool_call>` opener until it can tell whether it is real, in up to
+    three layers (an open code fence, a quote in the reasoning, and the tool-name check). If the output ended while an
+    opener was still held, the end-of-output step let the layers hand it back to each other and never finished.
+    Parsing runs on the API event loop, so the server then stopped answering every other request too.
+  - **When it happened:** with tools in the request and the output ending with an opener still held: reasoning that
+    ends in `<tool_call>` (with or without a partial `<function=` header); an unclosed code fence in the reasoning
+    followed by a tool call; content inside an open code fence that ends in `<tool_call>` (with or without a partial
+    header).
+  - **Since when:** 3.0.2.1, where the parser keeps quoted and fenced tool calls as text (`MERLIN_QWEN3_LITERAL_SPANS`,
+    on by default). With `MERLIN_QWEN3_LITERAL_SPANS=0`, 3.0.2.1 finished every case these tests record.
+  - **The fix:** at the end of an output each hold layer is flushed at most once; a layer that takes items after its
+    flush raises instead of looping, and the parser is left with no half-flushed state. A code fence that closes and another that opens inside the same piece of text is recognised as
+    closed, so for these inputs reasoning and tool calls no longer depend on how a stream was split into pieces. A bare
+    `<function=` at the end of a fenced block stays text.
+- **Content starts at its first visible character after the reasoning block, in streamed and non-streamed replies
+  alike.** A model that reasons writes `...</think>` followed by whitespace and then the answer; that whitespace is now
+  dropped, with or without tool calls. For example, content that was `"\n\nAnswer"` in 3.0.2.1, streamed or not, is now
+  `"Answer"`. When the reasoning block is followed directly by the answer, nothing changes. When the prompt already
+  closed the reasoning block (thinking off), or the parser has no reasoning, nothing is removed. Whitespace later in the
+  content is not touched. **This changes output bytes in both modes:** a client that relied on the leading whitespace
+  (to separate the answer, or to compare replies byte for byte) must adjust.
+- **Whitespace beside tool calls is kept, and text after a tool call is returned.**
+  - **Non-streaming replies:** the content around tool calls keeps the model's own whitespace; it is dropped only when
+    all of it is whitespace and the reply has tool calls. Text the model writes after a tool call is now returned
+    (before, a non-streaming reply dropped it). **These change non-streaming output bytes.**
+  - **Streaming replies:** the whitespace between the text and a tool call was already kept in a stream, and still
+    is; the non-streamed content now matches it (for example `"Answer\n\n"` before the call, where 3.0.2.1's non-streamed
+    reply gave `"Answer"`). Streamed content beside a tool call still changes when whitespace follows the reasoning
+    block, through the content-start change above (`"\n\nAnswer\n\n"` becomes `"Answer\n\n"`). A stream holds a run of
+    whitespace until the next text or the end of the output decides it, and the last reasoning piece takes back the
+    whitespace held before it.
+  - **Tool arguments whose schema also allows a string** stay strings unless the text is exactly the JSON text of a
+    number, boolean or null; a value the model wrote as a JSON string stays a string, also when a streaming converter
+    fails. The same holds on the `gemma4` tool-call format.
+- **A Qwen3 tool call opens only at a line start, and never inside a code fence or an inline code span.** This is the
+  `qwen3` parser, with `MERLIN_QWEN3_LITERAL_SPANS` on (the default; `0` leaves all of it as in 3.0.2.1).
+  - **The position rule:** a call opener (the `<tool_call>` token or a bare `<function=` header) starts a call only at
+    the start of the answer, at the start of a line after optional whitespace, or right after another call. Anywhere
+    else (a blockquote, a list item, the middle of a sentence) it is text, and so is everything after it; a header right
+    after such an opener is the rest of the quote. The decision is made when the opener arrives, so a stream holds
+    nothing more for it. Reasoning keeps its own rules. A `</think>` kept in the content (no reasoning parser) still
+    starts the answer, so a call written right after it opens.
+  - **Code:** inside an open code fence an opener is now always text, also when the output ends inside the fence. This
+    replaces the fence hold and its end-of-output rule, under which a block that ended an unclosed fence could still
+    become a call. An opener inside an inline code span (a run of backticks closed by the next run of exactly as many on
+    the same line) is held with what follows it until the span closes, and the whole span is then text. If the line, the
+    reasoning, the turn or the output ends first, the held items take the path they took before, so a real call stays a
+    call. A reply that explained the format and wrote `<tool_call>` in a markdown table cell used to lose the rest of
+    the reply and return a later example as a phantom call; it now returns the table verbatim and the one real call.
+  - **Constrained calls and other parsers:** a request whose calls a structural tag constrains (a named
+    `tool_choice`, `"required"` or strict tools) keeps the opener token as the call wherever the grammar placed it. Only
+    the Qwen3 parser applies the position rule; the parsers built on it keep their call positions.
+  - **Special tokens:** every added token the tokenizer flags special (other than the think and tool-call tokens) is
+    ignored when testing for a line start, so `skip_special_tokens` no longer decides whether a header after such a
+    token on a line opens a call. A special token the engine drops (one the config does not name, such as a vision or
+    pad token) no longer holds back the stream; before, it held every later delta to the end of the stream.
+  - **Checked:** re-parsing 600 recorded replies with quoted tool markup (Flash-Next and the 27B) returned no call from a
+    blockquote, list, mid-line, inline code or fence, kept every turn-start and line-start call, and kept the quoted
+    text; the recorded replies kept all 168 calls.
+- **Forced, required and strict tool calls on the Qwen tool parser open and close with the special tokens.** The tool
+  grammar named the `<tool_call>` opener as text, so the model could spell it in ordinary tokens; the parser then read
+  the call as text and the reply came back with no tool call (seen on Flash-Next). The grammar now uses the token ids
+  from the model's vocabulary for `tool_choice="required"`, a named `tool_choice` and tools with `"strict": true`. When
+  the four delimiter tokens cannot be found unambiguously in a tokenizer, the text form is kept with one warning. Three
+  differences in free text follow from this:
+  - an opener token followed by prose instead of a call is refused by the grammar;
+  - an opener spelled in ordinary characters is plain text, not a call;
+  - a think tag spelled in ordinary characters is allowed, as text.
+- **Strict string parameters with `maxLength` are bounded by a character budget.** On a strict Qwen tool, a top-level
+  string parameter with `maxLength` is now written as one grammar rule that counts characters (a character spelled in
+  byte tokens counts as one), cannot contain the call's closing sequence and accepts only well-formed UTF-8. Before, the
+  strict grammar unrolled the bound into one state per character. Parameters and schemas the rule cannot take keep the
+  generic strict grammar, and requests without `"strict": true` build the grammar they always built. Strict stays
+  opt-in. Measured on 3.0.2.2 as shipped, with the length table below, on Flash-Next (4 × RTX 3090, 2026-11-19):
+  - **Decode, strict against default, ms per output token:** 6.55 against 6.39 at one stream (1.03×), 14.57 against
+    14.57 at 8 streams (1.00×) and 27.66 against 25.77 at 24 streams (1.07×). The strict mode of 3.0.2.1 took 32.23 ms
+    per token at one stream (5.00× its default of 6.45; 3.0.2.1-era figure, 2026-11-15).
+  - **First request with a new bounded-string schema:** about 0.22 s longer to its first token than a repeat of the
+    same request (new schema 0.479 s at the median, repeat 0.254 s), against about 0.7 s longer in 3.0.2.1.
+  - **The first tool request after boot** still pays about 2.7 s more than a repeat (2.975 s against 0.249 s).
+  - All 14 strict decode sends were valid, and every one of 71 strict sends stayed within its `maxLength`.
+- **Tool-call grammars: string bounds from a length table, one whitespace run per gap, and a slow-fill guard.** A mask
+  is filled on the engine-core thread, one request after another, so one tool-call request with slow fills holds every
+  stream. Four changes bound that cost; none changes what a call may say.
+  - **A length table for string bounds (`VLLM_MERLIN_STRICT_LENGTH_TABLE`, on by default).** xgrammar cannot cache the
+    token masks of the character-budget rule above, so near the bound one fill cost up to a few hundred milliseconds. The
+    backend now compiles the tag without the budget and applies the bound itself: a per-tokenizer table of how many code
+    points each token adds to a value, a per-request tracker that mirrors the tag and advances and rolls back with the
+    matcher, and a mask that is the grammar's mask AND the table's for the characters left. It covers top-level
+    strings, strings inside JSON parameters (nested objects, arrays, `minLength` with `maxLength`), whole argument
+    objects and plain strings; shapes it does not model keep their bound in the grammar and are counted. The masks equal
+    the budgeted grammar's at every state (the recorded calls, bounds 0 to 200 on the five lane tokenizers, and random walks
+    with drafts and rollback). `VLLM_MERLIN_STRICT_LENGTH_TABLE=0` compiles the tag as given.
+  - **One whitespace run per gap, and a cap on it (`VLLM_MERLIN_STRICT_WS_CAP`, 64).** xgrammar writes each
+    one-property JSON part with a whitespace run on each side, so two unbounded runs met between parameters and a run of n
+    characters had n + 1 parses; the matcher kept them all and its memory grew with the square of the run (4.5 GB at
+    15,360 characters on a workstation, an out-of-memory kill on a CPU test host with the cap off). The grammar is now
+    compiled with one run per gap, with and without the length table, and 15,360 characters stay under 50 MiB.
+    The cap bounds each run at 64 characters at a site and 128 where one parameter ends and the next site starts;
+    string values are not capped. Non-strict tags and `response_format` grammars do not change.
+  - **One parse for the padding around a value.** Inside a parameter tag xgrammar pads a value with a whitespace run on
+    each side, and a value that can be empty (a string pattern such as `^[a-z/._]*$`) split a whitespace-only text between
+    the two runs in L + R + 1 ways: a fill took 300 ms at about 90 characters. The grammar now writes these values with
+    one parse per text, with the same accepted text, for: an anchored sequence of simple atoms none of which can match
+    whitespace; a class pattern `^[C]*$` whose class holds whitespace and not `<`; and a string-or-null union (exactly
+    `anyOf` string and null), which is written as the string because xgrammar pads a union but not a plain string. A tool
+    with no bounded string keeps its arguments as one JSON-schema element, and only its padded value fragments are
+    replaced. A tool without an enforced schema, called with `tool_choice="required"` or a named tool, gets xgrammar's
+    generic argument object; in its four XML-style argument formats each value now has one
+    parse for the whitespace at its start and end (before, a run of 12,288 characters took 2.9 GB; the tests hold it
+    under 50 MiB). Anything the rewrite cannot read back compiles as given.
+  - **A slow-fill guard (`VLLM_MERLIN_STRICT_STALL_GUARD`, on by default), a backstop.** Each mask fill of a tool-call
+    request that takes at least 300 ms of CPU time on the calling thread (`VLLM_MERLIN_STRICT_STALL_FLOOR_MS`) counts
+    toward that request's slow-fill time over its last 64 fills (`VLLM_MERLIN_STRICT_STALL_WINDOW`). At 5000 ms
+    (`VLLM_MERLIN_STRICT_STALL_BUDGET_MS`) the request ends with an error, as a request whose tokens the grammar rejects
+    does (the client gets `Internal server error`), and other requests continue; a log line and a counter record each
+    end. Healthy fills stay under the floor and add nothing. The recorded whitespace stall ends at fill 131 of 138; the
+    earlier rule of four slow fills in a row never fired on it, and that silence is kept as a regression test.
+    `VLLM_MERLIN_GRAMMAR_STEP_DIAG=1` (off by default) writes one NDJSON line per engine step with the accept, trim and
+    per-row mask fill times and the GPU time between the forward pass and sampling.
+  - **Still slow, and ended by the guard:** two value shapes (see Known limits).
+- **Qwen3.8-27B and ThinkingCap on four RTX 3090s with P2P (`27b-tp4-3090`) turn on four decode settings:**
+  `VLLM_DRAFT_BOUNDED_PLAN`, `VLLM_GDN_DECODE_FASTPATH`, `VLLM_GDN_SHARED_ALIGN_INDEX` and `VLLM_TARGET_SEQ_LENS_ASYNC`
+  default to 1, as on the two-card row; the two-card all-reduce settings are not set on this row. Your own value of each
+  is kept. Measured on 4 × RTX 3090 with P2P (four-arm A/B/B/A): one-stream milliseconds per output token 13.0 to
+  17.9 % lower on five of six cells (4K, 131K and 262K, thinking on and off; the sixth, 262K thinking on, 11.6 % inside
+  a wider run-to-run band), eight streams unchanged within the band; temperature-0 output identical on 28 of 28 prompts,
+  the KV pool (2,012,105 tokens) and the image floor unchanged. On ThinkingCap at 4K: 16.6 % (thinking on) and 16.8 %
+  (thinking off) lower, output identical. The other four-card rows and the one-card row set none of them.
+- **DFlash2 takes its own prefill-runs tick costs** (`SPEC=dflash2`; the Flash-Next profile's `base.spec_tick_costs`):
+  the launcher exports `VLLM_MERLIN_PREFILL_RUNS_TICK_COSTS=289.0,22.6,0.4` (prefill tick ms, decode round ms, fill
+  ticks) for DFlash2 only, instead of the engine default `139,25,1` that was measured on the MTP row, and only at the
+  chunk they were measured at, 2048 (the DFlash2 rows' default): the first number is the cost of one full-chunk step, so
+  with another `CHUNK` the launcher exports nothing, the engine default applies and one start-up note says so. Measured
+  on 4 × RTX 3090 (chunk 2048, 24/24 split): the sessions decode 0.296 of the time during a long ingest (target 0.30,
+  band ± 0.030) against 0.162 with the default; temperature-0 output was identical on 28 of 28 prompts, the KV pools were
+  unchanged and the image floor held. **The cost: a cold prompt's first token comes about 18 to 19 % later** (64K 11.7 to
+  13.9 s, 128K 23.8 to 28.2 s). The longest pause between streamed tokens during a 64K ingest stays about 0.82 s on
+  DFlash2 with or without the values (0.82 s before, 0.83 s after; MTP: 0.41 s). Every MTP row, and `SPEC=none`, keeps
+  the engine default and launches with the same arguments and environment as before; an exported
+  `VLLM_MERLIN_PREFILL_RUNS_TICK_COSTS` still wins at every chunk and for both drafters, and the launcher's note says
+  which source the engine got. DFlash2 stays opt-in. The variable is a runtime-only knob, so no compile or AOT cache is
+  invalidated by the upgrade.
+- **A request the KV cache cannot hold gets HTTP 400 with the cause, not 500.** Both scheduler capacity paths (a lone
+  running request that cannot grow, and a request that can never fit) now answer as a client error carrying the logged
+  cause. A streaming `/v1/responses` request that fails after `response.created` ends with a Responses `error` event,
+  and a failed background (stored) response carries its `error`.
+- **KV RAM cache: duplicates-first and waiting-last eviction, 8 assembling units and 64 copy credits are now the
+  defaults.** These act only in engines booted with the host tier (`--kv-ram-cache`, `--swarm`); an explicit value of
+  each variable still wins.
+  - **Duplicates first** (`MERLIN_KV_HOST_TIER__EVICT_DUPLICATES_FIRST`, was 0): when the host cache needs room, a unit
+    whose exclusive rows all duplicate GPU blocks in the free pool is given up after the running-twin duplicates and
+    before the host-only units. The guard is checked on the rows each take actually frees, at the take and again at
+    apply, and keeps a unit off the early class while a GPU twin lies within the walk's reclaim lookahead. An admission
+    that would take the GPU twins of a dropped host copy is held for at most two walks while the unit is copied first,
+    then goes ahead. A copy given up this way is copied again if the GPU later needs that space before the session
+    returns.
+  - **Waiting last** (`MERLIN_KV_HOST_TIER__EVICT_WAITING_LAST`, was 0): a request in the waiting queue claims the plain
+    hashes of its prompt at arrival and gives them up at admission or when it finishes or is aborted while waiting. Host
+    eviction takes every unclaimed unit first, in the existing order, then the claimed units, the furthest back in the
+    queue first. A unit is claimed by its exclusive rows only; leases, restoring rows and running twins keep their
+    protection. Nothing walks the queue per step.
+  - **Eight assembling units** (`MERLIN_KV_HOST_TIER__MAX_ASSEMBLING`, was 2) and **64 copy credits**
+    (`MERLIN_KV_HOST_TIER__COPY_CREDITS_D`, was 32). The cold-start hold cap stays a third of the GPU pool at any slot
+    count (a ninth at 8 slots would have refused the first preempt grace of a run on a 3 x 262K pool); the largest
+    recorded unit still replaces it once one exists.
+  - **The restore switches:** `MERLIN_KV_HOST_TIER__RESTORE_CREDITS_PER_SLOT` is on (measured alone on the 27B at 96 GB
+    with the KV RAM cache on, it cost no hit rate: 98.90 % of the trace's ceiling, no unguarded losses).
+    `MERLIN_KV_HOST_TIER__RESTORE_START_ANY_STEP` and `MERLIN_KV_HOST_TIER__RESTORE_SEAT_HOLD` are off, and each is
+    opt-in with `1`: the start switch alone costs about 1.9 percentage points of hit rate and adds unguarded losses, and
+    the hold needs it. `MERLIN_KV_HOST_TIER__SHARED_ROW_LONE` stays off (experimental): when set, a block with several
+    owners is copied on its own only when the union of its owners would never fit the host cache; any union that fits
+    fans out to the owners' members as with the switch off.
+  - **Diagnostics:** `MERLIN_KV_TIER_DIAG=1` adds lines (see Engine).
+- **Hy4 Flash ships with FP8 or BF16 Engram tables.** The FP8 Engram pack stays the default; the BF16 Engram pack
+  keeps the n-gram tables at their source precision, at 118 GiB of pinned host RAM instead of 60 GiB (the same
+  660,006,416 rows of 96 values at 192 B per row instead of 98 B). `./setup.sh --model hy4flash --engram bf16`
+  sizes the host RAM check (about 198 GiB available before the start, against 140 GiB for FP8), the memlock check
+  and the download for it and starts the launcher with `ENGRAM=bf16`; on `tools/merlin/launch.py` the `ENGRAM`
+  knob names the pack and is checked against the checkpoint's `config.json` (`engram_fp8_embedding` true = FP8,
+  false or absent = BF16). With `ENGRAM` unset the FP8 launch is unchanged. The BF16 Engram pack is untested on hardware:
+  it needs about 198 GiB of host RAM available, more than our four-card host has.
+
+### Measured on Merlin 3.0.2.2
+
+4× RTX 3090 without NVLink, P2P on, Zagitta's gpu-unlock, 220 W; runs of 2026-11-20 and 2026-11-21 (UTC), on trees that carry this release's engine code; the only later non-comment engine change is the MTP layer-index guard on pipeline-parallel layouts, and Ornith 1.5, the one lane it affects, was re-measured on it.
+Every lane was spot-checked on 3.0.2.2 (boot, smoke checks, one 4K thinking-on decode row and one 100K prefill row against its 3.0.2.1 figure and that row's run-to-run band, the KV pool and the needle panel). A lane inside every band keeps its 3.0.2.1 figures, marked ‡ below; a lane outside a band had the affected sections (decode ladder, exact 262K, agents) run again, with cold prefill, and the agents and GSM8K-200 rows in both thinking modes where the layout runs them, alongside.
+- decode is one stream, thinking on (effort medium where the template has levels), median of 3 (ThinkingCap 2× at 262K: median of 12);
+- 8 agents is the total of eight simultaneous follow-ups on 16K conversations.
+
+The 20 GB row is measured on 4 × RTX 3090 that emulate 20 GB cards (4 GiB held back per card), not on real 20 GB cards.
+
+| Checkpoint | GPUs | KV pool, tokens | Decode, tok/s, 4K / 131K / 262K | 262K prefill | 8 agents, tok/s, thinking on / off | GSM8K-200, thinking on / off |
+|---|---|---|---|---|---|---|
+| Flash-Next ‡ | 4× 24 GB | 924,993 | 174 / 188 / 192 | 6,839 tok/s | 640 / 641 † | 197 / 198 |
+| Flash-Next | 4× 20 GB (emulated) | 265,888 | 153 / 159 / 171 | 4,838 tok/s | n/a (pool held 6 of 8 on this run) | n/a |
+| Qwen3.8-27B ‡ | 2× | 826,689 | 248 / 197 / 160 | 1,117 tok/s | 740 / 677 | - / 194 |
+| Qwen3.8-27B | 4× | 2,012,105 | 315 / 296 / 267 | 2,118 tok/s | 1,012 / 857 | 198 ‡ / 195 |
+| Swift1.5 ‡ | 4× | 924,993 | 180 / 185 / 182 | 6,793 tok/s | 688 / 661 | 199 / 198 |
+| Swift1.5-Huihui ‡ | 4× | 924,993 | 178 / 190 / 203 | 6,893 tok/s | 719 / 668 † | 198 / 197 |
+| Qwen3.8-27B ‡ | 1× | 271,506 | 131 / 102 / 75 | 587 tok/s | n/a (two at most) | - / 194 |
+| ThinkingCap ‡ | 2× | 826,689 | 244 / 179 / 163 | 1,116 tok/s | 731 / 663 | - / 195 |
+| ThinkingCap | 4× | 2,012,105 | 287 / 277 / 274 | 2,118 tok/s | 997 / 875 | 197 / 194 |
+| Nemotron 3.5 Super VL ‡ | 4× | 1,856,367 | 105 / 102 / 101 | 4,193 tok/s | 444 / 417 | 196 / 194 |
+| Ornith 1.5 | 4× | 894,618 | 152 / 106 / 106 | 2,302 tok/s | 522 / 481 | 195 / 192 |
+
+‡ 3.0.2.1 figures, carried forward: the lane (or, in a 4× cell, that one figure) was not re-measured on 3.0.2.2. The 20 GB row has no GSM8K run; the one- and two-card rows have no thinking-on GSM8K-200 run (`-`), as in 3.0.2.1.
+† The Flash-Next and Swift1.5-Huihui thinking-off 8-agent cells are from 3.0.2.1's previous build: their runs on the published 3.0.2.1 wheel ended early (one reply stopped by itself; overlap windows of 0.25 and 0.29 s) and were not used.
+
+The spot checks of the carried lanes (4K thinking-on decode and 100K prefill on 3.0.2.2, against 3.0.2.1 and that row's band):
+- **Flash-Next 4× 24 GB:** 171.6 against 174.0 tok/s (band ±3 %); 6,999 against 7,036 tok/s (band ±3 %).
+- **Swift1.5:** 178.4 against 179.8 tok/s (band ±3 %); 6,999 against 6,964 tok/s (band ±3 %).
+- **Swift1.5-Huihui:** 178.9 against 178.4 tok/s (band ±3 %); 7,046 against 7,076 tok/s (band ±3 %).
+- **Qwen3.8-27B 2×:** 248.7 against 248.4 tok/s (band ±3 %); 1,670 against 1,687 tok/s (band ±3 %).
+- **Qwen3.8-27B 1×:** 130.6 against 130.7 tok/s (band ±3 %); 893 against 891 tok/s (band ±3 %).
+- **ThinkingCap 2×:** 243.7 against 244.0 tok/s (band ±3 %); 1,674 against 1,679 tok/s (band ±3 %).
+- **Nemotron 3.5 Super VL:** 98.3 against 104.8 tok/s (−6 %, inside this row's band of ±9 %); 5,111 against 5,082 tok/s (±3 %).
+
+Every carried lane booted to the same KV pool as on 3.0.2.1.
+
+Against 3.0.2.1:
+- **Qwen3.8-27B 4× and ThinkingCap 4×:** decode +20 % at 4K thinking on (315.5 against 262.0 and 287.2 against 240.1
+  tok/s), +15 % and +17 % at 131K, and +15 % and +18 % at exact 262K (267.2 and 274.2 tok/s; median of 3 sends,
+  266.7–277.6 and 265.2–276.0); thinking off +10 % to +20 % at every depth. The gain is the time per decode step, from
+  the four-card P2P decode settings now on by default: a median event interval of 12.8 ms against 15.4 ms at 4K, with
+  the tokens per event level. Over 6 sends at exact 262K the 27B gives 275.4 tok/s thinking on (266.7–299.7) and
+  181.1 tok/s off (173.0–205.7). Cold prefill 0 % to +1 %; eight agents thinking on +4 % and +2 % (short overlap windows,
+  3.41 and 3.61 s), thinking off 0 % and +2 % (857 and 875 tok/s). GSM8K-200 thinking off 195/200 and 194/200
+  (3.0.2.1: 195/200 and 193/200).
+- **Flash-Next 4× 20 GB:** decode +4 % / 0 % at 4K / 131K thinking on and 170.8 tok/s at exact 262K (+3 %; sends
+  163.4–176.8); cold prefill +5 % to +6 % (the 3.0.2.1 20 GB rows were measured on that release's previous build,
+  before its prefill runs change).
+- **Ornith 1.5:** thinking on, decode is level with 3.0.2.1 at 4K (152.1 against 148.7 tok/s) and 105.8 tok/s at
+  exact 262K (−1 %; sends 101.7–112.2). At 131K the median is 106.4 tok/s (−13 %; sends 97.9–124.5):
+  two of the three replies stopped by themselves at about 187 tokens, with fewer tokens per step, and six other
+  131K texts on the same engine path gave 117.5 tok/s (115.9–121.0; −4 % against 3.0.2.1's 122); with MTP the number of tokens per
+  step follows the text generated. Thinking off −5 % to +4 %. Cold prefill +1 %; eight agents +1 % thinking on and −1 %
+  off. GSM8K-200 195/200 thinking on and 192/200 off (3.0.2.1: 195/200 and 191/200).
+- **ThinkingCap 4×:** GSM8K-200 thinking on 197/200 (3.0.2.1: 196/200).
+
+**Hy4 Flash (new):** measured on 2026-11-20 and 2026-11-21 on the same install, with its own driver (not the frozen
+ladder above): one stream, thinking on at effort high (the lane's served default), T=0, each send a cold prefill,
+256 tokens out (128 at exact 262K), median of 3 sends; decode tok/s = (completion tokens − 1) / (last − first token
+time). DFly2 drafts; K=3 is the shipped default.
+
+| Checkpoint | GPUs | KV pool, tokens | Decode, tok/s, 4K / 128K / 262K | 262K prefill | 8 agents | GSM8K-200 |
+|---|---|---|---|---|---|---|
+| Hy4 Flash (`hy4flash-quad-3090`) | 4× | 609,398 | 75.7 / 67.1 § / 89.3 § | 1,384 tok/s | not run | not run |
+| Hy4 Flash (`hy4flash-octo-3090`) | 8× | 4,196,751 (estimate) | untested on hardware | untested | untested | untested |
+
+§ Measured at K=5 (the boot of the K sweep that ran every row), not at the shipped K=3. At 4K: K=3 75.7 tok/s (13.19 ms per token: median event
+interval / tokens per step), K=5 75.3 (13.33 ms), K=7 68.1 (14.77 ms), DFly2 off 45.1 (22.05 ms). 128K is a
+130,816-token prompt (sends 66.3–71.4 tok/s), 262K is exactly 261,888 tokens (sends 77.6–89.7). Cold prefill
+1,672 tok/s at 10,240 tokens and 1,608 tok/s at 102,400; 262K time to first token 189.3 s. The 8-card
+pool is the block arithmetic of the 4-card row, not a boot.
+
+Every row except Hy4 Flash is in the bench cards; the Hy4 Flash rows are in this section and the `hy4flash-quad-3090` profile evidence. Measured on 3.0.2.2: [Flash-Next 4× 20 GB](../models/flash-next/benchmarks/2026-11-21/BENCH-CARD.md) · [Qwen3.8-27B 4×](../models/qwen38-27b/benchmarks/2026-11-21/BENCH-CARD.md) · [ThinkingCap 4×](../models/thinkingcap/benchmarks/2026-11-21/BENCH-CARD.md) · [Ornith 1.5](../models/ornith1.5/benchmarks/2026-11-21/BENCH-CARD.md). Carried from 3.0.2.1: [Flash-Next](../models/flash-next/benchmarks/2026-11-12/BENCH-CARD.md) · [Swift1.5](../models/swift1.5/benchmarks/2026-11-12/BENCH-CARD.md) · [Swift1.5-Huihui](../models/swift1.5-huihui/benchmarks/2026-11-12/BENCH-CARD.md) · [Qwen3.8-27B](../models/qwen38-27b/benchmarks/2026-11-12/BENCH-CARD.md) · [ThinkingCap](../models/thinkingcap/benchmarks/2026-11-12/BENCH-CARD.md) · [Nemotron 3.5 Super VL](../models/nemotron-super-vl/benchmarks/2026-11-12/BENCH-CARD.md).
+
+### Before you upgrade
+
+- **New wheel.** The wheel is `vllm-0.33.0+merlin3.0.2.2.c56eeed392-cp313-cp313-linux_x86_64.whl`; `release/merlin-wheel.sha256` names it, so this checkout refuses the 3.0.2.1
+  wheel. The wheel's file name now carries the release (`...+merlin3.0.2.2...`), so it differs from the 3.0.2.1
+  wheel's. Its package description is now a fixed text, and it declares `jinja2 >= 3.1.6` (the version the release
+  lock already pins). Compiled files embed their build date, so a rebuild of the same sources is not byte-identical:
+  check a wheel by its published sha256 (`release/merlin-wheel.sha256`), not by rebuilding it.
+- **Stop the server before you update.** The engine is installed editable, so `git pull` changes the source a running
+  server imports. Every server started from the checkout now holds `.merlin/serve.lock`, and `./setup.sh` refuses to
+  reinstall while one runs. A server started by the 3.0.2.1 launcher does not hold the lock: restart it once after
+  updating.
+- **The launchers check the installed native code at every start, for every model family.** A tree without
+  `.build-source` (an install that `./setup.sh` or `release/install-env.sh` never recorded) is refused until
+  `./setup.sh` records it, and stale or modified native sources or changed build products are refused with the files to
+  commit, remove or repair. A bare checkout used only to launch an installed wheel, and a copy without Git metadata, are
+  judged on their recorded product hashes and start. `MERLIN_SKIP_NATIVE_CHECK=1` skips the native-source and FlashInfer
+  checks, with a warning on every start; see [release/README.md](../release/README.md).
+- **Three switches accept only `0` or `1`.** `MERLIN_REPACK_RELEASE`, `MERLIN_LOAD_PEAK_LOG` and
+  `MERLIN_QWEN3_LITERAL_SPANS` stop the start with an error naming the variable for any other value (`true`, `yes`, an
+  empty value). Unset keeps the default.
+- **Only the literal loopback addresses count as local.** `127.0.0.1` and `::1` serve without an API key and without a
+  warning; `localhost` is a name and no longer counts. Setup saves a `localhost` answer as `127.0.0.1` and says so, and generates a key for any other
+  bind. `merlin serve` with `HOST=localhost` and no key prints the no-authentication warning. A saved specific address
+  (for example an IPv6 address or `::`) is kept when the Access question is asked again, offered as `keep`.
+- **The 27B and Nemotron 3.5 Super VL launchers refuse `--disable-chunked-mm-input` with a long-prefill cap** (`LPT` /
+  `--long-prefill-token-threshold` above 0): an image longer than the cap could stall scheduling. Remove the flag or set
+  `LPT=0`.
+- **Output bytes change** (see Highlights): content after the reasoning block no longer starts with whitespace, in
+  streamed and non-streamed replies; non-streamed content keeps the whitespace before a tool call; non-streamed replies
+  return text written after a tool call. Clients that compare replies byte for byte with 3.0.2.1, or that relied on the
+  leading whitespace, will see these differences; tool calls themselves are unchanged.
+- **`/v1/messages` and `/v1/responses` streams now get the SSE keep-alive** that `merlin serve` turns on (a `: keep-alive`
+  comment line every 15 s while a stream sends nothing), as `/v1/chat/completions` and `/v1/completions` already did.
+  `-- --sse-keep-alive-interval 0` turns it off.
+- **The DFlash2 drafter's folder follows `--models-dir`** (Flash-Next family, `--spec dflash2` only). With
+  `--models-dir DIR`, a new download goes to `flash-next-dflash2` beside `DIR` instead of `~/models/flash-next-dflash2`.
+  A drafter already in `~/models/flash-next-dflash2` keeps being used while there is none beside `DIR`, so nothing is
+  downloaded again; when both exist the one beside `DIR` is used. The start-up note names the folder it takes.
+  `DFLASH2_MODEL` still overrides both. With the default `~/models/<model>` both places are the same folder.
+- **Metrics:** `vllm:merlin_kv_host_tier_census_events_total{event="restore_failed"}` (and the write-back log's
+  `restore_failed` field) now counts restore failures with the census off, where it stayed 0 before; the gauge series
+  `vllm:merlin_kv_host_tier_census{observation="host_rows_duplicate_running"}` and
+  `{observation="host_rows_duplicate_imminent"}` are removed (never measured, always 0); a failed store copy now logs
+  `SimpleCPUOffload: store copy for event N failed; the host copy is dropped` instead of the restore wording.
+
+### Fixes
+
+- **Streamed content after the reasoning no longer depends on where the stream is cut.** In 3.0.2.1, when whitespace after the reasoning
+  block was followed by text and a tool call, the streamed content changed with the delta boundaries: cut inside or
+  right after that whitespace, the whitespace moved to the end of the text (`"\nAnswer\n\n\n"` or `"Answer\n\n\n\n"` instead of
+  `"\n\nAnswer\n\n"`). The content is now the same at every cut.
+- **A stuck KV RAM cache lock now fails with a message after 900 s instead of hanging the boot.** The tier's ranks
+  take a host-wide lock (`/tmp/merlin-kv-host-tier.lock`) one at a time while they allocate their arenas. A process that
+  held it for good, or a second account on the same host, used to block every later boot with no output, or die with a
+  bare `PermissionError` when it tried to create the file. The file is now opened read-only when it exists (any account
+  can lock it), created only when it is missing, refused when it is a symbolic link or not a regular file, and waited
+  for at most `MERLIN_KV_HOST_TIER__ARENA_LOCK_TIMEOUT_S` seconds (default 900; the measured wait of a four-rank 96 GiB
+  boot is 64 s). A rank that has waited 5 s logs one line saying so, and each rank logs how long it held the lock. On a
+  timeout the error names the file, its owner and how to find the holder (`fuser` / `lsof`). Nothing changes for a boot
+  that is not blocked.
+- **KV RAM cache admission:** a copy the write-back refuses no longer frees a host row first; a request whose total
+  need is zero is not charged the full admission reservation; copy-on-write refusals and the restore retry bounds are
+  kept on host-tier admission, and a returning request with no work left is logged once and skipped. None of these
+  changes output tokens.
+- **`/v1/responses` refuses two different tools that would reach the model under one name** (for example a function
+  and a namespace member that flatten to the same `<namespace>__<name>`) with a 400 that names it. The same tool listed
+  twice is not refused.
+- **`/v1/messages` merges adjacent turns of the same role** before converting them, so a history split into several
+  user or assistant turns gives the same prompt as the one-turn form. Block order and `tool_use` ids are kept, and
+  system turns stay boundaries.
+- **`/v1/completions` counts cached prompt tokens once per prompt:** repeated stream chunks and the `n > 1` choices of
+  one prompt no longer add to the cached count twice.
+- **`prompt_logprobs` with the top-20 bound** is admitted with a smaller shared chunk where it was refused at the full
+  chunk; a request that cannot fit on its own is still refused.
+- **A non-FP8 KV cache uses unit k/v scales** on compressed-tensors checkpoints (a bfloat16 or float16 cache, or a layer
+  skipped with `--kv-cache-dtype-skip-layers`), instead of the checkpoint's FP8 scales. The shipped rows serve FP8 KV
+  and are unchanged.
+- **Server load tracking releases each request once.** A request whose client disconnected could be released twice,
+  which lowered the server-load figure below the real load.
+- **`merlin serve --instances N` probes readiness over HTTPS** when the server is started with TLS, and refuses a
+  readiness probe it cannot make before it starts any server.
+- **Setup keeps a specific bind address** instead of widening it, writes IPv6 endpoints in brackets, and a failed
+  install restores the checkout's build products and native records together with the previous venv (they are copied
+  to `.merlin/products-old-*` for the length of the install).
+- **`merlin doctor`** builds every report section from one configuration, refuses a report path that is not a regular
+  file, and its GPU probe has a deadline. Before installing, setup checks again, under the install lock, that the
+  checkout is still the planned commit with no modified tracked file.
+- **The native-build check warns** when the FlashInfer the server will import is not the recorded patched copy or cannot
+  be verified, and resolves a bare Rust-frontend name on the `PATH` the engine gets. Both only warn.
+- **The 27B four-card profiles advertise 131K session counts that fit the pool:** 14 instead of 15 on `tp4-sm80-24g`
+  and 62 instead of 63 on `tp4-sm80-80g` (estimates).
+- **The manual downloads in the model READMEs pin the revision setup downloads.** The Flash-Next, Qwen3.8-27B and
+  ThinkingCap READMEs and the engine README ran `hf download` without `--revision`, so their `sha256sum -c` step failed
+  once the Hugging Face repository moved on. Every manual download in the docs now names the revision that the model's
+  `checkpoint.sha256` and `release/download-sizes.json` record, the same one `./setup.sh` fetches.
+- **The DFlash2 drafter follows `--models-dir`.** `./setup.sh --spec dflash2` put the drafter in
+  `~/models/flash-next-dflash2` whatever `--models-dir` said. Setup and `merlin serve --spec dflash2` now use
+  `flash-next-dflash2` beside the checkpoint folder; `DFLASH2_MODEL` still wins, and a drafter already in
+  `~/models/flash-next-dflash2` is still found (see Before you upgrade). With the default models folder nothing moves.
+- **Speculative decoding with sampling: the resample insert kernel launches with one warp.** The kernel that inserts a
+  resampled token (`_insert_resampled_kernel`) reads the count of sampled tokens and stores that count plus one in
+  place. Launched with Triton's default four warps, a delayed warp can read the incremented count and index past the
+  request's logits rows, which faults on the temperature load; upstream reports `Warp Out of range Address` core dumps
+  with Gemma 4 MTP at four speculative tokens. The launch now passes `num_warps=1`, the change of vllm-project/vllm#66048
+  (by shustovTE, in vLLM 0.34.0); the other launches in the file already did. The sampling algorithm and every other
+  launch are unchanged. Sampled tokens are unchanged.
+- **`P2P=ipc` needs peer access inside each tensor-parallel group only.** In ipc mode NCCL runs with
+  `NCCL_P2P_DISABLE=1`, so pipeline send and receive and the expert-parallel collectives go through host shared memory;
+  only the PCIe-IPC all-reduce maps peer buffers, and the engine builds it on the tensor-parallel group alone. The
+  check now asks for CUDA peer access and a BAR1 of at least 1 GiB between the cards of each tensor-parallel group of the
+  chosen row's layout (contiguous runs of `tp` cards in rank order), not between every selected pair.
+  - `merlin serve` takes `P2P=ipc` into profile selection, so a refused request fails there; when no usual card set
+    passes, an ipc row may take peer-connected groups out of order (for example `CUDA_VISIBLE_DEVICES=0,2,1,3`).
+  - Refusals name the failed pair or card (`TP pair (GPU 2, GPU 3) has no CUDA peer access`,
+    `GPU 5 BAR1 256 MiB < 1 GiB`); `P2P=on` and a partial matrix in auto name the pairs without peer access. The
+    unreadable-matrix hint names the serve control (`P2P=ipc` on Flash-Next, `P2P=on` on the 27B and Super VL).
+  - `P2P=on` keeps the all-pairs and BAR1 requirements; `on`, `off` and unset select as before.
+- **Setup's 20 GB messages:** the recommendation on a host without a Flash-Next layout names the 4 x 20 GB layout, the
+  cold-expert note says what the profile check found instead of a bare status word, and the untested notice is cut
+  between words and never ends on a number without its unit.
+
+### Engine
+
+- **Parser self-test at every boot:** the served chat template and the tool and reasoning parsers are round-tripped
+  once in a background helper on a private tokenizer, comparing the exact stream and the whole text. A mismatch or
+  missing coverage is logged as a warning (`Parser/template self-test (...)`) and never blocks the server.
+  `merlin doctor --parser-selftest <checkpoint>` runs the same check without a server. It has no off switch. Its cost,
+  measured on four boots on 4 × RTX 3090 (Flash-Next with 24 agents, 27B on four cards and on two, and the Flash-Next
+  20 GB-card rows emulated) and on a CPU host: the check runs on a background thread for 0.87 to 0.98 s on the four
+  boots (about 0.85 s on the CPU host) and the server becomes ready without waiting for it; before start-up completes it takes a
+  synchronous snapshot of 0.25 to 0.37 s (CPU host); on the CPU host the server process gains no memory, and a short-lived helper
+  process peaks at about 240 MiB for about one second.
+- **`/v1/models` adds `kv_cache_capacity_tokens`:** total KV cache tokens shared by all requests on this server (the
+  engine's KV pool, the same figure the boot line `GPU KV cache size: N tokens` prints, e.g. 2,012,105 on 27B TP4 and
+  924,993 on Flash-Next fn-quad-3090; the minimum over the engines a server routes to; null for render-only servers or
+  engines without a KV pool). A single request is limited by `max_model_len`, not by this figure. It does not shrink
+  with occupancy. Like the boot line, it is sized in `max_model_len`-length requests, so on hybrid models it depends on
+  `max_model_len`.
+- **New metric:** `vllm:merlin_scheduler_policy_events_total{policy,event}` carries prefill-run and decode-first counter
+  deltas.
+- **MTP draft layers** are built at their runtime index on single-stage layouts when every by-name lookup agrees
+  (otherwise, and on every pipeline-parallel layout, the previous construction runs, with one warning), the draft step reaches the MTP module, and the speculative config reads one
+  module count. Outputs are bit-identical on the 27B and ThinkingCap.
+- **Diagnostics, all off by default and none changing a token or a policy decision:**
+  - `MERLIN_SPEC_RESIDUAL_DIAG=1` counts the rejection sampler's residual draws per rank on the device (rejection
+    events, residual draws with no finite mass, draws outside the support, token 0 at a rejection) and keeps a ring of
+    the first 4,096 zero-mass events. A counter line goes to the engine log every 512 verify steps and at shutdown, and
+    `MERLIN_SPEC_RESIDUAL_DIAG_OUT` names a directory for a per-rank JSON dump. Every rank that builds a rejection
+    sampler logs one line that reads back the stable residual setting, the diagnostic switch and the sampling methods.
+  - `MERLIN_KV_TIER_DIAG=1` logs each host restore as one line per event with the scheduler step and wall time
+    (lease-ready, slot-start, batch-issue, batch-commit, retire, first-compute; the slot-start and first-compute lines
+    carry the step the request headed the seat queue, `-1` when it never did), a restore-step line per active step (cap waiters, slots in use, issued and unissued restore rows), one line per
+    `never_fit` verdict with its owners, rows and the met block, and one `dup_first_unguarded` line per unit given up early
+    and then lost. That last line names the key whose loss ended the unit, whether that key was one of the early-freed
+    ones (`1`, `0`, or `-1` when the loss site names no key), how many early-freed keys still have a GPU block, the
+    request, the path that took the GPU twin and the stack that recorded the loss. The plans line also reports the
+    waiting-last evictions by claim and queue-rank bucket, and the restore seatless-start and seat-hold counters when
+    those switches are on.
+  - `VLLM_MERLIN_GRAMMAR_STEP_DIAG=1` writes per-step grammar timings (see Highlights).
+- **Hy4 Flash decode speed-ups, on by default on the hy4flash rows:** the hy4flash 4-card row
+  (`hy4flash-quad-3090`, TP2 x PP2) turns on `MERLIN_HY4_INDEXER_FAST`, `MERLIN_HY4_SWA_WINDOW_REUSE`,
+  `MERLIN_LATENT_IPC`, `MERLIN_HY4_DFLY_GRAPHS`,
+  `MERLIN_HY4_INDEXER_SELECT` and `MERLIN_COLD_EXPERTS_ADAPTIVE` (that last one only with the cold-expert offload on),
+  and DFly2 drafts 3 tokens instead of 5. The 4-card row also offloads cold experts by default on layers 26, 28, 30
+  and 33 at hot fraction 0.25, from a calibrated profile shipped as
+  `tools/merlin/profiles/expert_hot/hy4flash-p1-calibrated.json` (`MERLIN_COLD_EXPERTS=0` turns it off). The 8-card row (`hy4flash-octo-3090`) turns on the same set except
+  `MERLIN_LATENT_IPC` (measured at TP2 only) and `MERLIN_COLD_EXPERTS_ADAPTIVE` (the row has no cold-expert offload).
+  The TP4 DIAG row (`hy4flash-quad-3090-tp4`, new, `launch.py --profile` only) turns on none of them and offloads
+  cold experts on layers 37-41 at hot fraction 0.25 from a uniform placeholder profile. `MERLIN_HY4_INDEXER_FAST`,
+  `MERLIN_HY4_SWA_WINDOW_REUSE`, `MERLIN_LATENT_IPC`, `MERLIN_HY4_DFLY_GRAPHS` and `MERLIN_HY4_INDEXER_SELECT` are
+  bit-identical: serial in-engine compares at temperature 0 match the stock path token for token.
+  `MERLIN_HY4_SPARSE_DECODE` is opt-in: its ieee and split P modes are under accuracy qualification.
+  `MERLIN_COLD_EXPERTS_ADAPTIVE` moves expert placement only: serial outputs are unchanged, and
+  concurrent outputs vary run to run, as with any batch. `MERLIN_HY4_FUSED_ROUTER` is opt-in: as accurate as stock,
+  not bit-identical. Export `NAME=0` to turn one off, or `SPEC_K=5` (on `launch.py`) for the earlier draft length.
+- **Hy4 Flash KV pins are round byte counts with an engine fit:** the 4-card row pins 1,600,000,000 B per card
+  (was 1.75 GiB) and chunks prefill at 1,024 tokens (was 2,048): 6,351 blocks of 251,904 B, an engine fit of 2 x 262K
+  or 4 x 128K, 609,398 tokens measured (prefix caching on, FP8 `fp8_ds_mla`). The pin keeps at least 524 MiB free on
+  every card at idle and at the warm-up peak with DFly2 at K=3 and K=7. The 8-card row (`hy4flash-octo-3090`) is configured for `max_model_len` 1,048,576 at
+  10,800,000,000 B per card, an estimate of 4 x 1M (4,196,751 tokens). It is untested on hardware.
+- **Bench tools you can run (no engine change):** `benchmarks/suite/run.py` runs the benches behind the published
+  bench cards (single-stream decode, cold prefill, time to first token, the exact 262K row and the needle panel)
+  against any OpenAI-compatible Merlin server, with the cards' prompts, output caps, validity rules and medians
+  ([README](../benchmarks/suite/README.md)). `benchmarks/agentic/agentic_bench.py` runs 1, 2, 4 and 8 coding or
+  research agents at once and reports output and total tok/s, prefix-cache hit share, task success and step latency,
+  offline and from bundled data ([README](../benchmarks/agentic/README.md)). Both use the standard library only.
+- **Tests and developer tooling (no product change):** the wheel audit requires the full member set, a valid `RECORD`
+  and a scan of every member, and audits the built wheel's metadata (version, description, `Requires-Dist`,
+  `Requires-Python`, no shipped test fixtures); the package description is inlined in `pyproject.toml`, so a README-only
+  commit no longer changes the wheel. The knob-invariance check compares refusals and rejects incomplete checks; import
+  formatting is fixed in three entrypoint files. The load-transaction
+  return state in `simple_kv_offload` was renamed with no behaviour change.
+
+### New flags and environment variables
+
+| Name | Where | Default | What it does |
+|---|---|---|---|
+| `MERLIN_KV_HOST_TIER__ARENA_LOCK_TIMEOUT_S` | engine (KV RAM cache) | 900 | Seconds a rank waits for the host-wide arena lock before it stops with an error naming the file. Positive integer. |
+| `MERLIN_KV_HOST_TIER__EVICT_DUPLICATES_FIRST` | engine (KV RAM cache) | **1** (was 0) | When the host cache needs room it first gives up copies the GPU still holds in its free pool, then sessions only the host holds. `0` keeps the earlier order. |
+| `MERLIN_KV_HOST_TIER__EVICT_WAITING_LAST` | engine (KV RAM cache) | **1** (was 0) | When the host cache needs room it keeps the saved sessions that requests already waiting in the queue will use until last. `0` keeps the earlier order. |
+| `MERLIN_KV_HOST_TIER__GUARD_REQUIRED_KEYS` | engine (KV RAM cache) | **1** (new) | With duplicates first on, a session whose host copy was given up early is also guarded on the other pages it needs that only the GPU still holds: an admission that would take them waits (at most two walks) while the session is copied again, as for the pages given up. `0` guards only the pages given up. Acts only with `MERLIN_KV_HOST_TIER__EVICT_DUPLICATES_FIRST` on. Exactly `0` or `1`. |
+| `MERLIN_KV_HOST_TIER__MAX_ASSEMBLING` | engine (KV RAM cache) | **8** (was 2) | Units copied to the host at once whose landed rows are held until the unit is complete. `2` is the earlier value. |
+| `MERLIN_KV_HOST_TIER__COPY_CREDITS_D` | engine (KV RAM cache) | **64** (was 32, the value of `COPY_CREDITS`) | Copy (GPU to host) rows in flight per rank. Unset, it follows `MERLIN_KV_HOST_TIER__COPY_CREDITS` when that is set explicitly and is 64 when neither is set. `32` is the earlier value. |
+| `MERLIN_KV_HOST_TIER__RESTORE_START_ANY_STEP` | engine (KV RAM cache) | 0 (opt-in) | `1`: a waiting restore's copy starts on any step a restore slot is free, also while every running seat is taken, so the restored request takes the next free seat ahead of requests sent after it. Unset or `0` keeps the earlier order. Opt-in: it gains restore waits (returns reach their first token sooner) but, measured alone on the 27B at 96 GB with the KV RAM cache on, it costs about 1.9 percentage points of hit rate and adds unguarded losses. |
+| `MERLIN_KV_HOST_TIER__RESTORE_CREDITS_PER_SLOT` | engine (KV RAM cache) | **1** | The restore copy budget is `COPY_CREDITS` rows per restore slot (64 by default) instead of 32 rows shared by every restore in flight. `0` shares one budget. Measured alone on the 27B at 96 GB with the KV RAM cache on, it cost no hit rate (98.90 % of the trace's ceiling, no unguarded losses). |
+| `MERLIN_KV_HOST_TIER__SHARED_ROW_LONE` | engine (KV RAM cache) | 0 (experimental) | `1`: a block with more than one owner (for example the first page of a shared system prompt) is copied to the host on its own, only when the union of its owners would never fit the host cache; any union that fits fans out to the owners' members as with `0`. The owners still hold the row on landing, but a unit whose held rows are all such shared rows takes no assembling slot. Exactly `0` or `1`; not measured on GPUs. |
+| `MERLIN_KV_TIER_DIAG` | engine (KV RAM cache) | off | `1` logs host-tier decisions (new in 3.0.2.2: the restore lifecycle, `never_fit` verdicts and `dup_first_unguarded` lines; see Engine). Exactly `0` or `1`. |
+| `MERLIN_KV_HOST_TIER__RESTORE_SEAT_HOLD` | engine (KV RAM cache) | 0 (opt-in) | `1`: when a running seat frees while the oldest waiting request's restore copy is still in flight, the seat waits for it (one hold at a time, at most 3 s) instead of going to a request sent later, so restores keep their place in the queue. Acts only with `MERLIN_KV_HOST_TIER__RESTORE_START_ANY_STEP` on, so it carries that switch's cost. Unset or `0` keeps the earlier order. |
+| `MERLIN_SKIP_NATIVE_CHECK=1` | every launcher | off | Skips the native-source and FlashInfer provenance checks, with a warning on every start. Only the exact value `1`; build-product checksums are still checked. |
+| `merlin doctor --parser-selftest <checkpoint>` | `merlin doctor` | off | Round-trips a fixed reasoning and tool-call turn through the checkpoint's chat template and parsers (tokenizer files only). Takes `--reasoning-parser`, `--tool-call-parser`, `--chat-template`, `--chat-template-kwargs`. Warn-only. |
+| `--sse-keep-alive-interval` | vLLM; 15 from `merlin serve` | 0 in the engine | Now also covers `/v1/messages`, `/v1/responses` and `GET /v1/responses/{id}?stream=true`. |
+| `VLLM_DRAFT_BOUNDED_PLAN`, `VLLM_GDN_DECODE_FASTPATH`, `VLLM_GDN_SHARED_ALIGN_INDEX`, `VLLM_TARGET_SEQ_LENS_ASYNC` | 27B launcher, `27b-tp4-3090` with `P2P=on` | **1** (was unset) | Four-card P2P decode settings (see Highlights). Your own value is kept. |
+| `VLLM_MERLIN_PREFILL_RUNS_TICK_COSTS` | Flash-Next launcher, `SPEC=dflash2` at chunk 2048 | **289.0,22.6,0.4** (was the engine default) | DFlash2's prefill-runs tick costs (see Highlights). An exported value wins. |
+| `VLLM_MERLIN_STRICT_LENGTH_TABLE` | engine (tools with `"strict": true`) | **1** (new) | Applies a strict string's `maxLength` from a per-tokenizer length table instead of a grammar budget (see Highlights). `0` compiles the tag as given. Only `0` and `1`. |
+| `VLLM_MERLIN_STRICT_STALL_GUARD` | engine (tool-call requests) | **1** (new) | Ends a request whose mask fills keep taking long (see Highlights) with an error. `0` turns the guard off. Only `0` and `1`. |
+| `VLLM_MERLIN_STRICT_STALL_FLOOR_MS` | engine (tool-call requests) | 300 | CPU milliseconds a single mask fill must take before it counts toward the guard. A whole number from 1 to 600,000. |
+| `VLLM_MERLIN_STRICT_STALL_BUDGET_MS` | engine (tool-call requests) | 5000 | Counted slow-fill milliseconds at which the guard ends the request. A whole number from 50 to 3,600,000. |
+| `VLLM_MERLIN_STRICT_STALL_WINDOW` | engine (tool-call requests) | 64 | Number of a request's latest fills the guard counts over. A whole number from 1 to 100,000. |
+| `VLLM_MERLIN_GRAMMAR_STEP_DIAG` | engine | off | `1` writes one NDJSON line per engine step with the accept, trim and per-row mask fill times and the GPU time between the forward pass and sampling. |
+| `VLLM_MERLIN_STRICT_WS_CAP` | engine (tools with `"strict": true`) | 64 | Caps each whitespace run a strict tool call may write, between parameters and inside JSON values, at this many characters (twice that after a JSON parameter, where two runs meet). A whole number from 1 to 128: the cap bounds the parser memory and mask time a long run costs, so it cannot be turned off, and 0 or a value out of range stops the start. String values are not capped. |
+| `MERLIN_REPACK_RELEASE`, `MERLIN_LOAD_PEAK_LOG`, `MERLIN_QWEN3_LITERAL_SPANS` | engine | unchanged | Now only `0` or `1`; any other value stops the start. |
+| `kv_cache_capacity_tokens` | `/v1/models` | n/a | The engine's KV pool in tokens (see Engine). |
+| `error` (stored response), `error` event | `/v1/responses` | n/a | A failed stored response carries its error; a failed stream ends with an `error` event. |
+| `vllm:merlin_scheduler_policy_events_total` | metrics | n/a | Prefill-run and decode-first counter deltas. |
+| `VLLM_SPEC_STABLE_RESIDUAL` | engine | **1** (was 0) | The underflow-safe rejection-sampler residual is on by default; `0` restores the 3.0.2.1 residual. Only `0` and `1` are accepted. |
+| `MERLIN_SPEC_RESIDUAL_DIAG`, `MERLIN_SPEC_RESIDUAL_DIAG_OUT` | engine | off | Debug counters for the rejection sampler's residual draws, with an optional per-rank JSON directory. Sampled tokens are unchanged. |
+| `MERLIN_HY4_INDEXER_FAST` | engine (Hy4 Flash) | **1** on `hy4flash-quad-3090` and `hy4flash-octo-3090`, 0 elsewhere | `1`: the compressed indexer's FWHT and FP8 steps run as one kernel (bit-identical) and IndexPool scoring skips tiles no query can reach (same scores). |
+| `MERLIN_HY4_INDEXER_FAST2` | engine (Hy4 Flash) | 0 (experimental) | `1`: experimental gated pooling in the compressed indexer, with a different pooling reduction order. Not qualified for serving; leave it off. |
+| `MERLIN_HY4_INDEXER_SELECT` | engine (Hy4 Flash) | **1** on `hy4flash-quad-3090` and `hy4flash-octo-3090`, 0 elsewhere | `1`: the IndexPool group top-k's masking, packing and merge steps run as fused kernels around the same top-k and sort. Bit-identical. |
+| `MERLIN_HY4_SWA_WINDOW_REUSE` | engine (Hy4 Flash) | **1** on `hy4flash-quad-3090` and `hy4flash-octo-3090`, 0 elsewhere | `1`: the sliding-window causal rows are built once per forward and reused by the later sliding-window layers with the same window. Bit-identical. |
+| `MERLIN_HY4_SPARSE_DECODE`, `MERLIN_HY4_SPARSE_DECODE_HEAD_BLOCK` | engine (Hy4 Flash) | 0 (opt-in); head block 32 when the layer has 32 or more heads | `1`: sparse MLA decode and speculative verify run in Merlin's kernel (split P by default: the softmax weights in a high and a low BF16 part; or FP32 "ieee" P). Not bit-identical to stock; the ieee and split modes are under accuracy qualification, so it stays opt-in. `HEAD_BLOCK` (16 or 32) sets heads per CTA. |
+| `MERLIN_HY4_FUSED_ROUTER` | engine (Hy4 Flash) | 0 (opt-in) | `1`: for batches of up to 32 rows the router's gate projection runs in a Triton kernel (FP32 accumulation, at least as accurate as cuBLAS against an FP64 reference), then the stock top-k; larger batches use the stock path. As accurate as stock, not bit-identical (a different summation order); it chose the same experts as the stock router on every row of our tests. |
+| `MERLIN_HY4_DFLY_GRAPHS` | engine (Hy4 Flash) | **1** on `hy4flash-quad-3090` and `hy4flash-octo-3090`, 0 elsewhere | `1`: the DFly2 drafter's steps are captured as full CUDA graphs instead of running eagerly. Bit-identical. |
+| `MERLIN_LATENT_IPC` | engine (Hy4 Flash) | **1** on `hy4flash-quad-3090`, 0 elsewhere | `1`: the LatentMoE latent all-reduce (width 1536) also runs on the PCIe IPC all-reduce instead of falling back to NCCL. Bit-identical at TP2. Not on the 8-card row (TP4, not measured). |
+| `MERLIN_HY4_FUSE_IHC` | engine (Hy4 Flash) | 0 (off) | `1`: fused iHC boundaries in the Hy4 Flash decoder layer. Bit-identical to the stock kernels (including the 256-thread launch the stock RMS norm uses for 256 or more tokens). Off by default. |
+| `MERLIN_COLD_EXPERTS_ADAPTIVE`, `MERLIN_COLD_EXPERTS_ADAPTIVE_PERIOD`, `_SWAPS`, `_WINDOW`, `_MARGIN`, `_MMAX` | engine (cold-expert offload) | **1** on `hy4flash-quad-3090` when the cold-expert offload is on, 0 elsewhere; 8 / 4 / 64 / 2 / 32 | `1` (with `MERLIN_COLD_EXPERTS`): every `PERIOD` steps each offloaded layer swaps up to `SWAPS` of its most-used cold experts into the GPU slots of its least-used hot ones, by byte copy outside the CUDA graphs. Placement only: serial outputs are unchanged; concurrent outputs vary run to run, as with any batch. Swap totals are logged when they change and at shutdown. |
+| `MERLIN_EXPERT_HOT_COUNTS`, `MERLIN_EXPERT_HOT_WINDOWS`, `MERLIN_EXPERT_HOT_WINDOW_STEPS`, `MERLIN_EXPERT_HOT_MMAX`, `MERLIN_EXPERT_HOT_POLL_S` | engine (calibration) | off | Count routed-expert use per layer into per-rank JSON files, for building a cold-expert profile. Calibration only; does not change outputs. |
+| `DFLY` | hy4flash launcher | **1** (DFly2 on) | `0` turns the DFly2 drafter off; only `0` or `1`. The measured 4-card pool was read with DFly2 on. |
+| `COLD_STAGE` | hy4flash launcher | the last PP stage | With `MERLIN_COLD_EXPERTS` on, the PP stage the named cold-expert layers must sit on (`0` to PP - 1); ignored with a note when the offload is off. The KV pin is fixed per row, so the VRAM the offload frees is headroom and the KV pool does not change. |
+| `ENGRAM` | hy4flash launcher | `fp8` | `fp8` serves the FP8 Engram pack, `bf16` the BF16 Engram pack. The checkpoint's `config.json` must agree (`engram_fp8_embedding` true = FP8; false or absent = BF16), else the launcher stops with both named. Never passed to the engine, which reads the tables' dtype from the checkpoint. |
+| `--engram fp8\|bf16` | `./setup.sh --model hy4flash` | `fp8` | The Engram pack to plan, check the host for (host RAM, memlock, disk) and serve; it starts the launcher with `ENGRAM` set to match. Refused on every other model. |
+| `SPEC_K` | hy4flash launcher | **3** (was 5) | DFly2 draft length on the hy4flash rows, set on `tools/merlin/launch.py`. `./setup.sh` starts a row at its default and drops a `SPEC_K` export. |
+| `VLLM_SPARSE_INDEXER_MAX_LOGITS_MB` | hy4flash launcher | **64** on the hy4flash rows (the engine default is 512) | MiB of IndexPool scoring logits per slice. At 64 a prefill step past about 130K tokens of context is scored in more row slices, one extra scoring pass and all-gather per layer per slice, so the prefill memory stops growing with context. Bit-identical: the same per-token selection (slice bounds are equal on every DCP rank). An exported value wins. |
+| `MERLIN_MOE_REPACK_CHUNK_MB` | engine (Marlin WNA16 MoE load) | 64 | Input MiB per expert chunk when post-load processing repacks a Marlin MoE layer in place, which bounds the load peak; `0` is the stock whole-layer repack. The packed weights are the stock ones. A whole number; anything else stops the start. |
+| `MERLIN_MOE_CHUNK_TOKENS` | engine (Marlin MoE) | 0 (opt-in) | `N`: a step of more than `N` tokens runs the Marlin MoE call over `N`-token slices, with its caches sized for one slice (less workspace memory). Not bit-identical to the one-call path for steps above `N`; graphs at or below `N` tokens are stock; prefill cost unmeasured. `0` is the stock path. |
+
+### Known limits
+
+- **Hy4 Flash is new in this release.** The four-card row (`hy4flash-quad-3090`) is testing: its full-model runs
+  passed on our 4 x RTX 3090 host at the 1,600,000,000 B pin (the same tokens as the stock kernels on serial prompts,
+  262K prefill and decode with no out-of-memory, 13.19 ms per output token at K=3, a 609,398-token pool; the
+  profile's evidence lists the decode and prefill rates), and kernel parity qualification is pending. The eight-card row (`hy4flash-octo-3090`, 4 x 1M) is untested on hardware. Hy4 Flash runs from `tools/merlin/launch.py` and `./setup.sh --model hy4flash`;
+  `merlin serve` does not list it.
+- **The KV RAM cache is not supported on Hy4 Flash yet.** On 4 x RTX 3090 its host copies were written but never
+  restored, so it served no hits. `tools/merlin/launch.py` refuses `SWARM=1` and `MERLIN_KV_HOST_TIER_GIB` above 0 on
+  every hy4flash row before the engine starts, and `./setup.sh` refuses `--kv-ram-cache` above 0 and `--swarm`.
+- **The BF16 Engram pack is untested on hardware.** It needs about 198 GiB of host RAM available (118 GiB of pinned
+  tables), more than our four-card host has; the Hy4 Flash figures above are the FP8 pack's.
+- **Strict tool calls cost a little decode time at high concurrency** (1.03× at one stream, 1.00× at 8, 1.07× at 24
+  on Flash-Next), the first request with a new bounded-string schema waits about 0.22 s longer than a repeat, and the
+  first tool request after boot waits about 2.7 s longer (see Highlights). Strict stays opt-in.
+- **Two value shapes in tool-call grammars are still slow, and the slow-fill guard ends them.** A string `pattern`
+  that can contain `<` takes about 370 ms per mask fill, and a non-empty pattern (the `+` form) that can match spaces
+  takes about 2 s per fill (measured on the CPU test host); the grammar writes both as xgrammar does (the `+` form would need thousands of states to stay
+  exact). A request that keeps writing such a value reaches the guard's 5000 ms budget and ends with `Internal server
+  error`; other requests continue. The guard is a backstop, not a fix.
+- **DFlash2's cold prompts reach their first token about 18 to 19 % later** with the DFlash2 tick costs (see
+  Highlights); `VLLM_MERLIN_PREFILL_RUNS_TICK_COSTS=139,25,1` restores the engine default.
+- **The 27B `--swarm` KV RAM cache keeps its 48 GB default, and at that size it returns little on a busy trace.** On a
+  144-session multi-turn agent trace on 4 × RTX 3090 (TP4, GPU pool 2,012,105 tokens), the server served from cache
+  11.4 % of the trace's ceiling with the 48 GB host tier and 87.5 % with `--kv-ram-cache 96g`. At 96 GB the engine's processes peaked at
+  about 121 GiB of host memory (about 73 GiB at 48 GB). These figures were measured on 2026-11-15, before the
+  duplicates-first and waiting-last eviction orders became the defaults on 2026-11-18 (see Highlights).
+- **With the KV RAM cache and the restore-start and seat-hold switches on, returning requests are mostly served from the host tier (opt-in).** The restore-start and seat-hold switches above (off by default; set each to `1`) with the per-slot credits (on by default) keep the queue in order: a return no longer jumps ahead while its prefix is still on the GPU, and by its turn that GPU copy has usually been reused, so it restores from host RAM. On a multi-turn agent trace on the 27B (TP4, 4 × RTX 3090, 96 GB KV RAM cache), returns were served 34 from GPU and 399 from the host tier (131 and 264 with the three switches off), and returns reached their first token sooner (p50 186 s against 260 s, p95 275 s against 358 s). The cost: measured alone on the 27B at 96 GB with the host tier on, `MERLIN_KV_HOST_TIER__RESTORE_START_ANY_STEP` costs about 1.9 percentage points of hit rate and adds unguarded losses, so it (and the seat hold, which needs it) stays off by default; unset or `0` is the earlier order. The per-slot credits alone cost nothing measurable and are on.
+- **The 3.0.2.1 limits still apply** (the 20 GB rows untested on real cards, `tool_choice="auto"` and unfenced quoted
+  markup, KV RAM cache restore waits), as do the 3.0.2 limits, except that inline code is now treated as code in
+  tool-call markup (see Highlights).
+- **The stable-residual repair is on by default** (it was off in 3.0.2.1). The failure it repairs (a rejected draft
+  whose leftover distribution has no mass left in floating point) was not seen on Flash-Next or 27B TP4: 0 of 21,215
+  rejections (14,132 and 7,083). With the same seeds, one request at a time, the repair changed no output token on
+  either lane, and speed and the sampled GSM8K score stayed level. Other lanes (27B TP2 and TP1, ThinkingCap,
+  Ornith, `SPEC=dflash2`) were not measured. `VLLM_SPEC_STABLE_RESIDUAL=0` restores the 3.0.2.1 residual.
+
+### Docs
+
+- Every user-facing 3.0.2.2 knob is in the table above; README Features links to it.
+- SETUP gains the update steps for a checkout of a release tag and lists every folder setup writes under Uninstall;
+  the README's manual install pins the checkpoint revision.
+- The 27B README and reference state the KV RAM cache hit rates at 48 GB and 96 GB, the 27B reference the four-card
+  P2P settings, and the Flash-Next reference the DFlash2 tick costs and the KV RAM cache lock timeout.
+- A community bench card for Qwen3.8-27B on two modded RTX 3080 20 GB cards with dynamic-BAR1 P2P (2026-11-15,
+  contributed by brandon-nuttall; the contributor's measurements, not the maintainers') is added, and the
+  `27b-tp2-sm86-20g` row's P2P note and evidence cite it. The card and the note say that the dynamic-BAR1 driver
+  (`noon-at-cgn/geforce-dynbar1-p2p`) is a patched third-party stack that Merlin does not ship or test, and that P2P
+  stays off on the static-BAR1 595-era stack. The row stays untested by Merlin.
+- The README credits link every handle; two names stay in NOTICE only.
 
 ## Merlin 3.0.2.1
 

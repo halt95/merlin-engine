@@ -336,8 +336,8 @@ class CandidateSelector(nn.Module):
         # Under VLLM_HOST_EMBED_TABLE they live in pinned host memory and are read
         # through a UVA view, like the host embedding table (2 x 121.25 MiB =
         # 242.5 MiB per rank at vocab 248,320 x rank 256 BF16 off the binding
-        # stage).
-        self.host_codebooks = should_use_host_embed_table()
+        # stage). Resolved for the drafter that owns the codebooks, not the target.
+        self.host_codebooks = should_use_host_embed_table("DFlash2DraftModel")
         host = (
             {"device": "cpu", "pin_memory": PIN_MEMORY} if self.host_codebooks else {}
         )

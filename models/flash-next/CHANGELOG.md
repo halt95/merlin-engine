@@ -3,6 +3,33 @@
 Release notes of the Flash-Next recipe, newest first. See the [README](README.md) for current serving status
 and [reference](docs/reference.md) for configuration and evidence boundaries.
 
+## Merlin 3.0.2.2
+
+The recipe runs on **vLLM 0.33.0**, as in 3.0.2.1; the recipe version stays 3.0.0. See the
+[engine changelog](../../docs/CHANGELOG.md#merlin-3022) for the full release.
+
+- **Qwen3 parser:** the end-of-output hang with tools offered is fixed; content starts at its first visible
+  character after the reasoning, streamed or not (`"\n\nAnswer"` becomes `"Answer"`); non-streaming replies keep
+  the whitespace beside tool calls and return text written after a call; streamed content after whitespace that
+  follows the reasoning no longer depends on where the stream is cut; forced and strict tool calls open with the tool-call token.
+- **A Qwen3 tool call opens only at a line start** (the start of the answer, a line start after optional
+  whitespace, or right after a call) and never inside a code fence or an inline code span; elsewhere the opener
+  is text (`MERLIN_QWEN3_LITERAL_SPANS=0` leaves this as in 3.0.2.1).
+- **Strict and free-form tool-call grammars** bound each string from a length table, write one whitespace run
+  per gap, and a slow-fill guard ends a tool-call request whose mask fills keep taking long (see the engine
+  changelog's known limits for the two value shapes that still hit it).
+- **KV RAM cache defaults** (engines booted with the host tier): duplicates-first and waiting-last eviction are on,
+  8 units assemble at once and 64 copy credits are in flight; the restore-start and seat-hold switches stay off.
+- **`P2P=ipc`** checks peer access and BAR1 inside each tensor-parallel group only, not between every selected
+  pair.
+- **The rejection-sampler residual repair is on by default** (`VLLM_SPEC_STABLE_RESIDUAL`; `0` restores the
+  3.0.2.1 residual). On this lane with the same seeds, one request at a time, it changed no output token.
+- **DFlash2 (`SPEC=dflash2`) takes its own prefill-runs tick costs** at chunk 2048
+  (`VLLM_MERLIN_PREFILL_RUNS_TICK_COSTS=289.0,22.6,0.4`): the sessions keep decoding 0.296 of the time during a long
+  ingest (0.162 with the engine default), and a cold prompt's first token comes about 18 to 19 % later. MTP rows are
+  unchanged. See [reference](docs/reference.md).
+- **The KV RAM cache lock** waits at most `MERLIN_KV_HOST_TIER__ARENA_LOCK_TIMEOUT_S` (900 s) at boot.
+
 ## Merlin 3.0.2.1
 
 The Flash-Next recipe runs on **vLLM 0.33.0**, as in 3.0.2. The recipe version stays 3.0.0 (the VERSION file is

@@ -34,7 +34,11 @@ done < <(compgen -e)
 [ -z "$(git -C "$REPO" status --porcelain --untracked-files=no)" ] \
   || die "commit or discard tracked changes before building the release wheel"
 COMMIT="$(git -C "$REPO" rev-parse --short=10 HEAD)"
-VERSION="0.33.0+merlin.$COMMIT"
+# MERLIN_WHEEL_RELEASE=3.0.2.2 puts the release in the local version: 0.33.0+merlin3.0.2.2.<commit>
+# (release/wheel.py accepts it and the old 0.33.0+merlin.<commit>). Unset keeps the old form.
+REL="${MERLIN_WHEEL_RELEASE:-}"
+[ -z "$REL" ] || [[ "$REL" =~ ^[0-9]+(\.[0-9]+)*$ ]] || die "MERLIN_WHEEL_RELEASE must be dotted digits (e.g. 3.0.2.2), not '$REL'"
+VERSION="0.33.0+merlin$REL.$COMMIT"
 NAME="vllm-$VERSION-cp313-cp313-linux_x86_64.whl"
 [ ! -e "$OUT/$NAME" ] || die "$OUT/$NAME already exists"
 
@@ -82,7 +86,7 @@ echo "== build $NAME (TORCH_CUDA_ARCH_LIST=8.0;8.6;8.9) $(date -u +%FT%TZ)"
   PYTHONPATH="$SRC" PYTHONDONTWRITEBYTECODE=1 TMPDIR="$WORK/tmp" \
   "$PY" -m build --wheel --no-isolation --outdir "$WORK/dist" .)
 [ -f "$WORK/dist/$NAME" ] || die "build did not produce $NAME: $(ls "$WORK/dist")"
-if ! "$PY" -P "$REPO/release/wheel.py" audit "$WORK/dist/$NAME" --readme "$REPO/README.md" --forbid "$WORK" --forbid "$REPO" --forbid "$HOME"; then
+if ! "$PY" -P "$REPO/release/wheel.py" audit "$WORK/dist/$NAME" --engine "$REPO" --forbid "$WORK" --forbid "$REPO" --forbid "$HOME"; then
   mv "$WORK/dist/$NAME" "$OUT/$NAME.rejected"
   die "the wheel failed its audit; kept for inspection as $OUT/$NAME.rejected"
 fi

@@ -45,6 +45,8 @@ The concurrent decode workload is six **127K** sessions; six-131K residency was 
 
 ## Merlin 3.0.2.1 bench card (2026-11-12)
 
+Merlin 3.0.2.2 re-measured the 4 × 20 GB row: [3.0.2.2 bench card](benchmarks/2026-11-21/BENCH-CARD.md). The 4 × 20 GB cells below are the 3.0.2.1 figures.
+
 Maintainer measurements on 4× RTX 3090 (220 W, PCIe Gen4) with P2P (the aikitoria patched driver) and the Zagitta [gpu-unlock](https://github.com/Zagitta/gpu-unlock) kernel module, on vLLM 0.33.0, fresh `merlin serve` boots. The 4 × 24 GB rows were measured on the published wheel on 2026-11-11, except the thinking-off 8-agent row (its run on the published wheel ended early and was not used); that row (2026-11-11) and the 4 × 20 GB rows (2026-11-10) come from the previous build of that wheel (built on 2026-11-10, before the prefill runs change); method and every cell in the [bench card](benchmarks/2026-11-12/BENCH-CARD.md). Decode is one stream with thinking on at reasoning effort medium, the server default (tok/s after the first streamed token); prefill is one cold request. With thinking on, a 512-token agent follow-up may end inside the reasoning, and reasoning tokens count. Sessions held at once and the 24 GB 8 MP image panels were not re-run; they stay on the earlier cards below.
 
 | Measurement | Flash-Next |
@@ -131,7 +133,7 @@ Follow [release/README.md](../../release/README.md); the engine is built from th
 After a verified 0.33 build and environment are available, run from the repository root:
 
 ```bash
-venv/bin/hf download halt95/Qwen3.8-Flash-Next-W4A16-Merlin --local-dir ~/models/Flash-Next-Merlin
+venv/bin/hf download halt95/Qwen3.8-Flash-Next-W4A16-Merlin --revision cec53e9f90e5995b81691604ec0b32191debf797 --local-dir ~/models/Flash-Next-Merlin
 TREE="$PWD" VENV="$PWD/venv" CACHE_ROOT="$PWD/.vllm-cache" \
   models/flash-next/serve.sh ~/models/Flash-Next-Merlin
 ```

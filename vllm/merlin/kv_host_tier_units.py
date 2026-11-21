@@ -22,7 +22,14 @@ classes, in order: idle ownerless
 rows, units whose rows all duplicate GPU blocks held by running requests,
 units by LRU of host use (optionally probation before protected,
 ``kv_host_tier_policy``), units whose twins are about to leave the GPU.
-There is no retention interval. Lost units' exclusive host copies are
+With duplicates first (``MERLIN_KV_HOST_TIER__EVICT_DUPLICATES_FIRST``,
+default on) a unit whose twins all sit in the GPU free queue beyond the
+walker's reclaim reach goes after the running-twin duplicates and before
+LRU. With waiting last (``MERLIN_KV_HOST_TIER__EVICT_WAITING_LAST``,
+default on) the units a request in the waiting queue will use (by their
+exclusive rows) go after every unclaimed unit, the furthest back in the
+queue first; the order above holds inside each part. There is no
+retention interval. Lost units' exclusive host copies are
 unkeyed; there is no fragment directory or cross-tier value order.
 """
 
@@ -156,6 +163,117 @@ class UnitCounters:
 
 
 @dataclass
+class DupFirstCounters:
+    """Duplicates first (``MERLIN_KV_HOST_TIER__EVICT_DUPLICATES_FIRST=1``;
+    ``UnitTable.dup_first_counters`` is None with it off, so nothing of
+    this is exported then). Units, not rows, settle their outcome:
+
+    * ``evict_dup_first_rows`` / ``_units``: rows and units ``apply``
+      evicted early (of ``evict_imminent_dup_rows``); each such unit stays
+      recorded, unpublished, until one outcome below settles it once;
+    * ``dup_first_units_recopied``: the unit was published again
+      (``publish_unit``: every member landed on every rank, generation and
+      epoch checked), so a host copy of the same content exists again;
+    * ``dup_first_units_lost``: the unit was recorded lost (its loss cause
+      written: a required key gone from both tiers, or a later host
+      eviction) before it was published again;
+    * ``dup_first_units_lost_unguarded``: of those, the ones with an evicted
+      key whose GPU twin was seen by neither a walk's reclaim lookahead
+      (``note_reclaim_reach``) nor an admission's draw check
+      (``dup_first_draw_hits``) before the loss. Every pop outside the
+      walk's lookahead is an admission's draw, which the write-back's
+      admission gate checks before it draws, so this stays 0;
+    * ``dup_first_units_retired``: the unit left the table without a loss
+      (superseded by its session's next turn, which found its content on
+      the GPU, or a reset/clear);
+    * ``dup_first_draw_waits``: admissions (a restore's destinations
+      included) held because their draw would reclaim the GPU twin of a
+      unit evicted early; the unit is re-copied first;
+    * ``dup_first_draw_wait_steps`` / ``_max``: the walks those admissions
+      were held, in total and the longest;
+    * ``dup_first_draw_vetoes``: holds given up (the re-copy did not land
+      within ``DUP_FIRST_DRAW_WAIT_WALKS`` walks, or nothing could copy):
+      the draw goes ahead and reclaims the twin as any free block, so the
+      unit is lost, counted in ``dup_first_units_lost`` and never
+      unguarded (the draw check saw it)."""
+
+    evict_dup_first_rows: int = 0
+    evict_dup_first_units: int = 0
+    dup_first_units_recopied: int = 0
+    dup_first_units_lost: int = 0
+    dup_first_units_lost_unguarded: int = 0
+    dup_first_units_retired: int = 0
+    dup_first_draw_waits: int = 0
+    dup_first_draw_wait_steps: int = 0
+    dup_first_draw_wait_max: int = 0
+    dup_first_draw_vetoes: int = 0
+
+
+# Queue-rank buckets of a claimed victim,
+# split where the GPU side stops protecting waiters (16 pinned, 32 looked
+# at: ``KVCacheManager.MAX_PINNED_WAITERS`` / ``MAX_INSPECTED_WAITERS``).
+WAITING_RANK_BUCKETS = ((0, 15), (16, 31), (32, 63), (64, None))
+
+
+def waiting_rank_bucket(rank: int) -> str:
+    for lo, hi in WAITING_RANK_BUCKETS:
+        if hi is None or rank <= hi:
+            return f"{lo}_{hi}" if hi is not None else f"{lo}p"
+    raise AssertionError(rank)
+
+
+@dataclass
+class WaitingCounters:
+    """Queue claims on host units (``UnitTable.claim_waiting``). Kept with
+    ``MERLIN_KV_HOST_TIER__EVICT_WAITING_LAST=1`` (which also orders the
+    victims) or with the census on (counted only, the order unchanged);
+    ``UnitTable.waiting_counters`` is None otherwise.
+
+    * ``waiting_claims`` / ``waiting_reclaims``: arrivals, and preempted
+      requests claimed again at the front of the queue;
+      ``waiting_released_admitted`` / ``waiting_released_gone``: claims
+      ended by admission, and by a finish or abort while waiting;
+      ``waiting_released_parked``: claims a class pass ended because the
+      request's status left the queue with no hook (a preempted resumable
+      session that stopped and parked for its next chunk).
+    * ``waiting_arrivals_resident``: arrivals with a published unit on
+      their prefix; ``waiting_arrivals_lost_host_evicted`` /
+      ``waiting_arrivals_lost_other``: arrivals with none, whose prefix
+      was recorded lost before they arrived (host eviction, or another
+      cause): losses no queue order can fix; ``waiting_arrivals_none``:
+      neither (a new prefix, or one never recorded).
+    * ``evict_unclaimed_units``: victims no queued request claims;
+      ``evict_waiting_units`` (``_rows``): claimed victims, by queue rank
+      at eviction (``evict_waiting_rank_<bucket>``), and of them
+      ``evict_waiting_lost_units``: host-only (LRU) victims, whose request
+      will miss them.
+    * ``claim_keys`` / ``claim_units_marked`` / ``claim_units_ranked``:
+      claim work: hashes claimed or released, units marked by them, units
+      whose claim was re-read by a class pass."""
+
+    waiting_claims: int = 0
+    waiting_reclaims: int = 0
+    waiting_released_admitted: int = 0
+    waiting_released_gone: int = 0
+    waiting_released_parked: int = 0
+    waiting_arrivals_resident: int = 0
+    waiting_arrivals_lost_host_evicted: int = 0
+    waiting_arrivals_lost_other: int = 0
+    waiting_arrivals_none: int = 0
+    evict_unclaimed_units: int = 0
+    evict_waiting_units: int = 0
+    evict_waiting_rows: int = 0
+    evict_waiting_lost_units: int = 0
+    evict_waiting_rank_0_15: int = 0
+    evict_waiting_rank_16_31: int = 0
+    evict_waiting_rank_32_63: int = 0
+    evict_waiting_rank_64p: int = 0
+    claim_keys: int = 0
+    claim_units_marked: int = 0
+    claim_units_ranked: int = 0
+
+
+@dataclass
 class PlanCostCounters:
     """Planner work, observational only: never read by a decision,
     moved by probes too (``can_reserve``, ``host_evict_order``), kept apart
@@ -211,6 +329,15 @@ CLASS_RUNNING_DUP = "running_dup"
 CLASS_LRU = "lru"
 CLASS_IMMINENT_DUP = "imminent_dup"
 _CLASS_RANK = {CLASS_RUNNING_DUP: 0, CLASS_LRU: 1, CLASS_IMMINENT_DUP: 2}
+# The rank of a free-pool duplicate taken
+# early (``_Candidate.early``): after running-twin duplicates, before LRU.
+# Between the integer ranks, so every other candidate keeps its key. Read
+# only with the switch on (``_victim_key_dup_first``).
+_EARLY_RANK = 0.5
+
+
+def _class_rank(c: _Candidate) -> float:
+    return _EARLY_RANK if c.early else _CLASS_RANK[c.cls]
 
 
 def _victim_key(c: "_Candidate") -> tuple:
@@ -225,6 +352,32 @@ def _victim_key(c: "_Candidate") -> tuple:
     return (
         _CLASS_RANK[c.cls], c.rank if lru else 0, c.last_use, c.uid,
     )
+
+
+def _victim_key_dup_first(c: _Candidate) -> tuple:
+    """``_victim_key`` with the switch on: an imminent-twin duplicate marked
+    ``early`` sorts as its own class between running-twin duplicates and LRU
+    (``_EARLY_RANK``); with no such candidate the key is ``_victim_key``'s,
+    value for value."""
+    lru = c.cls == CLASS_LRU
+    return (
+        _class_rank(c), c.rank if lru else 0, c.last_use, c.uid,
+    )
+
+
+def _waiting_last(
+    key: Callable[[_Candidate], tuple],
+) -> Callable[[_Candidate], tuple]:
+    """``key`` with the queue claims in front: every unclaimed candidate in
+    ``key`` order, then the claimed ones, the furthest back in the queue
+    (largest claim sequence) first, ``key`` breaking ties."""
+
+    def waiting_key(c: _Candidate) -> tuple:
+        if c.claim is None:
+            return (0, 0, *key(c))
+        return (1, -c.claim, *key(c))
+
+    return waiting_key
 
 
 @dataclass(frozen=True)
@@ -255,6 +408,10 @@ class EvictionPlan:
     # imminent twins (running-twin duplicates, covered units and preferred
     # predecessors only), meets the same need. 0 by design.
     live_over_covered: int = 0
+    # The victims taken as early free-pool
+    # duplicates (``_Candidate.early``), in ``victims`` order; () with the
+    # switch off.
+    early: tuple[int, ...] = ()
 
     @property
     def satisfied(self) -> bool:
@@ -296,6 +453,17 @@ class _Candidate:
     # A published later unit extends this one
     # (``UnitTable._is_covered``); re-read per structure version.
     covered: bool = False
+    # An imminent-twin duplicate whose every
+    # GPU twin sits in the free queue beyond the walker's reclaim reach
+    # (``UnitTable._is_early``); set by the class pass, False with the
+    # switch off.
+    early: bool = False
+    # The queue sequence of the front-most
+    # waiting request claiming one of the exclusive rows (None: unclaimed),
+    # and whether it was read for this candidate's claims (the class pass
+    # re-reads it for a new candidate or a marked unit).
+    claim: int | None = None
+    claim_ok: bool = False
 
 
 # Queue moves logged between two
@@ -474,6 +642,69 @@ class UnitTable:
         )
         self._fallback_of: dict[int, int] = {}  # predecessor -> successor
         self._fallback: dict[int, int] = {}  # successor -> predecessor
+
+        # Duplicates first (``1`` or unset; ``0`` = the order without it): a unit
+        # whose exclusive rows all duplicate GPU blocks in the free queue is
+        # evicted after running-twin duplicates and before LRU, unless a twin
+        # lies within the walker's reclaim reach this step
+        # (``note_reclaim_reach``): that twin leaves the GPU before a re-copy
+        # could be offered, so such a unit keeps the last class. Without a
+        # reach for the current step no unit is early (the order without
+        # the switch).
+        self.dup_first = bool(
+            read_registered("MERLIN_KV_HOST_TIER__EVICT_DUPLICATES_FIRST")
+        )
+        self._reach: tuple[int, int] | None = None  # (step, reclaims)
+        # (step, reclaims, guard set, lookahead set): ``_near_reclaim``.
+        self._near: tuple[int, int, frozenset[int], frozenset[int]] | None = None
+        # Units evicted early, until an outcome settles them: uid -> {key of
+        # an evicted row: its GPU twin was inside a walk's lookahead since}.
+        self._dup_first_pending: dict[int, dict] = {}
+        # MERLIN_KV_TIER_DIAG=1 only: who reclaimed or un-hashed a GPU twin of
+        # a unit evicted early (``_df_note_reclaimer``), until it settles.
+        self._df_reclaimer: dict[int, str] = {}
+        self.dup_first_counters: DupFirstCounters | None = (
+            DupFirstCounters() if self.dup_first else None
+        )
+        # Required keys guarded too (``1`` or unset; ``0`` = the early-freed
+        # keys only): the draw hold, the walk's reach and the forced re-copy
+        # of a unit evicted early also cover its required keys that only the
+        # GPU holds (``_dup_first_required_hits``). The met marks and the
+        # unguarded count still read the early keys alone.
+        self._df_required = self.dup_first and bool(
+            read_registered("MERLIN_KV_HOST_TIER__GUARD_REQUIRED_KEYS")
+        )
+
+        # Waiting last (``1`` or unset; ``0`` = the order without it): the
+        # rows a request in the waiting queue will use are evicted after
+        # every unclaimed unit, the furthest back in the queue first. A
+        # request claims the plain hashes of its prompt at arrival
+        # (``claim_waiting``) and gives them up at admission or finish
+        # (``release_waiting``); a preempted request claims again at the
+        # front. A unit is claimed by its EXCLUSIVE rows only, so a page every
+        # session shares (a system prompt) claims nothing. With the census on
+        # the claims are kept and counted with the switch off too; the order
+        # is then the one without it.
+        self.waiting_last = bool(
+            read_registered("MERLIN_KV_HOST_TIER__EVICT_WAITING_LAST")
+        )
+        try:
+            census = bool(read_registered("MERLIN_KV_HOST_TIER_CENSUS"))
+        except Exception:
+            census = False
+        self.waiting_counters: WaitingCounters | None = (
+            WaitingCounters() if self.waiting_last or census else None
+        )
+        # plain hash -> queue sequences claiming it; request id -> (sequence,
+        # claimed hashes, the request); the live sequences, sorted (queue rank
+        # by bisect).
+        self._claims: dict[object, set[int]] = {}
+        self._claimant: dict[str, tuple[int, tuple, object]] = {}
+        self._claim_seqs: list[int] = []
+        self._claim_next = 0  # arrivals count up
+        self._claim_front = 0  # preempted re-claims count down (the front)
+        self._claim_version = 0
+        self._claim_marked: set[int] = set()  # units whose claim may differ
         # Classifies a GPU twin: "running" (a running request's table holds
         # it), "imminent" (grace-held / in the free queue: it leaves the GPU
         # next). Installed by the copy scheduler (SessionYield knows graces);
@@ -575,6 +806,10 @@ class UnitTable:
         self._loss_cause: str | None = None
         # Walker decisions on units it did not copy: uid -> cause.
         self._skip_cause: dict[int, str] = {}
+        # The met GPU block a skip was
+        # decided on and its generation then: a stamp whose block has moved
+        # to another generation no longer explains a loss.
+        self._skip_witness: dict[int, tuple[int, int]] = {}
         self.step = 0
         self.units: dict[int, RestoreUnit] = {}
         self._key_order: dict[int, list[BlockHashWithGroupId]] = {}
@@ -1095,6 +1330,14 @@ class UnitTable:
         if hold:
             self.host_pool.touch(hold)
 
+    def holds_only_shared(self, uid: int) -> bool:
+        """Every row ``uid`` holds while it assembles is also owned by
+        another unit (none is its own exclusive row)."""
+        rows = self._held.get(uid)
+        return bool(rows) and all(
+            len(self._block_owners(b)) > 1 for b in rows
+        )
+
     @property
     def assembling(self) -> int:
         """Units holding rows while they assemble."""
@@ -1173,6 +1416,8 @@ class UnitTable:
 
     def _drop_unit(self, unit: RestoreUnit) -> None:
         self._bump("drop_unit", uids=(unit.uid,), keys=self.ordered(unit))
+        if self._dup_first_pending:
+            self._dup_first_settle(unit.uid, "retired")  # no loss recorded
         if self._fallback or self._fallback_of:
             self._unlink_fallback(unit.uid)
         # Supersede-at-publish links: a dropped successor releases its kept
@@ -1211,6 +1456,7 @@ class UnitTable:
         self._published.discard(unit.uid)
         self._last_use.pop(unit.uid, None)
         self._skip_cause.pop(unit.uid, None)
+        self._skip_witness.pop(unit.uid, None)
         # The order first: ``ordered`` caches, so popping before it would keep
         # every dropped unit alive for the process.
         keys = self.ordered(unit)
@@ -1260,6 +1506,12 @@ class UnitTable:
             return False
         self._bump("publish")
         self._published.add(unit_id)
+        # Published: no skip explains a
+        # later loss of this unit.
+        self._skip_cause.pop(unit_id, None)
+        self._skip_witness.pop(unit_id, None)
+        if self._dup_first_pending:
+            self._dup_first_settle(unit_id, "recopied")
         members = self.host_members(unit)
         self._visible.update(b.block_id for b in members)
         # Visible first, so neither its own release nor a co-owner's
@@ -1688,6 +1940,333 @@ class UnitTable:
                     out[twin.block_id] = twin
         return list(out.values())
 
+    # -- duplicates first ---------------------
+
+    def note_reclaim_reach(self, step: int, reclaims: int) -> list[int]:
+        """The write-back walk of ``step`` looks ``reclaims`` GPU reclaims
+        ahead (its window plus the copy credits): the blocks those pops
+        take or destroy are near reclaim this step (``_near_reclaim``).
+        The keys of units evicted early whose GPU twins are inside this
+        lookahead are marked met (the walk meets them in its window).
+        Returns the units with a twin inside it (the walk copies them
+        first: ``WriteBack``'s forced re-copies); with required keys guarded,
+        also those whose GPU-only required key the lookahead takes (not
+        marked met)."""
+        self._reach = (step, max(0, int(reclaims)))
+        pending = self._dup_first_pending
+        if not pending:
+            return []
+        self._near_reclaim(step)
+        met = self._near[3]
+        get = self._gpu_block
+        near: list[int] = []
+        for uid, keys in pending.items():
+            for k in keys:
+                twin = get(k)
+                if twin is not None and twin.block_id in met:
+                    keys[k] = True
+                    if not near or near[-1] != uid:
+                        near.append(uid)
+        if self._df_required:
+            have = set(near)
+            near.extend(
+                u for u in self._dup_first_required_hits(met) if u not in have
+            )
+        return near
+
+    def _dup_first_twin_index(self) -> dict[int, list]:
+        """The pending-twin index, resolved now: GPU block id -> [(unit,
+        key)] for every evicted key of a unit evicted early and not yet
+        settled, over every GPU block that carries the key (the key leaves
+        the GPU only with the last of them)."""
+        cache = self.gpu_pool.cached_block_hash_to_block
+        index: dict[int, list] = {}
+        for uid, keys in self._dup_first_pending.items():
+            for k in keys:
+                for twin in cache.get_blocks(k):
+                    index.setdefault(twin.block_id, []).append((uid, k))
+        return index
+
+    def _dup_first_required_hits(self, ids: Iterable[int]) -> list[int]:
+        """Units evicted early that losing the GPU blocks ``ids`` would
+        destroy through a required key outside their early-freed rows: a
+        required key with no host copy whose every GPU block is in ``ids``.
+        Nothing is marked met (the met marks are the early keys' alone)."""
+        if not self._df_required or not ids:
+            return []
+        ids = ids if isinstance(ids, (set, frozenset)) else set(ids)
+        cache = self.gpu_pool.cached_block_hash_to_block
+        out: list[int] = []
+        for uid, early in self._dup_first_pending.items():
+            unit = self.units.get(uid)
+            if unit is None:
+                continue
+            for key in self.ordered(unit):
+                if (
+                    key in early or key not in unit.required
+                    or self._host_block(key) is not None
+                ):
+                    continue
+                twins = cache.get_blocks(key)
+                if twins and all(b.block_id in ids for b in twins):
+                    out.append(uid)
+                    break
+        return out
+
+    def _dup_first_keys(self, uid: int) -> list:
+        """The keys a forced re-copy of pending unit ``uid`` covers: its
+        early-freed keys, then (required keys guarded) its required keys
+        with no host copy."""
+        early = self._dup_first_pending.get(uid)
+        if early is None:
+            return []
+        keys = list(early)
+        unit = self.units.get(uid) if self._df_required else None
+        if unit is not None:
+            keys.extend(
+                k for k in self.ordered(unit)
+                if k not in early and k in unit.required
+                and self._host_block(k) is None
+            )
+        return keys
+
+    def dup_first_draw_hits(self, drawn: Sequence[KVCacheBlock]) -> list[int]:
+        """Units evicted early that an allocation drawing ``drawn`` (its pops
+        and the session peers they destroy) would lose: every GPU block
+        that carries one of their evicted keys is drawn. Those keys are
+        marked met (the draw check saw them, so such a loss is never
+        unguarded). With required keys guarded, also the units whose
+        GPU-only required key the draw takes (``_dup_first_required_hits``;
+        not marked met)."""
+        if not self._dup_first_pending:
+            return []
+        index = self._dup_first_twin_index()
+        ids = {b.block_id for b in drawn}
+        cache = self.gpu_pool.cached_block_hash_to_block
+        out: set[int] = set()
+        for bid in ids:
+            for uid, k in index.get(bid, ()):
+                if all(t.block_id in ids for t in cache.get_blocks(k)):
+                    self._dup_first_pending[uid][k] = True
+                    out.add(uid)
+        out.update(self._dup_first_required_hits(ids))
+        return sorted(out)
+
+    def dup_first_twins(self, uids) -> list[KVCacheBlock]:
+        """The GPU twins (``_gpu_block``, one per key of
+        ``_dup_first_keys``) of the pending units ``uids``, in that order."""
+        get = self._gpu_block
+        out: list[KVCacheBlock] = []
+        seen: set[int] = set()
+        for uid in uids:
+            for k in self._dup_first_keys(uid):
+                twin = get(k)
+                if twin is not None and twin.block_id not in seen:
+                    seen.add(twin.block_id)
+                    out.append(twin)
+        return out
+
+    def _near_reclaim(self, step: int) -> frozenset[int] | None:
+        """GPU block ids near reclaim for ``step``'s reach, read once per
+        step; None when no reach was given for ``step`` (then no unit is
+        early). The next ``reclaims`` pops (``iter_pool_reclaims``:
+        junctions, session breaks, their collateral) and every member of a
+        session group one of those pops breaks, whatever the group's host
+        backing: a break moves its free members to the queue front, and
+        destroys them when the group is not host-backed, which an eviction
+        of this plan can make it. The lookahead alone (popped and destroyed
+        blocks, what the walk's window visits) is kept for the met marks."""
+        reach = self._reach
+        if reach is None or reach[0] != step:
+            return None
+        got = self._near
+        if got is not None and got[:2] == reach:
+            return got[2]
+        from vllm.v1.core.kv_tier_state import iter_pool_reclaims
+
+        seen: set[int] = set()
+        near: set[int] = set()
+        if reach[1] > 0:
+            groups = self.gpu_pool.evict_groups
+            for block, _keyed, destroyed in iter_pool_reclaims(
+                self.gpu_pool, reach[1]
+            ):
+                seen.add(block.block_id)
+                seen.update(b.block_id for b in destroyed)
+                gid = groups._block_group.get(block.block_id)
+                if gid is not None:
+                    near.update(m.block_id for m in groups._groups.get(gid, ()))
+        near |= seen
+        out = frozenset(near)
+        self._near = (reach[0], reach[1], out, frozenset(seen))
+        return out
+
+    def _is_early(self, c: _Candidate, near: frozenset[int]) -> bool:
+        """``c`` (an imminent-twin duplicate) may go before LRU: every GPU
+        twin of its exclusive rows is in the free queue (no reference: not
+        grace-held, waiter- or transfer-pinned, nor run) and none is among
+        this step's near reclaims, so the walker meets each one in a later
+        window before the GPU can hand it out."""
+        return bool(c.excl_keys) and self._keys_early(c.excl_keys, near)
+
+    def _keys_early(self, row_keys, near: frozenset[int]) -> bool:
+        """Every GPU twin of every key in ``row_keys`` (one key list per host
+        row) is free, in the queue and outside ``near``."""
+        get = self._gpu_block
+        for keys in row_keys:
+            if not keys:
+                return False
+            for k in keys:
+                twin = get(k)
+                if (
+                    twin is None or twin.ref_cnt != 0
+                    or twin.prev_free_block is None
+                    or twin.block_id in near
+                ):
+                    return False
+        return True
+
+    def _take_early(self, take: Sequence[KVCacheBlock], step: int) -> bool:
+        """The guard on the rows a take actually frees (an earlier victim
+        may have left a shared or alias row to this one)."""
+        near = self._near_reclaim(step)
+        host = self.host_pool
+        return near is not None and bool(take) and self._keys_early(
+            [self._keys_of(host, b) for b in take], near
+        )
+
+    def _dup_first_settle(
+        self,
+        uid: int,
+        outcome: str,
+        *,
+        lost_key: BlockHashWithGroupId | None = None,
+    ) -> None:
+        """Settle a unit evicted early, once: ``recopied``, ``lost`` or
+        ``retired`` (``DupFirstCounters``). ``lost_key`` is the required key
+        whose loss ended the unit (diagnostic line only)."""
+        keys = self._dup_first_pending.pop(uid, None)
+        c = self.dup_first_counters
+        if keys is None or c is None:
+            return
+        if outcome == "recopied":
+            c.dup_first_units_recopied += 1
+        elif outcome == "lost":
+            c.dup_first_units_lost += 1
+            if not all(keys.values()):
+                c.dup_first_units_lost_unguarded += 1
+                if self._diag:
+                    self._df_diag_unguarded(uid, keys, lost_key)
+        else:
+            c.dup_first_units_retired += 1
+        self._df_reclaimer.pop(uid, None)
+
+    # -- MERLIN_KV_TIER_DIAG=1: who reclaimed an unguarded twin ---------------
+
+    def _df_note_reclaimer(self, keys, how: str) -> None:
+        """Debug only (MERLIN_KV_TIER_DIAG=1): a GPU block loses ``keys``
+        (``how``: popped by an allocation, or un-hashed otherwise). For each
+        unit evicted early with one of them among its evicted keys, remember
+        the code path doing it (``_df_reclaim_path``) for that unit's loss
+        line. Reads only; changes nothing."""
+        gone = set(keys)
+        path = None
+        for uid, pending in self._dup_first_pending.items():
+            if uid not in self._df_reclaimer and not gone.isdisjoint(pending):
+                if path is None:
+                    path = f"{how}:{self._df_reclaim_path()}"
+                self._df_reclaimer[uid] = path
+
+    @staticmethod
+    def _df_reclaim_path() -> str:
+        """The scheduler path on the current stack: ``restore_destination``
+        (a host restore's destinations), ``running_allocation``,
+        ``admission`` or ``admission_escape`` (a WAITING / PREEMPTED request,
+        escaped past the write-back gate), ``preemption``, else ``other``;
+        with the request id and the innermost engine frames."""
+        import sys
+
+        frames: list[str] = []
+        path = None
+        rid = "-"
+        f = sys._getframe(2)
+        while f is not None and len(frames) < 40:
+            name = f.f_code.co_name
+            frames.append(name)
+            if path is None:
+                if name == "place_restore_destinations":
+                    path = "restore_destination"
+                elif name in ("_preempt_request", "preempt_request"):
+                    path = "preemption"
+                elif name == "allocate_slots":
+                    req = f.f_locals.get("request")
+                    status = getattr(getattr(req, "status", None), "name", "")
+                    rid = str(getattr(req, "request_id", "-"))
+                    if status in ("WAITING", "PREEMPTED"):
+                        gate = getattr(f.f_locals.get("self"), "admission_gate", None)
+                        wb = getattr(gate, "__self__", None)
+                        escaped = rid in getattr(wb, "_escaped", ())
+                        path = "admission_escape" if escaped else "admission"
+                    else:
+                        path = "running_allocation"
+            f = f.f_back
+        inner = ">".join(reversed(frames[:6]))
+        return f"{path or 'other'} req={rid} frames={inner}"
+
+    @staticmethod
+    def _df_key_str(key: BlockHashWithGroupId | None) -> str:
+        """A short, stable name for a key: group id and hash prefix."""
+        if key is None:
+            return "-"
+        return f"g{get_group_id(key)}:{bytes(get_block_hash(key)).hex()[:16]}"
+
+    @staticmethod
+    def _df_loss_site() -> str:
+        """The code path of the loss being settled: the frames above
+        ``_record_loss`` on the current stack, outermost first, innermost
+        last (at most ten); ``-`` off that path. Reads only."""
+        import sys
+
+        frames: list[str] = []
+        f = sys._getframe(1)
+        above = False
+        while f is not None and len(frames) < 10:
+            name = f.f_code.co_name
+            if above:
+                frames.append(name)
+            elif name == "_record_loss":
+                above = True
+            f = f.f_back
+        return ">".join(reversed(frames)) or "-"
+
+    def _df_diag_unguarded(
+        self,
+        uid: int,
+        keys: dict,
+        lost_key: BlockHashWithGroupId | None = None,
+    ) -> None:
+        """One line per unit counted unguarded. ``by`` only says whether a GPU
+        reclaim of one of the early-evicted keys was seen; ``loss_key`` is the
+        required key whose loss ended the unit, ``loss_key_early`` whether it
+        is one of the early-evicted keys (1 / 0; -1 when the loss site names
+        no key), ``early_gpu`` how many early-evicted keys still have a GPU
+        block, and ``loss_site`` the stack that recorded the loss."""
+        tier = self.gpu_pool.tier if self.gpu_pool is not None else None
+        logger.info(
+            "KV tier diag: dup_first_unguarded uid=%d walk_step=%d "
+            "tier_step=%s keys_met=%d/%d host_rows=%d by=%s "
+            "loss_key=%s loss_key_early=%d early_gpu=%d/%d loss_site=%s",
+            uid, self.step, getattr(tier, "step", "-"),
+            sum(1 for v in keys.values() if v), len(keys),
+            sum(1 for _ in self.host_members(self.units[uid]))
+            if uid in self.units else 0,
+            self._df_reclaimer.get(uid, "unseen"),
+            self._df_key_str(lost_key),
+            -1 if lost_key is None else int(lost_key in keys),
+            sum(1 for k in keys if self._gpu_block(k) is not None), len(keys),
+            self._df_loss_site(),
+        )
+
     def _victim_class(self, exclusive: Sequence[KVCacheBlock]) -> str:
         if not exclusive:
             return CLASS_LRU
@@ -1712,28 +2291,284 @@ class UnitTable:
         the structure or a class changed. The result is the list the full
         rebuild gives: the same base order (``units`` order), the same
         classes (``_live_class``), the same sort key."""
-        key = (self._dir_version, step)
+        # The reach is part of the key (a
+        # reach noted after a pass of the same step re-reads ``early``).
+        key = (self._dir_version, step, self._reach if self.dup_first else None)
+        # Claims move the order only with
+        # the switch on (the census alone keeps the key and the order).
+        waiting = self.waiting_last
+        if self._claimant and self.waiting_counters is not None:
+            self._expire_claims()
+        if waiting:
+            key = (*key, self._claim_version)
         cached = self._cand_cache
         if cached is not None and cached[0] == key:
             return cached[1]
         self.plan_cost.class_passes += 1
         base = self._structure()
         changed = cached is None or cached[2] is not base
+        if waiting and self._claim_rank(base):
+            changed = True
+        # Off (or no reach given) keeps every
+        # ``early`` False, so the pass and the order are the ones without it.
+        dup_first = self.dup_first
+        near: frozenset[int] | None | bool = False  # False: not read yet
         for c in base:
             cls = self._live_class(c)
             if cls != c.cls:
                 c.cls = cls
                 changed = True
+            if dup_first:
+                early = False
+                if cls == CLASS_IMMINENT_DUP:
+                    if near is False:
+                        near = self._near_reclaim(step)
+                    early = near is not None and self._is_early(c, near)
+                if early != c.early:
+                    c.early = early
+                    changed = True
         if not changed:
             out = cached[1]
         elif self._fallback_of:
             self.plan_cost.resorts += 1
-            out = sorted(base, key=self._fallback_order)
+            order = self._fallback_order
+            out = sorted(base, key=_waiting_last(order) if waiting else order)
         else:
             self.plan_cost.resorts += 1
-            out = sorted(base, key=_victim_key)
+            order = _victim_key_dup_first if dup_first else _victim_key
+            out = sorted(base, key=_waiting_last(order) if waiting else order)
         self._cand_cache = (key, out, base)
         return out
+
+
+    # Cost: an arrival or a release walks the request's hashes once (one
+    # dict read per hash and group to find the units holding them, one set
+    # update per hash); a class pass re-reads the claim of only the new
+    # candidates and the marked units (their exclusive keys), on top of the
+    # walk over the candidates it already makes; a victim's queue rank is a
+    # bisection of the live sequences. Nothing walks the queue per step.
+    def claim_waiting(self, request: Request, front: bool = False) -> None:
+        """``request`` entered the waiting queue: it claims the plain hashes
+        of its tokens (the prompt at arrival; everything computed when a
+        preemption puts it back, ``front``: ahead of every arrival). A
+        request already claiming gives its old claim up first."""
+        wc = self.waiting_counters
+        if wc is None:
+            return
+        rid = request.request_id
+        if rid in self._claimant:
+            self._drop_claim(rid)
+        hashes = tuple(dict.fromkeys(request.block_hashes))
+        if front:
+            self._claim_front -= 1
+            seq = self._claim_front
+            wc.waiting_reclaims += 1
+        else:
+            self._claim_next += 1
+            seq = self._claim_next
+            wc.waiting_claims += 1
+        claims = self._claims
+        for h in hashes:
+            claims.setdefault(h, set()).add(seq)
+        self._claimant[rid] = (seq, hashes, request)
+        bisect.insort(self._claim_seqs, seq)
+        wc.claim_keys += len(hashes)
+        uids = self._units_of_hashes(hashes)
+        self._mark_claims(uids)
+        if not front:
+            self._count_arrival(hashes, uids)
+
+    def release_waiting(self, request_id: str, admitted: bool) -> None:
+        """``request_id`` left the waiting queue: admitted (its restore,
+        if any, now holds the rows it needs) or gone (finished, aborted)."""
+        wc = self.waiting_counters
+        if wc is None or request_id not in self._claimant:
+            return
+        if admitted:
+            wc.waiting_released_admitted += 1
+        else:
+            wc.waiting_released_gone += 1
+        self._drop_claim(request_id)
+
+    def _drop_claim(self, request_id: str) -> None:
+        seq, hashes, _ = self._claimant.pop(request_id)
+        claims = self._claims
+        for h in hashes:
+            seqs = claims.get(h)
+            if seqs is not None:
+                seqs.discard(seq)
+                if not seqs:
+                    del claims[h]
+        i = bisect.bisect_left(self._claim_seqs, seq)
+        del self._claim_seqs[i]
+        self.waiting_counters.claim_keys += len(hashes)
+        self._mark_claims(self._units_of_hashes(hashes))
+        if self.waiting_last:
+            # A unit holding a claimed key that no unit-table entry names (an
+            # alias key, or a row it lists that no unit keys) was not marked:
+            # the class pass re-reads every claim whose sequence has ended.
+            self._claim_version += 1
+
+    def _expire_claims(self) -> None:
+        """Drop the claim of every claimant whose status says it left the
+        waiting queue with no hook releasing it: parked for its next
+        streaming chunk (a preempted resumable session that stopped while
+        preempted), running, or finished. One status read per live claim,
+        once per class pass."""
+        from vllm.v1.request import RequestStatus
+
+        live = (
+            RequestStatus.WAITING,
+            RequestStatus.WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR,
+            RequestStatus.WAITING_FOR_REMOTE_KVS,
+            RequestStatus.PREEMPTED,
+        )
+        gone = [
+            rid for rid, (_, _, req) in self._claimant.items()
+            if (status := getattr(req, "status", None)) is not None
+            and status not in live
+        ]
+        for rid in gone:
+            self.waiting_counters.waiting_released_parked += 1
+            self._drop_claim(rid)
+
+    def _units_of_hashes(self, hashes: Iterable) -> set[int]:
+        """Every unit keying one of ``hashes`` in any group."""
+        key_units = self._key_units
+        gids = tuple(self._kind)
+        out: set[int] = set()
+        for h in hashes:
+            for g in gids:
+                got = key_units.get(make_block_hash_with_group_id(h, g))
+                if got:
+                    out |= got
+        return out
+
+    def _mark_claims(self, uids: set[int]) -> None:
+        if not uids:
+            return
+        self.waiting_counters.claim_units_marked += len(uids)
+        if self.waiting_last:
+            self._claim_marked |= uids
+            self._claim_version += 1
+
+    def _claim_of_keys(self, keys_per_row: Iterable[Iterable]) -> int | None:
+        """The front-most claim (smallest sequence) on any of these rows'
+        keys, or None."""
+        claims = self._claims
+        best: int | None = None
+        for keys in keys_per_row:
+            for k in keys:
+                seqs = claims.get(get_block_hash(k))
+                if seqs:
+                    m = min(seqs)
+                    if best is None or m < best:
+                        best = m
+        return best
+
+    def _claim_rank(self, base: list[_Candidate]) -> bool:
+        """Re-read the claim of every new candidate and every marked unit
+        (by its exclusive keys); True when one changed."""
+        marked, self._claim_marked = self._claim_marked, set()
+        changed = False
+        n = 0
+        live = set(self._claim_seqs)
+        for c in base:
+            # Re-read a new candidate, a marked unit, and one ranked by a
+            # claim that has ended (its key reached the unit without a
+            # unit-table entry, so the release did not mark it).
+            if c.claim_ok and c.uid not in marked and (
+                c.claim is None or c.claim in live
+            ):
+                continue
+            claim = self._claim_of_keys(c.excl_keys)
+            c.claim_ok = True
+            n += 1
+            if claim != c.claim:
+                c.claim = claim
+                changed = True
+        self.waiting_counters.claim_units_ranked += n
+        return changed
+
+    def waiting_rank(self, seq: int) -> int:
+        """Queue rank of a live claim sequence: the claims ahead of it."""
+        return bisect.bisect_left(self._claim_seqs, seq)
+
+    def _count_arrival(self, hashes: tuple, uids: set[int]) -> None:
+        """An arrival's prefix on the host: a published unit it claims
+        (by an exclusive row), else the deepest lost hash on it that no live
+        unit keys any more (a page live units still share is not lost)."""
+        wc = self.waiting_counters
+        published, cand_of = self._published, self._cand_of
+        mine = set(hashes)
+        for uid in uids:
+            c = cand_of.get(uid)
+            if uid in published and c is not None and any(
+                get_block_hash(k) in mine for keys in c.excl_keys for k in keys
+            ):
+                wc.waiting_arrivals_resident += 1
+                return
+        lost, key_units, gids = self.lost, self._key_units, tuple(self._kind)
+        for h in reversed(hashes):
+            got = lost.get(h)
+            if got is None or any(
+                key_units.get(make_block_hash_with_group_id(h, g)) for g in gids
+            ):
+                continue
+            if got[0] == "host_evicted":
+                wc.waiting_arrivals_lost_host_evicted += 1
+            else:
+                wc.waiting_arrivals_lost_other += 1
+            return
+        wc.waiting_arrivals_none += 1
+
+    def _count_waiting_victim(
+        self, take: Sequence[KVCacheBlock], cls: str
+    ) -> None:
+        """``apply`` took ``take`` (a unit's exclusive rows) of class
+        ``cls``: count it as claimed (with its queue rank) or not."""
+        wc = self.waiting_counters
+        host = self.host_pool
+        claim = self._claim_of_keys(self._keys_of(host, b) for b in take)
+        if claim is None:
+            wc.evict_unclaimed_units += 1
+            return
+        wc.evict_waiting_units += 1
+        wc.evict_waiting_rows += len(take)
+        if cls == CLASS_LRU:
+            wc.evict_waiting_lost_units += 1
+        bucket = waiting_rank_bucket(self.waiting_rank(claim))
+        name = "evict_waiting_rank_" + bucket
+        setattr(wc, name, getattr(wc, name) + 1)
+
+    def waiting_resident(self) -> dict[str, int]:
+        """Gauges for the diag line: the live claims, and the host rows of
+        the units a live claim holds (every row of such a unit, shared rows
+        once) with their tokens (full-attention rows at the group's block
+        size). Walks the cached candidates once."""
+        cache = self._struct_cache
+        rows: set[int] = set()
+        size = {g.group_id: g.block_size for g in self._full}
+        tokens = 0
+        units = 0
+        row_keys = self._row_keys
+        for c in cache[1] if cache is not None else ():
+            if self._claim_of_keys(c.excl_keys) is None:
+                continue
+            units += 1
+            for b in c.rows:
+                if b.block_id in rows:
+                    continue
+                rows.add(b.block_id)
+                keys = row_keys.get(b.block_id, ())
+                if keys:
+                    tokens += size.get(get_group_id(keys[0]), 0)
+        return {
+            "waiting_claimants": len(self._claimant),
+            "waiting_claimed_units": units,
+            "waiting_claimed_rows": len(rows),
+            "waiting_claimed_tokens": tokens,
+        }
 
     def _is_covered(self, uid: UnitId) -> bool:
         """``uid`` is a kept predecessor that a published, live later
@@ -2160,7 +2995,8 @@ class UnitTable:
             rank = self.policy.rank(succ)
             last = max(last, self._last_use.get(succ, 0))
         return (
-            _CLASS_RANK[c.cls], rank if c.cls == CLASS_LRU else 0,
+            _class_rank(c) if self.dup_first else _CLASS_RANK[c.cls],
+            rank if c.cls == CLASS_LRU else 0,
             last, anchor, behind,
         )
 
@@ -2186,12 +3022,13 @@ class UnitTable:
 
         Order: idle ownerless rows (counted, freed by nobody) -> units whose
         exclusive rows all duplicate GPU blocks held by running requests ->
-        units by LRU of host use (flag: probation before protected) -> units
-        whose twins are about to leave the GPU. A victim frees only its
-        EXCLUSIVE rows; a row shared with a unit that survives the plan is
-        never listed. A unit is skipped when one of its exclusive rows is
-        pinned, out of the free queue or protected: no lock spreads through
-        a shared row.
+        (duplicates first: units whose twins are all free beyond the reclaim
+        reach, ``_is_early``) -> units by LRU of host use (flag: probation
+        before protected) -> units whose twins are about to leave the GPU.
+        A victim frees only its EXCLUSIVE rows; a row shared with a unit
+        that survives the plan is never listed. A unit is skipped when one
+        of its exclusive rows is pinned, out of the free queue or protected:
+        no lock spreads through a shared row.
 
         ``displace_published=False`` (a lane that may not displace published
         host content): idle rows and running-twin duplicates only.
@@ -2245,6 +3082,8 @@ class UnitTable:
         # (shared roots of all-duplicate forks).
         gone: set[int] = set()
         freed: set[int] = set()
+        early: list[int] = []
+        deferred: list[_Candidate] = []
         remaining = list(cands)
         bypassed = False
         progress = False
@@ -2252,7 +3091,7 @@ class UnitTable:
 
         # The loop body, unchanged,
         # as a function the indexed first pass calls too.
-        def visit(cand: _Candidate) -> None:
+        def visit(cand: _Candidate, late: bool = False) -> None:
             nonlocal bypassed, progress
             # A constrained successor with displacement rights may replace
             # its own kept predecessor (budgeted replacement): never a
@@ -2322,6 +3161,15 @@ class UnitTable:
                 return
             if self._cf_only and self._cf_excluded(cand, cls, preferred):
                 return
+            if cand.early and not late and cls == CLASS_IMMINENT_DUP:
+                # The guard on the rows this
+                # take frees (an earlier victim may have left it a shared or
+                # alias row whose twin is near); a take that fails it goes
+                # with the last class, after this pass.
+                if not same and not self._take_early(take, step):
+                    deferred.append(cand)
+                    return
+                early.append(cand.uid)
             victims.append(cand.uid)
             ids = [b.block_id for b in take]
             rows.extend(ids)
@@ -2350,6 +3198,13 @@ class UnitTable:
                         break
                     self.plan_cost.cands_visited += 1
                     visit(cand)
+            if deferred:
+                late, deferred[:] = list(deferred), []
+                for cand in late:
+                    if idle + len(freed) >= need_rows:
+                        break
+                    self.plan_cost.cands_visited += 1
+                    visit(cand, late=True)
             if idle + len(freed) >= need_rows:
                 break
             if not progress:
@@ -2398,7 +3253,10 @@ class UnitTable:
             finally:
                 self._cf_only = False
             plan_args["live_over_covered"] = int(alt.satisfied)
-        plan = EvictionPlan(victims=victims, rows=rows, classes=classes, **plan_args)
+        plan = EvictionPlan(
+            victims=victims, rows=rows, classes=classes, early=tuple(early),
+            **plan_args,
+        )
         if not plan.satisfied:
             c.evict_plans_short += 1
             if bypassed and count:
@@ -2542,7 +3400,18 @@ class UnitTable:
                     # lane may not take it.
                     c.evict_apply_mismatch += 1
                     break
+                if uid in plan.early and not (
+                    cls == CLASS_IMMINENT_DUP
+                    and self._take_early(take, plan.step)
+                ):
+                    # A twin of the take came near reclaim (or was pinned)
+                    # since ``plan``: never an unguarded early take.
+                    c.evict_apply_mismatch += 1
+                    break
                 applied.add(uid)
+
+                if take and self.waiting_counters is not None:
+                    self._count_waiting_victim(take, cls)
                 c.evict_shared_kept += len(members) - len(take)
                 if own:
                     c.constrained_successor += 1
@@ -2570,6 +3439,16 @@ class UnitTable:
                 elif cls == CLASS_IMMINENT_DUP:
                     c.evict_imminent_dup_rows += len(take)
                     self.policy.on_drop(uid)
+                    dfc = self.dup_first_counters
+                    if dfc is not None and uid in plan.early:
+
+                        dfc.evict_dup_first_rows += len(take)
+                        dfc.evict_dup_first_units += 1
+                        host = self.host_pool
+                        pending = self._dup_first_pending.setdefault(uid, {})
+                        for b in take:
+                            for k in self._keys_of(host, b):
+                                pending.setdefault(k, False)
                 else:
                     self.policy.on_evict(uid, self._private_keys(unit))
                 self._published.discard(uid)
@@ -2711,10 +3590,38 @@ class UnitTable:
 
     LOST_KEYS_MAX = 1 << 16
 
-    def note_skip(self, unit: RestoreUnit, cause: str) -> None:
+    def note_skip(
+        self, unit: RestoreUnit, cause: str, block: KVCacheBlock | None = None
+    ) -> None:
         """The walker did not copy ``unit`` (skipped_tiny / never_fit): if
-        its GPU copy is reclaimed, that is the loss cause."""
+        its GPU copy is reclaimed, that is the loss cause, unless the unit
+        published since or ``block`` (the GPU block the skip was decided
+        on) moved to another generation (``_cause_of``)."""
         self._skip_cause[unit.uid] = cause
+        gen = self._generation(block)
+        if gen is None:
+            self._skip_witness.pop(unit.uid, None)
+        else:
+            self._skip_witness[unit.uid] = (block.block_id, gen)
+
+    def _generation(self, block: KVCacheBlock | None) -> int | None:
+        tier = getattr(self.gpu_pool, "tier", None) if block is not None else None
+        if tier is None or block.pool is self.host_pool:
+            return None
+        return tier.generation[block.block_id]
+
+    def _skip_of(self, unit: RestoreUnit) -> str | None:
+        """The unit's skip stamp if it still holds: the met block it was
+        decided on is in the same generation."""
+        cause = self._skip_cause.get(unit.uid)
+        witness = self._skip_witness.get(unit.uid)
+        if cause is None or witness is None:
+            return cause
+        block_id, gen = witness
+        tier = getattr(self.gpu_pool, "tier", None)
+        if tier is not None and tier.generation[block_id] != gen:
+            return None
+        return cause
 
     def _cause_of(self, unit: RestoreUnit) -> tuple[str, int]:
         age = self.step - self._last_use.get(unit.uid, self.step)
@@ -2722,7 +3629,7 @@ class UnitTable:
             return "host_evicted", age
         if self._loss_cause is not None:
             return self._loss_cause, age
-        return self._skip_cause.get(unit.uid, "missed_copy"), age
+        return self._skip_of(unit) or "missed_copy", age
 
     def _is_stale(self, unit: RestoreUnit) -> bool:
         """Diagnosis only: a later unit on the same chain holds every
@@ -2840,7 +3747,9 @@ class UnitTable:
         if self._is_covered(unit.uid):
             self.counters.units_lost_covered_early += 1
 
-    def _record_loss(self, unit: RestoreUnit) -> None:
+    def _record_loss(
+        self, unit: RestoreUnit, *, key: BlockHashWithGroupId | None = None
+    ) -> None:
         cause = self._cause_of(unit)
         for k in self.ordered(unit):
             if k not in unit.required:
@@ -2851,6 +3760,9 @@ class UnitTable:
         while len(self.lost) > self.LOST_KEYS_MAX:
             self.lost.popitem(last=False)
         self._skip_cause.pop(unit.uid, None)
+        self._skip_witness.pop(unit.uid, None)
+        if self._dup_first_pending:
+            self._dup_first_settle(unit.uid, "lost", lost_key=key)
 
     def loss_cause(self, block_hashes: Sequence[object]) -> tuple[str, int] | None:
         """The recorded loss cause of the deepest lost unit on this prefix."""
@@ -2866,7 +3778,7 @@ class UnitTable:
             if unit is None or key not in unit.required:
                 continue
             self._count_evicted(unit)
-            self._record_loss(unit)
+            self._record_loss(unit, key=key)
             remains = self._exclusive(unit)
             if self._keep_lost_remains:
                 # Only the failed load's read rows lose their keys; published
@@ -2927,6 +3839,8 @@ class UnitTable:
         self, block: KVCacheBlock, keys: Sequence[BlockHashWithGroupId]
     ) -> None:
         reclaimed = self._reclaiming == block.block_id
+        if self._diag and self._dup_first_pending:  # duplicates-first diag
+            self._df_note_reclaimer(keys, "reclaim" if reclaimed else "unhash")
         self._bump_gpu()
         self._reclaiming = None
         self.flush()
@@ -3028,6 +3942,8 @@ class UnitTable:
         self._group_of.clear()
         self._fallback_of.clear()
         self._fallback.clear()
+        self._dup_first_pending.clear()
+        self._df_reclaimer.clear()
         self.policy.clear()
         self._cand_cache = None
         self._bump("clear", full=True)

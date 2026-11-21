@@ -1,5 +1,86 @@
 # Changelog
 
+## Merlin 3.0.2.2
+
+The engine-side subset; the full 3.0.2.2 list is in the [main changelog](../CHANGELOG.md#merlin-3022).
+The engine stays on vLLM 0.33.0 (torch 2.14.0, Triton 3.8.0, FlashInfer 0.7.2.post1, Transformers 5.20.2), built for
+sm_80, sm_86 and sm_89 on CUDA 13.0, from the same native sources as 3.0.2.1. The wheel is `vllm-0.33.0+merlin3.0.2.2.c56eeed392-cp313-cp313-linux_x86_64.whl`; its
+version, `0.33.0+merlin3.0.2.2.c56eeed392`, carries the release, and the last part names the commit the compiled
+libraries were built from. Its metadata declares `jinja2 >= 3.1.6` and carries a fixed package description. The CUDA
+libraries are the ones 3.0.2.1 shipped, byte for byte; the Rust frontend (`vllm/vllm-rs`) is rebuilt from the same
+sources so that `vllm-rs --version` and the `/version` endpoint's `rust_frontend_version` report this release's
+version. Compiled files embed their build date, so a rebuild of the same sources is not byte-identical: check a wheel
+by its published sha256 (`release/merlin-wheel.sha256`), not by rebuilding it.
+
+- **Qwen3 parser, end-of-output flush:** each of the three hold layers is flushed at most once; a flushed layer stays
+  bypassed for the rest of the flush, and a layer that takes items after its flush raises instead of looping.
+  `finish()` leaves no half-flushed state.
+- **Qwen3 parser, call position:** with `MERLIN_QWEN3_LITERAL_SPANS` on (the default), a call opener (the `<tool_call>`
+  token or a bare `<function=` header) starts a call only at the start of the answer, at the start of a line after
+  optional whitespace, or right after a call; elsewhere (a blockquote, a list item, mid-sentence) it is text, with
+  everything after it. Inside a code fence an opener is always text, also at the end of the output; an opener inside an
+  inline code span is held until the span closes and is then text (a real call stays a call when the line, the
+  reasoning, the turn or the output ends first). Calls a structural tag constrains keep the opener token as the call
+  wherever the grammar placed it; only the Qwen3 parser applies the rule. Added special tokens are ignored in the line
+  test, and a special token the engine drops no longer holds back the stream. The boot self-test builds the same
+  parser as serving.
+- **Content start:** one module (`vllm/merlin/content_start.py`) drops the whitespace between a closing reasoning tag the
+  output wrote and the first visible content character, in streamed and non-streamed output, for the delegating
+  parser front end and the parser engine alike. Non-streaming content beside tool calls keeps the model's whitespace; a stream holds a whitespace-only run
+  until text or the end decides it.
+- **Tool grammar:** a forced, required or strict call on the Qwen tool parser is opened and closed by the special-token
+  ids resolved from the parser's vocabulary (the text form, with one warning, when they do not resolve cleanly). A
+  top-level `maxLength` string on a strict tool is one character-budget rule (`root[max_chars=N]`, which the pinned
+  xgrammar 0.2.8 provides) that cannot contain the closing sequence and takes only well-formed UTF-8.
+- **Tool grammar, cost bounds:** by default (`VLLM_MERLIN_STRICT_LENGTH_TABLE=1`) the bound is applied from a
+  per-tokenizer code-point length table and a per-request tracker instead of the grammar's budget, with masks equal to
+  the budgeted grammar's; each whitespace run in a strict call is written once per gap and capped
+  (`VLLM_MERLIN_STRICT_WS_CAP`, 64); padded values that can hold whitespace, string-or-null unions, unsplit tools and the
+  generic argument object of a required or named tool without a schema are written with one parse per text (the same
+  accepted text). A slow-fill guard (`VLLM_MERLIN_STRICT_STALL_GUARD`, on) ends a tool-call request whose mask fills of at
+  least 300 ms of CPU time add up to 5000 ms over its last 64 fills, with an error (`Internal server error`); other
+  requests continue. Two shapes stay slow and end this way: a pattern that can contain `<` (about 370 ms per fill) and a
+  non-empty pattern that can match spaces (about 2 s per fill), measured on the CPU test host.
+- **Scheduler:** both KV-capacity paths raise a typed error that the server maps to HTTP 400 with the cause; host-tier
+  admission judges a copy before freeing a host row, and a zero total need is exempt from the remeasured reservation.
+- **Telemetry:** `kv_cache_capacity_tokens` on `/v1/models` is the engine's KV pool (the minimum over the ranks a
+  frontend routes to); `vllm:merlin_scheduler_policy_events_total` is new; the `restore_failed` census event counts with
+  the census off, and two duplicate-row census gauges are removed.
+- **KV host tier:** the arena lock file is opened safely and waited for at most
+  `MERLIN_KV_HOST_TIER__ARENA_LOCK_TIMEOUT_S` seconds (default 900).
+- **KV host tier, restore start:** a waiting restore's copy starts on any step a restore slot is free, also
+  with every running seat taken, for at most 2 x `N_RESTORE` loads parked ahead of the seats and only while the
+  free pool keeps the running requests' one-step headroom; started restores take the next free seats in arrival
+  order. Opt-in, off by default (`MERLIN_KV_HOST_TIER__RESTORE_START_ANY_STEP=1`).
+  The restore copy budget is `COPY_CREDITS` rows per restore slot
+  (`MERLIN_KV_HOST_TIER__RESTORE_CREDITS_PER_SLOT`, on by default; `0` shares one budget).
+  A running seat that frees while the seat-queue head's restore copy is in flight is held for it, one hold at a
+  time for at most 3 s, and the pass then only starts restore copies (`MERLIN_KV_HOST_TIER__RESTORE_SEAT_HOLD=1`,
+  off by default). The plans log the three switches and `N_RESTORE` once at start. Measured alone, the restore
+  start costs about 1.9 percentage points of hit rate and adds unguarded losses on the 27B at 96 GB with the
+  host tier on, so it and the seat hold are opt-in; the per-slot credits cost nothing measurable and are on.
+- **KV host tier, defaults:** `MERLIN_KV_HOST_TIER__EVICT_DUPLICATES_FIRST` and
+  `MERLIN_KV_HOST_TIER__EVICT_WAITING_LAST` are on (was off), `MERLIN_KV_HOST_TIER__MAX_ASSEMBLING` is 8 (was 2) and
+  `MERLIN_KV_HOST_TIER__COPY_CREDITS_D` is 64 (was 32); an explicit value wins, `0` turns each switch off and `2` and
+  `32` give the earlier counts. The cold-start hold cap stays a third of the GPU pool at any slot count.
+  `MERLIN_KV_HOST_TIER__SHARED_ROW_LONE` stays off (experimental): a shared block is copied alone only when its owners'
+  union would never fit the host cache.
+- **Switches:** `MERLIN_REPACK_RELEASE`, `MERLIN_LOAD_PEAK_LOG` and `MERLIN_QWEN3_LITERAL_SPANS` accept only `0` or `1`.
+- **Rejection sampler:** the stable residual (`VLLM_SPEC_STABLE_RESIDUAL`) is on by default; `0` restores the 3.0.2.1
+  residual. `MERLIN_SPEC_RESIDUAL_DIAG=1` (off by default) counts the residual draws without changing a token. The
+  resample insert kernel launches with one warp (the change of vllm-project/vllm#66048): with the default four, a delayed
+  warp could read the incremented sampled-token count and index past the request's logits rows. Sampled tokens are
+  unchanged.
+- **Diagnostics (off by default, no token or policy change):** `MERLIN_KV_TIER_DIAG=1` logs the host restore lifecycle,
+  `never_fit` verdicts and, for a unit given up early and then lost, a `dup_first_unguarded` line naming the lost key and
+  the loss site; `VLLM_MERLIN_GRAMMAR_STEP_DIAG=1` writes per-step grammar timings.
+- **Preflight, `P2P=ipc`:** peer access and BAR1 are required between the cards of each tensor-parallel group of the
+  chosen row, not between every selected pair; `merlin serve` takes `P2P=ipc` into profile selection and may take
+  peer-connected groups out of order. `P2P=on` is unchanged.
+- **MTP:** the draft step reaches the MTP module, the speculative config reads one module count, and draft layers are
+  built at their runtime index when every by-name lookup agrees. Outputs are bit-identical on the 27B and ThinkingCap.
+- **Parser self-test:** a warn-only round trip of the served template and parsers runs at boot in a background helper.
+
 ## Merlin 3.0.2.1
 
 The engine-side subset; the full 3.0.2.1 list is in the [main changelog](../CHANGELOG.md#merlin-3021).

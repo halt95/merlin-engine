@@ -583,10 +583,12 @@ class Qwen4ExpModel(nn.Module, EagleModelMixin):
             if layer_type in _QSA_LAYER_TYPES
             and getattr(config, "indexer_n_heads", None) is not None
         )
+        # The host table below is resolved for
+        # this family's target architecture (vllm/merlin/envs.py).
         validate_qsa_block_topk(config)
         self.uses_host_embed_table = (
             get_pp_group().is_first_rank
-            and should_use_host_embed_table()
+            and should_use_host_embed_table("Qwen4ExpForCausalLM")
         )
         if self.uses_host_embed_table and getattr(
             config, "tie_word_embeddings", False

@@ -8,6 +8,7 @@ two 2026-10-12 cards.
 
 | date | card | release |
 |---|---|---|
+| 2026-11-21 | [Merlin 3.0.2.2: re-measured lanes](2026-11-21/README.md) | Merlin 3.0.2.2 (vLLM 0.33; four lanes re-run, the rest carried from 3.0.2.1 after a spot check) |
 | 2026-11-12 | [Merlin 3.0.2.1: all checkpoints](2026-11-12/README.md) | Merlin 3.0.2.1 (vLLM 0.33; measured 2026-11-09 to 2026-11-12 UTC) |
 | 2026-11-04 | [Merlin 3.0.2: all checkpoints](2026-11-04/README.md) | Merlin 3.0.2 (vLLM 0.33; Swift1.5, Swift1.5-Huihui and ThinkingCap run 2026-11-05) |
 | 2026-11-02 | [Merlin 3.0.1: all checkpoints](2026-11-02/README.md) | Merlin 3.0.1 (measured with gpu-unlock plus P2P) |

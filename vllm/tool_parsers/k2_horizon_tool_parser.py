@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by the Merlin project; see NOTICE.
 
 import json
 from collections.abc import Sequence
@@ -151,6 +152,10 @@ class K2HorizonToolParser(ToolParser):
     @staticmethod
     def _coerce_json_value(value: Any, schema: Any) -> Any:
         if not isinstance(schema, dict):
+            return value
+        # A JSON string the schema allows as
+        # a string is not reinterpreted.
+        if isinstance(value, str) and "string" in extract_types_from_schema(schema):
             return value
         raw_value = (
             value

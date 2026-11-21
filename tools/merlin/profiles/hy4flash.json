@@ -1,0 +1,219 @@
+{
+ "schema": 1,
+ "model": "hy4flash",
+ "labels": {
+  "tested": "tested on the reference host",
+  "testing": "full-model runs passed; kernel parity qualification pending",
+  "untested": "untested"
+ },
+ "launch": {
+  "note": "The hy4flash family shape of tools/merlin/launch.py (_build_hy4flash): Hy4 Flash (HYV4FlashForCausalLM) as TP x PP2 with DCP2 over the TP pair (TP-sharded MLA latent + IndexPool cache), FP8 fp8_ds_mla KV, Engram tables and the token embedding in host RAM, sparse MQA forced at config time. A launch.py lane for boot attempts: merlin serve does not list it; ./setup.sh --model hy4flash picks the row from the card count and starts launch.py with it. DFly2 is on by default (method dfly, K = SPEC_K, default 3 since 3.0.2.2; DFLY=0 off); the KV RAM cache is refused on hy4flash. Two packs: FP8 Engram tables (the default) and BF16 Engram tables; ENGRAM=fp8|bf16 (./setup.sh --engram) names the one served and must match the checkpoint config.json engram_fp8_embedding (true = FP8, false or absent = BF16), else the launcher refuses; host RAM and memlock are sized for the variant (BF16: ~118 GiB of tables pinned, ~198 GiB available).",
+  "port": 8000,
+  "served": "hy4flash",
+  "max_model_len": 262144,
+  "toolchain": "cuda_home",
+  "verify_tree": false,
+  "sparse_attention_heads": 32,
+  "mla_query_bytes_per_head": 1152,
+  "max_query_gather_bytes": 301989888,
+  "capture_sizes": [
+   1,
+   2,
+   3,
+   4,
+   6,
+   8
+  ]
+ },
+ "profiles": [
+  {
+   "id": "hy4flash-quad-3090",
+   "title": "Hy4 Flash: 4 x RTX 3090 24 GB, TP2 x PP2 + EP, DCP2, fp8_ds_mla KV",
+   "status": "testing",
+   "auto_select": false,
+   "match": {
+    "arch": [
+     "sm_86"
+    ],
+    "cards": 4,
+    "vram_gib": 24,
+    "p2p": "on",
+    "testing_gpu_names": [
+     "RTX 3090$"
+    ]
+   },
+   "launcher": {
+    "path": null
+   },
+   "layout": {
+    "tp": 2,
+    "pp": 2,
+    "ep": true,
+    "partition": [
+     21,
+     21
+    ]
+   },
+   "serve": {
+    "tensor_parallel": 2,
+    "pipeline_parallel": 2,
+    "decode_context_parallel_size": 2,
+    "cp_kv_cache_interleave_size": 64,
+    "block_size": 64,
+    "kv_cache_dtype": "fp8_ds_mla",
+    "kv_cache_memory": 1600000000,
+    "max_num_seqs": 8,
+    "max_num_batched_tokens": 1024,
+    "max_model_len": 262144
+   },
+   "capacity": {
+    "estimate": true,
+    "kv_blocks": 6351,
+    "pool_tokens": 609398,
+    "fit_131k": 4,
+    "fit_262k": 2,
+    "basis": "Measured: the boot log reads 609,398 tokens (2.32x 262K) at KV_BYTES 1,600,000,000 (round), fp8_ds_mla, prefix caching on, chunk 1024, DFly2 K=3 and K=7. Engine block arithmetic: 1,600,000,000 // 251,904 B per block (6 sparse layers x 656 B x 64 tokens per card) = 6,351 blocks; a 262,144-token request holds 2,732 blocks per rank (2,516 MLA + indexer, 9 sliding-window groups x 24), so the fit is (6,351 - 1) // 2,733 = 2 x 262K (4 x 128K). The pin leaves at least 578 MiB total minus used on PP0 at idle after capture and at the warm-up peak (660 MiB at K=3); 1,700,000,000 left 478 MiB on PP0 at K=7, under the 524 MiB floor."
+   },
+   "evidence": [
+    "4 x RTX 3090 24 GB, P2P on, measured 2026-11-20/21 at the 1,600,000,000 B pin (chunk 1024) on the 2026-11-20 release candidate: with the release defaults the server returns the same tokens as the stock kernels on serial prompts; decode 75.3 / 67.1 / 89.3 tok/s at 4K / 128K / 262K context on a K=5 boot (the release default is K=3: 13.19 ms per output token); decode tok/s depends on how well the draft predicts the text, which is why the 262K row is faster than 4K; cold prefill 1,672 / 1,608 / 1,384 tok/s at 10K / 100K / 262K; 262K prefill and decode with no out-of-memory; the boot log reads a 609,398-token pool.",
+    "Testing: full-model runs passed; kernel parity qualification pending."
+   ],
+   "notes": [
+    "The pool at the 1,600,000,000 B pin is measured (609,398 tokens); the engine fit is 2 x 262K (4 x 128K), see capacity.",
+    "CHUNK default 1024 (every measured run of this row used 1024): forced sparse MQA under DCP gathers the chunk's queries per sparse layer, chunk x 32 heads x 1152 B = 37.7 MB at 1024 (302 MB at 8192, the cap).",
+    "DFly2 source layers 25/29/33/37/41 sit on stage 1 of the 21/21 split; PP_PARTITION must keep them on the last stage.",
+    "KV RAM cache (--kv-ram-cache, --swarm, MERLIN_KV_HOST_TIER_GIB): not supported on Hy4 Flash yet; the launcher and setup refuse it.",
+    "3.0.2.2 speed defaults: the row's env turns on INDEXER_FAST, SWA_WINDOW_REUSE, LATENT_IPC, DFLY_GRAPHS, INDEXER_SELECT and COLD_EXPERTS_ADAPTIVE (a no-op without a cold-expert profile); K = 3. Export NAME=0 to turn one off. FUSE_IHC stays off.",
+    "Cold experts on by default from the row's env: layers 26/28/30/33 (PP1) at hot 0.25 with the calibrated profile hy4flash-p1-calibrated.json (decode counts over code, chat, zh, tool, math and long segments; in-sample hit 0.63-0.66 per layer). MERLIN_COLD_EXPERTS=0 turns it off, a profile path replaces it.",
+    "FUSED_ROUTER is opt-in (not bit-identical; the release's serial token compare matched without it).",
+    "SPARSE_DECODE is opt-in (MERLIN_HY4_SPARSE_DECODE=1): its ieee and split P modes are under accuracy qualification."
+   ],
+   "env": {
+    "MERLIN_COLD_EXPERTS": "tools/merlin/profiles/expert_hot/hy4flash-p1-calibrated.json",
+    "MERLIN_COLD_EXPERTS_LAYERS": "26,28,30,33",
+    "MERLIN_COLD_EXPERTS_HOT_FRAC": "0.25",
+    "MERLIN_HY4_INDEXER_FAST": "1",
+    "MERLIN_HY4_SWA_WINDOW_REUSE": "1",
+    "MERLIN_LATENT_IPC": "1",
+    "MERLIN_HY4_DFLY_GRAPHS": "1",
+    "MERLIN_HY4_INDEXER_SELECT": "1",
+    "MERLIN_COLD_EXPERTS_ADAPTIVE": "1"
+   }
+  },
+  {
+   "id": "hy4flash-quad-3090-tp4",
+   "title": "Hy4 Flash DIAG: 4 x RTX 3090 24 GB, TP4 (no PP) + EP4, DCP4, fp8_ds_mla KV, cold experts 37-41 at 0.25",
+   "status": "untested",
+   "auto_select": false,
+   "match": {
+    "arch": [
+     "sm_86"
+    ],
+    "cards": 4,
+    "vram_gib": 24,
+    "p2p": "on"
+   },
+   "launcher": {
+    "path": null
+   },
+   "layout": {
+    "tp": 4,
+    "pp": 1,
+    "ep": true,
+    "partition": []
+   },
+   "serve": {
+    "tensor_parallel": 4,
+    "pipeline_parallel": 1,
+    "decode_context_parallel_size": 4,
+    "cp_kv_cache_interleave_size": 64,
+    "block_size": 64,
+    "kv_cache_dtype": "fp8_ds_mla",
+    "kv_cache_memory": 1900000000,
+    "max_num_seqs": 8,
+    "max_num_batched_tokens": 2048,
+    "max_model_len": 262144
+   },
+   "capacity": {
+    "estimate": true,
+    "pool_tokens": 696249,
+    "basis": "Pool measured on the DIAG boot at the earlier 1.75 GiB pin: 696,249 tokens (2.66x 262K, an engine fit of 2 x 262K). Arithmetic only: KV per token per card equals the TP2 x PP2 x DCP2 row (all 11 sparse layers over 4 token shards against about 5.5 layers over 2), so the same KV_BYTES gives about the same pool; the replicated SWA ring doubles per card (small). Replicated weights (LatentMoE down/up, router gates) add about 441 MiB per card, hence the cold-expert default on layers 37-41 at hot 0.25 (96 cold experts per layer per rank, about 1.6 GiB per rank) for the 524 MiB floor. KV_BYTES 1,900,000,000 (round; the DIAG boot measured 696,249 tokens at 1.75 GiB): the TP4 x DCP4 block geometry is not modelled, so no fit is claimed."
+   },
+   "evidence": [],
+   "notes": [
+    "DIAG row, never a shipped default (auto_select false): TP4 x DCP4 with no pipeline stage, for the c1 step and 1M-pool comparison against hy4flash-quad-3090.",
+    "Cold experts on by default from the row's env: layers 37-41 at hot 0.25 with the uniform placeholder profile (MERLIN_COLD_EXPERTS=0 turns it off, a profile path replaces it). At TP4 every rank builds every layer, so each rank holds 96 cold experts per named layer.",
+    "Untested engine paths: the DCP4 sparse filter / interleave / LSE combine at 4 shards, FlashInfer PCIe IPC peer access across all four cards (otherwise NCCL all-reduces), and the DFly2 draft at TP4.",
+    "KV RAM cache (--kv-ram-cache, --swarm, MERLIN_KV_HOST_TIER_GIB): not supported on Hy4 Flash yet; the launcher and setup refuse it."
+   ],
+   "env": {
+    "MERLIN_COLD_EXPERTS": "tools/merlin/profiles/expert_hot/hy4flash-uniform.json",
+    "MERLIN_COLD_EXPERTS_LAYERS": "37,38,39,40,41",
+    "MERLIN_COLD_EXPERTS_HOT_FRAC": "0.25"
+   }
+  },
+  {
+   "id": "hy4flash-octo-3090",
+   "title": "Hy4 Flash: 8 x RTX 3090 24 GB, TP4 x PP2 + EP, DCP2, fp8_ds_mla KV",
+   "status": "untested",
+   "auto_select": false,
+   "match": {
+    "arch": [
+     "sm_86"
+    ],
+    "cards": 8,
+    "vram_gib": 24,
+    "p2p": "on"
+   },
+   "launcher": {
+    "path": null
+   },
+   "layout": {
+    "tp": 4,
+    "pp": 2,
+    "ep": true,
+    "partition": [
+     21,
+     21
+    ]
+   },
+   "serve": {
+    "tensor_parallel": 4,
+    "pipeline_parallel": 2,
+    "decode_context_parallel_size": 2,
+    "cp_kv_cache_interleave_size": 64,
+    "block_size": 64,
+    "kv_cache_dtype": "fp8_ds_mla",
+    "kv_cache_memory": 10800000000,
+    "max_num_seqs": 8,
+    "max_num_batched_tokens": 4096,
+    "max_model_len": 1048576
+   },
+   "capacity": {
+    "estimate": true,
+    "kv_blocks": 42873,
+    "pool_tokens": 4196751,
+    "fit_131k": 22,
+    "fit_262k": 13,
+    "fit_1m": 4,
+    "basis": "Estimate until the first 8-card boot: the block arithmetic of the 4-card row (measured), per rank, since DCP2 inside TP4 shards tokens over 2 ranks with the same 6 sparse layers per stage. KV_BYTES 10,800,000,000 (round) // 251,904 B = 42,873 blocks; a 1,048,576-token request holds 10,712 blocks per rank at chunk 4096 (10,064 MLA + indexer, 9 sliding-window groups x 72), so the fit is (42,873 - 1) // 10,713 = 4 x 1M (13 x 262K, 22 x 128K) and the engine would report 4,196,751 tokens (4.00x 1M), prefix caching on. 10,700,000,000 fits only 3 x 1M (42,476 blocks). Desk fit per card: experts at EP4 about 8.4-8.9 GiB, other weights about 2.0-2.2 GiB, activations and graphs about 1-1.5 GiB, KV 10.06 GiB: about 0.5-1 GiB free on each stage, near the 524 MiB floor; unmeasured."
+   },
+   "evidence": [],
+   "notes": [
+    "Boot-attempt row: TP4 x DCP2 sink ownership is checked in the CPU tests, nothing has run on 8 cards.",
+    "CHUNK default 4096: chunk x 16 gathered heads (32 / TP4 x DCP2) x 1152 B = 75.5 MB per sparse layer.",
+    "KV RAM cache (--kv-ram-cache, --swarm, MERLIN_KV_HOST_TIER_GIB): not supported on Hy4 Flash yet; the launcher and setup refuse it.",
+    "The 3.0.2.2 speed flags valid without cold experts and off the TP2 IPC path: INDEXER_FAST, SWA_WINDOW_REUSE, DFLY_GRAPHS, INDEXER_SELECT. Not LATENT_IPC (its IPC kernel is measured at TP2 only) and not COLD_EXPERTS_ADAPTIVE (needs the cold-expert offload). Export NAME=0 to turn one off.",
+    "Untested on hardware (pool is an estimate): max_model_len 1,048,576 (the checkpoint's max_position_embeddings) for 4 sessions at 1M each.",
+    "FUSED_ROUTER is opt-in (not bit-identical; the release's serial token compare matched without it).",
+    "SPARSE_DECODE is opt-in (MERLIN_HY4_SPARSE_DECODE=1): its ieee and split P modes are under accuracy qualification."
+   ],
+   "env": {
+    "MERLIN_HY4_INDEXER_FAST": "1",
+    "MERLIN_HY4_SWA_WINDOW_REUSE": "1",
+    "MERLIN_HY4_DFLY_GRAPHS": "1",
+    "MERLIN_HY4_INDEXER_SELECT": "1"
+   }
+  }
+ ]
+}

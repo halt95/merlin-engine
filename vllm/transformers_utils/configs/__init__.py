@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by the Merlin project; see NOTICE.
 """Model configs may be defined in this directory for the following reasons:
 
 - There is no configuration file defined by HF Hub or Transformers library.
@@ -35,6 +36,8 @@ _CLASS_TO_MODULE: dict[str, str] = {
     "FunAudioChatConfig": "vllm.transformers_utils.configs.funaudiochat",
     "FunAudioChatAudioEncoderConfig": "vllm.transformers_utils.configs.funaudiochat",
     "HYV4Config": "vllm.transformers_utils.configs.hy_v4",
+
+    "HYV4FlashConfig": "vllm.models.hy_v4_flash.configs",
     "IsaacConfig": "vllm.transformers_utils.configs.isaac",
     # RWConfig is for the original tiiuae/falcon-40b(-instruct) and
     # tiiuae/falcon-7b(-instruct) models. Newer Falcon models will use the
@@ -109,6 +112,7 @@ __all__ = [
     "FunAudioChatConfig",
     "FunAudioChatAudioEncoderConfig",
     "HYV4Config",
+    "HYV4FlashConfig",
     "HyperCLOVAXConfig",
     "IsaacConfig",
     "RWConfig",

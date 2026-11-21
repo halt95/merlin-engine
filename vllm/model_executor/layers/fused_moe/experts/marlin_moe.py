@@ -748,6 +748,10 @@ class MarlinExperts(LoRAExpertsMixin, MarlinExpertsBase):
         workspace1 = (M * topk, max(N, K))
         workspace2 = (M * topk * max(2 * N, K),)
         output = (M, K)
+        # (vllm/merlin/moe_workspace_chunk.py)
+        from vllm.merlin import moe_workspace_chunk as mwc
+        shapes = mwc.marlin_workspace_shapes(M, N, K, topk, mwc.chunk_tokens_for(self))
+        workspace1, workspace2, output = shapes
 
         return (workspace1, workspace2, output)
 
@@ -792,7 +796,11 @@ class MarlinExperts(LoRAExpertsMixin, MarlinExpertsBase):
                     return
                 self.moe_sum(input, output, topk_ids, expert_map)
 
-            fused_marlin_moe(
+            # M > MERLIN_MOE_CHUNK_TOKENS: slices
+            from vllm.merlin import moe_workspace_chunk as mwc
+            mwc.run_chunked(
+                fused_marlin_moe,
+                mwc.chunk_tokens_for(self, hooked),
                 hidden_states=hidden_states,
                 w1=w1,
                 w2=w2,

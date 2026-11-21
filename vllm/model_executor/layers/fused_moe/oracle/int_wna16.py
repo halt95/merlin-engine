@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by the Merlin project; see NOTICE.
 import sys
 from enum import Enum
 from typing import Any
@@ -613,11 +614,23 @@ def _process_weights_marlin(
     4. Permute scales (and optionally extract INT8 global scales).
     5. Permute bias tensors.
     """
-    # Canonical N-first → K-first for Marlin.
-    w13_qweight = w13_qweight.transpose(1, 2).contiguous()
-    w2_qweight = w2_qweight.transpose(1, 2).contiguous()
-    w13_scales = w13_scales.transpose(1, 2).contiguous()
-    w2_scales = w2_scales.transpose(1, 2).contiguous()
+
+    # Unpadded layers repack in byte-bounded expert chunks written over the
+    # loaded tensors (vllm/merlin/moe_repack_chunk.py): the same bytes, with a
+    # transient of two chunks instead of two more copies of the layer.
+    # MERLIN_MOE_REPACK_CHUNK_MB=0 = the stock path below.
+    from vllm.merlin import moe_repack_chunk
+
+    repack_chunk = moe_repack_chunk.chunk_bytes()
+    inter = layer.intermediate_size_per_partition
+    if repack_chunk and marlin_moe_padded_intermediate(inter, group_size) != inter:
+        repack_chunk = 0
+    if not repack_chunk:
+        # Canonical N-first → K-first for Marlin.
+        w13_qweight = w13_qweight.transpose(1, 2).contiguous()
+        w2_qweight = w2_qweight.transpose(1, 2).contiguous()
+        w13_scales = w13_scales.transpose(1, 2).contiguous()
+        w2_scales = w2_scales.transpose(1, 2).contiguous()
     if w13_qzeros is not None:
         w13_qzeros = w13_qzeros.transpose(1, 2).contiguous()
     if w2_qzeros is not None:
@@ -634,8 +647,46 @@ def _process_weights_marlin(
     w13_bias_out: torch.Tensor | None = None
     w2_bias_out: torch.Tensor | None = None
 
-    # --- FP8 weight / scale adjustment ---
-    if input_dtype == torch.float8_e4m3fn:
+
+    if repack_chunk:
+        # Weights and scales in their final Marlin layout; padding, repack and
+        # permute below are skipped (no padding on this path).
+        is_fp8 = input_dtype == torch.float8_e4m3fn
+        marlin_w13_qweight = moe_repack_chunk.repack_qweight(
+            w13_qweight,
+            num_bits=num_bits,
+            pack_factor=pack_factor,
+            is_a_8bit=is_a_8bit,
+            fp8_preprocess=is_fp8,
+            max_chunk_bytes=repack_chunk,
+        )
+        marlin_w2_qweight = moe_repack_chunk.repack_qweight(
+            w2_qweight,
+            num_bits=num_bits,
+            pack_factor=pack_factor,
+            is_a_8bit=is_a_8bit,
+            fp8_preprocess=is_fp8,
+            max_chunk_bytes=repack_chunk,
+        )
+        marlin_w13_scales = moe_repack_chunk.permute_scales(
+            w13_scales,
+            size_k=lambda _groups: inter,
+            group_size=group_size,
+            is_a_8bit=is_a_8bit,
+            fp8_scale=is_fp8,
+            max_chunk_bytes=repack_chunk,
+        )
+        marlin_w2_scales = moe_repack_chunk.permute_scales(
+            w2_scales,
+            size_k=lambda groups: groups
+            * (group_size if group_size != -1 else pack_factor),
+            group_size=group_size,
+            is_a_8bit=is_a_8bit,
+            fp8_scale=is_fp8,
+            max_chunk_bytes=repack_chunk,
+        )
+    # --- FP8 weight / scale adjustment (stock path) ---
+    elif input_dtype == torch.float8_e4m3fn:
         # NOTE: for non-zp quantization format only
         marlin_w13_qweight = ops.marlin_int4_fp8_preprocess(w13_qweight, inplace=False)
         marlin_w2_qweight = ops.marlin_int4_fp8_preprocess(w2_qweight, inplace=False)
@@ -666,38 +717,41 @@ def _process_weights_marlin(
         if w13_bias is not None:
             w13_bias = _pad_w13_bias(w13_bias, N, padded_N)
 
-    # --- Repack weights ---
-    marlin_w13_qweight = ops.gptq_marlin_moe_repack(
-        marlin_w13_qweight,
-        marlin_w13_qweight.shape[1] * pack_factor,
-        marlin_w13_qweight.shape[2],
-        num_bits,
-        is_a_8bit=is_a_8bit,
-    )
-    marlin_w2_qweight = ops.gptq_marlin_moe_repack(
-        marlin_w2_qweight,
-        marlin_w2_qweight.shape[1] * pack_factor,
-        marlin_w2_qweight.shape[2],
-        num_bits,
-        is_a_8bit=is_a_8bit,
-    )
 
-    # --- Permute scales ---
-    marlin_w13_scales = marlin_moe_permute_scales(
-        s=marlin_w13_scales,
-        size_k=layer.intermediate_size_per_partition,
-        size_n=marlin_w13_scales.shape[2],
-        group_size=group_size,
-        is_a_8bit=is_a_8bit,
-    )
-    group_size_or_pack_factor = group_size if group_size != -1 else pack_factor
-    marlin_w2_scales = marlin_moe_permute_scales(
-        s=marlin_w2_scales,
-        size_k=marlin_w2_scales.shape[1] * group_size_or_pack_factor,
-        size_n=marlin_w2_scales.shape[2],
-        group_size=group_size,
-        is_a_8bit=is_a_8bit,
-    )
+    if not repack_chunk:
+        # --- Repack weights ---
+        marlin_w13_qweight = ops.gptq_marlin_moe_repack(
+            marlin_w13_qweight,
+            marlin_w13_qweight.shape[1] * pack_factor,
+            marlin_w13_qweight.shape[2],
+            num_bits,
+            is_a_8bit=is_a_8bit,
+        )
+        marlin_w2_qweight = ops.gptq_marlin_moe_repack(
+            marlin_w2_qweight,
+            marlin_w2_qweight.shape[1] * pack_factor,
+            marlin_w2_qweight.shape[2],
+            num_bits,
+            is_a_8bit=is_a_8bit,
+        )
+
+
+        # --- Permute scales ---
+        marlin_w13_scales = marlin_moe_permute_scales(
+            s=marlin_w13_scales,
+            size_k=layer.intermediate_size_per_partition,
+            size_n=marlin_w13_scales.shape[2],
+            group_size=group_size,
+            is_a_8bit=is_a_8bit,
+        )
+        group_size_or_pack_factor = group_size if group_size != -1 else pack_factor
+        marlin_w2_scales = marlin_moe_permute_scales(
+            s=marlin_w2_scales,
+            size_k=marlin_w2_scales.shape[1] * group_size_or_pack_factor,
+            size_n=marlin_w2_scales.shape[2],
+            group_size=group_size,
+            is_a_8bit=is_a_8bit,
+        )
 
     if input_dtype == torch.int8:
         if layer.num_groups_w13 > 1:

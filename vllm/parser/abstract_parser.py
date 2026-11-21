@@ -35,6 +35,12 @@ from vllm.entrypoints.openai.chat_completion.protocol import (
 from vllm.entrypoints.openai.responses.protocol import ResponsesRequest
 from vllm.exceptions import VLLMValidationError
 from vllm.logger import init_logger
+from vllm.merlin.content_start import (
+    content_after_reasoning,
+    content_start_of,
+    reasoning_boundary,
+    reasoning_closed_by_output,
+)
 from vllm.merlin.tool_none import mark_delegates
 from vllm.parser.engine.adapters import ParserEngineToolAdapter
 from vllm.parser.metrics import record_tool_parser_invocation
@@ -441,12 +447,18 @@ class DelegatingParser(Parser):
         content: str | None,
         request: ChatCompletionRequest | ResponsesRequest,
         enable_auto_tools: bool = False,
+        after_reasoning: bool = False,
     ) -> tuple[list[FunctionCall] | None, str | None]:
         tool_parser = self._tool_parser
         if tool_parser is None:
-            return [], content
+
+            return [], content_after_reasoning(content, after_reasoning)
 
         if request.tool_choice == "none":
+
+            content = content_after_reasoning(
+                content, after_reasoning, tool_parser if self._engine_based else None
+            )
             if self._engine_based:
                 result = self.extract_tool_calls(content or "", request=request)
                 return [], result.content
@@ -467,6 +479,11 @@ class DelegatingParser(Parser):
             )
         )
 
+        # Engine tool passes consume the original
+        # content and its ids before removing the boundary whitespace.
+        content = content_after_reasoning(
+            content, after_reasoning, tool_parser if is_auto_tool_choice else None
+        )
         tool_calls = list[FunctionCall]()
         if is_named_tool_choice and supports_required_and_named:
             if content is None or (isinstance(content, str) and not content.strip()):
@@ -899,12 +916,18 @@ class DelegatingParser(Parser):
         # Parse with the token ids, as
         # streaming does, so a marker spelled in ordinary tokens stays text.
         ids = self._aligned_output_ids(model_output, model_output_token_ids)
+        # Only a boundary in generated output.
+        after_reasoning = False
         # Prompt closed reasoning.
         if self._prompt_reasoning_ended:
             reasoning, content = None, model_output
         else:
             with _token_aligned(self._reasoning_parser, ids):
                 reasoning, content = self.extract_reasoning(model_output, request)
+            # An empty block also has a boundary.
+            after_reasoning = reasoning_boundary(
+                self._reasoning_parser, model_output, reasoning, content
+            )
         # The content's own ids.
         content_ids = self._aligned_content_ids(ids, model_output, reasoning, content)
         with _token_aligned(self._tool_parser, content_ids):
@@ -912,6 +935,7 @@ class DelegatingParser(Parser):
                 content=content,
                 request=request,
                 enable_auto_tools=enable_auto_tools,
+                after_reasoning=after_reasoning,
             )
         return reasoning, content, tool_calls
 
@@ -1028,6 +1052,8 @@ class DelegatingParser(Parser):
             if should_transition:
                 state.reasoning_ended = True
                 reasoning_transitioned = True
+                # The output closed reasoning.
+                reasoning_closed_by_output(self, self._tool_parser)
                 current_token_ids = self._extract_content_ids(delta_token_ids)
                 # Flush whenever the reasoning parser is engine-based (not only
                 # when _engine_based is True): it buffers the post-marker text
@@ -1117,6 +1143,12 @@ class DelegatingParser(Parser):
             # Request for the name gate
             delta_message = self._flush_engine_parsers(delta_message, request)
 
+        # No whitespace between the end of
+        # reasoning and the first visible character.
+        # Wrapper normalization runs before this.
+        if not getattr(self, "_defer_content_start", False):
+            delta_message = content_start_of(self).take_delta(delta_message, finished)
+
         # Suppress reasoning deltas if not requested
         if delta_message and not request.include_reasoning:
             delta_message.reasoning = None
@@ -1194,6 +1226,13 @@ class DelegatingParser(Parser):
                         state.history_tool_call_cnt += sum(
                             tc.id is not None for tc in tool_delta.tool_calls
                         )
+                # A legacy tool parser
+                # that made neither a call nor content consumed nothing: at
+                # the end of output the held text is literal.
+                if not getattr(
+                    self._tool_parser, "engine_based_streaming", False
+                ) and not (flush_delta.content or flush_delta.tool_calls):
+                    flush_delta.content = text
             if flush_delta is None:
                 continue
             if delta_message is None:

@@ -1,7 +1,7 @@
 <!-- Modified by the Merlin project from the upstream vLLM README; see NOTICE. -->
 # Merlin engine
 
-Merlin is a vLLM fork tuned for NVIDIA Ampere and Ada (**sm_80, sm_86 and sm_89**) GPUs, with model recipes for the seven checkpoints below. **Merlin 3.0.2.1 is built on vLLM 0.33.0.** It combines the engine, launchers, checkpoint checksums and installation tooling in one repository. Model weights stay on Hugging Face.
+Merlin is a vLLM fork tuned for NVIDIA Ampere and Ada (**sm_80, sm_86 and sm_89**) GPUs, with model recipes for the seven checkpoints below. **Merlin 3.0.2.2 is built on vLLM 0.33.0.** It combines the engine, launchers, checkpoint checksums and installation tooling in one repository. Model weights stay on Hugging Face.
 
 The fork carries the sm_86 FP8 QSA attention reader, host-memory PLE embedding offload, RecoverSSM, prefix-cache retention, persistent top-k and guard telemetry. It serves an OpenAI-compatible API with vision, reasoning and tool calling. See the [upstream vLLM README](https://github.com/vllm-project/vllm/blob/v0.33.0/README.md) and [vLLM documentation](https://docs.vllm.ai/); Merlin changes are described in [CHANGELOG.md](../CHANGELOG.md) and [NOTICE](../../NOTICE).
 
@@ -19,7 +19,7 @@ The [models/ index](../../models/README.md) leads to each recipe's launchers, re
 | [Nemotron 3.5 Super VL](../../models/nemotron-super-vl/README.md) | 3.0.0 | [Nemotron-3.5-Super-VL-120B-A12B-W4A16-Merlin](https://huggingface.co/halt95/Nemotron-3.5-Super-VL-120B-A12B-W4A16-Merlin) | 4× RTX 3090 |
 | [Ornith 1.5](../../models/ornith1.5/README.md) | 3.0.0 | [Ornith-1.5-122B-A10B-W4A16-Merlin](https://huggingface.co/halt95/Ornith-1.5-122B-A10B-W4A16-Merlin) | 4× RTX 3090, with or without P2P |
 
-Recipe versions stay at 3.0.0 in Merlin 3.0.2.1 (the VERSION files are unchanged); the recipe changes are in the
+Recipe versions stay at 3.0.0 in Merlin 3.0.2.2 (the VERSION files are unchanged); the recipe changes are in the
 [changelog](../CHANGELOG.md). The previous public release is Merlin 3.0.2.
 
 ## Install and serve
@@ -39,16 +39,16 @@ git clone https://github.com/halt95/merlin-engine.git && cd merlin-engine && ./s
 
 Ctrl+C stops the server; `./setup.sh` again starts it straight away with the saved answers; `git pull && ./setup.sh` updates the engine without re-downloading the model. `--yes --model 27b` answers nothing, `--dry-run` shows the plan, `--reconfigure` asks again; every option, the update flow, where things live and how to uninstall are in [docs/SETUP.md](../../docs/SETUP.md), and [docs/how-to-serve.md](../../docs/how-to-serve.md) walks through it end to end. Nothing is installed system-wide (uv and Python 3.13 live under `.merlin/`, the engine in `venv/`).
 
-**Manual route.** From the Merlin 3.0.2.1 checkout, install once with the shared [release/install-env.sh](../../release/install-env.sh), download a checkpoint, then serve it:
+**Manual route.** From the Merlin 3.0.2.2 checkout, install once with the shared [release/install-env.sh](../../release/install-env.sh), download a checkpoint, then serve it:
 
 ```bash
 # Run from the repository root.
-curl -LO https://github.com/halt95/merlin-engine/releases/download/merlin-v3.0.2.1/vllm-0.33.0+merlin.c56eeed392-cp313-cp313-linux_x86_64.whl
-MERLIN_WHEEL="$PWD/vllm-0.33.0+merlin.c56eeed392-cp313-cp313-linux_x86_64.whl" bash release/install-env.sh ./venv   # prebuilt engine for sm_80, sm_86 and sm_89, checked against release/merlin-wheel.sha256
+curl -LO https://github.com/halt95/merlin-engine/releases/download/merlin-v3.0.2.2/vllm-0.33.0+merlin3.0.2.2.c56eeed392-cp313-cp313-linux_x86_64.whl
+MERLIN_WHEEL="$PWD/vllm-0.33.0+merlin3.0.2.2.c56eeed392-cp313-cp313-linux_x86_64.whl" bash release/install-env.sh ./venv   # prebuilt engine for sm_80, sm_86 and sm_89, checked against release/merlin-wheel.sha256
 # without MERLIN_WHEEL the installer compiles the engine instead (about 1.5 hours on 8 cores)
 
 # Download the checkpoint separately with the Hugging Face CLI.
-venv/bin/hf download halt95/Qwen3.8-Flash-Next-W4A16-Merlin --local-dir /path/to/flash-next
+venv/bin/hf download halt95/Qwen3.8-Flash-Next-W4A16-Merlin --revision cec53e9f90e5995b81691604ec0b32191debf797 --local-dir /path/to/flash-next
 (cd /path/to/flash-next && sha256sum -c /path/to/merlin-engine/models/flash-next/checkpoint.sha256)
 
 # Serve it.

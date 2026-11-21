@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by the Merlin project; see NOTICE.
 
 from vllm.tool_parsers.abstract_tool_parser import (
     ToolParser,
@@ -107,7 +108,7 @@ _TOOL_PARSERS_TO_REGISTER = {
         "HYV3ToolParser",
     ),
     "hy_v4": (
-        "hy_v4_tool_parser",
+        "hy_v4_flash_tool_parser",
         "HYV4ToolParser",
     ),
     "internlm": (

@@ -3,7 +3,7 @@
 """The logic behind ``./setup.sh``: host checks, a few questions, the download plan, install, checkpoint, start.
 
     setup.sh [--yes] [--model M] [--models-dir D] [--host H] [--api-key K] [--port P] [--tp N] [--instances N]
-             [--ple fp8|int6] [--kv-ram-cache SIZE] [--swarm | --no-swarm] [--spec mtp|dflash2]
+             [--ple fp8|int6] [--kv-ram-cache SIZE] [--swarm | --no-swarm] [--spec mtp|dflash2] [--engram fp8|bf16]
              [--from-source] [--no-start] [--dry-run] [--reconfigure] [--rehash] [--simulate SPEC]
     merlin pull <model> [--models-dir D] [--rehash]        (download + verify only; no GPU needed)
 
@@ -20,12 +20,14 @@ import argparse
 import contextlib
 import errno
 import hashlib
+import ipaddress
 import json
 import os
 import re
 import secrets
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -37,6 +39,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import hy4_setup as H  # noqa: E402
 import launch as L  # noqa: E402
 import ple_pack as PP  # noqa: E402
 import ple_store as PS  # noqa: E402
@@ -52,6 +55,10 @@ RELEASE_LOCK = "requirements-0.33.lock"
 SETUP_WITHHELD: dict[str, str] = {}  # none in this release
 # flash-next, swift1.5, swift1.5-huihui, 27b, 27b-thinkingcap, nemotron-super-vl, ornith1.5
 MODELS = [m for m in L.CHECKPOINTS if m not in SETUP_WITHHELD]
+# The models setup offers: MODELS, then Hy4 Flash, which launch.py serves by its row
+# (hy4_setup.py: its own row choice, host checks and verified pack download; merlin
+# serve does not list it)
+CHOICES = MODELS + [H.MODEL]
 FAMILY = {k: v[0] for k, v in L.CHECKPOINTS.items()}
 RECIPE = {k: v[1] for k, v in L.CHECKPOINTS.items()}
 FAMILY_DIR = {k: Path(v[1]).name for k, v in L.CHECKPOINTS.items()}
@@ -455,6 +462,15 @@ def disk_free(path: Path) -> int | None:
         return None
 
 
+def disk_free_for(inv: pf.Inventory | None) -> Callable[[Path], int | None]:
+    """The free-space reader for a plan on ``inv``: the simulated host's ``:disk=GIB``
+    on every path, else the real filesystems (``disk_free``, looked up at call time)."""
+    sim = inv.host.disk_free_bytes if inv is not None else None
+    if sim is not None:
+        return lambda path: sim
+    return lambda path: disk_free(path)
+
+
 def device_of(path: Path) -> Any:
     try:
         return os.stat(nearest_existing(path)).st_dev
@@ -533,7 +549,12 @@ def build_parser() -> argparse.ArgumentParser:
         epilog="Every option and the update / uninstall flow: docs/SETUP.md",
     )
     ap.add_argument("--yes", "-y", action="store_true", help="no questions: the recommended (or given) answers, downloads confirmed")
-    ap.add_argument("--model", choices=MODELS, help="checkpoint to install and serve")
+    ap.add_argument(
+        "--model",
+        choices=CHOICES,
+        help="checkpoint to install and serve (hy4flash: 4 or 8 x 24 GB, the row "
+        "follows the card count)",
+    )
     ap.add_argument("--models-dir", metavar="DIR", help="checkpoint folder (default ~/models/<model>; an existing verified copy is reused). "
                     "With --ple int6 it is still the FP8 checkpoint: the INT6 overlay is DIR-int6 and the pack is shared beside it")
     ap.add_argument("--host", help="127.0.0.1 (this machine only, default) or 0.0.0.0 (network: needs --api-key or one is generated)")
@@ -560,6 +581,9 @@ def build_parser() -> argparse.ArgumentParser:
                     "default no, on rows that have a swarm cap; --no-swarm turns a saved one off. An exported SEQS still wins over every cap")
     ap.add_argument("--spec", choices=S.SPEC_CHOICES, help="Flash-Next: the drafter, mtp (default; bigger pool: 6 x 131K or "
                     f"3 x 262K) or dflash2 ({S.dflash2_why(strict=False).replace(chr(37), chr(37) * 2)}; downloads {S.DFLASH2_REPO})")
+    ap.add_argument("--engram", choices=list(H.ENGRAMS), default=None,
+                    help=f"hy4flash: the Engram tables, fp8 (~{H.ENGRAM_FP8_GIB:.0f} GiB pinned in host RAM, the default) or "
+                    f"bf16 (~{H.ENGRAM_BF16_GIB:.0f} GiB, ~{H.ram_need_gib(0, 'bf16'):.0f} GiB host RAM available): one pack each")
     ap.add_argument("--from-source", action="store_true", help="compile the engine instead of taking the release wheel")
     ap.add_argument("--no-start", action="store_true", help="install and download, then stop before `merlin serve`")
     ap.add_argument("--dry-run", action="store_true", help="print checks, answers, download plan and serve command; download and write nothing")
@@ -570,17 +594,36 @@ def build_parser() -> argparse.ArgumentParser:
     return ap
 
 
+def _valid_host(h: Any) -> bool:
+    """A bind address setup accepts, on the command line and in the saved file alike: ``localhost`` or an IPv4 / IPv6
+    address (``ipaddress``: 192.0.2.10, 0.0.0.0, ::, ::1, fd00::5). The saved spelling is kept as given."""
+    if not isinstance(h, str):
+        return False
+    if h == "localhost":
+        return True
+    try:
+        ipaddress.ip_address(h)
+    except ValueError:
+        return False
+    return True
+
+
 def parse_args(argv: list[str]) -> argparse.Namespace:
     args = build_parser().parse_args(argv)
     if args.simulate and not args.no_start:  # nothing ever starts on fabricated hardware; --no-start still installs
         args.dry_run = True
-    if args.host and args.host not in ("127.0.0.1", "0.0.0.0", "localhost", "::1"):
-        if not re.fullmatch(r"[0-9.]+|[0-9a-fA-F:]+", args.host):
-            raise SetupError(f"--host {args.host!r}: give an IP address (127.0.0.1 or 0.0.0.0)", 2)
+    if args.host is not None and not _valid_host(args.host):
+        raise SetupError(f"--host {args.host!r}: give an IP address (127.0.0.1 or 0.0.0.0)", 2)
     if args.port is not None and not 1 <= args.port <= 65535:
         raise SetupError(f"--port {args.port}: 1..65535", 2)
     if args.tp is not None and args.tp < 1 or args.instances is not None and args.instances < 1:
         raise SetupError("--tp and --instances take whole numbers >= 1", 2)
+    if args.model == H.MODEL and hy4_flag_problem(args):
+        raise SetupError(hy4_flag_problem(args) or "", 2)
+    # The Engram pack is a Hy4 Flash choice only
+    if args.engram is not None and args.model != H.MODEL:
+        raise SetupError(f"--engram {args.engram}: applies to {H.MODEL} only (--model {H.MODEL}"
+                         + (f", not {args.model})" if args.model else "; the model was not named)"), 2)
     args.ple_table = args.ple
     try:
         args.kv_ram_cache_gib = None if args.kv_ram_cache is None else S.parse_kv_ram_cache(args.kv_ram_cache)
@@ -593,7 +636,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         raise SetupError(f"--ple int6 applies to the Flash-Next family only, not {args.model}", 2)
     if args.model and not fn_family(args.model) and args.ple_store == "disk":
         raise SetupError(f"--ple-store disk applies to the Flash-Next family only, not {args.model}", 2)
-    if args.model and not tier_family(args.model) and args.kv_ram_cache_gib:
+    # Not supported on Hy4 Flash yet (0 = off is accepted)
+    if args.model == H.MODEL and args.kv_ram_cache_gib:
+        raise SetupError(f"--kv-ram-cache {args.kv_ram_cache}: {L.HY4_KV_TIER_UNSUPPORTED}", 2)
+    no_tier = args.model and args.model != H.MODEL and not tier_family(args.model)
+    if no_tier and args.kv_ram_cache_gib:
         raise SetupError(f"--kv-ram-cache applies to the Flash-Next family, the 27B and Ornith 1.5 only, not {args.model}", 2)
     if args.swarm:
         if args.model and not swarm_family(args.model):
@@ -613,7 +660,7 @@ def _valid_saved(saved: dict[str, Any] | None) -> dict[str, Any]:
     out: dict[str, Any] = {}
     if saved.get("model") in MODELS:
         out["model"] = saved["model"]
-    if saved.get("host") in ("127.0.0.1", "0.0.0.0", "localhost", "::1"):
+    if _valid_host(saved.get("host")):
         out["host"] = saved["host"]
     if isinstance(saved.get("from_source"), bool):
         out["from_source"] = saved["from_source"]
@@ -686,7 +733,15 @@ def save_answers(path: Path, saved: dict[str, Any] | None, a: Answers) -> dict[s
 def answers_complete(a: Answers, saved: dict[str, Any] | None) -> bool:
     """A saved set exists for this model (folder, port, layout) and network access has its key."""
     s = _valid_saved(saved)
-    return bool(a.model) and a.model in s["models"] and a.port is not None and (a.host == "127.0.0.1" or bool(a.api_key))
+    return bool(a.model) and a.model in s["models"] and a.port is not None and (L.is_loopback(a.host) or bool(a.api_key))
+
+
+def bad_saved_host(saved: dict[str, Any] | None, args: argparse.Namespace) -> str | None:
+    """The saved host when it is not a valid address and this run gives no --host. ``merge_answers`` falls back to
+    127.0.0.1 for it; setup must not then save that fallback silently over the user's network bind."""
+    if args.host is not None or not saved or "host" not in saved or _valid_host(saved["host"]):
+        return None
+    return repr(saved["host"])
 
 
 def read_key(path: Path) -> str | None:
@@ -763,17 +818,32 @@ def compiler_env(a: Answers, env: dict[str, str]) -> dict[str, str]:
     return env
 
 
-def git_problem(repo: Path, run: Callable[[list[str]], str | None], env: dict[str, str] | None = None) -> Problem | None:
+def git_problem(repo: Path, run: Callable[[list[str]], str | None], env: dict[str, str] | None = None,
+                require_clean: bool = True) -> Problem | None:
+    """git is there and ``repo`` is a checkout; with ``require_clean`` also that no tracked file is modified (the
+    installer records the commit as the engine's source, so only a run that installs needs a clean tree)."""
     if which("git", env) is None:
         return Problem("FAIL", "git", "git is missing", f"{APT} git")
     dirty = run(["git", "-C", str(repo), "status", "--porcelain", "--untracked-files=no"])
     if dirty is None:
         return Problem("FAIL", "git", f"{repo} is not a git checkout (a ZIP download?)",
                        "clone the repository with git (git clone ...) and run ./setup.sh inside it")
-    if dirty.strip():
+    if require_clean and dirty.strip():
         return Problem("FAIL", "git", "tracked files are modified; the installer records a clean commit as the engine's source",
                        f"commit or revert them (cd {repo} && git status)")
     return None
+
+
+def source_moved(repo: Path, run: Callable[[list[str]], str | None], env: dict[str, str] | None,
+                 planned: str | None) -> str | None:
+    """Under the install lock, just before an install: why the source is no longer what the approved plan was made for, or
+    None. HEAD must still be the planned commit (it is the one the install record names) and no tracked file may be
+    modified; either can change while setup waits for the lock or for the confirmation."""
+    now = head_commit(repo, run)
+    if now != planned:
+        return f"the checkout moved from {planned} to {now} while setup waited"
+    problem = git_problem(repo, run, env)
+    return problem.text if problem else None
 
 
 def driver_problem(inv: pf.Inventory) -> Problem | None:
@@ -1042,7 +1112,8 @@ def serve_env(a: Answers) -> dict[str, str]:
         env["PLE_STORE"] = a.ple_store or "ram"  # the answer, never a stale export
         env["SPEC"] = a.spec or SPEC_DEFAULT  # the resolved choice wins over an ambient SPEC (serve_plan resolves from this env)
         if a.spec == "dflash2":
-            env["DFLASH2_MODEL"] = str(drafter_dir())  # the copy setup downloaded and verified
+            # the copy setup downloaded and verified
+            env["DFLASH2_MODEL"] = str(drafter_dir(a))
     env["MERLIN_HOME"] = str(REPO)
     return env
 
@@ -1072,7 +1143,7 @@ def serve_words(a: Answers, repo: Path = REPO) -> list[str]:
     """The serve command's shell words (environment first; the key is read from its file, never printed)."""
     pre = [f"HOST={a.host}", f"PORT={a.port}"] + (["VLLM_API_KEY=\"$(cat .merlin/api-key)\""] if a.api_key else [])
     if fn_family(a.model) and a.spec == "dflash2":
-        pre.append(f"DFLASH2_MODEL={shlex.quote(str(drafter_dir()))}")
+        pre.append(f"DFLASH2_MODEL={shlex.quote(str(drafter_dir(a)))}")
     return pre + [shlex.quote(x) for x in serve_argv(a, repo)]
 
 
@@ -1081,6 +1152,8 @@ def default_port(model: str) -> int:
 
 
 def served_name(model: str) -> str:
+    if model == H.MODEL:
+        return H.registry()["launch"]["served"]
     reg = S._load(model)
     if FAMILY[model] == "flash-next":
         ck = reg.get("checkpoints", {}).get(model, {})
@@ -1431,11 +1504,46 @@ def download_plan(a: Answers, repo: Path, state: dict[str, Any] | None, commit: 
     plans the checkpoint only (merlin pull)."""
     table = table or sizes_table(repo)
     plan = DownloadPlan()
+    if engine:
+        engine_items(plan, a, repo, state, commit, table)
+    item, need, rev, remaining = checkpoint_item(a.model, a.base_dir(), repo, table, fetch, online)
+    plan.items.append(item)
+    plan.need_checkpoint, plan.revision = need, rev
+    if need and remaining:
+        plan.disk.append(DiskNeed(a.base_dir(), remaining, f"the rest of the {a.model} checkpoint"))
+    if fn_family(a.model) and is_variant(a.ple_table) and not int6_reason(a.model, repo, table):
+        item, need, remaining = pack_item(a, repo, table, fetch, online)
+        plan.items.append(item)
+        if need and remaining:
+            plan.disk.append(DiskNeed(a.pack_dir(), remaining, "the INT6 PLE pack"))
+        plan.items.append(Download("INT6 overlay", f"links -> {a.checkpoint_dir()}", 0, "models",
+                                   "links to the FP8 checkpoint and the pack + a generated config.json and index; the FP8 files are not changed"))
+    if fn_family(a.model) and a.spec == "dflash2":
+        d, ck = drafter_dir(a), dflash2_entry(table)
+        if not dflash2_present(d, repo):
+            plan.items.append(Download("drafter DFlash2", f"hf download {ck['repo']} --revision {ck['revision']} -> {d}", ck["bytes"],
+                                       "models", f"{ck['files']} files; config.json and model.safetensors checked ({DFLASH2_LIST})"))
+            plan.disk.append(DiskNeed(d, ck["bytes"], "the DFlash2 drafter"))
+        else:
+            plan.items.append(Download("drafter DFlash2", str(d), 0, "models", "present; verified before serving"))
+    return plan
+
+
+def engine_items(
+    plan: DownloadPlan,
+    a: Answers,
+    repo: Path,
+    state: dict[str, Any] | None,
+    commit: str | None,
+    table: dict[str, Any],
+) -> None:
+    """The engine's part of a plan (wheel or source build, the locked packages, the
+    venv's disk), when the recorded install does not match this checkout."""
     sha, wheel = wheel_record(repo)
     venv = repo / "venv"
     factor = table.get("venv_factor", 3)
     pk = table["packages"]
-    if engine and not venv_current(repo, install_state(repo, a.from_source, commit), state):
+    if not venv_current(repo, install_state(repo, a.from_source, commit), state):
         plan.need_install = True
         if a.from_source:
             plan.items.append(Download("engine source build", "compiles csrc/ (about 1.5 h on 8 cores)", 0, "repo"))
@@ -1457,27 +1565,6 @@ def download_plan(a: Answers, repo: Path, state: dict[str, Any] | None, commit: 
         # so it adds a need only when .merlin is on another device and the move copies it there
         if venv.exists() and device_of(repo / ".merlin") != device_of(venv):
             plan.disk.append(DiskNeed(repo / ".merlin", pk["bytes"] * factor, "the previous venv, kept until the new one verifies"))
-    item, need, rev, remaining = checkpoint_item(a.model, a.base_dir(), repo, table, fetch, online)
-    plan.items.append(item)
-    plan.need_checkpoint, plan.revision = need, rev
-    if need and remaining:
-        plan.disk.append(DiskNeed(a.base_dir(), remaining, f"the rest of the {a.model} checkpoint"))
-    if fn_family(a.model) and is_variant(a.ple_table) and not int6_reason(a.model, repo, table):
-        item, need, remaining = pack_item(a, repo, table, fetch, online)
-        plan.items.append(item)
-        if need and remaining:
-            plan.disk.append(DiskNeed(a.pack_dir(), remaining, "the INT6 PLE pack"))
-        plan.items.append(Download("INT6 overlay", f"links -> {a.checkpoint_dir()}", 0, "models",
-                                   "links to the FP8 checkpoint and the pack + a generated config.json and index; the FP8 files are not changed"))
-    if fn_family(a.model) and a.spec == "dflash2":
-        d, ck = drafter_dir(), dflash2_entry(table)
-        if not dflash2_present(d, repo):
-            plan.items.append(Download("drafter DFlash2", f"hf download {ck['repo']} --revision {ck['revision']} -> {d}", ck["bytes"],
-                                       "models", f"{ck['files']} files; config.json and model.safetensors checked ({DFLASH2_LIST})"))
-            plan.disk.append(DiskNeed(d, ck["bytes"], "the DFlash2 drafter"))
-        else:
-            plan.items.append(Download("drafter DFlash2", str(d), 0, "models", "present; verified before serving"))
-    return plan
 
 
 DFLASH2_LIST = "models/flash-next/dflash2.sha256"
@@ -1491,8 +1578,11 @@ def dflash2_entry(table: dict[str, Any]) -> dict[str, Any]:
     return ck
 
 
-def drafter_dir() -> Path:
-    return S.dflash2_dir()
+def drafter_dir(a: Answers) -> Path:
+    """The DFlash2 drafter's folder for these answers: beside the checkpoint folder
+    (--models-dir), after DFLASH2_MODEL and with an existing copy in the old ~/models
+    location still found, as serve_cli.dflash2_location() orders them."""
+    return S.dflash2_dir(base=a.base_dir())
 
 
 def dflash2_present(d: Path, repo: Path = REPO) -> bool:
@@ -1505,7 +1595,7 @@ def pull_drafter(repo: Path, a: Answers, env: dict[str, str], table: dict[str, A
     if not (fn_family(a.model) and a.spec == "dflash2"):
         return
     runner = runner or sh
-    d, ck, lst = drafter_dir(), dflash2_entry(table), repo / DFLASH2_LIST
+    d, ck, lst = drafter_dir(a), dflash2_entry(table), repo / DFLASH2_LIST
     if checkpoint_missing(d, lst):
         hf = hf_tool(repo, env, runner)
         d.mkdir(parents=True, exist_ok=True)
@@ -1679,13 +1769,146 @@ def install_lock(merlin_dir: Path):
         os.close(fd)  # closing the descriptor releases the lock
 
 
+# What an install writes into the checkout itself (the editable install extracts the wheel's products in place):
+# install-env.sh's hashed set (every .so under vllm/, every file of these three trees but __pycache__ / .pyc), the
+# Rust executable and _version.py, the three product provenance files and the two native records (the native check's,
+# not hashed by the product check). A failed install restores exactly this set, presence and absence alike.
+PRODUCT_TREES = ("triton_kernels", "vllm_flash_attn", "third_party")
+PRODUCT_FILES = ("vllm/vllm-rs", "vllm/_version.py", ".build-products.sha256", ".build-products", ".build-source",
+                 ".build-native", ".build-flashinfer.sha256")
+PRODUCTS_MANIFEST = "manifest.json"
+
+
+def product_paths(repo: Path) -> set[str]:
+    """Repo-relative POSIX paths of the install's write set present now (files and symlinks, never directories)."""
+    pkg = repo / "vllm"
+    found: set[Path] = set()
+    if pkg.is_dir():
+        for pattern in ("*.so", "*.so.*"):
+            found.update(p for p in pkg.rglob(pattern) if p.is_file() or p.is_symlink())
+        for name in PRODUCT_TREES:
+            if (pkg / name).is_dir():
+                found.update(p for p in (pkg / name).rglob("*") if (p.is_file() or p.is_symlink())
+                             and "__pycache__" not in p.parts and p.suffix != ".pyc")
+    for rel in PRODUCT_FILES:
+        if (repo / rel).is_file() or (repo / rel).is_symlink():
+            found.add(repo / rel)
+    return {p.relative_to(repo).as_posix() for p in found}
+
+
+def snapshot_products(repo: Path, dest: Path) -> int:
+    """Copy the write set into ``dest`` (bytes, mode, symlink targets) with a manifest of what was present; a path
+    absent from the manifest is one the install added. Copies, never hardlinks or renames: extraction rewrites its
+    targets in place, and a rename would take source-controlled third_party files out of the checkout."""
+    dest.mkdir(parents=True, exist_ok=True)
+    present: dict[str, dict[str, Any]] = {}
+    for rel in sorted(product_paths(repo)):
+        src = repo / rel
+        if src.is_symlink():
+            present[rel] = {"link": os.readlink(src)}
+            continue
+        copy = dest / "files" / rel
+        copy.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, copy)
+        present[rel] = {"mode": stat.S_IMODE(src.stat().st_mode)}
+    write_json(dest / PRODUCTS_MANIFEST, {"present": present}, 0o600)
+    return len(present)
+
+
+class ProductRestoreError(OSError):
+    """Some paths of the write set could not be put back. Every path was still tried; the text names each one that
+    was not restored (with its error), each provenance or record file that was, and how many other files were."""
+
+    def __init__(self, failed: list[str], restored: list[str]):
+        self.failed, self.restored = failed, restored
+        named = [r for r in restored if r in PRODUCT_FILES]
+        others = len(restored) - len(named)
+        done = ", ".join(named + ([f"{others} other product files"] if others else [])) or "nothing"
+        super().__init__(f"not restored: {'; '.join(failed)}; restored: {done}")
+
+
+def restore_products(repo: Path, snap: Path) -> None:
+    """Put the checkout's write set back as ``snapshot_products`` found it: added paths removed first (which also
+    frees their space), then the rest restored from the copy. One path failing does not stop the others; the copy in
+    ``snap`` is never touched, and any failure raises ``ProductRestoreError`` naming the paths not restored."""
+    manifest = read_json(snap / PRODUCTS_MANIFEST)
+    if manifest is None or not isinstance(manifest.get("present"), dict):
+        raise OSError(f"{snap / PRODUCTS_MANIFEST} is missing or unreadable")
+    present: dict[str, dict[str, Any]] = manifest["present"]
+    failed: list[str] = []
+    restored: list[str] = []
+    for rel in sorted(product_paths(repo) - set(present)):
+        try:
+            (repo / rel).unlink()
+            restored.append(rel)
+        except OSError as e:
+            failed.append(f"{rel} (added by the install, could not be removed: {e})")
+    for rel, entry in sorted(present.items()):
+        target = repo / rel
+        try:
+            if target.is_symlink() or target.is_file():
+                target.unlink()  # a fresh file, never a write through whatever the failed run left at that path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if "link" in entry:
+                os.symlink(entry["link"], target)
+            else:
+                shutil.copy2(snap / "files" / rel, target)
+                os.chmod(target, entry["mode"])
+            restored.append(rel)
+        except OSError as e:
+            failed.append(f"{rel} ({e})")
+    if failed:
+        raise ProductRestoreError(failed, restored)
+
+
+@contextlib.contextmanager
+def servers_locked_out(merlin_dir: Path):
+    """Hold ``.merlin/serve.lock`` exclusively for the install, or refuse at once: every server started from this
+    checkout holds it shared for its life (launch.hold_serve_lock), and the install moves and deletes the venv it
+    runs on. Taken before anything is fetched or copied, so a refused run has changed nothing; released when the
+    install returns, so the server setup starts next can take it. A filesystem without ``flock`` gets a warning and
+    the install goes on (it cannot be checked there). Re-entrant within one process (``_main`` takes it before it
+    writes the answers, ``install_engine`` again inside)."""
+    try:
+        import fcntl
+    except ImportError:  # not Linux: only the CPU tests get here
+        yield
+        return
+    path = merlin_dir / L.SERVE_LOCK
+    key = str(path.resolve())
+    if key in _LOCKS_HELD:
+        yield
+        return
+    merlin_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise SetupError(f"a server started from this checkout is running ({path} is held; `fuser -v {path}` "
+                             "lists the processes): the install would move its venv. Stop it (Ctrl+C, or stop the "
+                             "--instances PIDs), then run ./setup.sh again; nothing was changed", 1) from None
+        except OSError as e:  # ENOLCK and friends (some NFS / overlay mounts)
+            print(f"setup: warning: cannot check for a running server ({path}: {e}); make sure no server started "
+                  "from this checkout is running", file=sys.stderr, flush=True)
+        _LOCKS_HELD.add(key)
+        try:
+            yield
+        finally:
+            _LOCKS_HELD.discard(key)
+    finally:
+        os.close(fd)  # releases the exclusive hold
+
+
 def install_engine(repo: Path, a: Answers, env: dict[str, str], runner: Callable[..., int] = sh) -> None:
     """install-env.sh into ``venv`` then ``--verify``, holding ``.merlin/setup.lock`` throughout. An existing venv is
-    moved aside first (the editable install binds the venv to its path, so the new one must take that path), and
-    comes back when the install or the verify fails: a failed update never leaves the host without its working
-    engine. Success removes only this run's old venv; a ``venv-old-*`` an interrupted earlier run left is named,
-    not deleted (it may be someone's only rollback copy)."""
-    with install_lock(repo / ".merlin"):
+    moved aside first (the editable install binds the venv to its path, so the new one must take that path), and the
+    checkout's build products (``product_paths``: the editable install writes them into the checkout, and the old
+    venv runs on them) are copied aside. Both come back when the install or the verify fails, and the restored
+    products are checked with the launcher's own product check before setup says so. Success removes only this run's
+    old venv and product copy; a ``venv-old-*`` an interrupted earlier run left is named, not deleted (it may be
+    someone's only rollback copy). A server running from this checkout stops it first (``servers_locked_out``)."""
+    with install_lock(repo / ".merlin"), servers_locked_out(repo / ".merlin"):
         _install_engine_locked(repo, a, env, runner)
 
 
@@ -1694,15 +1917,32 @@ def _install_engine_locked(repo: Path, a: Answers, env: dict[str, str], runner: 
     venv = repo / "venv"
     old_dir = repo / ".merlin"
     old = None
-    if venv.exists():
-        old = old_dir / f"venv-old-{time.strftime('%Y%m%d-%H%M%S')}"
-        print(f"setup: moving the working venv aside -> {old} (restored if the install fails, removed when it verifies)", flush=True)
+    # The native records (.build-native, .build-flashinfer.sha256) belong to the venv being replaced: they are in
+    # PRODUCT_FILES, so the durable copy below holds them (or their absence) and a failed install puts them back with
+    # the other products, never leaving the restored venv paired with the attempted build's provenance.
+    stamp = time.strftime('%Y%m%d-%H%M%S')
+    snap = None
+    if venv.exists() or product_paths(repo):  # a first install over an already-built checkout is restored too
         old_dir.mkdir(parents=True, exist_ok=True)
-        shutil.move(str(venv), str(old))
+        snap = Path(tempfile.mkdtemp(prefix=f"products-old-{stamp}-", dir=old_dir))
+        try:
+            n = snapshot_products(repo, snap)
+        except OSError as e:  # nothing has changed yet: stop here rather than install without a way back
+            shutil.rmtree(snap, ignore_errors=True)
+            raise SetupError(f"could not copy the checkout's build products aside ({e}); nothing was installed: the "
+                             "venv and the checkout's build products are as they were") from None
+        print(f"setup: copied {n} build products aside -> {snap} (restored if the install fails, removed when it "
+              "verifies)", flush=True)
     env = compiler_env(a, env)
     env.pop("MERLIN_WHEEL", None)
     t0 = time.time()
     try:
+        if venv.exists():
+            moving = old_dir / f"venv-old-{stamp}"
+            print(f"setup: moving the working venv aside -> {moving} (restored if the install fails, removed when it verifies)", flush=True)
+            old_dir.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(venv), str(moving))
+            old = moving
         if not a.from_source:
             local = os.environ.get("MERLIN_WHEEL")
             if local and Path(local).is_file():
@@ -1718,23 +1958,80 @@ def _install_engine_locked(repo: Path, a: Answers, env: dict[str, str], runner: 
         if rc != 0:
             raise SetupError(f"release/install-env.sh --verify failed (rc {rc})")
     except BaseException as e:  # noqa: BLE001 - restore on any failure, Ctrl+C included
-        if old is not None:
-            shutil.rmtree(venv, ignore_errors=True)
-            shutil.move(str(old), str(venv))
-            msg = "; the previous venv is back in place, the engine still serves"
-        else:
-            msg = f"; the partial venv is left at {venv} for diagnosis"
+        try:
+            msg = _roll_back(repo, venv, old, snap)
+        except Exception as r:  # noqa: BLE001 - the install error stays the reported one
+            kept = ", ".join(str(p) for p in (old, snap) if p is not None) or "none"
+            msg = f"; the rollback itself failed ({r}); copies kept: {kept}"
         if isinstance(e, SetupError):
-            raise SetupError(str(e) + msg, e.code) from None
+            raise SetupError(str(e) + msg, e.code) from e
         print(f"setup: install interrupted{msg}", file=sys.stderr, flush=True)
         raise
     if old is not None:
         shutil.rmtree(old, ignore_errors=True)
+    if snap is not None:
+        shutil.rmtree(snap, ignore_errors=True)
     left = sorted(p.name for p in old_dir.glob("venv-old-*"))
     if left:
         print(f"setup: note: {', '.join(left)} in {old_dir} left by an earlier interrupted install; remove them once "
               "no rollback is needed", flush=True)
     print(f"setup: engine installed and verified in {time.time() - t0:.0f} s -> {venv}", flush=True)
+
+
+def _roll_back(repo: Path, venv: Path, old: Path | None, snap: Path | None) -> str:
+    """Undo a failed install: build products first, then the venv, then the launcher's product check on the restored
+    products (when the checkout had verified ones before). Returns the text the error ends with. Each step runs on its
+    own: one that fails is named there with the copy that is kept (the product copy too whenever the venv could not
+    come back), the steps after it still run where they are safe, and nothing here replaces the original error."""
+    parts: list[str] = []
+    keep = False
+    products_back = False
+    verified_before = False
+    if snap is not None:
+        verified_before = ".build-products.sha256" in ((read_json(snap / PRODUCTS_MANIFEST) or {}).get("present") or {})
+        try:
+            restore_products(repo, snap)
+            products_back = True
+            parts.append("the previous build products are back in place")
+        except Exception as e:  # noqa: BLE001 - a rollback step never replaces the install error
+            keep = True
+            parts.append(f"restoring the build products failed ({e}); the copy is kept at {snap}")
+    venv_back = False
+    if old is not None:
+        try:  # the partial venv must be gone first: a move into a surviving directory would nest the old one inside it
+            if venv.is_symlink() or venv.is_file():
+                venv.unlink()
+            elif venv.exists():
+                shutil.rmtree(venv)
+        except Exception as e:  # noqa: BLE001 - a rollback step never replaces the install error
+            parts.append(f"removing the partial venv at {venv} failed ({e}); the previous venv is kept at {old}")
+        else:
+            try:
+                shutil.move(str(old), str(venv))
+                venv_back = True
+                parts.append("the previous venv is back in place")
+            except Exception as e:  # noqa: BLE001 - a rollback step never replaces the install error
+                parts.append(f"moving the previous venv back failed ({e}); it is kept at {old}")
+        if not venv_back and snap is not None and not keep:
+            keep = True  # the two copies belong together: the old venv runs on these products
+            parts.append(f"the previous build products are kept at {snap} too")
+    else:
+        parts.append(f"the partial venv is left at {venv} for diagnosis")
+    if products_back and verified_before:
+        try:
+            L._verify_products(str(repo))
+            parts.append("and the restored products pass the launcher's product check"
+                         + (": the previous install is restored" if venv_back else ""))
+        except Exception as e:  # noqa: BLE001 - LaunchError, or the check itself breaking: never the reported error
+            if not keep:
+                parts.append(f"but the launcher's product check fails on the restored products ({e}); the copy is "
+                             f"kept at {snap}")
+            else:
+                parts.append(f"but the launcher's product check fails on the restored products ({e})")
+            keep = True
+    if snap is not None and not keep:
+        shutil.rmtree(snap, ignore_errors=True)
+    return "; " + ", ".join(parts)
 
 
 def hf_tool(repo: Path, env: dict[str, str], runner: Callable[..., int] = sh) -> Path:
@@ -1950,6 +2247,8 @@ def ask_questions(a: Answers, inv: pf.Inventory, ui: Asker, args: argparse.Names
 
     if want("model"):
         a = _ask_model(a, inv, ui, args, table, saved)
+        if a.model == H.MODEL:
+            return a
     if want("layout"):
         a = _ask_layout(a, inv, ui, args, repo)
     a = normalize_fn(a)  # the PLE table and the KV tier are flags only (--ple, --kv-ram-cache): never asked
@@ -2155,7 +2454,7 @@ def say_flag_rows(a: Answers, inv: pf.Inventory, ui: Asker, repo: Path = REPO) -
 def answers_block(a: Answers, inv: pf.Inventory, ui: Asker, title: str, hint: str = "", repo: Path = REPO) -> None:
     """The answers as aligned rows (the --yes summary and a saved re-run); for Flash-Next also the drafter, KV RAM
     cache and PLE table rows with the flag that changes each."""
-    access = "local (127.0.0.1)" if a.host == "127.0.0.1" else f"network ({a.host})"
+    access = access_label(a.host)
     ui.section(title, hint)
     rows = [("model", a.model), ("layout", layout_label(a))]
     rows += [("folder", str(a.checkpoint_dir())), ("access", access + (", API key" if a.api_key else "")), ("port", str(a.port))]
@@ -2171,17 +2470,21 @@ def _ask_model(a: Answers, inv: pf.Inventory, ui: Asker, args: argparse.Namespac
     if menus:
         ui.section("Model", "(Enter = recommended)")
         sizes = {m: gib(table["checkpoints"][m].get("bytes")) if table["checkpoints"][m].get("bytes") else "" for m in MODELS}
-        nw, sw, iw = max(map(len, MODELS)), max(map(len, sizes.values())), len(f"{len(MODELS)})")
-        for i, m in enumerate(MODELS, 1):
+        sizes[H.MODEL] = gib(H.PACK_BYTES)
+        titles = {**TITLE, H.MODEL: H.TITLE}
+        nw, sw = max(map(len, CHOICES)), max(map(len, sizes.values()))
+        iw = len(f"{len(CHOICES)})")
+        for i, m in enumerate(CHOICES, 1):
             first = f"  {f'{i})':>{iw}} {m:<{nw}}  {sizes[m]:>{sw}}  "
-            ui.para(TITLE[m] + ("  (recommended)" if m == rec else ""), first, " " * len(first))
+            tag = "  (recommended)" if m == rec else ""
+            ui.para(titles[m] + tag, first, " " * len(first))
         ui.para(f"why {rec}: {why}" if rec else f"no recommendation: {why}", " " * (iw + 3), code="2")
     else:
         ui.gap()
         ui.row("Recommended", f"{rec} - {why}" if rec else f"none - {why}")
     if args.model is None:
         before = a.model
-        a.model = ui.ask("Model", a.model or rec or "27b", MODELS)
+        a.model = ui.ask("Model", a.model or rec or "27b", CHOICES)
         if a.model != before:  # another model: its own saved block, or its defaults (never the other model's folder)
             block = _valid_saved(saved)["models"].get(a.model, {})
             for k in PER_MODEL:
@@ -2189,6 +2492,8 @@ def _ask_model(a: Answers, inv: pf.Inventory, ui: Asker, args: argparse.Namespac
                     setattr(a, k, block.get(k))
     else:
         ui.row("Model", f"{a.model} (--model)")
+    if a.model == H.MODEL:  # its row, checks and questions are hy4_main's
+        return a
     if _choose(a.model, inv) is None:
         ui.note("NOTE", f"no {a.model} layout fits this hardware (merlin doctor --model {FAMILY[a.model]} explains)")
     return a
@@ -2223,22 +2528,52 @@ def _ask_layout(a: Answers, inv: pf.Inventory, ui: Asker, args: argparse.Namespa
     return a
 
 
+def access_kind(host: Any) -> str:
+    """The Access answer a saved bind stands for: ``local`` for 127.0.0.1 (and ``localhost``, which setup saves as
+    127.0.0.1), ``network`` for 0.0.0.0, ``keep`` for any other valid address (::1, ::, a specific interface): the two
+    first choices write exactly 127.0.0.1 and 0.0.0.0, so any other bind is offered as its own choice and a re-asked
+    question never changes it. A malformed value is ``network``, as before: it is never offered to be kept."""
+    if host in ("127.0.0.1", "localhost"):
+        return "local"
+    if host == "0.0.0.0" or not _valid_host(host):
+        return "network"
+    return "keep"
+
+
+def access_label(host: str) -> str:
+    """The access row of the answers: local for a loopback bind, network for a wildcard, else the one address."""
+    if L.is_loopback(host):
+        return f"local ({host})"
+    return f"network ({host})" if L.is_wildcard(host) else f"this address only ({host})"
+
+
+def _keep_text(host: str) -> str:
+    if L.is_loopback(host):
+        return f"this machine only ({host}, the saved address)"
+    if L.is_wildcard(host):
+        return f"every host that can reach this machine ({host}, the saved address), an API key is required"
+    return f"the saved address {host} only, an API key is required"
+
+
 def _ask_access(a: Answers, ui: Asker, args: argparse.Namespace, key_path: Path) -> Answers:
     if args.host is None:
+        cur = access_kind(a.host)
+        keep = a.host if cur == "keep" else None
         if not ui.yes:
             ui.section("Access")
             ui.say("  1) local    this machine only (127.0.0.1)")
             ui.para("every host that can reach this machine (0.0.0.0), an API key is required", "  2) network  ")
-        cur = "local" if a.host == "127.0.0.1" else "network"
-        pick = ui.ask("Access", cur, ["local", "network"])
-        a.host = "127.0.0.1" if pick == "local" else "0.0.0.0"
-    if a.host != "127.0.0.1" and not a.api_key:
+            if keep:
+                ui.para(_keep_text(keep), "  3) keep     ")
+        pick = ui.ask("Access", cur, ["local", "network"] + (["keep"] if keep else []))
+        a.host = {"local": "127.0.0.1", "network": "0.0.0.0"}.get(pick, keep)
+    if not L.is_loopback(a.host) and not a.api_key:
         a.api_key = secrets.token_urlsafe(32)
         ui.gap()
         ui.para(f"API key, shown this once (kept in {key_path}, mode 0600):", "  ")
         ui.say("      " + ui.style(a.api_key))
         ui.para("Clients send `Authorization: Bearer <key>`; `cat` that file prints it again.", "  ")
-    if a.host == "127.0.0.1" and not args.api_key:
+    if L.is_loopback(a.host) and not args.api_key:
         a.api_key = None
     return a
 
@@ -2255,7 +2590,7 @@ def review_answers(a: Answers, inv: pf.Inventory, ui: Asker, args: argparse.Name
                "folder": args.models_dir is not None, "access": args.host is not None, "port": args.port is not None}
     while True:
         values = {"model": a.model, "layout": layout_label(a), "folder": str(a.checkpoint_dir()),
-                  "access": "local (127.0.0.1)" if a.host == "127.0.0.1" else f"network ({a.host}), API key",
+                  "access": access_label(a.host) + ("" if L.is_loopback(a.host) else ", API key"),
                   "port": str(a.port or default_port(a.model))}
         open_ = [k for k in REVIEW_ITEMS if not flagged[k]]
         if not open_:
@@ -2272,6 +2607,8 @@ def review_answers(a: Answers, inv: pf.Inventory, ui: Asker, args: argparse.Name
             return a
         before = a.model
         a = ask_questions(a, inv, ui, args, repo, table, saved, key_path, only={pick})
+        if a.model == H.MODEL:  # hy4_main asks its own folder, access and port
+            return a
         if pick == "model" and a.model != before:
             a = ask_questions(a, inv, ui, args, repo, table, saved, key_path, only={"layout", "drafter", "swarm", "context", "folder", "port"})
         elif pick == "layout":
@@ -2459,8 +2796,18 @@ def _main(argv: list[str], inp: Any, out: Any, run: Callable[[list[str]], str | 
     table = sizes_table(repo)
     saved = read_json(merlin_dir / SETUP_JSON)
     a = merge_answers(saved, args, args.api_key or read_key(key_path))
+    if args.pull_only and a.model == H.MODEL:
+        raise SetupError(
+            f"merlin pull does not fetch {H.MODEL}; ./setup.sh --model {H.MODEL} "
+            "--no-start downloads and verifies it (and installs the engine)",
+            2,
+        )
     if args.pull_only:
         return pull_main(args, a, repo, table, ui)
+    bad_host = bad_saved_host(saved, args)
+    if bad_host and ui.yes:
+        raise SetupError(f"{merlin_dir / SETUP_JSON} has host {bad_host}, which is not an IP address; give --host "
+                         "(127.0.0.1 for this machine only, 0.0.0.0 for the network, or the address to bind)", 2)
     inv = pf.simulate(args.simulate) if args.simulate else pf.probe()
     ui.say(ui.style(f"Merlin {release_version(repo)} setup") + " (by Halt95)")
     ui.row("  repo", str(repo), 10)
@@ -2468,7 +2815,7 @@ def _main(argv: list[str], inp: Any, out: Any, run: Callable[[list[str]], str | 
 
     # Host checks that cost no download.
     env = dict(os.environ)
-    problems = [p for p in (git_problem(repo, run, env), gcc_problem(run, env, a), driver_problem(inv)) if p]
+    problems = [p for p in (git_problem(repo, run, env, require_clean=False), gcc_problem(run, env, a), driver_problem(inv)) if p]
     if a.from_source:
         problems += source_build_problems(run, env)
     if report_problems(problems, ui):
@@ -2478,13 +2825,28 @@ def _main(argv: list[str], inp: Any, out: Any, run: Callable[[list[str]], str | 
     if a.cc and not os.environ.get("CC"):
         ui.row("  compiler", f"{a.cc} / {a.cxx} (remembered in .merlin/setup.json)", 10)
 
+    if a.model == H.MODEL and args.model == H.MODEL:
+        return hy4_main(args, a, inv, ui, repo, table, key_path, run, env)
     a = reconcile_ple_store(a, args, ui)
     # Questions (a complete saved set for this model is reused unless --reconfigure).
     asked = False
-    if not answers_complete(a, saved) or args.reconfigure:
+    if bad_host:
+        ui.gap()
+        ui.note("WARN", f"the saved host {bad_host} in {merlin_dir / SETUP_JSON} is not an IP address; the questions "
+                        "come again so the bind is chosen, not replaced by 127.0.0.1 unasked")
+    if a.host == "localhost":  # a name is not exempt from the key; the literal address it stands for is
+        a.host = "127.0.0.1"
+        ui.gap()
+        ui.note("NOTE", "host localhost is saved as 127.0.0.1: only the literal loopback addresses 127.0.0.1 and ::1 "
+                        "serve without an API key")
+    if bad_host or not answers_complete(a, saved) or args.reconfigure:
         a = ask_questions(a, inv, ui, args, repo, table, saved, key_path)
+        if a.model == H.MODEL:  # chosen from the menu
+            return hy4_main(args, a, inv, ui, repo, table, key_path, run, env)
         if not ui.yes:
             a = review_answers(a, inv, ui, args, repo, table, saved, key_path)
+            if a.model == H.MODEL:  # changed to it in the review
+                return hy4_main(args, a, inv, ui, repo, table, key_path, run, env)
         asked = True
     else:
         answers_block(a, inv, ui, "Saved answers", "(from .merlin/setup.json; --reconfigure asks again)", repo)
@@ -2530,7 +2892,10 @@ def _main(argv: list[str], inp: Any, out: Any, run: Callable[[list[str]], str | 
     commit = head_commit(repo, run)
     state = read_json(merlin_dir / STATE_JSON)
     plan = download_plan(a, repo, state, commit, table=table)
-    more += disk_problems(plan)
+    dirty = git_problem(repo, run, env) if plan.need_install else None  # a modified tracked file blocks only a run that
+    if dirty:  # records the commit (an install), not a restart
+        more.append(dirty)
+    more += disk_problems(plan, disk_free_for(inv))
     failed = report_problems(more, ui)
     ui.gap()
     ui.say(render_plan(plan, args.dry_run, ui.color, ui.width).rstrip("\n"))
@@ -2549,7 +2914,9 @@ def _main(argv: list[str], inp: Any, out: Any, run: Callable[[list[str]], str | 
             notes.append(S.KV_TIER_UNTESTED[FAMILY[a.model]])
     notes += [n.removeprefix("note: ") for n in cap_said if n.startswith("note: ")]
     if fn_family(a.model) and a.spec == "dflash2":
-        notes.append(f"--spec dflash2: drafter {S.DFLASH2_REPO} -> {drafter_dir()}; {S.dflash2_why()}")
+        where = S.dflash2_location(a.base_dir())[1]
+        notes.append(f"--spec dflash2: drafter {S.DFLASH2_REPO} -> {drafter_dir(a)} "
+                     f"({where}); {S.dflash2_why()}")
     if notes:
         ui.gap()
     for n in notes:
@@ -2569,19 +2936,28 @@ def _main(argv: list[str], inp: Any, out: Any, run: Callable[[list[str]], str | 
     if asked and plan.pending() and ui.ask("Proceed with the downloads above? (y/n)", "y", ["y", "n", "yes", "no"]) in ("n", "no"):
         ui.say("setup: stopped; nothing downloaded and nothing saved.")
         return 1
-    if a.api_key and (asked or args.api_key):
-        write_private(key_path, a.api_key + "\n", 0o600)
-    save_answers(merlin_dir / SETUP_JSON, saved, a)
+    # An install takes its locks (another ./setup.sh, a running server) before the answers or the key are written, so
+    # a refusal leaves them as they were; install_engine re-enters both. The install record is written under the same
+    # lock as the venv it describes.
+    with contextlib.ExitStack() as locks:
+        if plan.need_install:
+            locks.enter_context(install_lock(merlin_dir))
+            locks.enter_context(servers_locked_out(merlin_dir))
+            moved = source_moved(repo, run, env, commit)  # the plan was made before the lock and the confirmation
+            if moved:
+                raise SetupError(f"{moved}; nothing was installed. Run ./setup.sh again.", 1)
+        if a.api_key and (asked or args.api_key):
+            write_private(key_path, a.api_key + "\n", 0o600)
+        save_answers(merlin_dir / SETUP_JSON, saved, a)
 
-    # Install, checkpoint, state.
-    env["PATH"] = f"{merlin_dir / 'bin'}:{env.get('PATH', '')}"
-    if plan.need_install:
-        with install_lock(merlin_dir):  # the install record is written under the same lock as the venv it describes
+        # Install, checkpoint, state.
+        env["PATH"] = f"{merlin_dir / 'bin'}:{env.get('PATH', '')}"
+        if plan.need_install:
             install_engine(repo, a, env)
             write_json(merlin_dir / STATE_JSON, {**install_state(repo, a.from_source, commit), "installed_at": int(time.time())})
-    else:
-        ui.gap()
-        ui.para("Engine: venv is current (wheel + lock + commit unchanged since the last install); nothing to install.")
+        else:
+            ui.gap()
+            ui.para("Engine: venv is current (wheel + lock + commit unchanged since the last install); nothing to install.")
     pull_checkpoint(repo, a, env, plan.revision, args.rehash)
     pull_drafter(repo, a, env, table, args.rehash)
     if args.no_start:
@@ -2596,6 +2972,314 @@ def _main(argv: list[str], inp: Any, out: Any, run: Callable[[list[str]], str | 
     print_endpoint(a, ui, key_path)
     sys.stdout.flush()
     os.execvpe(serve_argv(a, repo)[0], serve_argv(a, repo), serve_env(a))
+    return 0  # pragma: no cover
+
+
+# --------------------------------------------------------------------------------------
+# Hy4 Flash (hy4_setup.py): served by launch.py --profile <row>, the row from the card
+# count
+# --------------------------------------------------------------------------------------
+HY4_NOT_FLAGS = (
+    ("tp", "--tp"),
+    ("instances", "--instances"),
+    ("ple", "--ple"),
+    ("ple_store", "--ple-store"),
+    ("spec", "--spec"),
+    ("swarm", "--swarm"),
+    ("context", "--context"),
+)
+
+
+def hy4_flag_problem(args: argparse.Namespace) -> str | None:
+    """The flags that do not apply to Hy4 Flash (its row is picked from the card count
+    and served as it is)."""
+    given = [flag for k, flag in HY4_NOT_FLAGS if getattr(args, k, None) is not None]
+    if not given:
+        return None
+    return (
+        f"{', '.join(given)}: not for {H.MODEL}, whose row follows the card count "
+        f"({H.supported_text()}) and is served as the profile has it; --models-dir, "
+        "--host, --api-key and --port apply (the KV RAM cache is not supported on "
+        "Hy4 Flash yet)"
+    )
+
+
+def hy4_words(
+    a: Answers, repo: Path, profile_id: str, tier_per_rank: int, engram: str = H.ENGRAM_DEFAULT
+) -> list[str]:
+    """The launcher command's shell words (environment first; the key is read from its
+    file, never printed)."""
+    key = ['VLLM_API_KEY="$(cat .merlin/api-key)"'] if a.api_key else []
+    pre = [f"HOST={a.host}", f"PORT={a.port}", f"{L.HY4_ENGRAM_ENV}={engram}"] + key
+    if tier_per_rank:
+        pre.append(f"{L.FN_KV_HOST_TIER}={tier_per_rank}")
+    argv = H.launcher_argv(repo, profile_id, a.base_dir())
+    return pre + [shlex.quote(x) for x in argv]
+
+
+def hy4_main(
+    args: argparse.Namespace,
+    a: Answers,
+    inv: pf.Inventory,
+    ui: Asker,
+    repo: Path,
+    table: dict[str, Any],
+    key_path: Path,
+    run: Callable[[list[str]], str | None],
+    env: dict[str, str],
+) -> int:
+    """./setup.sh for Hy4 Flash: the row for these cards (refused otherwise), host RAM /
+    memlock / disk, the engine install, the verified pack download, then launch.py
+    --profile <row>. Answers are not saved (each run names --model hy4flash); the API
+    key is, as for every model."""
+    bad = hy4_flag_problem(args)
+    if bad:
+        raise SetupError(bad, 2)
+    # Refuse an exported SWARM=1 / MERLIN_KV_HOST_TIER_GIB or a
+    # cache size from the menu here, before the row knobs are stripped from the environment.
+    try:
+        L._hy4_refuse_kv_tier(env)
+    except L.LaunchError as e:
+        raise SetupError(str(e), e.code) from None
+    if a.kv_ram_cache_gib or getattr(args, "kv_ram_cache_gib", None):
+        raise SetupError(f"--kv-ram-cache: {L.HY4_KV_TIER_UNSUPPORTED}", 2)
+    merlin_dir = repo / ".merlin"
+    reg = H.registry()
+    a.model = H.MODEL
+    if args.models_dir is None and not ui.yes:
+        a.models_dir = ui.ask(
+            "Models folder (an existing verified download is reused)",
+            a.models_dir or default_dir(a.model),
+        )
+    a = _ask_access(a, ui, args, key_path)
+    if args.port is None and not ui.yes:
+        p = ui.ask("Port", str(a.port or reg["launch"]["port"]))
+        ok = p.isascii() and p.isdigit() and len(p) <= 5 and 1 <= int(p) <= 65535
+        if not ok:
+            raise SetupError(f"port {p!r}: 1..65535", 2)
+        a.port = int(p)
+    a.port = a.port or int(reg["launch"]["port"])
+    dest = a.base_dir()
+    # The pack: FP8 Engram tables unless --engram bf16
+    engram = getattr(args, "engram", None) or H.ENGRAM_DEFAULT
+    hf_repo, hf_revision = H.hub_source(engram)
+    pack = H.pack_bytes(engram)
+
+    ui.gap()
+    ui.row("Model", f"{H.MODEL} - {H.TITLE}")
+    ui.row("Engram", f"{engram.upper()} tables (--engram {engram}"
+           + (", the default)" if engram == H.ENGRAM_DEFAULT else ")"))
+    choice = H.select_row(inv, reg)
+    if choice.profile is None:
+        report_problems([Problem("FAIL", "row", choice.why, "")], ui)
+        ui.gap()
+        ui.say("setup: Hy4 Flash has no row for this hardware; nothing was downloaded.")
+        return 3
+    prof = choice.profile
+    n_ranks = H.ranks(prof)
+    ui.row("Row", choice.why)
+    ui.row("Folder", str(dest))
+    key_note = " (API key in .merlin/api-key)" if a.api_key else ""
+    ui.row("Access", f"{a.host}:{a.port}" + key_note)
+    venv_python = repo / "venv" / "bin" / "python"
+    lock = repo / "release" / RELEASE_LOCK
+    ui.row("CUDA", H.nvrtc_text(lock, venv_python, run, inv.source == "probe"))
+
+    problems: list[Problem] = []
+    # GiB per server, split over the row's ranks (whole GiB per rank)
+    tier_total = args.kv_ram_cache_gib or 0
+    per_rank = tier_total // n_ranks
+    if tier_total and not per_rank:
+        problems.append(
+            Problem(
+                "FAIL",
+                "kv-ram-cache",
+                f"--kv-ram-cache {tier_total}g is under 1 GiB per rank over the "
+                f"{n_ranks} ranks of {prof['id']}",
+                "a larger --kv-ram-cache, or 0 (off)",
+            )
+        )
+    have, what = ram_budget(inv)
+    checks = (
+        H.ram_check(have, what, per_rank * n_ranks, len(inv.gpus), engram),
+        H.memlock_check(*H.memlock_limit(inv), per_rank, engram),
+    )
+    for c in checks:
+        if c:
+            problems.append(Problem(*c))
+    conflict = H.folder_conflict(dest)
+    if conflict:
+        problems.append(
+            Problem(
+                "FAIL",
+                "folder",
+                f"{dest} {conflict}; nothing is downloaded over another checkpoint",
+                "choose another folder (--models-dir)",
+            )
+        )
+    if hf_repo:
+        verified = H.marker_current(dest, hf_repo, hf_revision, engram)
+    else:
+        verified = H.marker_current(dest, engram=engram)
+    commit = head_commit(repo, run)
+    plan = DownloadPlan()
+    engine_items(plan, a, repo, read_json(merlin_dir / STATE_JSON), commit, table)
+    remaining = max(0, pack - H.present_bytes(dest))
+    check_note = (
+        "every LFS file checked against the sha256 and size the hub states "
+        "(X-Linked-Etag / X-Linked-Size on a no-redirect HEAD); a shard without them "
+        "is refused"
+    )
+    what_ck = f"checkpoint {H.MODEL}"
+    if verified:
+        plan.items.append(
+            Download(what_ck, str(dest), 0, "models", "present and verified")
+        )
+    elif hf_repo is None:
+        plan.items.append(
+            Download(
+                what_ck,
+                "not published yet (its repository is named at release)",
+                remaining,
+                "models",
+                check_note,
+            )
+        )
+        if not args.dry_run:
+            problems.append(
+                Problem(
+                    "FAIL",
+                    "checkpoint",
+                    f"the Hy4 Flash {engram.upper()} Engram pack is not published yet: "
+                    "this setup names no "
+                    f"repository to download it from, and {dest} holds no copy it "
+                    "verified",
+                    "a release that names the pack's repository",
+                )
+            )
+    else:
+        if hf_revision:
+            rev = f" --revision {hf_revision}"
+        else:
+            rev = " (no pinned revision yet)"
+        src = f"hub {hf_repo}{rev} -> {dest}"
+        plan.items.append(Download(what_ck, src, remaining, "models", check_note))
+        plan.need_checkpoint = True
+    if not verified and remaining:
+        plan.disk.append(
+            DiskNeed(dest, remaining, f"the rest of the {H.MODEL} checkpoint")
+        )
+    dirty = git_problem(repo, run, env) if plan.need_install else None
+    if dirty:
+        problems.append(dirty)
+    problems += disk_problems(plan, disk_free_for(inv))
+
+    lenv = H.launch_env(a.host, a.port, a.api_key, per_rank, engram)
+    run_env = H.launcher_environ({**lenv, "MERLIN_HOME": str(repo)}, env)
+    lplan = None
+    try:
+        lplan = H.launcher_plan(repo, prof["id"], dest, run_env)
+    except L.LaunchError as e:
+        why = str(e).strip() or "the launcher refused the row"
+        problems.append(Problem("FAIL", "launch", why, ""))
+    failed = report_problems(problems, ui)
+    ui.gap()
+    ui.say(render_plan(plan, args.dry_run, ui.color, ui.width).rstrip("\n"))
+    ui.section("Serve", "(launch.py --profile: merlin serve does not list hy4flash)")
+    for line in shell_wrap(hy4_words(a, repo, prof["id"], per_rank, engram), ui.width):
+        ui.say(line)
+    notes: list[str] = []
+    if lplan is not None:
+        ui.section(
+            "Launcher plan",
+            "(launch.py resolves this from the row; nothing here is setup's own)",
+        )
+        for line in shell_wrap([shlex.quote(x) for x in lplan.argv()], ui.width):
+            ui.say(line)
+        levels = ("note", "warning", "WARNING")
+        notes += [
+            n.split(": ", 1)[1] if n.split(": ", 1)[0] in levels and ": " in n else n
+            for n in lplan.notes
+        ]
+    notes += H.serve_hints(lplan is not None and H.dfly_on(lplan), engram)
+    if hf_repo is None and not verified:
+        notes.append(
+            "the pack's Hugging Face repository is named at release; until then setup "
+            f"checks this host and plans the {gib(pack)} download, and serves "
+            "only a copy it verified earlier"
+        )
+    ui.gap()
+    for n in notes:
+        ui.note("NOTE", n)
+    if failed:
+        ui.gap()
+        ui.say(
+            "setup: fix the FAIL lines above and run ./setup.sh again; nothing was "
+            "downloaded."
+        )
+        return 1
+    if args.dry_run:
+        ui.gap()
+        ui.say(
+            "Dry run: nothing downloaded, nothing installed, nothing written, nothing "
+            "started."
+        )
+        return 0
+    yes_no = ["y", "n", "yes", "no"]
+    ask = "Proceed with the downloads above? (y/n)"
+    if not ui.yes and plan.pending() and ui.ask(ask, "y", yes_no) in ("n", "no"):
+        ui.say("setup: stopped; nothing downloaded and nothing saved.")
+        return 1
+    with contextlib.ExitStack() as locks:
+        if plan.need_install:
+            locks.enter_context(install_lock(merlin_dir))
+            locks.enter_context(servers_locked_out(merlin_dir))
+            moved = source_moved(repo, run, env, commit)
+            if moved:
+                raise SetupError(
+                    f"{moved}; nothing was installed. Run ./setup.sh again.", 1
+                )
+        if a.api_key and not L.is_loopback(a.host):
+            write_private(key_path, a.api_key + "\n", 0o600)
+        env["PATH"] = f"{merlin_dir / 'bin'}:{env.get('PATH', '')}"
+        if plan.need_install:
+            install_engine(repo, a, env)
+            record = install_state(repo, a.from_source, commit)
+            write_json(
+                merlin_dir / STATE_JSON, {**record, "installed_at": int(time.time())}
+            )
+        else:
+            ui.gap()
+            ui.para(
+                "Engine: venv is current (wheel + lock + commit unchanged since the "
+                "last install); nothing to install."
+            )
+    if not verified or args.rehash:
+        if hf_repo is None:
+            raise SetupError(
+                f"{dest}: the Hy4 Flash {engram.upper()} Engram pack is not published "
+                "yet; nothing to verify against",
+                1,
+            )
+        ui.section("Checkpoint", f"{hf_repo} -> {dest}")
+        try:
+            H.pull(dest, hf_repo, hf_revision, rehash=args.rehash, say=ui.say, engram=engram)
+        except (H.HubError, OSError) as e:
+            raise SetupError(
+                f"{H.MODEL} download: {e}; finished files stay, ./setup.sh again "
+                "continues",
+                1,
+            ) from None
+    if args.no_start:
+        ui.gap()
+        ui.say("Done. Start it with:")
+        for line in shell_wrap(hy4_words(a, repo, prof["id"], per_rank, engram), ui.width):
+            ui.say(line)
+        return 0
+    print_endpoint(a, ui, key_path)
+    sys.stdout.flush()
+    argv = H.launcher_argv(repo, prof["id"], dest)
+    os.execvpe(argv[0], argv, run_env)
     return 0  # pragma: no cover
 
 
@@ -2643,6 +3327,8 @@ def pull_main(args: argparse.Namespace, a: Answers, repo: Path, table: dict[str,
 
 def print_endpoint(a: Answers, ui: Asker, key_path: Path) -> None:
     host = "127.0.0.1" if a.host in ("0.0.0.0", "::") else a.host
+    if ":" in host and not host.startswith("["):  # an IPv6 literal goes in brackets in a URL (as the launcher's banner)
+        host = f"[{host}]"
     auth = ["-H", f'"Authorization: Bearer $(cat {shlex.quote(str(key_path))})"'] if a.api_key else []
     n = a.instances if a.instances and a.instances > 1 else 1
     ports = ", ".join(str(a.port + i) for i in range(n))
@@ -2650,11 +3336,12 @@ def print_endpoint(a: Answers, ui: Asker, key_path: Path) -> None:
     ui.gap()
     ui.para(f"http://{host}:{a.port}/v1  (OpenAI-compatible; /v1/messages for /v1/messages clients)"
             + (f"; instances on ports {ports}" if n > 1 else ""), "Endpoint  ", head=True)
-    if a.host == "0.0.0.0":
+    if a.host in ("0.0.0.0", "::"):
         ui.para(f"reachable from the network on every address of this machine, port {a.port}; the API key is in {key_path} (0600)",
                 " " * 10)
     ui.section("Test", "(once the log says `Application startup complete`)")
-    for line in shell_wrap(["curl", "-s", f"http://{host}:{a.port}/v1/chat/completions", "-H", "'Content-Type: application/json'",
+    # quoted: zsh reads an unquoted [::1] as a glob; an IPv4 or hostname URL prints as before (shlex adds nothing)
+    for line in shell_wrap(["curl", "-s", shlex.quote(f"http://{host}:{a.port}/v1/chat/completions"), "-H", "'Content-Type: application/json'",
                             *auth, "-d", shlex.quote(body)], ui.width):
         ui.say(line)
     ui.gap()

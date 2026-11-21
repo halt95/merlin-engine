@@ -19,8 +19,9 @@ name = "vllm"
 # the Merlin author and NOTICE ship in the built package
 authors = [{name = "vLLM Team"}, {name = "halt95 (Merlin modifications)"}]
 license = "Apache-2.0"
+# (short fixed text: a README-only commit must not change the wheel)
+readme = {text = "Merlin is a vLLM fork for NVIDIA Ampere and Ada GPUs: one install command, pre-tuned model profiles and one OpenAI-compatible API.\n\nInstall, models and documentation: https://github.com/halt95/merlin-engine/blob/merlin-v3.0.2.2/README.md\n", content-type = "text/markdown"}
 license-files = ["LICENSE", "NOTICE"]
-readme = "README.md"
 description = "A high-throughput and memory-efficient inference and serving engine for LLMs"
 classifiers = [
     "Programming Language :: Python :: 3.11",

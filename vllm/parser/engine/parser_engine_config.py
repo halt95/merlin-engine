@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by the Merlin project; see NOTICE.
 """Declarative configuration for model tool-call and reasoning formats.
 
 Each model format is described by a :class:`ParserEngineConfig` that specifies:
@@ -27,6 +28,11 @@ from vllm.parser.engine.events import EventType
 # Maps a raw argument delta to the JSON text it appends to the open trailing
 # value, or returns None when the delta may change anything else.
 ArgValueExtender = Callable[[str], str | None]
+
+
+class TypedString(str):
+    """A string the model itself wrote as a string, in a format whose other
+    values are text with no type of their own."""
 
 
 class ParserState(Enum):
@@ -81,6 +87,23 @@ class ParserEngineConfig:
     wait_for_reasoning: bool | None = None
 
     arg_converter: Callable[[str, bool], str] | None = None
+
+    # True when the strings ``arg_converter``
+    # writes are text the model gave no type (XML-style parameters, bare
+    # values). Such text may be read as a number, a boolean or null where the
+    # schema allows it. False when the converter keeps the model's own JSON
+    # types: a string is then one the model typed as a string, and is kept
+    # wherever the schema allows a string.
+    args_raw_text: bool = False
+
+    # For a raw-text format in which the
+    # model marks some strings itself (Gemma4's delimited strings): called
+    # with the same ``(raw_args, partial)`` as ``arg_converter``, returns the
+    # converted value tree, in which a string the model typed is a
+    # :class:`TypedString` and every other string is a plain ``str``. The
+    # schema pass keeps a typed string wherever the schema allows a string and
+    # reads the others as ``args_raw_text`` says.
+    arg_typed_strings: Callable[[str, bool], object] | None = None
 
     stream_arg_deltas: bool = True
 

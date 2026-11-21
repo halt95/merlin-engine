@@ -23,6 +23,7 @@ from vllm.entrypoints.generate.base.protocol import (
     ToolCall,
 )
 from vllm.logger import init_logger
+from vllm.merlin.content_start import ContentStart
 from vllm.merlin.tool_none import set_mode
 from vllm.parser.abstract_parser import Parser, StreamState
 from vllm.parser.engine.events import EventType, SemanticEvent
@@ -30,6 +31,7 @@ from vllm.parser.engine.parser_engine_config import (
     ArgValueExtender,
     ParserEngineConfig,
     ParserState,
+    TypedString,
 )
 from vllm.parser.engine.streaming_parser_engine import StreamingParserEngine
 from vllm.renderers.chat_utils import get_tool_call_id_type, make_tool_call_id
@@ -161,12 +163,18 @@ class ParserEngine(Parser):
         self._deferred_content: str = ""
         self._deferred_reasoning: str = ""
         self._content_has_nonws: bool = False
+
+        self._content_start = ContentStart(self._engine.state is ParserState.REASONING)
         self._suppress_tool_calls: bool = False
 
         self._arg_converter = parser_engine_config.arg_converter
         self._arg_structural_chars = parser_engine_config.arg_structural_chars
         self._arg_value_extender = parser_engine_config.arg_value_extender
         self._stream_arg_deltas = parser_engine_config.stream_arg_deltas
+
+        self._args_raw_text = parser_engine_config.args_raw_text
+
+        self._arg_typed_strings = parser_engine_config.arg_typed_strings
         self._strip_trailing_reasoning_ws = (
             parser_engine_config.strip_trailing_reasoning_whitespace
         )
@@ -175,6 +183,11 @@ class ParserEngine(Parser):
         )
         self._strip_content_ws_with_tools = (
             parser_engine_config.strip_content_whitespace_with_tools
+        )
+        # Either setting drops content that
+        # is only whitespace once the response has tool calls.
+        self._drops_ws_only_content = (
+            self._drop_ws_only_content_before_tools or self._strip_content_ws_with_tools
         )
 
         vocab = self.vocab
@@ -256,9 +269,17 @@ class ParserEngine(Parser):
 
     def finish_streaming(self) -> DeltaMessage | None:
         events = self._engine.finish()
-        if events or self._deferred_content:
-            return self._events_to_delta(events, finished=True)
-        return None
+        # The last delta takes the reasoning
+        # whitespace an earlier delta held back, as every other delta does; a
+        # tail still held at the end is dropped, as non-streaming does.
+        delta = (
+            self._events_to_delta(events, finished=True)
+            if events or self._deferred_content
+            else None
+        )
+        delta = self._strip_trailing_reasoning(delta)
+        self._deferred_reasoning = ""
+        return delta
 
     def _reset(self, initial_state: ParserState | None = None) -> None:
         prompt_closed = initial_state is None and self._prompt_closes_reasoning
@@ -270,6 +291,8 @@ class ParserEngine(Parser):
         self._deferred_content = ""
         self._deferred_reasoning = ""
         self._content_has_nonws = False
+        # A parse that begins inside reasoning
+        self._content_start.reset(self._engine.state is ParserState.REASONING)
         self._prompt_streaming_prepared = False
 
     def adjust_request(
@@ -290,19 +313,35 @@ class ParserEngine(Parser):
         delta_text: str,
         delta_token_ids: Sequence[int],
     ) -> list[SemanticEvent]:
+        # Prompt adjustment may open an empty block.
+        if self._engine.state is ParserState.REASONING:
+            self._content_start.reasoning_open()
         delta_text, delta_token_ids = self._preprocess_feed(delta_text, delta_token_ids)
         return self._engine.feed(delta_text, delta_token_ids)
 
     # ── Schema-aware type correction ─────────────────────────────────
 
     @staticmethod
-    def _coerce_value(value: object, schema: dict) -> tuple[object, bool]:
+    def _coerce_value(
+        value: object, schema: dict, raw: bool = False, typed: object = None
+    ) -> tuple[object, bool]:
         """Coerce a single value according to its schema.
 
         Returns ``(coerced_value, changed)``.
         """
         if isinstance(value, str):
             types = extract_types_from_schema(schema)
+            # *raw* marks text the model
+            # wrote without a type (an XML-style parameter). Any other string
+            # was typed as a JSON string by the model: where the schema
+            # allows a string it is not reinterpreted. Text that was read as
+            # an object or an array is returned as parsed: what is inside it
+            # had JSON types.
+            # *typed* is the converter's own
+            # value for this position: a string it marks was typed by the
+            # model, whatever *raw* says of the rest.
+            if (not raw or isinstance(typed, TypedString)) and "string" in types:
+                return value, False
             coerced = coerce_to_schema_type(value, types)
             if coerced is not value:
                 return coerced, True
@@ -311,7 +350,9 @@ class ParserEngine(Parser):
         if isinstance(value, dict):
             nested_props = schema.get("properties")
             if isinstance(nested_props, dict):
-                _, changed = ParserEngine._coerce_dict(value, nested_props)
+                # A converter that builds
+                # nested values leaves their strings as untyped as the rest.
+                _, changed = ParserEngine._coerce_dict(value, nested_props, raw, typed)
                 return value, changed
             return value, False
 
@@ -321,7 +362,13 @@ class ParserEngine(Parser):
                 changed = False
                 for i, item in enumerate(value):
                     coerced, item_changed = ParserEngine._coerce_value(
-                        item, items_schema
+
+                        item,
+                        items_schema,
+                        raw,
+                        typed[i]
+                        if isinstance(typed, list) and i < len(typed)
+                        else None,
                     )
                     if item_changed:
                         value[i] = coerced
@@ -337,14 +384,19 @@ class ParserEngine(Parser):
         return value, False
 
     @staticmethod
-    def _coerce_dict(args: dict, properties: dict) -> tuple[dict, bool]:
+    def _coerce_dict(
+        args: dict, properties: dict, raw: bool = False, typed: object = None
+    ) -> tuple[dict, bool]:
         """Coerce all values in *args* using *properties* schemas."""
         changed = False
         for key, value in args.items():
             prop = properties.get(key)
             if not isinstance(prop, dict):
                 continue
-            coerced, val_changed = ParserEngine._coerce_value(value, prop)
+
+            coerced, val_changed = ParserEngine._coerce_value(
+                value, prop, raw, typed.get(key) if isinstance(typed, dict) else None
+            )
             if val_changed:
                 args[key] = coerced
                 changed = True
@@ -440,7 +492,13 @@ class ParserEngine(Parser):
                 streamable.add(key)
         return streamable
 
-    def _fix_arg_types(self, args_json: str, func_name: str) -> str:
+    def _fix_arg_types(
+        self,
+        args_json: str,
+        func_name: str,
+        raw: bool | None = None,
+        typed: object = None,
+    ) -> str:
         """Correct parameter types using the tool schema.
 
         String values are coerced via :func:`coerce_to_schema_type`.
@@ -461,11 +519,27 @@ class ParserEngine(Parser):
         if not properties:
             return args_json
 
-        _, changed = self._coerce_dict(args, properties)
+        # *raw* is given by a caller whose
+        # arguments did not come out of the converter.
+        if raw is None:
+            raw = self._args_raw_text
+        _, changed = self._coerce_dict(args, properties, raw, typed)
 
         if changed:
             return json.dumps(args, ensure_ascii=False)
         return args_json
+
+    def _typed_strings(
+        self, raw_args: str, partial: bool
+    ) -> object:
+        """The converter's value tree with the strings the model typed marked,
+        or ``None`` when the format does not mark any."""
+        if self._arg_typed_strings is None or not self._tools:
+            return None
+        try:
+            return self._arg_typed_strings(raw_args, partial)
+        except (json.JSONDecodeError, ValueError, TypeError):
+            return None
 
     def _is_valid_tool_name(self, name: str) -> bool:
         if not self.parser_engine_config.validate_tool_names:
@@ -497,11 +571,11 @@ class ParserEngine(Parser):
         content: str,
         tools_called: bool,
     ) -> str | None:
-        if tools_called:
-            if self._strip_content_ws_with_tools:
-                content = content.strip()
-            elif self._drop_ws_only_content_before_tools and not content.strip():
-                content = ""
+        # Content next to tool calls keeps
+        # the whitespace the model wrote, as a stream sends it; content that is
+        # nothing but whitespace is still dropped.
+        if tools_called and self._drops_ws_only_content and not content.strip():
+            content = ""
         return content or None
 
     # ── Streaming: parse_delta ────────────────────────────────────────
@@ -808,6 +882,11 @@ class ParserEngine(Parser):
             reasoning = reasoning.rstrip() or None
 
         content = delta.content if delta else None
+        # Text after a tool call is
+        # deferred for the stream's last delta; one pass has no later delta.
+        if self._deferred_content:
+            content = (content or "") + self._deferred_content
+            self._deferred_content = ""
         if content:
             content = self._strip_content_whitespace(
                 content, tool_call_info.tools_called
@@ -864,16 +943,30 @@ class ParserEngine(Parser):
         for event in events:
             match event.type:
                 case EventType.TEXT_CHUNK:
+                    # No whitespace between the
+                    # end of reasoning and the first visible character.
+                    # Reasoning adapters hand the ids and
+                    # original text to the parser that owns the content boundary.
+                    text = (
+                        event.value
+                        if self.skip_tool_parsing
+                        else self._content_start.take(event.value)
+                    )
+                    if not text:
+                        continue
                     if seen_tool_event:
-                        self._deferred_content += event.value
+                        self._deferred_content += text
                     else:
-                        content_parts.append(event.value)
+                        content_parts.append(text)
                 case EventType.REASONING_CHUNK:
+                    self._content_start.reasoning_open()
                     reasoning_parts.append(event.value)
                 case EventType.REASONING_END:
+                    self._content_start.reasoning_ended()
                     self._reasoning_ended = True
                 case EventType.TOOL_CALL_START:
                     if not suppress:
+                        self._content_start.tool_call()
                         seen_tool_event = True
                         self._ensure_slot(event.tool_index)
                 case EventType.TOOL_NAME:
@@ -889,7 +982,7 @@ class ParserEngine(Parser):
                         seen_tool_event = True
                         self._handle_tool_end(event, tool_call_deltas)
                 case EventType.REASONING_START:
-                    pass  # no delta-level effect
+                    self._content_start.reasoning_open()
 
         if len(tool_call_deltas) > 1:
             tool_call_deltas = self._coalesce_tool_call_deltas(tool_call_deltas)
@@ -904,6 +997,12 @@ class ParserEngine(Parser):
             if deferred_now:
                 content_parts.append(deferred_now)
             self._deferred_content = ""
+        # Text held from an earlier delta
+        # was written before this delta's text, so it leaves with it even when
+        # the delta also carries a call; text after the call stays held.
+        elif carried_deferred and content_parts:
+            content_parts.insert(0, carried_deferred)
+            self._deferred_content = self._deferred_content[len(carried_deferred) :]
 
         content_str = "".join(content_parts)
 
@@ -914,7 +1013,12 @@ class ParserEngine(Parser):
             if stripped:
                 self._content_has_nonws = True
             elif self._tool_slots:
-                if self._drop_ws_only_content_before_tools:
+                # Whitespace is held, not
+                # dropped, while text can still follow it: it is then the start
+                # of that text. Only the end of the output drops it.
+                if self._drops_ws_only_content:
+                    if not finished or self._deferred_content:
+                        self._deferred_content = content_str + self._deferred_content
                     content_str = ""
             elif not finished:
                 self._deferred_content = content_str
@@ -1111,7 +1215,12 @@ class ParserEngine(Parser):
             return None
 
         if slot.name:
-            current_json = self._fix_arg_types(current_json, slot.name)
+
+            current_json = self._fix_arg_types(
+                current_json,
+                slot.name,
+                typed=self._typed_strings(slot.args, True),
+            )
 
         prev = slot.streamed_json
         safe_json, value_streams = self._safe_arg_prefix(current_json, slot.string_keys)
@@ -1134,14 +1243,26 @@ class ParserEngine(Parser):
             return None
 
         slot = self._tool_slots[idx]
+        # Match non-streaming extraction.
+        raw = self._args_raw_text
+        typed = None
         try:
             final_json = converter(slot.args, False)
+
+            typed = self._typed_strings(slot.args, False)
         except (json.JSONDecodeError, ValueError, TypeError):
             logger.debug("arg converter failed (flush): %s", slot.args[:80])
-            return None
+            # JSON fallback strings are typed.
+            final_json = self._extract_args_json(slot.args, slot.name)
+            try:
+                json.loads(final_json)
+            except (json.JSONDecodeError, ValueError, TypeError):
+                return None
+            raw = False
 
         if final_json:
-            final_json = self._fix_arg_types(final_json, slot.name)
+
+            final_json = self._fix_arg_types(final_json, slot.name, raw, typed)
 
         prev = slot.streamed_json
         if final_json and len(final_json) > len(prev):
@@ -1181,6 +1302,10 @@ class ParserEngine(Parser):
             name = slot.name.strip()
             raw_body = slot.args
 
+            # Arguments read from a JSON
+            # body instead of by the converter carry the model's own types.
+            from_converter = False
+            typed = None
             if not name and raw_body.strip():
                 name, args_json = self._extract_name_and_args(raw_body)
             elif raw_body.strip():
@@ -1188,6 +1313,9 @@ class ParserEngine(Parser):
                 if converter is not None:
                     try:
                         args_json = converter(raw_body, False)
+                        from_converter = True
+
+                        typed = self._typed_strings(raw_body, False)
                     except (json.JSONDecodeError, ValueError, TypeError):
                         logger.debug(
                             "arg converter failed (extract): %s", raw_body[:80]
@@ -1200,7 +1328,9 @@ class ParserEngine(Parser):
 
             if self._accept_tool_name(name):
                 self._ensure_tool_id(slot, name)
-                args_json = self._fix_arg_types(args_json, name)
+
+                raw = self._args_raw_text and from_converter
+                args_json = self._fix_arg_types(args_json, name, raw, typed)
                 tool_calls.append(
                     ToolCall(
                         id=slot.id,

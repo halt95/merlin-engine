@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by the Merlin project; see NOTICE.
 
 import logging
 import time
@@ -519,6 +520,13 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
         )
         self.perf_metrics_prom = self._perf_metrics_cls(
             vllm_config, labelnames, per_engine_labelvalues
+        )
+
+
+        from vllm.merlin.scheduler_telemetry import PolicyCounterProm
+
+        self.policy_counter_prom = PolicyCounterProm(
+            self._counter_cls, labelnames, per_engine_labelvalues
         )
 
         #
@@ -1144,6 +1152,8 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
     ):
         """Log to prometheus."""
         if scheduler_stats is not None:
+
+            self.policy_counter_prom.observe(scheduler_stats.policy_counters, engine_idx)
             self.gauge_scheduler_running[engine_idx].set(
                 scheduler_stats.num_running_reqs
             )

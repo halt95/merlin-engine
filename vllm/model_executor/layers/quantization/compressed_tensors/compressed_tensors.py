@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by the Merlin project; see NOTICE.
 
 from functools import partial
 from typing import TYPE_CHECKING, Any, Literal, cast
@@ -74,6 +75,12 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from vllm.platforms import current_platform
+
+# (cache-dtype predicates for the k/v scale rule)
+from vllm.v1.kv_cache_interface import (
+    is_quantized_kv_cache,
+    kv_cache_uses_per_token_head_scales,
+)
 
 if TYPE_CHECKING:
     from vllm.model_executor.models.utils import WeightsMapper
@@ -1252,6 +1259,17 @@ class CompressedTensorsKVCacheMethod(BaseKVCacheMethod):
         """Override the default vLLM placeholder scales with the llm-compressor loaded
         scales. Zero points are not used as only symmetric quantization is supported.
         """
+        # An unquantised cache (bf16/fp16, or a
+        # layer left at "auto" by --kv-cache-dtype-skip-layers) is written without
+        # scales, so it must be read with k/v scale 1.0, as the base rule does; a
+        # per-token-head cache computes its scales in the kernel. Filled in place
+        # (shape kept) so the buffers, _float and _cpu copies below all follow.
+        # q keeps its loaded value, as in the base rule.
+        if not is_quantized_kv_cache(
+            layer.kv_cache_dtype
+        ) or kv_cache_uses_per_token_head_scales(layer.kv_cache_dtype):
+            layer.k_scale.data.fill_(1.0)
+            layer.v_scale.data.fill_(1.0)
         # Buffers (not Parameters) so sleep snapshots them; ATTN_HEAD changes shape.
         layer.register_buffer("_k_scale", layer.k_scale.detach())
         layer.register_buffer("_v_scale", layer.v_scale.detach())

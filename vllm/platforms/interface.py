@@ -1480,6 +1480,10 @@ class Platform:
                 message = unknown_merlin_env_warning(env)
                 if message is not None:
                     logger.warning("%s", message)
+        # A knob whose bad value must stop the boot
+        from vllm.merlin.envs import check_at_boot
+
+        check_at_boot()
 
     @classmethod
     def get_kv_cache_config_builder_cls(cls, vllm_config: "VllmConfig") -> str:

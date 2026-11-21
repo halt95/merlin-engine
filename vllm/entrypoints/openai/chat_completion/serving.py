@@ -173,6 +173,22 @@ class OpenAIServingChat(GenerateBaseServing):
             is_harmony=self.model_config.hf_config.model_type == "gpt_oss",
             tokenizer=self.renderer.tokenizer,
         )
+        # Warn-only round trip of the served template and parsers
+        try:
+            from vllm.merlin.parser_selftest import check_at_boot
+
+            check_at_boot(
+                self.renderer.tokenizer,
+                self.chat_template,
+                self.parser_cls,
+                self.default_chat_template_kwargs,
+                tool_parser_name=tool_parser,
+                reasoning_parser_name=reasoning_parser,
+                model_config=self.model_config,
+                background=True,
+            )
+        except Exception:  # warn only: the self-test never blocks boot
+            logger.warning("Parser/template self-test could not run", exc_info=True)
         self.exclude_tools_when_tool_choice_none = exclude_tools_when_tool_choice_none
 
         self.enable_prompt_tokens_details = enable_prompt_tokens_details

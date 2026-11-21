@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by the Merlin project; see NOTICE.
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, cast
 
@@ -41,6 +42,11 @@ def check_attention_cp_compatibility(
             if layer_impl is None:
                 continue
             if not check_pcp and layer_impl.dcp_world_size == 1:
+                continue
+            # A layer whose KV is replicated, not
+            # DCP-sharded (impl dcp_world_size 1, e.g. Hy4's SWA layers), takes
+            # no part in the DCP LSE combine or the interleaved KV layout.
+            if pcp_size == 1 and layer_impl.dcp_world_size == 1:
                 continue
             if vllm_config.speculative_config is not None and interleave_size > 1:
                 assert layer_impl.supports_mtp_with_cp_non_trivial_interleave_size, (

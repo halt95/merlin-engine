@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by the Merlin project; see NOTICE.
 """Gemma4 parser.
 
 Handles channel-based reasoning plus custom tool call format in a single
@@ -26,6 +27,7 @@ from vllm.parser.engine.parser_engine_config import (
     ParserEngineConfig,
     ParserState,
     Transition,
+    TypedString,
 )
 
 if TYPE_CHECKING:
@@ -138,10 +140,12 @@ def _parse_gemma4_fields(
                 value = args_str[val_start:]
                 if partial:
                     value = _strip_partial_delim(value)
-                result[key] = value
+                # A delimited string.
+                result[key] = TypedString(value)
                 open_key = key
                 break
-            result[key] = args_str[val_start:end_pos]
+
+            result[key] = TypedString(args_str[val_start:end_pos])
             i = end_pos + _DELIM_LEN
 
         elif args_str[i] == "{":
@@ -227,9 +231,11 @@ def _parse_gemma4_array(arr_str: str, *, partial: bool = False) -> list:
             i += _DELIM_LEN
             end_pos = arr_str.find(STRING_DELIM, i)
             if end_pos == -1:
-                items.append(arr_str[i:])
+                # A delimited string.
+                items.append(TypedString(arr_str[i:]))
                 break
-            items.append(arr_str[i:end_pos])
+
+            items.append(TypedString(arr_str[i:end_pos]))
             i = end_pos + _DELIM_LEN
 
         elif arr_str[i] == "{":
@@ -304,12 +310,26 @@ def _drop_call_closer(text: str, paren_excess: bool) -> str:
     return text
 
 
-def _gemma4_arg_converter(raw_args: str, partial: bool) -> str:
-    """Convert Gemma4 custom arg format to a JSON string."""
+# The converter and the typed-string view
+# each parse the text afresh: no parse is shared, so no caller can change what
+# another one gets.
+def _gemma4_parsed(raw_args: str, partial: bool) -> dict:
     text = raw_args.strip()
     text = _drop_call_closer(text, text.count("(") < text.count(")"))
-    parsed = _parse_gemma4_args(text, partial=partial)
-    return json.dumps(parsed, ensure_ascii=False)
+
+    return _parse_gemma4_args(text, partial=partial)
+
+
+def _gemma4_arg_converter(raw_args: str, partial: bool) -> str:
+    """Convert Gemma4 custom arg format to a JSON string."""
+    return json.dumps(_gemma4_parsed(raw_args, partial), ensure_ascii=False)
+
+
+def _gemma4_typed_strings(raw_args: str, partial: bool) -> dict:
+    """The value tree ``_gemma4_arg_converter`` writes, in which a string the
+    model delimited is a ``TypedString`` and a bare value is a plain ``str``.
+    """
+    return _gemma4_parsed(raw_args, partial)
 
 
 def _gemma4_arg_value_extender(raw_args: str) -> ArgValueExtender | None:
@@ -454,6 +474,8 @@ def gemma4_config(thinking: bool = False) -> ParserEngineConfig:
             ParserState.TOOL_ARGS: EventType.ARG_VALUE_CHUNK,
         },
         arg_converter=_gemma4_arg_converter,
+        args_raw_text=True,
+        arg_typed_strings=_gemma4_typed_strings,
         arg_value_extender=_gemma4_arg_value_extender,
         tool_args_json=False,
         arg_structural_chars=frozenset(",:{}[]<"),

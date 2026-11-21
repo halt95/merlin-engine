@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by the Merlin project; see NOTICE.
 
 # Adapted from
 # Copyright 2023 The vLLM team.
@@ -210,10 +211,14 @@ class HYV4DecoderLayer(nn.Module):
 class HYV4Model(nn.Module):
     """HY V4 backbone."""
 
+
+    decoder_layer_cls = HYV4DecoderLayer
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
 
-        config = _normalize_hyv4_config(vllm_config.model_config.hf_config)
+
+        config = _normalize_hyv4_config(vllm_config.model_config.hf_text_config)
         cache_config = vllm_config.cache_config
         quant_config = vllm_config.quant_config
         parallel_config = vllm_config.parallel_config
@@ -246,7 +251,7 @@ class HYV4Model(nn.Module):
             self.embed_tokens = PPMissingLayer()
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
-            lambda prefix: HYV4DecoderLayer(
+            lambda prefix: self.decoder_layer_cls(
                 config=config,
                 vllm_config=vllm_config,
                 cache_config=cache_config,
@@ -598,6 +603,8 @@ class HYV4Model(nn.Module):
 
 
 class HYV4ForCausalLM(nn.Module, SupportsPP, SupportsLoRA):
+
+    model_cls = HYV4Model
     hf_to_vllm_mapper = WeightsMapper(
         orig_to_new_stacked={
             ".q_a_proj": (".fused_qkv_a_proj", 0),
@@ -619,7 +626,8 @@ class HYV4ForCausalLM(nn.Module, SupportsPP, SupportsLoRA):
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
-        config = vllm_config.model_config.hf_config
+
+        config = vllm_config.model_config.hf_text_config
         quant_config = vllm_config.quant_config
         self.config = config
         self.quant_config = quant_config
@@ -630,7 +638,7 @@ class HYV4ForCausalLM(nn.Module, SupportsPP, SupportsLoRA):
         eplb_config = parallel_config.eplb_config
         self.num_redundant_experts = eplb_config.num_redundant_experts
 
-        self.model = HYV4Model(
+        self.model = self.model_cls(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )
         if get_pp_group().is_last_rank:

@@ -117,7 +117,12 @@ TINY_FA_PAGES = 2
 # Units assembling at once (their landed rows are held until publish);
 # a new unit waits while this many are in progress, so held halves never fill
 # the host. MERLIN_KV_HOST_TIER__MAX_ASSEMBLING overrides it.
-MAX_ASSEMBLING = 2
+MAX_ASSEMBLING = 8
+# Before any unit is recorded, the walker's hold cap (``_hold_cap``) is this
+# fraction of the GPU pool: a third, as it was when MAX_ASSEMBLING + 1 was 3.
+# It does not follow MAX_ASSEMBLING: at 8 units a ninth of a 3x262K pool is
+# smaller than one 262K request, so its first preempt grace would be refused.
+COLD_HOLD_CAP_DIVISOR = 3
 ASSEMBLING_ENV = "MERLIN_KV_HOST_TIER__MAX_ASSEMBLING"
 N_RESTORE_ENV = "MERLIN_KV_HOST_TIER__N_RESTORE"
 DEFAULT_N_RESTORE = 2
@@ -133,11 +138,40 @@ STORE_PINS_ENV = "MERLIN_KV_HOST_TIER__MAX_PENDING_STORE_BLOCKS"
 # Keep a published successor's predecessor as its fallback restore point
 # (``kv_host_tier_units``); 0/unset = off.
 FALLBACK_ENV = "MERLIN_KV_HOST_TIER__FALLBACK_BOUNDARY"
-# The D default equals COPY_CREDITS (32 rows); COPY_CREDITS_D sets another.
-DEFAULT_COPY_CREDITS_D = DEFAULT_COPY_CREDITS
+# A block the walk meets that belongs to more than one restore unit is
+# copied as a lone row (``WriteBack._met_members``); 0/unset = the owners'
+# union is judged and started as one unit, as before.
+SHARED_LONE_ENV = "MERLIN_KV_HOST_TIER__SHARED_ROW_LONE"
+# Host eviction takes free-pool duplicates before host-only units
+# (``kv_host_tier_units``); 1 or unset = on, 0 = the order without it.
+DUP_FIRST_ENV = "MERLIN_KV_HOST_TIER__EVICT_DUPLICATES_FIRST"
+# A waiting restore's copy starts on any step a restore slot is free, not
+# only on a step with a free running seat (``kv_host_tier_plans``); 1 = on,
+# 0/unset = off (the default).
+START_ANY_STEP_ENV = "MERLIN_KV_HOST_TIER__RESTORE_START_ANY_STEP"
+# The restore copy budget per step is COPY_CREDITS rows per restore slot
+# (N_RESTORE x COPY_CREDITS) instead of COPY_CREDITS shared by every
+# restore in flight; 1/unset = on (the default), 0 = off.
+CREDITS_PER_SLOT_ENV = "MERLIN_KV_HOST_TIER__RESTORE_CREDITS_PER_SLOT"
+# A freed running seat waits (one hold, bounded) for the seat-queue head
+# whose restore copy is in flight or waiting for a slot, instead of going
+# to a later arrival; 1 = on (acts only with START_ANY_STEP_ENV on),
+# 0/unset = off (the default).
+SEAT_HOLD_ENV = "MERLIN_KV_HOST_TIER__RESTORE_SEAT_HOLD"
+# The D default is 64 rows when neither COPY_CREDITS_D nor COPY_CREDITS is set
+# (COPY_CREDITS stays the restore direction's 32); an explicit COPY_CREDITS
+# is what D follows when COPY_CREDITS_D is unset, and COPY_CREDITS_D sets
+# another.
+DEFAULT_COPY_CREDITS_D = 64
+# An admission whose draw would reclaim the
+# GPU twin of a unit evicted early waits at most this many walks for the
+# unit's re-copy, then draws anyway (a veto, ``dup_first_draw_vetoes``).
+DUP_FIRST_DRAW_WAIT_WALKS = 2
 GATE_ENVS = (
     CREDITS_ENV, ESCAPE_ENV, N_RESTORE_ENV, ASSEMBLING_ENV,
-    CREDITS_D_ENV, BYTES_D_ENV, STORE_PINS_ENV, FALLBACK_ENV,
+    CREDITS_D_ENV, BYTES_D_ENV, STORE_PINS_ENV, FALLBACK_ENV, SHARED_LONE_ENV,
+    DUP_FIRST_ENV,
+    START_ANY_STEP_ENV, CREDITS_PER_SLOT_ENV, SEAT_HOLD_ENV,
 )
 
 
@@ -148,15 +182,18 @@ def copy_credits() -> int:
 
 
 def copy_credits_d() -> int | None:
-    """Demotion-direction row credits when set explicitly; None = follow
-    ``credits_cap`` (COPY_CREDITS)."""
+    """Demotion-direction row credits: ``COPY_CREDITS_D`` when set; None =
+    follow ``credits_cap`` when only ``COPY_CREDITS`` is set explicitly;
+    64 when neither is set."""
     import os
 
     from vllm.merlin.envs import _e2_positive_int
 
     if CREDITS_D_ENV in os.environ:
         return _e2_positive_int(CREDITS_D_ENV, DEFAULT_COPY_CREDITS_D)
-    return None
+    if CREDITS_ENV in os.environ:
+        return None
+    return DEFAULT_COPY_CREDITS_D
 
 
 def copy_bytes_d() -> int:
@@ -172,6 +209,45 @@ def fallback_boundary() -> bool:
     from vllm.merlin.envs import _e2_strict_switch
 
     return bool(_e2_strict_switch(FALLBACK_ENV, default=False))
+
+
+def shared_row_lone() -> bool:
+    """Whether a met block with more than one owning unit is copied as a
+    lone row (exactly 0 or 1; unset = off)."""
+    from vllm.merlin.envs import _e2_strict_switch
+
+    return bool(_e2_strict_switch(SHARED_LONE_ENV, default=False))
+def evict_duplicates_first() -> bool:
+    """Whether host eviction takes free-pool duplicates before host-only
+    units (exactly 0 or 1; unset = on)."""
+    from vllm.merlin.envs import _e2_strict_switch
+
+    return bool(_e2_strict_switch(DUP_FIRST_ENV, default=True))
+
+
+def restore_start_any_step() -> bool:
+    """Whether a waiting restore's copy may start on a step with no free
+    running seat (exactly 0 or 1; unset = off)."""
+    from vllm.merlin.envs import _e2_strict_switch
+
+    return bool(_e2_strict_switch(START_ANY_STEP_ENV, default=False))
+
+
+def restore_credits_per_slot() -> bool:
+    """Whether the restore copy budget is COPY_CREDITS rows per restore slot
+    (exactly 0 or 1; unset = on; 0: COPY_CREDITS for all restores)."""
+    from vllm.merlin.envs import _e2_strict_switch
+
+    return bool(_e2_strict_switch(CREDITS_PER_SLOT_ENV, default=True))
+
+
+def restore_seat_hold() -> bool:
+    """Whether a freed running seat is held for the seat-queue head whose
+    restore copy is in flight or waiting for a slot (exactly 0 or 1; unset =
+    off)."""
+    from vllm.merlin.envs import _e2_strict_switch
+
+    return bool(_e2_strict_switch(SEAT_HOLD_ENV, default=False))
 
 
 def max_pending_store_blocks() -> int:
@@ -391,6 +467,20 @@ class WriteBack:
         )
         self._bytes_d = copy_bytes_d() if credits_cap is None else 0
         self.max_store_pins = max_pending_store_blocks()
+
+        self.shared_row_lone = shared_row_lone()
+        # Owners of a row the walk copied alone (``_met_members``): a landed
+        # shared row they hold does not give them an assembly slot.
+        self._lone_owners: set[int] = set()
+        # MERLIN_KV_TIER_DIAG=1: one line per ``never_fit`` verdict of the
+        # walk (``_diag_never_fit``). Debug only; off, the verdict path reads
+        # this one attribute.
+        try:
+            from vllm.merlin.envs import read_registered
+
+            self._diag = bool(read_registered("MERLIN_KV_TIER_DIAG"))
+        except Exception:
+            self._diag = False
         # Host row bytes per rank (set by the runtime; 0 = rows only).
         self._row_bytes = 0
         # True once the restore direction keeps its own credit account
@@ -517,6 +607,17 @@ class WriteBack:
         self._cap_now = 0
         self._head_need = 0
         self._last_head_need = 0
+        # GPU blocks admissions drew since
+        # the last walk (their restore destinations included;
+        # ``note_draws``), and the previous walk's count: both widen the
+        # reclaim reach the duplicates-first guard reads. Admissions held
+        # for a unit's re-copy: request id -> [last walk, walks held,
+        # vetoed]; the units the walk copies first (a draw met them, or the
+        # walk's own lookahead did), in order.
+        self._draws = 0
+        self._last_draws = 0
+        self._df_holds: dict[str, list] = {}
+        self._df_forced: dict[int, None] = {}
         self._res_progress: dict[int, int] = {}
         # Issued member -> its reservation key, so a landing counts as the
         # unit's progress too.
@@ -705,7 +806,8 @@ class WriteBack:
     def _hold_cap(self) -> int:
         """Free GPU blocks the walker may hold at once: one restore unit's
         worth (the largest recorded unit, read once per walk step), or a
-        third of the GPU pool before any unit is recorded."""
+        third of the GPU pool (``COLD_HOLD_CAP_DIVISOR``) before any unit is
+        recorded."""
         if self.hold_cap is not None:
             return self.hold_cap
         if self._cap_step != self.step:
@@ -714,7 +816,7 @@ class WriteBack:
                 (len(u.required) for u in self.units.units.values()), default=0
             ) if self.units is not None else 0
             self._cap_now = largest or max(
-                1, self.gpu_pool.num_gpu_blocks // (self.max_assembling + 1)
+                1, self.gpu_pool.num_gpu_blocks // COLD_HOLD_CAP_DIVISOR
             )
         return self._cap_now
 
@@ -777,10 +879,20 @@ class WriteBack:
         out: dict = {}
         if units is None:
             return out
+        lone = self._lone_owners
+        if lone:
+            done = [u for u in lone if u not in units.units or units.is_published(u)]
+            lone.difference_update(done)
         for uid in units.assembling_uids():
             unit = units.units.get(uid)
-            if unit is not None:
-                out[uid] = unit
+            if unit is None:
+                continue
+            if uid in lone and units.holds_only_shared(uid):
+                # Held only rows a
+                # lone copy brought (shared with other owners): no slot.
+                # Work of its own (backlog, reserved, in flight) adds it back.
+                continue
+            out[uid] = unit
         for block in self.backlog:
             for unit in units.unit_of_block(block):
                 out[unit.uid] = unit
@@ -1118,7 +1230,42 @@ class WriteBack:
     def _note_skip(self, block: "KVCacheBlock", cause: str) -> None:
         if self.units is not None:
             for unit in self.units.unit_of_block(block):
-                self.units.note_skip(unit, cause)
+                self.units.note_skip(unit, cause, block)
+
+    def _met_members(
+        self, block: "KVCacheBlock", *, cached: bool = True
+    ) -> list["KVCacheBlock"]:
+        """What the walk (and the admission mirror) takes as the unit of a
+        met block: its owners' GPU members (``_unit_members``), or with
+        ``SHARED_ROW_LONE`` on, the block alone when more than one unit owns
+        it AND the owners' union would never fit the host (``_unit_rows`` of
+        the owners and their members over ``_host_capacity``: the
+        ``never_fit`` test of ``_start_verdict``). Such a union, for a page
+        every live unit shares, was refused whole, took every owner's GPU
+        members out of the step's walk and stamped every owner's loss cause.
+        Any union that fits (a session's predecessor and successor sharing
+        their prefix, a few forks) fans out exactly as with the switch off.
+        A shared row restores nothing by itself: each owner is a lookup
+        source only once host-complete (``publish_unit``). Copied alone it
+        lands once and every owner it completes publishes; an owner it
+        leaves incomplete holds the row (``hold_unpublished``) without an
+        assembly slot (``_active_units``) until it publishes or a co-owner's
+        publication makes the row visible."""
+        if self.units is None:
+            return [block] if cached else []
+        members = (
+            self._unit_members(block) if cached
+            else self._unit_members_uncached(block)
+        )
+        if getattr(self, "shared_row_lone", False):
+            owners = self.units.unit_of_block(block)
+            if len(owners) > 1:
+                order = [block] + [m for m in members if m is not block]
+                if self._unit_rows(owners, order) > self._host_capacity():
+                    if cached:  # the walk's own take, not the gate's mirror
+                        self._lone_owners.update(u.uid for u in owners)
+                    return [block]
+        return members
 
     def _unit_members(self, block: "KVCacheBlock") -> list["KVCacheBlock"]:
         if self.units is None:
@@ -1483,6 +1630,18 @@ class WriteBack:
         window = reach + self.demand_hint
         demand = self.demand_hint
         self.demand_hint = 0
+        if self.units is not None and getattr(self.units, "dup_first", False):
+            # The walk's reclaim lookahead
+            # (the window loop's ``cap`` below), for the host eviction order,
+            # widened by the draws the window does not see: the larger of the
+            # escapes' and restores' draws since this walk and the previous
+            # one (the next scheduler pass draws as much again).
+            extra = max(self._draws, self._last_draws)
+            self._last_draws, self._draws = self._draws, 0
+            for uid in self.units.note_reclaim_reach(
+                step, window + max(self.credits_d, 0) + extra
+            ):
+                self._df_forced.setdefault(uid)
         # The admission gate judges starts against this walk's headroom.
         self._last_headroom = headroom
         # The waiting head's need since the last walk (the hold budget).
@@ -1595,6 +1754,34 @@ class WriteBack:
                 fresh_short = fresh_ok + 1  # every such row was counted
             return want <= fresh_ok
 
+        def admission(block: "KVCacheBlock") -> str | None:
+            """Why a copy of ``block`` may not issue now, or None: out of
+            credits (``"credits"``), at the store-pin cap (``"pins"``), short
+            of running headroom (``"headroom"``) or of the waiting head's
+            hold floor (``"head"``). No side effects: judged before any
+            ``room`` call may evict a host row the copy would not use."""
+            if budget <= 0:
+                return "credits"
+            if not self._store_pins_fit([block], picked_ids):
+                return "pins"
+            bid = block.block_id
+            if block.ref_cnt == 0 and bid not in self._held_gpu:
+                # The pin takes the block out of the free queue: never below
+                # what running requests allocate this step. A held member was
+                # charged when its hold was decided.
+                if gpu_free - 1 < headroom:
+                    return "headroom"
+                if bid not in whole and (
+                    gpu_free - 1 < headroom + self._last_head_need
+                ):
+                    # A new source pin obeys the hold budget's floor too, or
+                    # rolling one-row copies re-take every block the waiting
+                    # head needs. A started unit's member just waits (the
+                    # stall release bounds it). Not for a unit started whole
+                    # (``whole``), whose pins all issue now.
+                    return "head"
+            return None
+
         def take(block: "KVCacheBlock", lone: bool = True) -> bool:
             """Pick ``block`` if it needs and may get a copy; False stops the
             walk (out of credits, of running headroom, or of host rows for an
@@ -1608,7 +1795,13 @@ class WriteBack:
             if not tier.is_ready(block):
                 c.demote_not_ready += 1
                 return True
-            if budget <= 0 or not self._store_pins_fit([block], picked_ids):
+            refused = admission(block)
+            if refused is not None:
+                if refused == "head" and not capped:
+                    # A non-atomic member loop may stop here once per offer;
+                    # the walk counts one stop, not one per member.
+                    capped = True
+                    c.demote_copy_capped += 1
                 return False
             reserved = bid in self._res_members
             unitless = self.units is not None and not self.units.unit_of_block(block)
@@ -1626,25 +1819,8 @@ class WriteBack:
                     c.demote_dropped_host_full += 1
                 return True
             if block.ref_cnt == 0 and bid not in self._held_gpu:
-                # The pin takes the block out of the free queue: never below
-                # what running requests allocate this step. A held member was
-                # charged when its hold was decided.
-                if gpu_free - 1 < headroom:
-                    return False
-                if bid not in whole and (
-                    gpu_free - 1 < headroom + self._last_head_need
-                ):
-                    # A new source pin obeys
-                    # the hold budget's floor too, or rolling one-row copies
-                    # re-take every block the waiting head needs. A started
-                    # unit's member just waits (the stall release bounds it).
-                    # A non-atomic member loop may stop here once per offer;
-                    # the walk counts one stop. Not for a
-                    # unit started whole (``whole``), whose pins all issue now.
-                    if not capped:
-                        capped = True
-                        c.demote_copy_capped += 1
-                    return False
+                # Admitted above against the same GPU count (``room`` does
+                # not change it): charge the pin.
                 gpu_free -= 1
             picked.append(block)
             picked_ids.add(bid)
@@ -1731,6 +1907,7 @@ class WriteBack:
                     self._dropped_cr.add(ident)
                     c.demote_dropped_credits += 1
 
+        forced = self._dup_first_forced()
         if not stopped and window > 0:
             # Unready victims do not use up the window: reach
             # past them, by at most P more victims.
@@ -1741,8 +1918,11 @@ class WriteBack:
             def victims():
                 """Window victims, each followed by the session peers its
                 pop's destructive break would un-hash: they are
-                destroyed by the same pop, so they are victims too."""
+                destroyed by the same pop, so they are victims too. The
+                forced re-copies come first;
+                they do not use up the window."""
                 nonlocal seen
+                yield from ((f, False) for f in forced)
                 for victim, _keyed, destroyed in iter_pool_reclaims(
                     tier.pool, cap
                 ):
@@ -1761,7 +1941,7 @@ class WriteBack:
                     continue  # its unit was already judged this step
                 if primary and not tier.is_ready(node):
                     limit = min(limit + 1, cap)
-                members = self._unit_members(node)
+                members = self._met_members(node)
                 # The met member first, then the rest of its unit.
                 order = [node] + [m for m in members if m is not node]
                 if len(order) > 1:
@@ -1784,9 +1964,11 @@ class WriteBack:
                     node_uids = [
                         u.uid for u in self.units.unit_of_block(node)
                     ] if self.units is not None else []
-                    if need and node_uids:
+                    if need and node_uids and admission(node) is None:
                         # Make its row now, for its own unit (``take`` finds
-                        # it idle; a full host is counted there).
+                        # it idle; a full host is counted there). Only for a
+                        # copy that may issue: a refused one (credits, pin
+                        # cap, headroom) would leave the evicted row idle.
                         room(need, units=node_uids)
                     # A full host: ``take`` counts it host-full dropped.
                     if not take(node):
@@ -1808,6 +1990,8 @@ class WriteBack:
                     if ident not in self._too_large:
                         self._too_large.add(ident)
                         c.demote_unit_too_large += 1
+                        if self._diag:
+                            self._diag_never_fit(node, node_units, order, rows)
                     self._note_skip(node, "never_fit")
                     continue
                 if verdict == "credits":
@@ -2159,6 +2343,13 @@ class WriteBack:
     def credits_d(self, value: int | None) -> None:
         self._credits_d = value
 
+    def _d_capacity(self) -> int:
+        """Sustainable demotion rows per batch, before transient deductions."""
+        rows = self.credits_d
+        if self.bytes_d > 0 and self.row_bytes > 0:
+            rows = min(rows, self.bytes_d // self.row_bytes)
+        return max(0, rows)
+
     def _d_budget(self) -> int:
         """Demotion credits left: rows (``credits_d``), and, with a byte cap
         per rank (``bytes_d``), the rows the bytes left still cover."""
@@ -2167,13 +2358,16 @@ class WriteBack:
         # never delay a reactive copy (lane-1 copies in flight
         # held the D credits, so a zero-running waiter's victims could not be
         # copied until the gate escaped, max_idle_wait 9).
+        rows = self._d_capacity()
         in_flight = len(self.in_flight) - self._lane1_in_flight()
-        rows = self.credits_d - in_flight
+        row_credits_left = self.credits_d - in_flight
         if not self.split_directions:
             # Shared credits until the restore side keeps its own
             # account (``plans.begin_tick``): restore DMA and the credits
             # reserved for a waiting restore batch still count here.
-            rows -= self.promote_dma + self.promote_reserved
+            row_credits_left -= self.promote_dma + self.promote_reserved
+        # Restore DMA consumes shared row credits, not demotion bytes.
+        rows = min(rows, row_credits_left)
         if self.bytes_d > 0 and self.row_bytes > 0:
             # The opt-in byte cap is ONE D2H budget per rank.
             # Every demotion copy in flight is charged, lane 1 included
@@ -2473,6 +2667,82 @@ class WriteBack:
         # GRACE / PREEMPT / RUNNING copy releases its destination row too.
         return bool(self.promote_dma or self.in_flight)
 
+    def _dup_first_forced(self) -> list["KVCacheBlock"]:
+        """The free, dirty GPU twins of the units to copy first: units evicted
+        early whose twin a draw or the walk's lookahead met, until settled."""
+        forced = self._df_forced
+        if not forced or self.units is None:
+            return []
+        pending = self.units._dup_first_pending
+        for uid in [u for u in forced if u not in pending]:
+            del forced[uid]
+        tier = self.tier
+        return [
+            b for b in self.units.dup_first_twins(forced)
+            if b.ref_cnt == 0 and tier.is_dirty(b)
+        ]
+
+    def _dup_first_hold(
+        self, request: "Request", num_new_blocks: int, adopted
+    ) -> bool:
+        """the exact draw check. True holds
+        this admission for a walk: its ``num_new_blocks`` pops (after
+        adopting ``adopted``; a restore's destinations and tails are in the
+        count) would reclaim every GPU block of a key whose host copy an
+        early eviction dropped, or (``MERLIN_KV_HOST_TIER__GUARD_REQUIRED_KEYS``
+        on, the default) of any required key of such a unit that only the
+        GPU holds. The unit is copied first by the next walk
+        (its twin then leaves the free queue, transfer-pinned, and lands
+        backed). After ``DUP_FIRST_DRAW_WAIT_WALKS`` walks, or at once when
+        no copy can progress, the hold is vetoed: the draw goes ahead."""
+        units = self.units
+        rid = request.request_id
+        held = self._df_holds.get(rid)
+        if held is not None and held[2]:
+            return False  # vetoed: this admission draws as it is
+        if not units._dup_first_pending:
+            self._df_holds.pop(rid, None)
+            return False
+        exclude = frozenset(
+            b.block_id for group in adopted for b in group if not b.is_null
+        )
+        drawn: list[KVCacheBlock] = []
+        for n, (block, _keyed, destroyed) in enumerate(
+            iter_pool_reclaims(self.tier.pool, num_new_blocks, exclude), 1
+        ):
+            drawn.append(block)
+            drawn.extend(p for p in destroyed if p.block_id not in exclude)
+            if n >= num_new_blocks:
+                break
+        uids = units.dup_first_draw_hits(drawn)
+        if not uids:
+            self._df_holds.pop(rid, None)
+            return False
+        dfc = units.dup_first_counters
+        if held is None:
+            if not self.can_progress():
+                dfc.dup_first_draw_vetoes += 1
+                self._df_holds[rid] = [self.step, 0, True]
+                return False
+            held = self._df_holds[rid] = [self.step, 1, False]
+            dfc.dup_first_draw_waits += 1
+            dfc.dup_first_draw_wait_steps += 1
+        elif held[0] != self.step:
+            if held[1] >= DUP_FIRST_DRAW_WAIT_WALKS or not self.can_progress():
+                dfc.dup_first_draw_vetoes += 1
+                held[2] = True
+                return False
+            held[0] = self.step
+            held[1] += 1
+            dfc.dup_first_draw_wait_steps += 1
+        dfc.dup_first_draw_wait_max = max(dfc.dup_first_draw_wait_max, held[1])
+        for uid in uids:
+            self._df_forced.setdefault(uid)
+        self._head_need = num_new_blocks
+        # The walk's window covers this draw too.
+        self.demand_hint = max(self.demand_hint, num_new_blocks)
+        return True
+
     def _charge_escape(
         self, request: "Request", num_new_blocks: int, exclude: frozenset[int]
     ) -> None:
@@ -2492,6 +2762,18 @@ class WriteBack:
             if self._escaped.get(rid) != npre:
                 self._escaped[rid] = npre
                 self.counters.demote_escapes += 1
+
+    def note_draws(self, num_blocks: int) -> None:
+        """``num_blocks`` GPU blocks an admission drew from the free pool
+        (its restore destinations and tails included): the next walk's
+        duplicates-first reach covers as many more reclaims, so a unit whose
+        twins a draw of that size would reach is not evicted early (it
+        would only hold the next such admission for its re-copy).
+        Recorded only with duplicates first on (nothing else reads it)."""
+        if num_blocks > 0 and self.units is not None and getattr(
+            self.units, "dup_first", False
+        ):
+            self._draws += num_blocks
 
     def can_progress(self) -> bool:
         """A demotion is in flight or can be issued (credits come back as
@@ -2589,6 +2871,67 @@ class WriteBack:
             ):
                 return "held_capped", start
         return None, start
+
+    # Units listed in full per line, at
+    # most (``uids`` lists every one). ``_diag`` is set in ``__init__``; the
+    # class default covers an instance built without it.
+    _DIAG_NEVER_FIT_UNITS = 32
+    _diag = False
+
+    def _diag_never_fit(self, node, node_units, order, rows: int) -> None:
+        """MERLIN_KV_TIER_DIAG=1: the ``never_fit`` verdict the walk met at
+        ``node`` (once per block generation, with ``demote_unit_too_large``):
+        the owning units, the rows ``_unit_rows`` summed for them (their host
+        rows plus the GPU members not backed there) against the host's rows,
+        and the met block's keys (group, short hash, primary or alias, owner
+        count) and position (tokens, and its page in each owner's chain).
+        Reads only; the verdict and the walk are unchanged."""
+        from vllm.v1.core.kv_cache_utils import get_block_hash, get_group_id
+
+        units, tier = self.units, self.tier
+        host: set[int] = set()
+        for u in node_units:
+            host.update(b.block_id for b in units.host_members(u))
+        gpu = sum(
+            1 for m in order if m.block_id in self.in_flight or tier.is_dirty(m)
+        )
+        keys = list(units._keys_of(self.gpu_pool, node))
+        key_parts = [
+            f"g{get_group_id(k)}:{bytes(get_block_hash(k))[:6].hex()}"
+            f":{'primary' if i == 0 else 'alias'}"
+            f":owners={len(units._key_units.get(k, ()))}"
+            for i, k in enumerate(keys)
+        ]
+        owned = sorted(node_units, key=lambda u: u.uid)
+        unit_parts = []
+        for u in owned[: self._DIAG_NEVER_FIT_UNITS]:
+            chain = units.ordered(u)
+            where = "none"
+            for k in keys:
+                if k in u.keys:
+                    g = get_group_id(k)
+                    page = sum(
+                        1 for x in chain[: chain.index(k)] if get_group_id(x) == g
+                    )
+                    where = f"g{g}:page={page}"
+                    break
+            unit_parts.append(
+                f"{u.uid}:tokens={u.boundary}:{where}"
+                f":host={len(units.host_members(u))}"
+            )
+        more = len(owned) - len(unit_parts)
+        if more > 0:
+            unit_parts.append(f"+{more}")
+        logger.info(
+            "KV tier diag: never_fit step=%d block=%d gen=%d tokens=%s "
+            "units=%d rows=%d host_part=%d gpu_part=%d host_rows=%d "
+            "members=%d keys=[%s] uids=[%s] owners=[%s]",
+            self.step, node.block_id, tier.generation[node.block_id],
+            getattr(node, "block_hash_num_tokens", None), len(owned), rows,
+            len(host), gpu, self._host_capacity(), len(order),
+            " ".join(key_parts), ",".join(str(u.uid) for u in owned),
+            " ".join(unit_parts),
+        )
 
     def _issues_whole(self, fresh, need: int, budget: int, *, node_units=()) -> bool:
         """Whether every fresh member of the unit issues its copy in this walk
@@ -2749,7 +3092,7 @@ class WriteBack:
 
         if self._tiny(block):
             return []
-        members = self._unit_members_uncached(block) if self.units is not None else []
+        members = self._met_members(block, cached=False)
         order = [block] + [m for m in members if m is not block]
         copies = [m for m in order if copyable(m)]
         if self.units is None:
@@ -2896,7 +3239,12 @@ class WriteBack:
         resets ``_head_need`` and the next admission overwrites it. The idle
         breaker is checked first, as in ``admit``. The need registered is the
         full sequence's (see ``_issues_whole``'s known limits, head size)."""
-        if self.gpu_pool is None or num_new_blocks <= 0:
+        if (
+            self.gpu_pool is None
+            or num_new_blocks <= 0
+            or num_new_blocks > self.gpu_pool.num_gpu_blocks
+        ):
+            # A same-step CoW deferral is not a demand demotion can satisfy.
             return
         self._head_need = num_new_blocks
         rid = request.request_id
@@ -2922,8 +3270,36 @@ class WriteBack:
         ``shortfall`` is the allocator's real shortfall; ``adopted`` the
         blocks the allocation adopts (they leave the free queue before the
         fresh blocks are popped, so they are not reclaims).
+
+        With duplicates first on, the draw is checked first
+        (``_dup_first_hold``) and an admission that draws is recorded
+        (``note_draws``).
         """
-        if self.gpu_pool is None:
+        df = (
+            self.units is not None and getattr(self.units, "dup_first", False)
+            and self.gpu_pool is not None and shortfall <= 0
+            and 0 < num_new_blocks <= self.gpu_pool.num_gpu_blocks
+        )
+        if df and self._dup_first_hold(request, num_new_blocks, adopted):
+            return 0, True
+        got = self._admit(request, num_new_blocks, shortfall, adopted)
+        if df and got[0] <= 0 and not got[1]:
+            self._df_holds.pop(request.request_id, None)
+            self.note_draws(num_new_blocks)
+        return got
+
+    def _admit(
+        self,
+        request: "Request",
+        num_new_blocks: int,
+        shortfall: int,
+        adopted: Sequence[Sequence["KVCacheBlock"]],
+    ) -> tuple[int, bool]:
+        if (
+            self.gpu_pool is None
+            or num_new_blocks > self.gpu_pool.num_gpu_blocks
+        ):
+            # Preserve the allocator refusal without installing a head floor.
             return shortfall, False
         rid = request.request_id
         # The waiting queue's head as of this admission pass: the
@@ -3002,9 +3378,12 @@ class WriteBack:
         A total-wait bound scaled by the batches the demand needs
         (``cdiv(need, P)``, doubled) is the backstop. Also escapes when
         ``can_progress`` is false."""
+        capacity = self._d_capacity()
+        if capacity <= 0:
+            return True
         waited = self._waits.get(rid)
         if waited is not None and waited[1] != self.step:
-            batches = max(1, -(-waited[2] // max(1, self.credits_cap)))
+            batches = max(1, -(-waited[2] // capacity))
             # Only consecutive waits count; a stretch of passes
             # without one (a real shortfall) ages the stalled count out.
             stalled = waited[4] if self.step - waited[1] <= 1 else 0
@@ -3057,6 +3436,7 @@ class WriteBack:
     def forget_request(self, rid: str) -> None:
         self._waits.pop(rid, None)
         self._escaped.pop(rid, None)
+        self._df_holds.pop(rid, None)
 
     # -- reset --------------------------------------------------------------
     def reset(self) -> None:
@@ -3082,6 +3462,11 @@ class WriteBack:
         self._cap_step = -1
         self._head_need = 0
         self._last_head_need = 0
+        self._df_holds.clear()
+        self._df_forced.clear()
+        self._lone_owners.clear()
+        self._draws = 0
+        self._last_draws = 0
         if self.units is not None:
             self.units.protect(())
         self._skipped.clear()

@@ -43,6 +43,8 @@ Extra arguments go to `vllm serve` after the launcher's own flags; later flags w
 
 ## Merlin 3.0.2.1 bench card (2026-11-12)
 
+Merlin 3.0.2.2 re-measured every row: [3.0.2.2 bench card](benchmarks/2026-11-21/BENCH-CARD.md). The cells below are the 3.0.2.1 figures.
+
 Maintainer measurements on 4× RTX 3090 (220 W, PCIe Gen4) with P2P (the aikitoria patched driver) and the Zagitta [gpu-unlock](https://github.com/Zagitta/gpu-unlock) kernel module, on vLLM 0.33.0, fresh `merlin serve` boots, 2026-11-10 and 2026-11-11, on the previous build of the 3.0.2.1 wheel (built on 2026-11-10, before the prefill runs change; not re-measured on the published wheel); method and every cell in the [bench card](benchmarks/2026-11-12/BENCH-CARD.md). Decode is one stream with thinking on (this template has no effort levels) (tok/s after the first streamed token); prefill is one cold request. With thinking on, a 512-token agent follow-up may end inside the reasoning, and reasoning tokens count. The prompts-sent-at-once test and the image panel were not re-run; they stay on the earlier cards below.
 
 | Measurement | Ornith 1.5 |

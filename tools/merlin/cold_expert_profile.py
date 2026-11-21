@@ -28,6 +28,19 @@ Usage (capture -> profile):
 ``--config`` ties the profile to the checkpoint (sha256 of config.json; the
 launcher and the engine refuse a mismatch). Without it the profile is a
 placeholder (allowed, logged loudly at boot).
+
+``--counts-dir`` reads the engine's own counter
+instead (``MERLIN_EXPERT_HOT_COUNTS``, vllm/merlin/expert_hot_counts.py:
+``seg-<seq>-<name>-rank<r>-pid<p>.json``). Same ranking: decode distinct-step
+counts first, prefill slot counts as tie-break. Segments named by ``--skip``
+(default ``boot``: warmup, profile and capture runs) are left out. The ranks of
+one stage see the same router output, so one rank's counts are used per layer;
+ranks that disagree are refused unless ``--sum-ranks`` (a sequence-parallel
+MoE, where each rank routes a slice of the tokens).
+
+    python tools/merlin/cold_expert_profile.py --counts-dir <dir> \\
+        --config <checkpoint>/config.json --stage 38-41 --layers 4 --hot-frac 0.25 \\
+        --name <checkpoint name> --out tools/merlin/profiles/expert_hot/<name>.json
 """
 
 from __future__ import annotations
@@ -121,6 +134,74 @@ def load(probe_dir: str):
     return E, K, segs, groups
 
 
+COUNTS_FORMAT = "merlin-expert-hot-counts/1"
+
+
+def load_counts(counts_dir: str, model: str | None = None, skip=("boot",), sum_ranks=False):
+    """-> (experts, topk, dec, pre, nsteps, owners, segment names) from the engine
+    counter's segment files. dec/pre: {layer: [count per expert]}."""
+    files = sorted(glob.glob(os.path.join(counts_dir, "seg-*-rank*-pid*.json")))
+    if not files:
+        raise SystemExit(f"no counter segments in {counts_dir}")
+    docs = []
+    for f in files:
+        with open(f, encoding="utf-8") as fh:
+            d = json.load(fh)
+        if d.get("format") != COUNTS_FORMAT:
+            raise SystemExit(f"{f}: not a {COUNTS_FORMAT} segment")
+        if d.get("segment") in skip:
+            continue
+        docs.append(d)
+    if not docs:
+        raise SystemExit(f"every segment in {counts_dir} is skipped ({', '.join(skip)})")
+    layer_counts = defaultdict(set)
+    for d in docs:
+        for row in d["layers"]:
+            layer_counts[row["model"]].add(int(row["layer"]))
+    if model is None:
+        model = max(sorted(layer_counts), key=lambda m: len(layer_counts[m]))
+    elif model not in layer_counts:
+        raise SystemExit(f"model {model!r} not in the segments ({sorted(layer_counts)})")
+    E = K = None
+    per = defaultdict(dict)  # (segment seq, name, layer) -> {rank: row}
+    owners: dict = defaultdict(dict)
+    names = set()
+    for d in docs:
+        for row in d["layers"]:
+            if row["model"] != model:
+                continue
+            e, k = int(row["experts"]), int(row["topk"])
+            if (E, K) not in ((None, None), (e, k)):
+                raise SystemExit(f"segments disagree on experts/top-k: {E}/{K} vs {e}/{k}")
+            E, K = e, k
+            layer = int(row["layer"])
+            per[(int(d["seq"]), d["segment"], layer)][int(d["rank"])] = row
+            owners[layer][int(d["rank"])] = frozenset(int(x) for x in row["local"])
+            names.add(f'{int(d["seq"]):04d}-{d["segment"]}')
+    dec = defaultdict(lambda: [0] * E)
+    pre = defaultdict(lambda: [0] * E)
+    steps = defaultdict(int)
+    for (seq, name, layer), by_rank in sorted(per.items()):
+        rows = [by_rank[r] for r in sorted(by_rank)]
+        same = all(r["step"] == rows[0]["step"] and r["prefill"] == rows[0]["prefill"]
+                   for r in rows[1:])
+        if not same and not sum_ranks:
+            raise SystemExit(
+                f"segment {seq}-{name} layer {layer}: ranks {sorted(by_rank)} counted different "
+                "routing; a sequence-parallel MoE needs --sum-ranks")
+        use = rows if (sum_ranks and not same) else rows[:1]
+        for r in use:
+            for e in range(E):
+                dec[layer][e] += int(r["step"][e])
+                pre[layer][e] += int(r["prefill"][e])
+        steps[(seq, name)] = max(steps[(seq, name)], sum(int(r["decode_calls"]) for r in use))
+    groups = {}
+    for layer, by_rank in owners.items():
+        sets = list(dict.fromkeys(by_rank[r] for r in sorted(by_rank)))
+        groups[layer] = [set(x) for x in sets] if sets else None
+    return E, K, dec, pre, sum(steps.values()), groups, sorted(names)
+
+
 def freq(segs, E):
     dec = defaultdict(lambda: [0] * E)
     pre = defaultdict(lambda: [0] * E)
@@ -165,7 +246,13 @@ def parse_stage(raw: str):
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("--probe-dir", required=True)
+    src = ap.add_mutually_exclusive_group(required=True)
+    src.add_argument("--probe-dir")
+    src.add_argument("--counts-dir", help="MERLIN_EXPERT_HOT_COUNTS segments (engine counter)")
+    ap.add_argument("--model", help="--counts-dir: model class to read (default: most layers)")
+    ap.add_argument("--skip", default="boot", help="--counts-dir: comma list of segment names to drop")
+    ap.add_argument("--sum-ranks", action="store_true",
+                    help="--counts-dir: sum ranks that counted different tokens (sequence-parallel MoE)")
     ap.add_argument("--out", required=True)
     ap.add_argument("--config", help="checkpoint config.json (ties the profile to it)")
     ap.add_argument("--name", default="")
@@ -176,8 +263,15 @@ def main(argv=None) -> int:
     a = ap.parse_args(argv)
     if not 0.0 <= a.hot_frac < 1.0:
         raise SystemExit("--hot-frac must be in [0, 1)")
-    E, K, segs, groups = load(a.probe_dir)
-    dec, pre, nsteps = freq(segs, E)
+    if a.counts_dir:
+        skip = tuple(x for x in a.skip.split(",") if x)
+        E, K, dec, pre, nsteps, groups, seg_names = load_counts(
+            a.counts_dir, a.model, skip, a.sum_ranks)
+        source_dir, basis_input = a.counts_dir, "engine counter (MERLIN_EXPERT_HOT_COUNTS)"
+    else:
+        E, K, segs, groups = load(a.probe_dir)
+        dec, pre, nsteps = freq(segs, E)
+        seg_names, source_dir, basis_input = sorted(segs), a.probe_dir, "fn2_probe capture"
     layers = sorted(set(dec) | set(pre))
     sha, L = None, a.num_layers
     if a.config:
@@ -203,7 +297,8 @@ def main(argv=None) -> int:
         "top_k": K,
         "checkpoint": {"name": a.name, "config_sha256": sha},
         "source": {
-            "tool": VERSION, "probe_dir": a.probe_dir.replace("\\", "/"), "segments": sorted(segs),
+            "tool": VERSION, "probe_dir": source_dir.replace("\\", "/"), "segments": seg_names,
+            "input": basis_input,
             "decode_steps": nsteps, "generated": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "basis": "decode distinct-step frequency, prefill token counts as tie-break",
             "in_sample_hit_at_default": {str(x): round(per_layer[x], 4) for x in default},

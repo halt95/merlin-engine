@@ -16,7 +16,7 @@
 # --no-kernel-module; peer-to-peer support remains a host-driver property.
 set -euo pipefail
 REPO_URL="${REPO_URL:-https://github.com/halt95/merlin-engine.git}"
-REPO_REF="${REPO_REF:-merlin-v3.0.2.1}"
+REPO_REF="${REPO_REF:-merlin-v3.0.2.2}"
 APP="${APP:-/opt/flash-next}"
 VENV="${VENV:-/opt/venv}"
 [ "$(id -u)" = 0 ] || { echo "run provision.sh as root" >&2; exit 1; }

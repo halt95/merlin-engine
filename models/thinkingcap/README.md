@@ -13,7 +13,7 @@ with vision, tool calls and MTP speculative decoding, behind one OpenAI-compatib
 [![Context](https://img.shields.io/badge/context-262K_per_request-ffb000)](../qwen38-27b/docs/reference.md#the-kv-budget)
 [![ThinkingCap](https://img.shields.io/badge/%F0%9F%A4%97_checkpoint-ThinkingCap--Qwen3.8--27B--W4A16--Merlin-ffd21e)](https://huggingface.co/halt95/ThinkingCap-Qwen3.8-27B-W4A16-Merlin)
 
-> **Recipe 3.0.0 / Merlin 3.0.2.1:** **vLLM 0.33.0**. ThinkingCap is a profile of the
+> **Recipe 3.0.0 / Merlin 3.0.2.2:** **vLLM 0.33.0**. ThinkingCap is a profile of the
 > [Qwen3.8-27B recipe](../qwen38-27b/README.md). Its wrappers forward to the TP2/TP4 base launchers.
 > Both use **FGPC ON** (`--enable-mamba-shared-prefix-checkpoint`), pools **826,689 / 2,012,105 tokens** (TP4 = RecoverSSM on; ThinkingCap TP4 check PASS, 32/32 checks),
 > and the **8 MP (8,388,608 pixel)** release cap. The integrated launchers default to this cap.
@@ -47,6 +47,8 @@ Both checkpoints run on the same engine, pins, port (8100) and served name (`qwe
 capacity rows) is in [ThinkingCap checkpoint profile](../qwen38-27b/docs/reference.md#thinkingcap-checkpoint-profile).
 
 ## Merlin 3.0.2.1 bench card (2026-11-12)
+
+Merlin 3.0.2.2 re-measured the four-card rows: [3.0.2.2 bench card](benchmarks/2026-11-21/BENCH-CARD.md). The four-card cells below are the 3.0.2.1 figures.
 
 Maintainer measurements on 4× RTX 3090 (220 W, PCIe Gen4) with P2P (the aikitoria patched driver) and the Zagitta [gpu-unlock](https://github.com/Zagitta/gpu-unlock) kernel module, on vLLM 0.33.0, fresh `merlin serve` boots, 2026-11-10 and 2026-11-11, on the previous build of the 3.0.2.1 wheel (built on 2026-11-10, before the prefill runs change; not re-measured on the published wheel, except the two-card 262K decode, re-measured on it on 2026-11-12 with 12 sends); method and every cell in the [bench card](benchmarks/2026-11-12/BENCH-CARD.md). Decode is one stream with thinking on at reasoning effort medium, the server default (tok/s after the first streamed token); prefill is one cold request. With thinking on, a 512-token agent follow-up may end inside the reasoning, and reasoning tokens count. Sessions held at once and the 8 MP image panels were not re-run; they stay on the earlier cards below.
 
@@ -94,7 +96,7 @@ Install the shared engine and its environment as described in the
 are integrated; the archived 0.30 bundle does not install 3.0.0. Then, from the repository root:
 
 ```bash
-HF_HUB_DISABLE_TELEMETRY=1 venv/bin/hf download halt95/ThinkingCap-Qwen3.8-27B-W4A16-Merlin --local-dir ./ckpt-thinkingcap
+HF_HUB_DISABLE_TELEMETRY=1 venv/bin/hf download halt95/ThinkingCap-Qwen3.8-27B-W4A16-Merlin --revision 916246dd9059f3eee5d27b9c49b67f04bce363fb --local-dir ./ckpt-thinkingcap
 (cd ckpt-thinkingcap && sha256sum -c ../models/thinkingcap/checkpoint.sha256)   # the 11 checkpoint files
 MAX_PIXELS=8388608 MODEL=$PWD/ckpt-thinkingcap models/thinkingcap/serve.sh        # dual card, TP=2
 MAX_PIXELS=8388608 MODEL=$PWD/ckpt-thinkingcap models/thinkingcap/serve-tp4.sh    # quad card, TP=4

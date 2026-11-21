@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by the Merlin project; see NOTICE.
 """# MLA Common Components
 
 This file implements common components for MLA implementations.
@@ -773,11 +774,13 @@ class MLAAttention(nn.Module, AttentionLayerBase):
     @property
     def chunked_prefill_workspace_size(self) -> int:
         if self._chunked_prefill_workspace_size is None:
-            self._chunked_prefill_workspace_size = (
-                MLACommonMetadataBuilder.determine_chunked_prefill_workspace_size(
-                    self._vllm_config
-                )
-            )
+            # A backend that never gathers a
+            # dense prefill context sizes this itself (vllm/merlin/mla_workspace.py).
+            from vllm.merlin.mla_workspace import workspace_builder
+
+            builder = workspace_builder(self, MLACommonMetadataBuilder)
+            size = builder.determine_chunked_prefill_workspace_size(self._vllm_config)
+            self._chunked_prefill_workspace_size = size
         return self._chunked_prefill_workspace_size
 
     def update_kv_cache(
@@ -1387,6 +1390,11 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 self.kv_cache_dtype
             ),
         )
+        # An impl that keeps its cache whole on every
+        # DCP rank (Hy4 Flash SWA layers) declares kv_dcp_replicated; the KV
+        # manager and block table then treat its group as replicated.
+        if getattr(self.impl, "kv_dcp_replicated", False):
+            common_kwargs["dcp_sharded"] = False
         if self.sliding_window is not None:
             return SlidingWindowMLASpec(
                 **common_kwargs,

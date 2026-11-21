@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Modified by the Merlin project; see NOTICE.
 
-import os
 from collections.abc import Sequence
 from dataclasses import dataclass
 
@@ -40,18 +39,21 @@ from vllm.utils.torch_utils import (
 )
 
 DEFAULT_VOCAB_PADDING_SIZE = 64
+# The setting is resolved in vllm/merlin/envs.py
 HOST_EMBED_TABLE_ENV = "VLLM_HOST_EMBED_TABLE"
 
 
-def host_embed_table_enabled() -> bool:
-    """Return whether the exact host-embedding opt-in is set."""
-    return os.environ.get(HOST_EMBED_TABLE_ENV, "") == "1"
+def host_embed_table_enabled(architecture: str) -> bool:
+    """Return the host-embedding setting for the architecture that owns the table."""
+    from vllm.merlin.envs import host_embed_table_setting
+
+    return host_embed_table_setting(architecture)
 
 
-def should_use_host_embed_table() -> bool:
+def should_use_host_embed_table(architecture: str) -> bool:
     """Keep the PLE offload worker's model construction on the meta device."""
     return (
-        host_embed_table_enabled()
+        host_embed_table_enabled(architecture)
         and torch.empty(0).device.type != "meta"
     )
 

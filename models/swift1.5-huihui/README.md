@@ -1,4 +1,4 @@
-# Swift1.5-Huihui · Merlin 3.0.2.1
+# Swift1.5-Huihui · Merlin 3.0.2.2
 
 The launcher serves Froggeric's fixed Qwen3.8 template,
 [`froggeric-qwen-v22.5.jinja`](../qwen38-27b/templates/froggeric-qwen-v22.5.jinja), the same template as the

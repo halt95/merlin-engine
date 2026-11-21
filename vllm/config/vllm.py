@@ -120,6 +120,7 @@ DEFAULT_BREAKABLE_CUDAGRAPH_ARCHITECTURES = frozenset(
         "Glm5NextMTPModel",
         "GlmMoeDsaForCausalLM",
         "HYV4ForCausalLM",
+        "HYV4FlashForCausalLM",
         "HYV4MTPModel",
         "InklingForCausalLM",
         "InklingForConditionalGeneration",
@@ -673,7 +674,10 @@ class VllmConfig:
         dspark_fill_in = speculative_config.use_dspark() and not getattr(
             speculative_config.draft_model_config.hf_config, "sample_from_anchor", True
         )
-        if speculative_config.use_dflash() or dspark_fill_in:
+        # DFly2 writes its bonus + N query KV too.
+        if speculative_config.use_dflash() or dspark_fill_in or (
+            speculative_config.use_dfly()
+        ):
             # Fill-in drafting uses a bonus query plus one query per draft token.
             # DSpark's anchor-sampling layout does not need the extra slot.
             return self.num_speculative_tokens + 1
@@ -699,6 +703,10 @@ class VllmConfig:
         """
         speculative_config = self.speculative_config
         if speculative_config is None or not speculative_config.use_eagle():
+            return 0
+        # DFly2 reads only sampled tokens (an unfinished
+        # prefill chunk does not draft), nothing past the computed range.
+        if speculative_config.use_dfly():
             return 0
         if speculative_config.use_multi_module_mtp():
             # Each MTP module reads one token further ahead than the one before
@@ -1527,11 +1535,17 @@ class VllmConfig:
         self.engram_config.verify_model_config(model_config)
         self.engram_config.resolve_dp_shared_memory(self.parallel_config)
         self.engram_config.verify_parallel_config(self.parallel_config)
-        # An explicit cpu_offload=True beside the pull transport is
-        # a double offload; refused here, before any worker starts.
-        from vllm.v1.e2_guards import verify_engram_against_pull
+        # An explicit cpu_offload=True beside the pull
+        # transport is a double offload, refused here before any worker starts.
+        # Hy4 Flash owns its Engram host tables (cpu_offload=True, no PLE pull
+        # transport), so the guard is not for it.
+        from vllm.v1.e2_guards import (
+            engram_pull_guard_applies,
+            verify_engram_against_pull,
+        )
 
-        verify_engram_against_pull(self.engram_config)
+        if engram_pull_guard_applies(model_config):
+            verify_engram_against_pull(self.engram_config)
         logger.info_once("Resolved Engram configuration: %s", str(self.engram_config))
 
     def _reject_mismatched_float_kv_cache(self) -> None:
@@ -2422,7 +2436,8 @@ class VllmConfig:
                     f" num_lookahead_tokens={self.num_lookahead_tokens}."
                 )
             spec = self.speculative_config
-            if spec.use_dflash() or spec.use_dspark():
+
+            if spec.use_dflash() or spec.use_dspark() or spec.use_dfly():
                 max_num_active_seqs = (
                     self.scheduler_config.max_num_active_seqs
                     or self.scheduler_config.max_num_seqs
@@ -3118,7 +3133,8 @@ class VllmConfig:
             # own speculators.
             if (
                 speculative_config.parallel_drafting
-                and speculative_config.method not in ("dflash", "dspark")
+                # DFly2 has its own V2 speculator
+                and speculative_config.method not in ("dflash", "dspark", "dfly")
             ):
                 unsupported.append("parallel drafting for EAGLE speculative decoding")
 
@@ -3157,6 +3173,8 @@ class VllmConfig:
         if self.speculative_config:
             if self.speculative_config.method == "dspark":
                 unsupported.append("dspark speculative decoding")
+            elif self.speculative_config.method == "dfly":
+                unsupported.append("dfly speculative decoding")
             elif self.speculative_config.is_xpress():
                 unsupported.append("xpress speculative decoding")
             if self.speculative_config.enable_adaptive_verification:

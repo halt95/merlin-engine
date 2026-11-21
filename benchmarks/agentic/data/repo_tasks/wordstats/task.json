@@ -1,0 +1,6 @@
+{
+  "id": "wordstats",
+  "title": "word_counts miscounts words",
+  "issue": "wordstats.word_counts gives wrong counts. 'The' and 'the' are counted as different words, two spaces or a newline between words produce an empty-string entry, and a token made only of punctuation (such as '...') is counted as a word. Words should be compared case-insensitively, split on any whitespace, and have leading and trailing . , ; : ! ? stripped; tokens that are empty after stripping are ignored. Also, top_words must break ties in count alphabetically. The tests in tests/ describe the expected behaviour.",
+  "test_dir": "tests"
+}

@@ -1,6 +1,6 @@
 # Reference
 
-The detail behind the [README](../README.md) for Merlin 3.0.2.1, Merlin engine **built on vLLM 0.33.0**.
+The detail behind the [README](../README.md) for Merlin 3.0.2.2, Merlin engine **built on vLLM 0.33.0**.
 The current measured claims are in the [3.0.2.1 bench card](../benchmarks/2026-11-12/BENCH-CARD.md) (the [3.0.2 card](../benchmarks/2026-11-04/BENCH-CARD.md) is its comparator, and the [3.0.1 card](../benchmarks/2026-11-02/BENCH-CARD.md) has the release before); see also [Benchmarks](#benchmarks). Historical measurements are explicitly marked
 **v3.0.0 (0.30) figure**; their original release labels are retained, and they are not re-measured 0.32 or 0.33 results.
 
@@ -128,7 +128,8 @@ Use `merlin serve flash-next <checkpoint-dir> --spec dflash2`, or
 `./setup.sh --model flash-next --spec dflash2` to download and verify the drafter before serving.
 The drafter is `incoai/Qwen3.8-Flash-Next-DFlash2`, about 1.2 GB, checked against
 [`dflash2.sha256`](../dflash2.sha256). Serving uses `DFLASH2_MODEL` when set, otherwise
-`~/models/flash-next-dflash2`, and refuses to start if the drafter is missing.
+`flash-next-dflash2` beside the checkpoint folder, otherwise an existing `~/models/flash-next-dflash2`, and refuses
+to start if the drafter is missing.
 For a direct recipe launch, set `SPEC=dflash2 DFLASH2_MODEL=/path/to/drafter`.
 
 Only the three 4 x 3090 P2P rows have qualified DFlash2 geometry: `fn-quad-3090`,
@@ -139,6 +140,24 @@ Other rows and the 27B, Super VL and Ornith families refuse DFlash2. The qualifi
 step budget costs the drafter's sliding-window layers one block per request). Decode measured +5–18 % versus MTP on
 4 x 3090, but the 815,203-token pool (pin 3,630,000,000 B, FP32 GDN state, align-mode prefix caching) holds
 3 x 262K sessions (5 x 131K) by the engine's fit, not 6 x 131K.
+
+DFlash2 also takes its own prefill-runs tick costs. The launcher exports
+`VLLM_MERLIN_PREFILL_RUNS_TICK_COSTS=289.0,22.6,0.4` (prefill tick ms, decode round ms, fill ticks) when `SPEC=dflash2`,
+the prefill runs are on and the launch's prefill chunk is 2048, the chunk the values were measured at and the DFlash2
+rows' default. The first number is the cost of one full-chunk step, so it scales with the chunk and the values are not
+valid at another one: with another `CHUNK` (1024, 4096, ...) the launcher exports nothing, the engine default `139,25,1`
+applies and one start-up note says so (`PP_PARTITION` and the other geometry overrides change no chunk and keep the
+values). The values live once in the profile (`base.spec_tick_costs` in `tools/merlin/profiles/flash-next.json`: the
+chunk and three positive finite numbers; a malformed or null entry refuses to start). The engine
+default `139,25,1` was measured on the MTP row; with it a DFlash2 session decodes only 0.162 of the time during a long
+ingest against the 0.30 target, and with the DFlash2 values 0.296 (target 0.30, band +/- 0.030), with temperature-0 output
+identical on 28 of 28 prompts, unchanged KV pools and the image floor held (4 x RTX 3090, chunk 2048). The cost is that a
+cold prompt's first token comes about 18 to 19 percent later (64K 11.7 to 13.9 s, 128K 23.8 to 28.2 s, a cold 262K send
+49.4 to 58.2 s in the same run); the longest pause between streamed tokens (about 0.82 s on DFlash2 during a 64K ingest) is
+not lengthened by the values (0.82 s before, 0.83 s after). An exported `VLLM_MERLIN_PREFILL_RUNS_TICK_COSTS` wins over the
+profile value at every chunk and for either drafter, and the launcher's start-up note says which source the engine got.
+Every MTP row, and `SPEC=none`, keeps the engine default `139,25,1` and starts with the same arguments and environment as
+before. The variable is runtime-only (not an AOT or compile-cache factor), so upgrading recompiles nothing.
 
 ### Host-RAM KV cache
 
@@ -178,15 +197,22 @@ blank means unset.
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `MERLIN_KV_HOST_TIER__COPY_CREDITS` | `32` | Restore (host to GPU) rows in flight per rank; also the default for the copy credits below. Positive integer. |
-| `MERLIN_KV_HOST_TIER__COPY_CREDITS_D` | `COPY_CREDITS` | Copy (GPU to host) rows in flight per rank. Positive integer. Running-session copies take at most a quarter of it (at least one row). |
+| `MERLIN_KV_HOST_TIER__COPY_CREDITS` | `32` | Restore (host to GPU) rows in flight per rank. Positive integer. |
+| `MERLIN_KV_HOST_TIER__COPY_CREDITS_D` | `64` | Copy (GPU to host) rows in flight per rank. Positive integer; `32` is the earlier default. Unset, it follows `COPY_CREDITS` when that is set explicitly and is 64 when neither is set. Running-session copies take at most a quarter of it (at least one row). |
 | `MERLIN_KV_HOST_TIER__COPY_BYTES_D_MIB` | `0` | Optional cap on copy bytes in flight per rank, in MiB; every copy counts, running-session copies included. `0` = rows only; a nonzero cap below one row is refused at boot. |
-| `MERLIN_KV_HOST_TIER__MAX_PENDING_STORE_BLOCKS` | `0` | Experimental, off by default. Optional cap on the distinct GPU blocks the copy path holds at once (held, staged and in flight, including blocks a request still references). `0` = off. A value below the largest restore unit stops that unit's copies, so it is recomputed on its return; size it from the measured unit geometry. Untested on a box. |
-| `MERLIN_KV_HOST_TIER__FALLBACK_BOUNDARY` | `0` | Experimental, off by default. `1` keeps a session's previous restore point (its predecessor unit) on the host behind its newest one, so host eviction takes the newest unit's own rows first and the session still restores at the previous boundary instead of recomputing from zero. No copy and no new publication: the kept rows were already published. It costs one recurrent endpoint and sliding window per live session on the host. Exactly `0` or `1`; needs the tier on. Untested on a box. |
+| `MERLIN_KV_HOST_TIER__MAX_PENDING_STORE_BLOCKS` | `0` | Experimental, off by default. Optional cap on the distinct GPU blocks the copy path holds at once (held, staged and in flight, including blocks a request still references). `0` = off. A value below the largest restore unit stops that unit's copies, so it is recomputed on its return; size it from the measured unit geometry. Untested on GPUs. |
+| `MERLIN_KV_HOST_TIER__FALLBACK_BOUNDARY` | `0` | Experimental, off by default. `1` keeps a session's previous restore point (its predecessor unit) on the host behind its newest one, so host eviction takes the newest unit's own rows first and the session still restores at the previous boundary instead of recomputing from zero. No copy and no new publication: the kept rows were already published. It costs one recurrent endpoint and sliding window per live session on the host. Exactly `0` or `1`; needs the tier on. Untested on GPUs. |
+| `MERLIN_KV_HOST_TIER__SHARED_ROW_LONE` | `0` | Experimental, off by default. `1`: a block that belongs to several saved sessions at once (for example the first page of a shared system prompt) is copied to the host on its own, once for all of them. `0` (the default) judges all those sessions together as one copy, which for a page every session shares can be larger than the whole host cache: then none of their blocks is copied that step. Exactly `0` or `1`; needs the tier on. Untested on GPUs. |
+| `MERLIN_KV_HOST_TIER__EVICT_DUPLICATES_FIRST` | `1` | `1` (the default): when the host cache needs room, it first gives up copies the GPU still holds in its free pool, then sessions only the host holds. `0` keeps the earlier order that gives up host-only sessions first and the GPU-held copies last. A copy given up this way is copied again if the GPU later needs that space before the session returns; copies whose GPU blocks are about to be reused are kept. With no such copy on the host the order is the same either way. Exactly `0` or `1`; needs the tier on. |
+| `MERLIN_KV_HOST_TIER__EVICT_WAITING_LAST` | `1` | `1` (the default): when the host cache needs room, it keeps the saved sessions that requests already waiting in the queue will use until last, and among those gives up first the ones whose request is furthest back in the queue. Sessions no waiting request will use go first, in the usual order. `0` keeps the earlier order, which does not look at the queue. With `MERLIN_KV_HOST_TIER_CENSUS=1` the log also gets a `SimpleCPU tier waiting:` line each metrics interval, counting how many evicted sessions belonged to waiting requests, with either setting. Exactly `0` or `1`; needs the tier on. |
 | `MERLIN_KV_HOST_TIER__N_RESTORE` | `2` | Restores in flight at once. A request that finds them all busy waits while they progress (see below). Positive integer. |
-| `MERLIN_KV_HOST_TIER__MAX_ASSEMBLING` | `2` | Units copied at once whose landed rows are held until the unit is complete; a new unit waits while this many are in progress. Positive integer. |
+| `MERLIN_KV_HOST_TIER__RESTORE_START_ANY_STEP` | `0` | Opt-in, off by default. `1`: a waiting request's restore starts its copy on any step a restore slot is free, also while every running seat is taken, so it is loaded when a seat frees and takes that seat ahead of requests sent after it. Bounded: copies started this way hold blocks only for requests among the next 2 x `N_RESTORE` to take a seat (those already loaded or loading count), and only while the free pool keeps the running requests' one-step growth. Pool, concurrency and context are unchanged. Unset or `0` keeps the earlier order (a restore's copy starts only on a step with a free seat). Exactly `0` or `1`; needs the tier on. The trade: restore waits shrink, but measured alone on the 27B at 96 GB with the host tier on, this switch costs about 1.9 percentage points of hit rate and adds unguarded losses. |
+| `MERLIN_KV_HOST_TIER__RESTORE_CREDITS_PER_SLOT` | `1` | On by default. The restore copy budget per step is `COPY_CREDITS` rows for each restore slot (`N_RESTORE` x `COPY_CREDITS`, 64 rows by default) instead of `COPY_CREDITS` shared by every restore in flight, so two restores in flight each copy in one batch. No memory cost (a restore's rows are held from its start either way); a step can copy up to twice the rows. `0` shares `COPY_CREDITS` among all restores in flight. Exactly `0` or `1`; needs the tier on. Measured alone on the 27B at 96 GB with the host tier on, it cost no hit rate (98.90 % of the trace's ceiling, no unguarded losses). |
+| `MERLIN_KV_HOST_TIER__RESTORE_SEAT_HOLD` | `0` | Opt-in, off by default. `1`: when a running seat frees and the oldest waiting request is a host restore whose copy is still in flight (or waiting for a restore slot), the seat waits for it instead of going to a later arrival; one hold at a time, at most 3 s, then the earlier order; while the seat is held the pass only starts restore copies, as with every seat taken. No memory cost; a held seat idles at most 3 s. Acts only with `MERLIN_KV_HOST_TIER__RESTORE_START_ANY_STEP` on. Unset or `0` is off. Exactly `0` or `1`; needs the tier on. It carries the cost of `RESTORE_START_ANY_STEP` (about 1.9 percentage points of hit rate and unguarded losses on the 27B at 96 GB), which it needs. |
+| `MERLIN_KV_HOST_TIER__MAX_ASSEMBLING` | `8` | Units copied at once whose landed rows are held until the unit is complete; a new unit waits while this many are in progress. Positive integer; `2` is the earlier default. |
 | `MERLIN_KV_HOST_TIER__ESCAPE_STEPS` | `8` | Waits without progress after which an admission held for a pending copy goes ahead anyway (the copy is then missed). Positive integer. |
 | `MERLIN_KV_HOST_TIER__ADMISSION` | off | `off`, `0` or `lru`: plain LRU. `slru` (experimental): new units enter probation, a host restore promotes a unit to protected (at most 80 % of published rows), and a copy for a session that is not returning never displaces protected content. |
+| `MERLIN_KV_HOST_TIER__ARENA_LOCK_TIMEOUT_S` | `900` | Seconds a rank waits for the host-wide lock (`/tmp/merlin-kv-host-tier.lock`) that makes the ranks and servers on one host allocate their arenas one at a time. When another process still holds it after this long, the rank stops with an error that names the file, its owner and `fuser` / `lsof`, instead of waiting for as long as the holder lives; a rank that has waited 5 s logs one line saying so. Positive whole number of seconds. The default is 14 times the measured wait of a four-rank boot at 96 GiB (64 s) and 24 times the largest single hold (37 s, a 52 GiB arena); raise it only for a host whose arena allocation is much slower than that. |
 | `MERLIN_KV_HOST_TIER_CENSUS` | `0` | `1` turns on the debug census (a per-step occupancy scan); off on the served path. |
 | `VLLM_RECOVERSSM_CHECK_OWNERSHIP` | `0` | Debug only: `1` checks RecoverSSM state ownership, with a host sync per commit. |
 | `MERLIN_KV_HOST_TIER_FAIL_LOADS`, `MERLIN_KV_HOST_TIER_FAIL_STORES` | `0` | Debug only: the first N restore / copy transfers per rank fail, to drive the recompute path. Never serve with them set. |

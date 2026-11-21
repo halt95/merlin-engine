@@ -17,6 +17,7 @@ if TYPE_CHECKING:
 # only configurable here if it actually has such layers to store.
 _NGRAM_LAYER_FIELDS = {
     "DeepseekV41ForCausalLM": "engram_layer_ids",
+    "HYV4FlashForCausalLM": "engram_layer_ids",
     **dict.fromkeys(flashnext_family.target_archs(), "ple_layer_ids"),
 }
 

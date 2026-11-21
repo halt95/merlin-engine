@@ -31,6 +31,7 @@ from vllm.logger import init_logger
 from vllm.merlin import decode_first
 from vllm.merlin import kv_host_tier
 from vllm.merlin import prefill_runs
+from vllm.merlin import strict_stall_guard
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
 from vllm.multimodal.encoder_budget import MultiModalBudget
 from vllm.multimodal.inputs import MultiModalKwargsItem
@@ -464,6 +465,12 @@ class Scheduler(SchedulerInterface):
             if self.connector is not None
             else None
         )
+        # MERLIN_KV_TIER_DIAG's restore lifecycle
+        # lines read the blocks admissions leave parked loads (off: no life).
+        if getattr(self.tier_plans, "life", None) is not None:
+            self.tier_plans.life.parked_reserved = lambda: (
+                self._inflight_prefill_reserved_blocks(parked_only=True)
+            )
         # Finished turns' grace pins are off with a
         # connector, as waiter pins are (_pin_waiting_hits); the host-RAM KV
         # tier keeps both.
@@ -576,6 +583,10 @@ class Scheduler(SchedulerInterface):
         # advances in runs of full chunks between decode-only windows (None =
         # off, the default; refuses inconsistent settings here).
         self.prefill_runs = prefill_runs.state(self)
+        # Independent of the host tier and logs.
+        from vllm.merlin.scheduler_telemetry import PolicyCounterDeltas
+
+        self.policy_counter_deltas = PolicyCounterDeltas()
 
         # Counts of non-empty steps scheduled / processed. update_from_output
         # is called once per scheduled step in FIFO order, so these stay in sync.
@@ -1229,19 +1240,24 @@ class Scheduler(SchedulerInterface):
                             continue
 
                         pool = self.kv_cache_manager.block_pool
-                        request.stop_reason = (
+                        capacity_cause = (
                             "KV cache capacity exhausted: the lone running request "
                             f"cannot allocate its next {num_new_tokens} token(s) "
                             f"with {self.num_lookahead_tokens} lookahead token(s) "
                             f"after {request.num_computed_tokens} computed tokens "
                             f"({pool.get_num_free_blocks()} free blocks, "
-                            f"{pool.num_gpu_blocks} total blocks). "
-                            "Increase KV cache memory or reduce the request length."
+                            f"{pool.num_gpu_blocks} total blocks)."
+                        )
+
+                        # The client text has no server-side advice; the log keeps it.
+                        request.stop_reason = (
+                            f"{capacity_cause} Reduce the request length."
                         )
                         logger.error(
-                            "Request %s failed: %s",
+                            "Request %s failed: %s Increase KV cache memory or "
+                            "reduce the request length.",
                             request.request_id,
-                            request.stop_reason,
+                            capacity_cause,
                         )
                         self.kv_capacity_error_reqs.add(request.request_id)
                         break
@@ -1412,43 +1428,98 @@ class Scheduler(SchedulerInterface):
         if not preempted_reqs and self._pause_state != PauseState.PAUSED_ALL:
             step_skipped_waiting: deque[Request] = deque()
             step_skipped_kv_holding: deque[Request] = deque()
+            # With every running seat taken,
+            # MERLIN_KV_HOST_TIER__RESTORE_START_ANY_STEP keeps scanning the
+            # waiting queue only to start restore copies (seatless), for at
+            # most ``seatless_window`` requests in seat order; the loads it
+            # starts queue behind the KV holders, in arrival order.
+            seatless, seatless_window = False, 0
+            seatless_started: list[Request] = []
+            # True until the pass skips a
+            # request: the request it looks at heads the seat queue.
+            at_head = True
             self.thrash.pin_arrivals()
 
             def skip_request(from_queue: RequestQueue) -> None:
+                nonlocal at_head
+                at_head = False
                 request_to_skip = from_queue.pop_request()
                 self.deferred_waiting.add(request_to_skip)
                 if self._holds_kv_blocks(request_to_skip):
-                    step_skipped_kv_holding.appendleft(request_to_skip)
+                    if seatless:  # behind every holder.
+                        seatless_started.append(request_to_skip)
+                    else:
+                        step_skipped_kv_holding.appendleft(request_to_skip)
                 else:
                     step_skipped_waiting.appendleft(request_to_skip)
+
+            # The head just skipped keeps
+            # one free seat (``held_seat``): later arrivals take only the
+            # others, and with none left the pass only starts restore copies
+            # within the seatless window, as with every seat taken.
+            held_seat = 0
+
+            def seat_held(request_id: str, cap_wait: bool = False) -> None:
+                nonlocal held_seat
+                plans = self.tier_plans
+                if head and not held_seat:
+                    held_seat = int(plans.hold_seat(request_id, cap_wait=cap_wait))
 
             while token_budget > 0:
                 # Requests holding KV blocks are always drained first, and are
                 # the only ones admitted under PAUSED_NEW (e.g. async KV loads).
                 request_queue = self.kv_holding_waiting
-                if not request_queue and self._pause_state == PauseState.UNPAUSED:
+                if (  # seatless: waiting only.
+                    seatless or not request_queue
+                ) and self._pause_state == PauseState.UNPAUSED:
                     request_queue = self.waiting
                 if not request_queue or input_budget <= draft_slots:
                     break
-                if (  # inactive: as a budget of Q
-                    runs_step is not None
-                    and not runs_step.active
-                    and runs_step.prefill_budget <= 0
-                ):
-                    break
+                # Scan for zero-compute work after Q.
+                # Transfer eligibility and remaining work need prefix lookup.
                 # Paused streaming sessions (WAITING_FOR_STREAMING_REQ) are not
                 # in `running` but still hold a model-runner request slot.
                 num_running = len(self.running) + self.num_waiting_for_streaming_input
-                if num_running >= self.max_num_active_reqs:
+                # A full running set ends the
+                # scan unless restore copies may start seatless (0: switch off).
+                # A held seat counts as taken.
+                if num_running + held_seat >= self.max_num_active_reqs and not seatless:
+                    plans = self.tier_plans
+                    seatless_window = (
+                        plans.seatless_window(self._num_parked_loads())
+                        if plans is not None
+                        and plans.start_any_step
+                        and self._pause_state == PauseState.UNPAUSED
+                        else 0
+                    )
+                    if seatless_window <= 0:
+                        break
+                    seatless = self.tier_plans.seatless_pass = True
+                    continue
+                if seatless and (
+                    seatless_window <= 0 or not self.tier_plans.restore_slot_free()
+                ):
                     break
 
                 request = request_queue.peek_request()
                 request_id = request.request_id
+                # With a seat free, a head
+                # whose restore copy is in flight or waits for a slot keeps
+                # the seat (TierPlans.hold_seat): no later arrival takes it.
+                head = at_head and not seatless and self.tier_plans is not None
+                if head and self.tier_plans.life is not None:
+                    self.tier_plans.life.seat_head(request_id)
 
                 ready_to_schedule = self._handle_blocked_waiting_request(request)
                 if not ready_to_schedule:
                     skip_request(request_queue)
+                    seat_held(request_id)
                     continue
+                if seatless:  # one seat-order place.
+                    seatless_window -= 1
+                    if request.num_computed_tokens:
+                        skip_request(request_queue)
+                        continue
 
                 if request.num_stale_output_tokens and not request.drop_stale_output:
                     # Deliverable stale output still in flight: resuming now
@@ -1482,7 +1553,13 @@ class Scheduler(SchedulerInterface):
                     plan_hit = self._admit_prefix_plan(request)
                     if plan_hit is None:
                         skip_request(request_queue)
+
+                        seat_held(request_id, cap_wait=True)
                         continue
+                if seatless and (plan_hit is None or not plan_hit[3]):
+                    # No restore, no seatless start.
+                    skip_request(request_queue)
+                    continue
                 if plan_hit is not None:
                     did_prefix_cache_lookup = True
                     (
@@ -1674,6 +1751,25 @@ class Scheduler(SchedulerInterface):
                         skip_request(request_queue)
                         continue
 
+                # Async loads and fully computed
+                # returns may pass a spent budget; one-token returns still compute.
+                if (
+                    runs_step is not None
+                    and not runs_step.active
+                    and runs_step.prefill_budget <= 0
+                    and not load_kv_async
+                    and (  # exclude replay compute.
+                        num_computed_tokens < request.num_tokens
+                        or (
+                            did_prefix_cache_lookup
+                            and self.prefix_replay_tokens > 0
+                            and not window_loaded
+                        )
+                    )
+                ):
+                    skip_request(request_queue)
+                    continue
+
                 # cost-aware admission: a young miss
                 # behind protected pinned waiters is admitted only if it fits
                 # without yielding a pin or un-hashing a block they need.
@@ -1725,6 +1821,21 @@ class Scheduler(SchedulerInterface):
                     # `request.num_prompt_tokens` to consider the resumed
                     # requests, which have output tokens.
                     num_new_tokens = request.num_tokens - num_computed_tokens
+                    # A fully computed return has
+                    # no model work yet; retain its KV and keep scanning.
+                    if num_new_tokens == 0:
+                        # Diagnose a stalled return once.
+                        logger.warning_once(
+                            "Request %s has no tokens to schedule "
+                            "(state=%s, num_tokens=%d, num_computed_tokens=%d); "
+                            "keeping it waiting with its KV.",
+                            request.request_id,
+                            request.status.name,
+                            request.num_tokens,
+                            num_computed_tokens,
+                        )
+                        skip_request(request_queue)
+                        continue
                     if runs_step is not None and num_new_tokens > 1:
                         # A prefill admission takes the step's prefill cap; one
                         # token left is a decode row on the decode headroom.
@@ -1903,6 +2014,10 @@ class Scheduler(SchedulerInterface):
                     # plus its own spec decode step blocks, to avoid deadlock and
                     # predictable preemptions.
                     reserved_blocks += self._spec_decode_step_blocks
+                    if seatless:  # running headroom.
+                        reserved_blocks += self.tier_plans.seatless_floor(
+                            len(self.running)
+                        )
                     # The others' remainders gate its first draw only, as
                     # before, so its copy starts when it did. When no block
                     # can come back (nothing running or scheduled, no free
@@ -1933,9 +2048,9 @@ class Scheduler(SchedulerInterface):
                 # Replayed tokens are already counted in the adopted hit; a
                 # chunk that ends inside the replayed range needs no new slots.
                 num_tokens_past_hit = max(num_new_tokens - num_replay_tokens, 0)
-                new_blocks = self.kv_cache_manager.allocate_slots(
-                    request,
-                    num_tokens_past_hit,
+                # Reuse token and zeroing inputs.
+                allocation_kwargs = dict(
+                    num_new_tokens=num_tokens_past_hit,
                     num_new_computed_tokens=num_new_local_computed_tokens,
                     new_computed_blocks=new_computed_blocks,
                     num_lookahead_tokens=effective_lookahead_tokens,
@@ -1952,12 +2067,20 @@ class Scheduler(SchedulerInterface):
                     full_sequence_reserved_blocks=full_sequence_reserved_blocks,
                     full_sequence_lookahead_tokens=full_sequence_lookahead_tokens,
                     has_scheduled_reqs=bool(self.running),
+                    # Finish the shared inputs.
+                )
+                # Same arguments on every attempt.
+                new_blocks = self.kv_cache_manager.allocate_slots(
+                    request,
+                    **allocation_kwargs,
                     evicts_needed=(
                         self.thrash.eviction_check(request, protected)
                         if protected
                         else None
                     ),
                 )
+                if seatless and new_blocks is None:
+                    break
 
                 kv_cache_manager = self.kv_cache_manager
                 # never yield a pin for a young miss
@@ -1980,22 +2103,8 @@ class Scheduler(SchedulerInterface):
                     ):
                         new_blocks = self.kv_cache_manager.allocate_slots(
                             request,
-                            num_new_tokens,
-                            num_new_computed_tokens=num_new_local_computed_tokens,
-                            new_computed_blocks=new_computed_blocks,
-                            num_lookahead_tokens=effective_lookahead_tokens,
-                            num_external_computed_tokens=num_external_computed_tokens,
-                            delay_cache_blocks=load_kv_async,
-                            num_encoder_tokens=num_encoder_tokens,
-                            full_sequence_must_fit=full_sequence_must_fit,
-                            reserved_blocks=reserved_blocks,
-                            full_sequence_reserved_blocks=(
-                                full_sequence_reserved_blocks
-                            ),
-                            full_sequence_lookahead_tokens=(
-                                full_sequence_lookahead_tokens
-                            ),
-                            has_scheduled_reqs=bool(self.running),
+                            # Identical allocation inputs.
+                            **allocation_kwargs,
                         )
                     yield_for_head = new_blocks is None and (
                         # A retry that
@@ -2014,22 +2123,8 @@ class Scheduler(SchedulerInterface):
                     ):
                         new_blocks = self.kv_cache_manager.allocate_slots(
                             request,
-                            num_new_tokens,
-                            num_new_computed_tokens=num_new_local_computed_tokens,
-                            new_computed_blocks=new_computed_blocks,
-                            num_lookahead_tokens=effective_lookahead_tokens,
-                            num_external_computed_tokens=num_external_computed_tokens,
-                            delay_cache_blocks=load_kv_async,
-                            num_encoder_tokens=num_encoder_tokens,
-                            full_sequence_must_fit=full_sequence_must_fit,
-                            reserved_blocks=reserved_blocks,
-                            full_sequence_reserved_blocks=(
-                                full_sequence_reserved_blocks
-                            ),
-                            full_sequence_lookahead_tokens=(
-                                full_sequence_lookahead_tokens
-                            ),
-                            has_scheduled_reqs=bool(self.running),
+                            # Identical allocation inputs.
+                            **allocation_kwargs,
                         )
                 if (
                     yield_for_head
@@ -2043,22 +2138,8 @@ class Scheduler(SchedulerInterface):
                         num_scheduled_tokens,
                         lambda: self.kv_cache_manager.allocate_slots(
                             request,
-                            num_new_tokens,
-                            num_new_computed_tokens=num_new_local_computed_tokens,
-                            new_computed_blocks=new_computed_blocks,
-                            num_lookahead_tokens=effective_lookahead_tokens,
-                            num_external_computed_tokens=num_external_computed_tokens,
-                            delay_cache_blocks=load_kv_async,
-                            num_encoder_tokens=num_encoder_tokens,
-                            full_sequence_must_fit=full_sequence_must_fit,
-                            reserved_blocks=reserved_blocks,
-                            full_sequence_reserved_blocks=(
-                                full_sequence_reserved_blocks
-                            ),
-                            full_sequence_lookahead_tokens=(
-                                full_sequence_lookahead_tokens
-                            ),
-                            has_scheduled_reqs=bool(self.running),
+                            # Identical allocation inputs.
+                            **allocation_kwargs,
                         ),
                     )
                 while (
@@ -2073,20 +2154,8 @@ class Scheduler(SchedulerInterface):
                 ):
                     new_blocks = self.kv_cache_manager.allocate_slots(
                         request,
-                        num_new_tokens,
-                        num_new_computed_tokens=num_new_local_computed_tokens,
-                        new_computed_blocks=new_computed_blocks,
-                        num_lookahead_tokens=effective_lookahead_tokens,
-                        num_external_computed_tokens=num_external_computed_tokens,
-                        delay_cache_blocks=load_kv_async,
-                        num_encoder_tokens=num_encoder_tokens,
-                        full_sequence_must_fit=full_sequence_must_fit,
-                        reserved_blocks=reserved_blocks,
-                        full_sequence_reserved_blocks=full_sequence_reserved_blocks,
-                        full_sequence_lookahead_tokens=(
-                            full_sequence_lookahead_tokens
-                        ),
-                        has_scheduled_reqs=bool(self.running),
+                        # Identical allocation inputs.
+                        **allocation_kwargs,
                     )
 
                 if new_blocks is None:
@@ -2270,6 +2339,8 @@ class Scheduler(SchedulerInterface):
                         self.kv_cache_manager.get_ring_block_ids(request.request_id)
                     )
                     skip_request(request_queue)
+                    # Its copy just started.
+                    seat_held(request.request_id)
                     continue
 
                 request = request_queue.pop_request()
@@ -2341,6 +2412,10 @@ class Scheduler(SchedulerInterface):
                 self.kv_holding_waiting.prepend_requests(step_skipped_kv_holding)
             if step_skipped_waiting:
                 self.waiting.prepend_requests(step_skipped_waiting)
+            if seatless:  # behind every holder.
+                for started in seatless_started:
+                    self.kv_holding_waiting.add_request(started)
+                self.tier_plans.seatless_pass = False
             # No plan lease outlives a pass.
             if self.tier_plans is not None:
                 self.tier_plans.release_pending()
@@ -3244,6 +3319,11 @@ class Scheduler(SchedulerInterface):
                 request.resumable = False
                 stopped = True
 
+            elif strict_stall_guard.should_end(req_id):
+                request.status = RequestStatus.FINISHED_ERROR
+                request.resumable = False
+                stopped = True
+
             routed_experts = None
             should_emit_output = bool(
                 new_token_ids or pooler_output is not None or stopped
@@ -3359,6 +3439,20 @@ class Scheduler(SchedulerInterface):
         error_req_ids = set(request_errors)
         error_req_ids.update(self.encoder_cache_mismatch_reqs)
         self.encoder_cache_mismatch_reqs.clear()
+
+        # A request that can never fit the pool is the client's to shorten:
+        # it reaches the API as a validation error carrying the logged cause,
+        # not as an opaque internal error. A grammar error keeps its own.
+        for req_id in self.kv_capacity_error_reqs | self.kv_dead_end_reqs:
+            capacity_req = self.requests.get(req_id)
+            if (
+                req_id not in request_errors
+                and capacity_req is not None
+                and isinstance(capacity_req.stop_reason, str)
+            ):
+                request_errors[req_id] = RequestError(
+                    code="validation_error", message=capacity_req.stop_reason
+                )
         error_req_ids.update(self.kv_capacity_error_reqs)
         self.kv_capacity_error_reqs.clear()
         error_req_ids.update(self.kv_dead_end_reqs)
@@ -4025,19 +4119,26 @@ class Scheduler(SchedulerInterface):
         if shortfall <= held_by_others:
             return False
         if request.request_id not in self.kv_dead_end_reqs:
+
+            # One description for the log (with server-side advice) and for
+            # the client message (without it).
+            detail = (
+                f"needs {len(own) + free + shortfall} KV cache blocks at once "
+                f"({len(own)} held + {free + shortfall} new) but at most "
+                f"{usable - held_by_others} of the {usable} usable blocks "
+                "can ever be free for it"
+            )
+            request.stop_reason = (
+                f"KV cache capacity exceeded: the request {detail}. "
+                "Reduce the request length."
+            )
             logger.error(
-                "Request %s can never be scheduled: it needs %d KV cache "
-                "blocks at once (%d held + %d new) but at most %d of the %d "
-                "usable blocks can ever be free for it. Finishing it with an "
-                "error instead of waiting forever. Raise "
+                "Request %s can never be scheduled: it %s. Finishing it with "
+                "an error instead of waiting forever. Raise "
                 "--kv-cache-memory-bytes (or --gpu-memory-utilization), or "
                 "lower max_model_len or the request's length.",
                 request.request_id,
-                len(own) + free + shortfall,
-                len(own),
-                free + shortfall,
-                usable - held_by_others,
-                usable,
+                detail,
             )
         request.resumable = False
         self.kv_dead_end_reqs.add(request.request_id)
@@ -4299,6 +4400,10 @@ class Scheduler(SchedulerInterface):
             cudagraph_stats=cudagraph_stats,
             perf_stats=perf_stats,
             ec_connector_stats=ec_connector_stats_payload,
+            # Drain cumulative policy counters.
+            policy_counters=self.policy_counter_deltas.snapshot(
+                self.prefill_runs, self.decode_first
+            ),
         )
 
     def make_spec_decoding_stats(
@@ -4463,6 +4568,7 @@ class Scheduler(SchedulerInterface):
             for other in self.requests.values()
             if other is not request
         )
+
 
     def _blocks_will_return(self, request: Request) -> bool:
         """Whether a block will come back without any request running: a

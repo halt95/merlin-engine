@@ -9,17 +9,18 @@ bytes, and driver free memory (``mem_get_info``) before and after. At the end
 the worst modules are logged, so a boot-time free-memory dip seen by an NVML
 sampler can be attributed to live tensors (allocated) or to the caching
 allocator (reserved > allocated, which torch frees on demand). No effect on
-weights or numerics; off means a single env read per load.
+weights or numerics; off means a single env read per load. A value other
+than ``0`` or ``1`` is refused at the first bracket (model construction).
 """
 
 from __future__ import annotations
 
 import contextlib
-import os
 from collections.abc import Iterator
 
 import torch
 
+import vllm.envs as envs
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
@@ -29,7 +30,7 @@ _ROWS: list[tuple[int, str, int, int, int, int]] = []
 
 
 def enabled() -> bool:
-    return os.environ.get("MERLIN_LOAD_PEAK_LOG", "0") == "1"
+    return envs.MERLIN_LOAD_PEAK_LOG
 
 
 @contextlib.contextmanager

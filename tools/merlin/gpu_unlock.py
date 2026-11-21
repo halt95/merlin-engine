@@ -45,6 +45,7 @@ FAMILY_OF = {dev: fam for fam, devs in FAMILIES.items() for dev in devs}
 REGS = (("FR1", 0x00823818), ("SS0", 0x0082381C), ("SS1", 0x00823820))
 UNLOCKED = {"SS0": 0x88888888, "SS1": 0x00000008}  # FR1 (a speed readout) does not gate the result
 TIMEOUT_S = 5.0
+KILL_WAIT_S = 1.0  # after the kill, how long the probe waits for the child to be reaped before it abandons it
 O_SYNC = getattr(os, "O_SYNC", 0o4010000)  # Linux values; the fallbacks only let CPU tests import this elsewhere
 PROT_READ = getattr(mmap, "PROT_READ", 1)
 MAP_SHARED = getattr(mmap, "MAP_SHARED", 1)
@@ -56,7 +57,30 @@ _WHERE_WHY = {"container": "inside a container; check on the host", "vm": "insid
               "wsl": "inside WSL2; check on the host", "unknown": "cannot confirm bare metal"}
 # -I: no PYTHON* environment, user site or script directory; -S: no site hooks. Only this file and the stdlib load.
 _CHILD = "import sys; sys.path.insert(0, sys.argv[1]); import gpu_unlock; sys.exit(gpu_unlock.child_main(sys.argv[2]))"
-_run = subprocess.run
+
+
+def _bounded_run(argv: list[str], *, capture_output: bool = False, text: bool = False,
+                 timeout: float | None = None) -> subprocess.CompletedProcess:
+    """``subprocess.run`` whose deadline holds. After a timeout ``run`` kills the child and then waits for it with no limit,
+    so a child stuck in uninterruptible sleep on a register read would hang the caller; here the kill is followed by one
+    short wait and the child is abandoned if it is still not gone (it was already unkillable)."""
+    pipe = subprocess.PIPE if capture_output else None
+    proc = subprocess.Popen(argv, stdout=pipe, stderr=pipe, text=text)
+    try:
+        out, err = proc.communicate(timeout=timeout)
+    except BaseException as e:
+        proc.kill()
+        try:
+            proc.communicate(timeout=KILL_WAIT_S)
+        except (subprocess.TimeoutExpired, OSError, ValueError):
+            pass  # not reaped: abandon it rather than wait
+        if isinstance(e, subprocess.TimeoutExpired):
+            raise subprocess.TimeoutExpired(argv, timeout) from None
+        raise
+    return subprocess.CompletedProcess(argv, proc.returncode, out, err)
+
+
+_run = _bounded_run
 Reader = Callable[[str], "str | None"]
 
 

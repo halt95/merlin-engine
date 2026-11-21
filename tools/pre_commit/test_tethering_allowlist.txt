@@ -52,6 +52,70 @@ tests/v1/ec_connector/integration/test_epd_correctness.py  # run_epd_correctness
 tests/v1/ec_connector/integration/test_nixl_failure.py  # 2-GPU + NIXL E/PD integration test (#55290); no Buildkite job collects ec_connector/integration/
 tests/v1/kv_connector/nixl_integration/test_disagg_accuracy.py  # run by intel_jobs/misc_intel.yaml's run_xpu_disagg_accuracy_test.sh, which names it via $EXP_ROOT (the script's own dir) - not statically resolvable
 
+# Tests the Merlin fork added (every path below is absent at
+# v0.33.0). The fork has no Buildkite pipeline; its CPU gate tracks them in lists kept
+# outside the tree (suite lists, or explicit skip and failing lists). An entry ending in
+# "/" covers every test module under a directory the fork added whole; the other entries
+# are exact paths of fork-added files inside upstream directories.
+# tests/merlin/test_tethering_fork_rule.py checks that no directory entry (whatever its
+# comment) and no fork-reason entry covers a file that exists at v0.33.0, so an upstream
+# test can never fall under this section.
+tests/merlin/  # tracked by the fork's CPU gate (run from its suite lists, or held on its explicit skip or failing lists); the fork has no Buildkite pipeline
+tests/merlin_cpu/  # tracked by the fork's CPU gate (run from its suite lists, or held on its explicit skip or failing lists); the fork has no Buildkite pipeline
+tests/merlin_series27b/  # tracked by the fork's CPU gate (run from its suite lists, or held on its explicit skip or failing lists); the fork has no Buildkite pipeline
+tests/triton_utils/  # tracked by the fork's CPU gate (run from its suite lists, or held on its explicit skip or failing lists); the fork has no Buildkite pipeline
+tests/v1/ple_offload/  # tracked by the fork's CPU gate (run from its suite lists, or held on its explicit skip or failing lists); the fork has no Buildkite pipeline
+tests/models/qwen4_exp/test_autotune_cache.py  # tracked by the fork's CPU gate (run from its suite lists, or held on its explicit skip or failing lists); the fork has no Buildkite pipeline
+tests/models/qwen4_exp/test_boot_warmup.py  # tracked by the fork's CPU gate (run from its suite lists, or held on its explicit skip or failing lists); the fork has no Buildkite pipeline
+tests/models/qwen4_exp/test_gdn_prefill_warmup.py  # tracked by the fork's CPU gate (run from its suite lists, or held on its explicit skip or failing lists); the fork has no Buildkite pipeline
+tests/models/qwen4_exp/test_hc_sp_pp_guard.py  # tracked by the fork's CPU gate (run from its suite lists, or held on its explicit skip or failing lists); the fork has no Buildkite pipeline
+tests/models/qwen4_exp/test_hc_sp_refusal.py  # tracked by the fork's CPU gate (run from its suite lists, or held on its explicit skip or failing lists); the fork has no Buildkite pipeline
+tests/models/qwen4_exp/test_host_embed_capture_sentinel.py  # tracked by the fork's CPU gate (run from its suite lists, or held on its explicit skip or failing lists); the fork has no Buildkite pipeline
+tests/models/qwen4_exp/test_host_uva_embedding.py  # tracked by the fork's CPU gate (run from its suite lists, or held on its explicit skip or failing lists); the fork has no Buildkite pipeline
+tests/models/qwen4_exp/test_mtp_qsa_kv_scales.py  # tracked by the fork's CPU gate (run from its suite lists, or held on its explicit skip or failing lists); the fork has no Buildkite pipeline
+tests/models/qwen4_exp/test_ple_common.py  # tracked by the fork's CPU gate (run from its suite lists, or held on its explicit skip or failing lists); the fork has no Buildkite pipeline
+tests/models/qwen4_exp/test_ple_fast_ids.py  # tracked by the fork's CPU gate (run from its suite lists, or held on its explicit skip or failing lists); the fork has no Buildkite pipeline
+tests/models/qwen4_exp/test_ple_file_table.py  # tracked by the fork's CPU gate (run from its suite lists, or held on its explicit skip or failing lists); the fork has no Buildkite pipeline
+tests/models/qwen4_exp/test_ple_format_guard.py  # tracked by the fork's CPU gate (run from its suite lists, or held on its explicit skip or failing lists); the fork has no Buildkite pipeline
+tests/models/qwen4_exp/test_ple_formats.py  # tracked by the fork's CPU gate (run from its suite lists, or held on its explicit skip or failing lists); the fork has no Buildkite pipeline
+tests/models/qwen4_exp/test_ple_fp8_selector_checkpoint.py  # tracked by the fork's CPU gate (run from its suite lists, or held on its explicit skip or failing lists); the fork has no Buildkite pipeline
+tests/models/qwen4_exp/test_ple_int6.py  # tracked by the fork's CPU gate (run from its suite lists, or held on its explicit skip or failing lists); the fork has no Buildkite pipeline
+tests/models/qwen4_exp/test_ple_int8_row.py  # tracked by the fork's CPU gate (run from its suite lists, or held on its explicit skip or failing lists); the fork has no Buildkite pipeline
+tests/models/qwen4_exp/test_ple_pp_placement.py  # tracked by the fork's CPU gate (run from its suite lists, or held on its explicit skip or failing lists); the fork has no Buildkite pipeline
+tests/models/qwen4_exp/test_ple_pull_reuse.py  # tracked by the fork's CPU gate (run from its suite lists, or held on its explicit skip or failing lists); the fork has no Buildkite pipeline
+tests/models/qwen4_exp/test_ple_pull_sp.py  # tracked by the fork's CPU gate (run from its suite lists, or held on its explicit skip or failing lists); the fork has no Buildkite pipeline
+tests/models/qwen4_exp/test_qsa_arch_dispatch.py  # tracked by the fork's CPU gate (run from its suite lists, or held on its explicit skip or failing lists); the fork has no Buildkite pipeline
+tests/models/qwen4_exp/test_qsa_backend_capability.py  # tracked by the fork's CPU gate (run from its suite lists, or held on its explicit skip or failing lists); the fork has no Buildkite pipeline
+tests/models/qwen4_exp/test_qsa_block_topk_check.py  # tracked by the fork's CPU gate (run from its suite lists, or held on its explicit skip or failing lists); the fork has no Buildkite pipeline
+tests/models/qwen4_exp/test_qsa_clip_reader_lifecycle.py  # tracked by the fork's CPU gate (run from its suite lists, or held on its explicit skip or failing lists); the fork has no Buildkite pipeline
+tests/models/qwen4_exp/test_qsa_draft_meta.py  # tracked by the fork's CPU gate (run from its suite lists, or held on its explicit skip or failing lists); the fork has no Buildkite pipeline
+tests/models/qwen4_exp/test_qsa_draft_meta_triton_replay.py  # tracked by the fork's CPU gate (run from its suite lists, or held on its explicit skip or failing lists); the fork has no Buildkite pipeline
+tests/models/qwen4_exp/test_qsa_e4m3_decoder.py  # tracked by the fork's CPU gate (run from its suite lists, or held on its explicit skip or failing lists); the fork has no Buildkite pipeline
+tests/models/qwen4_exp/test_qsa_prefill_logits_backing.py  # tracked by the fork's CPU gate (run from its suite lists, or held on its explicit skip or failing lists); the fork has no Buildkite pipeline
+tests/models/qwen4_exp/test_qsa_prepare_main_position_clamp.py  # tracked by the fork's CPU gate (run from its suite lists, or held on its explicit skip or failing lists); the fork has no Buildkite pipeline
+tests/models/qwen4_exp/test_qsa_ring_tag_contract.py  # tracked by the fork's CPU gate (run from its suite lists, or held on its explicit skip or failing lists); the fork has no Buildkite pipeline
+tests/models/qwen4_exp/test_qsa_shape_envelope.py  # tracked by the fork's CPU gate (run from its suite lists, or held on its explicit skip or failing lists); the fork has no Buildkite pipeline
+tests/models/qwen4_exp/test_qsa_sm8x_prefill_launch.py  # tracked by the fork's CPU gate (run from its suite lists, or held on its explicit skip or failing lists); the fork has no Buildkite pipeline
+tests/models/qwen4_exp/test_qsa_warm_load.py  # tracked by the fork's CPU gate (run from its suite lists, or held on its explicit skip or failing lists); the fork has no Buildkite pipeline
+tests/models/qwen4_exp/test_sp_compile_parity.py  # tracked by the fork's CPU gate (run from its suite lists, or held on its explicit skip or failing lists); the fork has no Buildkite pipeline
+tests/models/test_radio_cpe_window.py  # tracked by the fork's CPU gate (run from its suite lists, or held on its explicit skip or failing lists); the fork has no Buildkite pipeline
+tests/test_envs_switch_parser.py  # tracked by the fork's CPU gate (run from its suite lists, or held on its explicit skip or failing lists); the fork has no Buildkite pipeline
+tests/test_flashnext_family.py  # tracked by the fork's CPU gate (run from its suite lists, or held on its explicit skip or failing lists); the fork has no Buildkite pipeline
+tests/test_merlin_e2_toggles.py  # tracked by the fork's CPU gate (run from its suite lists, or held on its explicit skip or failing lists); the fork has no Buildkite pipeline
+tests/test_merlin_marlin_moe_cfg.py  # tracked by the fork's CPU gate (run from its suite lists, or held on its explicit skip or failing lists); the fork has no Buildkite pipeline
+tests/test_merlin_toggle_defaults.py  # tracked by the fork's CPU gate (run from its suite lists, or held on its explicit skip or failing lists); the fork has no Buildkite pipeline
+tests/test_qwen35_family.py  # tracked by the fork's CPU gate (run from its suite lists, or held on its explicit skip or failing lists); the fork has no Buildkite pipeline
+tests/transformers_utils/processors/test_nano_nemotron_vl_tiler.py  # tracked by the fork's CPU gate (run from its suite lists, or held on its explicit skip or failing lists); the fork has no Buildkite pipeline
+tests/transformers_utils/test_flashnext_config_aliases.py  # tracked by the fork's CPU gate (run from its suite lists, or held on its explicit skip or failing lists); the fork has no Buildkite pipeline
+tests/transformers_utils/test_qwen35_config_aliases.py  # tracked by the fork's CPU gate (run from its suite lists, or held on its explicit skip or failing lists); the fork has no Buildkite pipeline
+tests/v1/test_compile_profile_guard.py  # tracked by the fork's CPU gate (run from its suite lists, or held on its explicit skip or failing lists); the fork has no Buildkite pipeline
+tests/v1/test_e2_guards.py  # tracked by the fork's CPU gate (run from its suite lists, or held on its explicit skip or failing lists); the fork has no Buildkite pipeline
+tests/v1/test_e2_ple_mode.py  # tracked by the fork's CPU gate (run from its suite lists, or held on its explicit skip or failing lists); the fork has no Buildkite pipeline
+tests/v1/test_ple_pp_stage_pool.py  # tracked by the fork's CPU gate (run from its suite lists, or held on its explicit skip or failing lists); the fork has no Buildkite pipeline
+tests/v1/test_ple_pull_compile_profile.py  # tracked by the fork's CPU gate (run from its suite lists, or held on its explicit skip or failing lists); the fork has no Buildkite pipeline
+tests/v1/test_pp_kv_projection.py  # tracked by the fork's CPU gate (run from its suite lists, or held on its explicit skip or failing lists); the fork has no Buildkite pipeline
+tests/v1/test_qsa_sm80_capacity.py  # tracked by the fork's CPU gate (run from its suite lists, or held on its explicit skip or failing lists); the fork has no Buildkite pipeline
+
 # tests/platforms/
 tests/platforms/test_cpu.py  # CPU-only unit test; no job targets tests/platforms/
 

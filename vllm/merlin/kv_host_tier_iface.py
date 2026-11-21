@@ -346,8 +346,7 @@ COUNTERS_V3: tuple[str, ...] = (
 # Census additions (``kv_host_tier_census.GAUGES`` / ``EVENTS``).
 CENSUS_GAUGES_V3: tuple[str, ...] = (
     "host_rows_published", "host_rows_provisional", "host_rows_idle",
-    "host_rows_leased", "host_rows_duplicate_running",
-    "host_rows_duplicate_imminent", "grace_pins_active",
+    "host_rows_leased", "grace_pins_active",
 )
 CENSUS_EVENTS_V3: tuple[str, ...] = (
     "split_lost_gpu_ckpt_host_fa", "split_lost_host_ckpt_gpu_fa",

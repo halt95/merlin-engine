@@ -187,6 +187,19 @@ class XgrammarBackend(StructuredOutputBackend):
                     tags, s_tag["triggers"]
                 )
             else:
+
+                from vllm.merlin import strict_length_table, tag_whitespace
+
+                fast = strict_length_table.compile_fast(
+                    self, grammar_spec, stop_token_ids
+                )
+                if fast is not None:
+                    return fast
+                grammar_spec = tag_whitespace.one_run_per_gap(grammar_spec)
+
+                from vllm.merlin.xml_value_ws import one_value_parse
+
+                grammar_spec = one_value_parse(grammar_spec)
                 ctx = self.full_vocab_compiler.compile_structural_tag(grammar_spec)
         else:
             logger.error(

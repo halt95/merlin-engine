@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by the Merlin project; see NOTICE.
 
 
 import json
@@ -30,6 +31,7 @@ from xgrammar.structural_tag import (
     StarFormat,
     TagFormat,
     TagsWithSeparatorFormat,
+    TokenFormat,
     TokenTriggeredTagsFormat,
     TriggeredTagsFormat,
 )
@@ -875,6 +877,361 @@ def _hy_v4_argument_keys(parameters: dict[str, Any]) -> tuple[list[str], list[st
     required_keys += [k for k in required if k not in properties]
     optional_keys = [k for k in properties if k not in required_set]
     return required_keys, optional_keys
+
+
+# The xgrammar builtin ``qwen_3_coder`` tag begins a call with the text
+# ``<tool_call>``, which the grammar also lets the model spell in ordinary
+# tokens (``<``, ``tool``, ``_call``, ``>``). The parser reads such a spelling as
+# text, so the call came back as raw markup. This builder has the same language
+# but begins and ends a call with the two special tokens, so the spelled form
+# cannot be generated. The Qwen engine tool parser selects it only when the
+# tokenizer has all four tokens below and falls back to the builtin otherwise.
+QWEN_3_CODER_TOKEN_MODEL = "qwen_3_coder_token"
+QWEN_3_CODER_TOKENS = ("<tool_call>", "</tool_call>", "<think>", "</think>")
+
+
+def _qwen_3_coder_text_structural_tag(
+    function_tools: list[FunctionToolParam],
+    tool_choice: SimplifiedToolChoice,
+    reasoning: bool,
+) -> StructuralTag:
+    """The xgrammar builtin text form, for the cases the token form skips."""
+    dumped_tools = []
+    for tool in function_tools:
+        function: dict[str, Any] = {"name": tool.function.name}
+        if tool.function.strict is not None:
+            function["strict"] = tool.function.strict
+        if tool.function.description is not None:
+            function["description"] = tool.function.description
+        if tool.function.parameters is not None:
+            function["parameters"] = tool.function.parameters
+        dumped_tools.append({"type": "function", "function": function})
+    dumped_choice: Any = (
+        {"type": "function", "function": {"name": function_tools[0].function.name}}
+        if tool_choice == "forced" and function_tools
+        else tool_choice
+    )
+    return get_xgrammar_model_structural_tag(
+        model="qwen_3_coder",
+        tools=dumped_tools,
+        tool_choice=dumped_choice,
+        reasoning=reasoning,
+    )
+
+
+# The generic strict grammar of a raw string parameter with ``maxLength N`` unrolls the
+# bound into one automaton state per character, and its end marker ``</parameter>`` can
+# also be value text, so for the unused part of the bound the matcher carries a second
+# "the value goes on" branch whose token masks cannot be cached: a strict call costs
+# about five times a default one per token. The block below says the same thing with
+# xgrammar's own character budget (``root[max_chars=N]``, code points), which has neither.
+#
+# What it enforces, for a top-level string parameter whose schema is exactly
+# ``type: string`` + ``maxLength`` (annotations aside) of a strict tool whose object
+# schema is closed (``additionalProperties: false``): the length bound of the value as
+# the parser delivers it, in Unicode code points. The value is a grammar rule with a
+# character budget (``root[max_chars=N]``). The budget counts whole code points; the
+# rule takes well-formed UTF-8 only, so a lone continuation byte, or a lead byte not
+# followed by its continuation bytes, is never allowed whatever tokens spell it, while a
+# character spelled in byte tokens counts as one; and it compiles in time that does not
+# grow with N. The rule is a small automaton that cannot contain the closing sequence
+# (a newline and ``</parameter>``), so the value has one parse. Differences from the
+# generic grammar, which is looser in each: whitespace between the tags and the value is
+# part of the value and counted (the generic grammar leaves it free, so the parser can
+# deliver more than N); the newline after the opening tag and the one before the closing
+# tag are required (the generic grammar makes them optional); and a value cannot
+# contain a newline followed by the closing tag (the generic grammar accepts one by
+# reading a later closing tag as the end, and refuses the same text in a string with no
+# bound). Whitespace between parameters is free, the order is the declared one, optional
+# parameters may be left out, as in the generic grammar. Every other parameter (other
+# keywords on a string, numbers, arrays, objects, enums, patterns, a ``minLength``)
+# keeps the generic strict grammar, one parameter at a time, and so does a whole schema
+# the block cannot split (open objects, references, other object keywords): never a
+# dropped constraint, only the cost of the generic one. Every special and added token
+# is allowed exactly where the generic grammar allows it, and nothing else is.
+_QWEN_XML_SPACE = "(?:[ ]|\\t|\\n|\\r)*"
+# A strict call caps each whitespace run at VLLM_MERLIN_STRICT_WS_CAP characters
+# (default 64): between parameters and in JSON values.
+_QWEN_XML_SPACE_CAPPED = "(?:[ ]|\\t|\\n|\\r){{0,{}}}"
+_QWEN_XML_OBJECT_KEYS = frozenset(
+    {"type", "properties", "required", "additionalProperties", "description", "title"}
+)
+_QWEN_XML_ANNOTATION_KEYS = frozenset({"description", "title", "default", "examples"})
+
+
+def _has_key(node: Any, key: str) -> bool:
+    if isinstance(node, dict):
+        return key in node or any(_has_key(v, key) for v in node.values())
+    if isinstance(node, list):
+        return any(_has_key(v, key) for v in node)
+    return False
+
+
+def _bounded_string_limit(schema: Any) -> int | None:
+    """``maxLength`` when ``schema`` is exactly a string with that bound, else None."""
+    if not isinstance(schema, dict) or schema.get("type") != "string":
+        return None
+    if not set(schema) <= {"type", "maxLength"} | _QWEN_XML_ANNOTATION_KEYS:
+        return None
+    limit = schema.get("maxLength")
+    if isinstance(limit, bool) or not isinstance(limit, int) or not 0 <= limit <= 10**6:
+        return None
+    return limit
+
+
+def _bounded_value_rule(limit: int, closing: str = "\n</parameter>") -> str:
+    """EBNF for a value of at most ``limit`` code points that does not contain ``closing``.
+
+    One rule per prefix of ``closing`` (the automaton that avoids the substring); the
+    budget is on the root rule, which counts code points of what it expands to.
+    """
+    size = len(closing)
+    special = sorted(set(closing))
+    assert all(c.isalpha() or c in "\n</>" for c in special)
+
+    def after(matched: int, char: str) -> int:
+        seen = closing[:matched] + char
+        return next(k for k in range(min(len(seen), size), -1, -1) if seen.endswith(closing[:k]))
+
+    quote = lambda c: '"\\n"' if c == "\n" else f'"{c}"'
+    # any character but the closing sequence's own, and no surrogate (no UTF-8 text holds one)
+    other = "[^" + "".join("\\n" if c == "\n" else c for c in special) + "\\uD800-\\uDFFF]"
+    lines = [f"root[max_chars={limit}] ::= s0"]
+    for matched in range(size):
+        options = ['""', f"{other} s0"]
+        for char in special:
+            nxt = after(matched, char)
+            if nxt < size:  # reaching ``size`` would complete the closing sequence
+                options.append(f"{quote(char)} s{nxt}")
+        lines.append(f"s{matched} ::= " + " | ".join(options))
+    return "\n".join(lines)
+
+
+def _bounded_string_block(
+    name: str, limit: int, space: str = _QWEN_XML_SPACE
+) -> SequenceFormat:
+    from xgrammar.structural_tag import GrammarFormat
+
+    return SequenceFormat(
+        elements=[
+            RegexFormat(pattern=space),
+            TagFormat(
+                begin=f"<parameter={name}>\n",
+                content=GrammarFormat(grammar=_bounded_value_rule(limit)),
+                end="\n</parameter>",
+            ),
+        ]
+    )
+
+
+def _strict_whitespace(function: Any) -> tuple[int | None, str]:
+    """(JSON whitespace cap, space between parameters) for one tool: capped at
+    VLLM_MERLIN_STRICT_WS_CAP for a strict tool, else as upstream."""
+    from vllm import envs
+
+    if getattr(function, "strict", None):
+        cap = envs.VLLM_MERLIN_STRICT_WS_CAP
+        return cap, _QWEN_XML_SPACE_CAPPED.format(cap)
+    return None, _QWEN_XML_SPACE
+
+
+def _qwen_3_coder_arguments(function: Any) -> Any:
+    """The argument grammar of one tool: generic, or with bounded string parameters."""
+    parameters = get_function_parameters(function)
+
+    cap, space = _strict_whitespace(function)
+    generic = JSONSchemaFormat(
+        json_schema=parameters,
+        style="qwen_xml",
+        any_order=False,
+        max_whitespace_cnt=cap,
+    )
+    if not getattr(function, "strict", None) or not isinstance(parameters, dict):
+        return generic
+    properties = parameters.get("properties")
+    required = parameters.get("required", [])
+    why = None
+    if parameters.get("type") != "object" or parameters.get("additionalProperties") is not False:
+        why = "the object is not closed"
+    elif not set(parameters) <= _QWEN_XML_OBJECT_KEYS or _has_key(parameters, "$ref"):
+        why = "the object has keywords or references the block does not split"
+    elif not isinstance(properties, dict) or not properties:
+        why = "no properties"
+    elif not isinstance(required, list) or not set(required) <= set(properties):
+        why = "required names an unknown property"
+    elif not all(
+        isinstance(n, str) and n.isascii() and n.replace("_", "").replace("-", "").replace(".", "").isalnum()
+        for n in properties
+    ):
+        why = "a parameter name is not a plain identifier"
+    from vllm.logger import init_logger
+
+    log = init_logger(__name__)
+    if why is not None:
+        log.debug_once("Tool %s keeps the generic strict argument grammar: %s.", function.name, why)
+        return generic
+    limits = {n: _bounded_string_limit(s) for n, s in properties.items()}
+    if all(limit is None for limit in limits.values()):
+        return generic
+    elements: list[Any] = []
+    for name, schema in properties.items():
+        if limits[name] is not None:
+            block: Any = _bounded_string_block(name, limits[name], space)
+        else:
+            if isinstance(schema, dict) and "maxLength" in schema:
+                log.debug_once(
+                    "Tool %s parameter %s keeps the generic strict grammar: its string schema "
+                    "has keywords besides maxLength (%s).",
+                    function.name,
+                    name,
+                    ", ".join(sorted(set(schema) - {"type", "maxLength"} - _QWEN_XML_ANNOTATION_KEYS)),
+                )
+            block = JSONSchemaFormat(
+                json_schema={
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {name: schema},
+                    "required": [name],
+                },
+                style="qwen_xml",
+                any_order=False,
+                max_whitespace_cnt=cap,
+            )
+        elements.append(block if name in required else OptionalFormat(content=block))
+    elements.append(RegexFormat(pattern=space))
+    return SequenceFormat(elements=elements)
+
+
+def _qwen_3_coder_call_body(tool: FunctionToolParam) -> SequenceFormat:
+    """What follows ``<tool_call>`` up to ``</tool_call>`` for one tool."""
+    function = tool.function
+    return SequenceFormat(
+        elements=[
+            ConstStringFormat(value=f"\n<function={function.name}>\n"),
+            _qwen_3_coder_arguments(function),
+            ConstStringFormat(value="\n</function>\n"),
+        ]
+    )
+
+
+@register_vllm_structural_tag(QWEN_3_CODER_TOKEN_MODEL)
+def get_qwen_3_coder_token_structural_tag(
+    function_tools: list[FunctionToolParam],
+    builtin_tools: list[BuiltinToolParam],
+    tool_choice: SimplifiedToolChoice,
+    reasoning: bool,
+    token_suffix: str = "",
+) -> StructuralTag:
+    """Build the Qwen3-Coder tool-call tag with special-token delimiters.
+
+    Same language as the xgrammar builtin ``qwen_3_coder`` tag, except that a
+    call opens with the ``<tool_call>`` token and closes with the
+    ``</tool_call>`` token (resolved by name from the tokenizer at compile time,
+    never by id). A forced choice is one such call; ``required`` and ``auto``
+    allow free text around calls, entered by the ``<tool_call>`` token, with
+    ``<think>`` and ``</think>`` excluded from the free text as the builtin does.
+
+    Args:
+        function_tools: Normalized function tools with ``strict`` pinned by
+            ``resolve_tool_strictness``.
+        builtin_tools: Unused; Qwen3-Coder has no builtin tools. A request that
+            has some gets the builtin text form.
+        tool_choice: Simplified tool choice (``auto`` / ``required`` /
+            ``forced``).
+        reasoning: Whether the grammar also covers the reasoning phase; if so
+            the builtin text form is returned.
+        token_suffix: Unused; the tokens are fixed.
+
+    """
+    del token_suffix
+    if reasoning or builtin_tools:
+        return _qwen_3_coder_text_structural_tag(function_tools, tool_choice, reasoning)
+    if tool_choice == "forced" and not function_tools:
+        raise ValueError("Forced tool choice must resolve to exactly one tool.")
+    bodies = [_qwen_3_coder_call_body(tool) for tool in function_tools]
+    excludes = ["<think>", "</think>"]
+    if not bodies:
+        return StructuralTag(format=AnyTextFormat(excludes=excludes))
+    call = TagFormat(
+        begin=TokenFormat(token="<tool_call>"),
+        content=bodies[0] if len(bodies) == 1 else OrFormat(elements=bodies),
+        end=TokenFormat(token="</tool_call>"),
+    )
+    if tool_choice == "forced":
+        return StructuralTag(format=call)
+    return StructuralTag(
+        format=TokenTriggeredTagsFormat(
+            trigger_tokens=["<tool_call>"],
+            tags=[call],
+            exclude_tokens=excludes,
+            at_least_one=tool_choice == "required",
+        )
+    )
+
+
+def qwen_3_coder_token_ids(tokenizer: Any) -> tuple[dict[str, int], list[str]]:
+    """The id of each of ``QWEN_3_CODER_TOKENS`` in ``tokenizer``, and why any is unusable.
+
+    A name is usable when the vocabulary gives it one id, the tokenizer's own lookup
+    gives the same id (an added token and a vocabulary entry must agree), the name
+    encodes to exactly that one id, and that id decodes back to the name. The Qwen
+    parser finds the same tokens by ``vocab.get(name)``, so grammar and parser agree.
+    """
+    ids: dict[str, int] = {}
+    problems: list[str] = []
+    try:
+        vocab = tokenizer.get_vocab()
+    except Exception as exc:  # a tokenizer without a vocabulary cannot name tokens
+        return ids, [f"no vocabulary ({exc})"]
+    for name in QWEN_3_CODER_TOKENS:
+        token_id = vocab.get(name)
+        if token_id is None:
+            problems.append(f"{name}: not in the vocabulary")
+            continue
+        try:
+            lookup = getattr(tokenizer, "convert_tokens_to_ids", None)
+            if lookup is not None and lookup(name) != token_id:
+                problems.append(f"{name}: the vocabulary and the added-token lookup differ")
+            elif list(tokenizer.encode(name, add_special_tokens=False)) != [token_id]:
+                problems.append(f"{name}: does not encode to its single id")
+            elif tokenizer.decode([token_id]) != name:
+                problems.append(f"{name}: its id decodes to something else")
+            else:
+                ids[name] = token_id
+        except Exception as exc:
+            problems.append(f"{name}: could not be checked ({exc})")
+    return ids, problems
+
+
+def resolve_structural_tag_tokens(
+    tag: StructuralTag, ids: dict[str, int]
+) -> StructuralTag:
+    """Replace every token given by name in ``tag`` with its id from ``ids``, in place.
+
+    The request is validated before any tokenizer is at hand (xgrammar cannot
+    resolve a token string without one), so the tag carries ids. Raises
+    ``KeyError`` for a name ``ids`` lacks.
+    """
+
+    def ident(token: str | int) -> int:
+        return ids[token] if isinstance(token, str) else token
+
+    def visit(node: Any) -> None:
+        if isinstance(node, TokenFormat):
+            node.token = ident(node.token)
+        elif isinstance(node, BaseModel):
+            for name in type(node).model_fields:
+                value = getattr(node, name)
+                if name in ("trigger_tokens", "exclude_tokens"):
+                    setattr(node, name, [ident(t) for t in value])
+                else:
+                    visit(value)
+        elif isinstance(node, (list, tuple)):
+            for item in node:
+                visit(item)
+
+    visit(tag.format)
+    return tag
 
 
 @register_vllm_structural_tag("hy_v4")

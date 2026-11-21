@@ -142,6 +142,7 @@ _CONFIG_REGISTRY: dict[str, type[PreTrainedConfig]] = LazyConfigDict(
     k3_dspark="K3DSparkConfig",
     funaudiochat="FunAudioChatConfig",
     hy_v4="HYV4Config",
+    hy_v4_flash="HYV4FlashConfig",
     hyperclovax="HyperCLOVAXConfig",  # Upstream class, hub remote code is broken
     isaac="IsaacConfig",
     kimi_k2="DeepseekV3Config",  # Kimi K2 uses same architecture as DeepSeek V3

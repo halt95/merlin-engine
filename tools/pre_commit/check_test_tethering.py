@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by the Merlin project; see NOTICE.
 """Check that test files are wired into ("tethered to") the Buildkite CI.
 
 A test file is *tethered* when at least one Buildkite job actually collects it -
@@ -778,6 +779,61 @@ def all_test_modules() -> list[str]:
     return sorted(path for path in paths if is_test_module(path))
 
 
+# Symlink shapes, read from git's own modes
+def tracked_symlinks() -> set[str]:
+    """Tracked paths under ``tests/`` that git records as symlinks (mode 120000),
+    read from the index, so a checkout where a symlink is a plain file is judged
+    the same as one where it is a link. Outside a git checkout, the links found
+    on disk."""
+    try:
+        listing = subprocess.run(
+            ["git", "-C", str(REPO_ROOT), "ls-files", "-s", "-z", "--", "tests/"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+    except (OSError, subprocess.CalledProcessError):
+        return {
+            path.relative_to(REPO_ROOT).as_posix()
+            for path in (REPO_ROOT / "tests").rglob("*")
+            if path.is_symlink()
+        }
+    return {
+        record.split("\t", 1)[1]
+        for record in listing.split("\0")
+        if record.startswith("120000 ") and "\t" in record
+    }
+
+
+def symlink_shape_problems(entries: list[str], symlinks: set[str]) -> list[str]:
+    """One line per allowlist entry that a symlink could turn into an exemption
+    for an upstream test: an entry that is, or sits below, a tracked symlink, and
+    a directory entry with a tracked symlink (a directory too) anywhere below it."""
+    problems = []
+    for entry in entries:
+        parts = entry.rstrip("/").split("/")
+        for n in range(1, len(parts) + 1):
+            prefix = "/".join(parts[:n])
+            if prefix in symlinks:
+                how = "is" if n == len(parts) else "sits below"
+                problems.append(
+                    f"error: {ALLOWLIST_PATH.name}: {entry} {how} the tracked "
+                    f"symlink {prefix} (git mode 120000), so it could exempt "
+                    "an upstream test under a fork-only name"
+                )
+                break
+        else:
+            if entry.endswith("/"):
+                for link in sorted(p for p in symlinks if p.startswith(entry)):
+                    problems.append(
+                        f"error: {ALLOWLIST_PATH.name}: {link} is a tracked "
+                        f"symlink (git mode 120000) inside the exempted "
+                        f"directory {entry}; an alias could carry an upstream "
+                        "test in under a fork-only name"
+                    )
+    return problems
+
+
 def load_allowlist() -> set[str]:
     """Read the allowlist file into a set of repo-relative paths. Blank lines and
     ``#`` comments (whole-line or trailing) are ignored."""
@@ -787,8 +843,50 @@ def load_allowlist() -> set[str]:
     paths = set()
     for line in ALLOWLIST_PATH.read_text().splitlines():
         path = line.split("#", 1)[0].strip()
+        # "dir/" entry covers its test modules
+        if path.endswith("/"):
+            parts = path[:-1].split("/")
+            if (
+                parts[0] != "tests"
+                or len(parts) < 2
+                or any(part in ("", ".", "..") or "\\" in part for part in parts)
+                or not (REPO_ROOT / path).is_dir()
+            ):
+                sys.exit(
+                    f"error: {ALLOWLIST_PATH.name}: directory entry {path!r} must "
+                    "be an existing directory below tests/ (not tests/ itself, "
+                    "not absolute, no '..')"
+                )
+            entry_dir = REPO_ROOT / path
+            real_dir = REPO_ROOT.resolve().joinpath(*parts)
+            if entry_dir.resolve() != real_dir:
+                sys.exit(
+                    f"error: {ALLOWLIST_PATH.name}: directory entry {path!r} is, "
+                    "or sits below, a symlink or junction"
+                )
+            for found in entry_dir.rglob("*.py"):
+                rel = found.relative_to(REPO_ROOT).as_posix()
+                if not is_test_module(rel):
+                    continue
+                if found.resolve() != real_dir.joinpath(
+                    *found.relative_to(entry_dir).parts
+                ):
+                    print(
+                        f"error: {ALLOWLIST_PATH.name}: {rel} is a symlink, or "
+                        "below one, and is not exempted",
+                        file=sys.stderr,
+                    )
+                    continue
+                paths.add(rel)
+            continue
         if path:
             paths.add(path)
+    # Refuse the symlink shapes
+    lines = ALLOWLIST_PATH.read_text().splitlines()
+    entries = [ln.split("#", 1)[0].strip() for ln in lines]
+    problems = symlink_shape_problems([e for e in entries if e], tracked_symlinks())
+    if problems:
+        sys.exit("\n".join(problems))
     return paths
 
 

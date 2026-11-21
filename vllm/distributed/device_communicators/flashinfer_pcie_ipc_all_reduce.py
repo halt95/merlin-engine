@@ -23,6 +23,7 @@ from vllm.distributed.device_communicators.custom_all_reduce import _all_ranks_t
 from vllm.distributed.parallel_state import in_the_same_node_as
 from vllm.logger import init_logger
 from vllm.merlin import pcie_ipc_tune_cache
+from vllm.merlin.latent_ipc import Latent
 from vllm.platforms import current_platform
 
 if TYPE_CHECKING:
@@ -140,6 +141,7 @@ class FlashInferPcieIpcAllReduce:
         dtype: torch.dtype,
         capture_sizes: Sequence[int],
         tune_cache: Path,
+        extra_widths: Sequence[int] = (),
     ) -> None:
         """Allocate, tune, and prepare the exact graph-capture shapes."""
         if self.disabled or self.workspace is not None:
@@ -163,6 +165,8 @@ class FlashInferPcieIpcAllReduce:
             return
 
         self.hidden_dim = int(hidden_dim)
+        # hidden_dim, then the opt-in extra widths
+        self.widths = Latent.widths(self.hidden_dim, extra_widths)
         self.dtype = dtype
         max_numel = batches[-1] * self.hidden_dim
         # One load decision per TP
@@ -189,14 +193,15 @@ class FlashInferPcieIpcAllReduce:
         torch.accelerator.synchronize(self.device)
         workspace.rebind_stream()
         workspace.tune(
-            [self.hidden_dim],
+            list(self.widths),
             dtype=dtype,
             tune_group=self.tune_group,
         )
         pcie_ipc_tune_cache.finish(
             Path(tune_cache), self.rank, mixed_group, self._barrier_tune_group
         )
-        workspace.prepare([(batch, self.hidden_dim) for batch in batches], dtype=dtype)
+        # Every capture size at every width
+        workspace.prepare(Latent.shapes(batches, self.widths), dtype=dtype)
         torch.accelerator.synchronize(self.device)
         workspace.rebind_stream()
         logger.info_once(
@@ -207,6 +212,7 @@ class FlashInferPcieIpcAllReduce:
             dtype,
             batches[-1],
         )
+        Latent.log(self, batches)
 
     # CPU-group collectives
     def _device_index(self) -> int:
@@ -229,7 +235,7 @@ class FlashInferPcieIpcAllReduce:
             and inp.is_cuda
             and inp.is_contiguous()
             and inp.dim() == 2
-            and inp.shape[1] == self.hidden_dim
+            and Latent.fits(self, inp.shape[1])
             and inp.dtype == self.dtype
             and workspace.supports(inp)
         )
@@ -302,4 +308,6 @@ def warmup_flashinfer_pcie_ipc_allreduce(worker: "Worker") -> None:
         dtype=worker.model_config.dtype,
         capture_sizes=capture_sizes,
         tune_cache=tune_cache,
+
+        extra_widths=Latent.extra(worker.model_config.hf_text_config),
     )

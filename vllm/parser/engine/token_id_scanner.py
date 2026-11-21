@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by the Merlin project; see NOTICE.
 """Scan delta token IDs for special tokens and split the stream into
 pre-lexed terminals and plain text chunks."""
 
@@ -255,6 +256,12 @@ class TokenIDScanner:
             elif pos == 0:
                 results.append(terminal)
                 remaining = remaining[len(terminal.text) :]
+            # A dropped special token's
+            # text may never reach this text (a pass that already removed it):
+            # it adds nothing, so nothing waits for it.
+            elif terminal.terminal == DROP_TERMINAL:
+                if prefix_token_count:
+                    results.append(TextChunk("", token_count=prefix_token_count))
             else:
                 # Accumulate text until terminal text arrives —
                 # only the terminal provides a reliable split point.
@@ -380,11 +387,14 @@ class TokenIDScanner:
                 # arrives in delta_text (stripped by detokenizer).
                 # Don't defer remaining content waiting for text
                 # that will never come.
-                if (
-                    not has_later_valid
-                    and consumed < len(delta_text)
-                    and anchor.terminal != DROP_TERMINAL
-                ):
+                # Not deferred either: a
+                # deferred terminal holds every later text until its own text
+                # arrives, which for a dropped token may be never.
+                if anchor.terminal == DROP_TERMINAL:
+                    if count_groups[i]:
+                        new_results.append(TextChunk("", token_count=count_groups[i]))
+                    continue
+                if not has_later_valid and consumed < len(delta_text):
                     self._deferred_post_text += delta_text[consumed:]
                     consumed = len(delta_text)
                 self._deferred_terminals.append(anchor)

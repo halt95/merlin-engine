@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by the Merlin project; see NOTICE.
 """Inference-only Qwen3_5 MTP model."""
 
 from collections.abc import Iterable
@@ -12,6 +13,7 @@ from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
 from vllm.distributed import get_pp_group, tensor_model_parallel_all_gather
 from vllm.logger import init_logger
+from vllm.merlin import mtp_quant_targets
 from vllm.model_executor.layers.fused_moe.utils import (
     is_model_fused_shared_expert_compatible,
 )
@@ -115,7 +117,20 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
                 dynamic = hf_qc.get("dynamic", {})
                 if any(k.startswith("-:") and "mtp" in k for k in dynamic):
                     vllm_config.quant_config = None
-        self.layers = torch.nn.ModuleList(
+        # An early branch: when the quant config's
+        # by-name outcomes are verified unchanged the layers are built at the runtime
+        # index from a copy of the config (as Qwen4Exp numbers its MTP layers); else
+        # this is None and the base construction below runs untouched.
+        layers_at_runtime_index = mtp_quant_targets.runtime_index_layers(
+            vllm_config,
+            self.mtp_start_layer_idx,
+            self.num_mtp_layers,
+            prefix,
+            lambda config, layer_prefix: Qwen3_5DecoderLayer(
+                config, layer_type="full_attention", prefix=layer_prefix
+            ),
+        )
+        self.layers = layers_at_runtime_index or torch.nn.ModuleList(
             Qwen3_5DecoderLayer(
                 vllm_config,
                 layer_type="full_attention",
@@ -285,10 +300,17 @@ class Qwen3_5MTP(LocalArgmaxMixin, nn.Module, SupportsMultiModal, SupportsPP):
         hidden_states: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
+        # The draft step selects the MTP module.
+        spec_step_idx: int = 0,
         **kwargs: object,
     ):
         hidden_states = self.model(
-            input_ids, positions, hidden_states, intermediate_tensors, inputs_embeds
+            input_ids,
+            positions,
+            hidden_states,
+            intermediate_tensors,
+            inputs_embeds,
+            spec_step_idx=spec_step_idx,
         )
         return hidden_states
 
@@ -298,6 +320,13 @@ class Qwen3_5MTP(LocalArgmaxMixin, nn.Module, SupportsMultiModal, SupportsPP):
         spec_step_idx: int = 0,
     ) -> torch.Tensor | None:
         return self.logits_processor(self.lm_head, hidden_states)
+
+    # The multi-module speculator passes the
+    # step to the local argmax too; every module shares this one head.
+    def get_top_tokens(
+        self, hidden_states: torch.Tensor, spec_step_idx: int = 0
+    ) -> torch.Tensor:
+        return super().get_top_tokens(hidden_states)
 
     def is_unused_checkpoint_weight(self, name: str) -> bool:
         return not name.startswith("mtp.") and not any(

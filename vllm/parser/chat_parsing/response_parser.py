@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by the Merlin project; see NOTICE.
 
 # Copyright 2026 The HuggingFace Team. All rights reserved.
 # ruff: noqa
@@ -22,6 +23,8 @@ from __future__ import annotations
 import copy
 import json
 from typing import Any
+
+from vllm.tool_parsers.utils import NOT_A_LITERAL, json_literal_of_type
 
 from .content_parsers import STREAMABLE_PARSERS, process_field
 from .response_templates import (
@@ -48,6 +51,14 @@ def _schema_types(schema: Any) -> tuple[str, ...]:
 
 def _coerce(raw: str, types: tuple[str, ...]) -> Any:
     for type_name in types:
+        # With a string alternative the text
+        # becomes another type only when it is that value's own JSON text.
+        if "string" in types:
+            if type_name != "string":
+                literal = json_literal_of_type(raw, type_name)
+                if literal is not NOT_A_LITERAL:
+                    return literal
+            continue
         try:
             if type_name == "integer":
                 try:

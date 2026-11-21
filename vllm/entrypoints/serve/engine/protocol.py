@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by the Merlin project; see NOTICE.
 
 # Adapted from
 # https://github.com/lm-sys/FastChat/blob/168ccc29d3f7edc50823016105c024fe2282732a/fastchat/protocol/openai_api_protocol.py
@@ -110,6 +111,19 @@ class ModelCard(OpenAIBaseModel):
     root: str | None = None
     parent: str | None = None
     max_model_len: int | None = None
+
+    kv_cache_capacity_tokens: int | None = Field(
+        default=None,
+        ge=0,
+        description=(
+            "Total KV cache tokens shared by all requests on this server (the "
+            "engine's KV pool, the minimum over its engines); a single request "
+            "is limited by max_model_len. Sized in max_model_len-length "
+            "requests: on hybrid models it varies with max_model_len, and many "
+            "shorter requests hold fewer tokens in total. Does not shrink with "
+            "occupancy. Null without a KV pool."
+        ),
+    )
     permission: list[ModelPermission] = Field(default_factory=list)
 
 

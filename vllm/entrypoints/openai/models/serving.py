@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by the Merlin project; see NOTICE.
 
 from asyncio import Lock
 from collections import defaultdict
@@ -162,6 +163,10 @@ class OpenAIServingModels:
             for lora in self.lora_requests.values()
         ]
         model_list.data.extend(lora_cards)
+        # Aliases and adapters use one pool.
+        capacity = self.engine_client.vllm_config.cache_config.kv_cache_capacity_tokens
+        for card in model_list.data:
+            card.kv_cache_capacity_tokens = capacity
         return model_list
 
     async def load_lora_adapter(

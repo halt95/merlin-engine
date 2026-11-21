@@ -223,11 +223,18 @@ def check_gate_envs(gib: int) -> None:
     if set_names:
         wb.copy_credits()
         wb.escape_steps()
+        wb.n_restore()
+        wb.max_assembling()
         # The demotion direction's own row and byte credits.
         wb.copy_credits_d()
         wb.copy_bytes_d()
         wb.max_pending_store_blocks()
         wb.fallback_boundary()
+        wb.shared_row_lone()
+        wb.evict_duplicates_first()
+        wb.restore_start_any_step()
+        wb.restore_credits_per_slot()
+        wb.restore_seat_hold()
 
 
 # --- Host memory bounds ----------------------------------------------------
@@ -466,27 +473,35 @@ RESTORE_UNIT_TOKENS = 262_144
 
 def restore_unit_blocks(
     cfg: "KVCacheConfig", tokens: int = RESTORE_UNIT_TOKENS,
-    *, coordinator: Any = None,
+    *, coordinator: Any = None, block_sizes: Any = None,
 ) -> int:
     """Rows in the complete restore manifest, including EAGLE proof sources.
 
     Excludes the host null row and assembly allowance; capacity warnings add
-    those separately through restore_capacity_blocks.
+    those separately through restore_capacity_blocks. ``block_sizes``: the
+    resolved per-group tokens per row (DCP-scaled), as the manifest takes them.
     """
     from vllm.merlin.kv_restore_dependencies import restore_dependency_manifest
 
     return sum(
         group.blocks for group in restore_dependency_manifest(
-            cfg, tokens, coordinator=coordinator
+            cfg, tokens, coordinator=coordinator, block_sizes=block_sizes
         )
     )
 
 
-def min_tier_rows(spec: "KVCacheConfig") -> int:
-    """Minimum host data rows for one 262K restore unit in this layout."""
+def min_tier_rows(spec: "KVCacheConfig", block_sizes: Any = None) -> int:
+    """Minimum host data rows for one 262K restore unit in this layout.
+
+    ``block_sizes`` are the resolved per-group row
+    sizes in tokens. Under DCP a sharded group's row holds ``block_size x DCP``
+    tokens (each rank keeps its own shard in the same row id), so the spec's
+    block size would count twice the rows at DCP2 (Hy4 Flash: 5,128 instead of
+    2,568 for the latent + IndexPool + SWA groups). None: the specs' own sizes
+    (exact without DCP, the Flash-Next and 27B lanes)."""
     # This is the unit term of the old three-unit L_max calculation: divide
     # out its two restore slots and one assembly slot.
-    return restore_unit_blocks(spec, RESTORE_UNIT_TOKENS)
+    return restore_unit_blocks(spec, RESTORE_UNIT_TOKENS, block_sizes=block_sizes)
 
 
 def host_block_bytes(cfg: "KVCacheConfig") -> int:
@@ -559,6 +574,229 @@ def check_arena_fits(arena_bytes: int) -> None:
 # memory bounds). Held from the arena check until the arena is allocated and
 # locked, so the next rank's check sees it as used.
 ARENA_LOCK_PATH = "/tmp/merlin-kv-host-tier.lock"
+# Seconds a rank waits for that lock before it stops with an error naming the
+# file (MERLIN_KV_HOST_TIER__ARENA_LOCK_TIMEOUT_S overrides it). One rank holds
+# the lock for its own allocate + mlock only, and the ranks of a boot take it in
+# turn, so the wait of the last rank is the sum of every earlier hold. Measured
+# holds (log line "SimpleCPUOffloadWorker [CPU]" to "host-RAM KV tier: rank",
+# whole seconds, 4 x RTX 3090 and a one-rank 27B): 14 to 18 s at 24 GiB per rank
+# (4 ranks in turn: 64 s for the 96 GiB tier), 37 s for the largest single
+# arena (52 GiB), about 0.7 s per GiB. 900 s is 14 times the 4-rank queue, 24
+# times the largest single hold and about 6 times 4 ranks of 52 GiB at that
+# rate, and still a clean error instead of a hang when a holder is stuck.
+ARENA_LOCK_TIMEOUT_S = 900
+ARENA_LOCK_TIMEOUT_ENV = "MERLIN_KV_HOST_TIER__ARENA_LOCK_TIMEOUT_S"
+ARENA_LOCK_POLL_S = 0.2
+# A rank that has waited this long for the lock says so once, so a slow queue
+# is told apart from a stuck holder before the deadline.
+ARENA_LOCK_NOTE_S = 5.0
+# How often the lock file may be found deleted or replaced while a rank takes
+# the lock (each time the rank opens the path again) before it gives up.
+ARENA_LOCK_REOPEN_ROUNDS = 8
+
+
+def _logger() -> Any:
+    from vllm.logger import init_logger
+
+    return init_logger(__name__)
+
+
+def arena_lock_timeout_s() -> float:
+    """The lock wait in seconds: the knob when set, else ARENA_LOCK_TIMEOUT_S."""
+    import vllm.envs as envs
+
+    value = envs.MERLIN_KV_HOST_TIER__ARENA_LOCK_TIMEOUT_S
+    return float(ARENA_LOCK_TIMEOUT_S if value is None else value)
+
+
+def _arena_lock_owner(path: str) -> str:
+    """Owner and mode of the lock file for an error message (never follows a link)."""
+    import os
+
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return "owner unknown"
+    return f"owner uid {st.st_uid}, mode {st.st_mode & 0o7777:04o}"
+
+
+def _widen_new_file(fd: int, path: str) -> None:
+    """Make a file this process has just created readable by every account,
+    whatever the creator's umask, so servers of other users can open it and
+    serialise on it. Only ever called on a file created here by O_EXCL, never
+    on one another account made. A refusal does not stop this rank (the lock
+    works for the account that made the file); it is logged once and a later
+    account that cannot open the file gets the permission message."""
+    import os
+
+    try:
+        os.fchmod(fd, 0o644)
+    except OSError as e:
+        _logger().warning(
+            "host-RAM KV tier: could not set mode 0644 on the new arena lock "
+            "file %s (%s). The lock works for this account, but another "
+            "account cannot open it until its owner runs chmod 644 on it.",
+            path, e,
+        )
+
+
+def _open_arena_lock(path: str) -> int:
+    """Open the shared lock file for flock and return the descriptor.
+
+    The existing file is opened read-only without O_CREAT: a read-only open
+    needs no ownership of the file, and the kernel's protected-regular rule
+    (fs.protected_regular) refuses an O_CREAT open of another user's file in a
+    sticky directory such as /tmp. Only a missing file is created, with
+    O_EXCL, and a creator that loses the race opens the file the winner made.
+    The file is never unlinked here and never followed through a symlink; what
+    is opened must be a regular file. The descriptor is closed on every error
+    after the open.
+    """
+    import errno
+    import os
+    import stat
+
+    # O_NONBLOCK: a FIFO planted at the path cannot hold the open before the
+    # regular-file check below; it has no effect on a regular file or flock.
+    base = (os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NONBLOCK", 0))
+    uid = os.getuid() if hasattr(os, "getuid") else "?"
+    fd, created = -1, False
+    for _ in range(8):
+        try:
+            fd = os.open(path, base)
+            break
+        except FileNotFoundError:
+            pass
+        except PermissionError as e:
+            raise RuntimeError(
+                f"host-RAM KV tier: cannot open the existing arena lock file "
+                f"{path} ({_arena_lock_owner(path)}; this process runs as uid "
+                f"{uid}). Every server on this host opens that one file, so it "
+                "must be readable by this account: ask its owner to make it "
+                "readable (chmod 644)."
+            ) from e
+        except OSError as e:
+            if e.errno == errno.ELOOP:
+                raise OSError(
+                    errno.ELOOP,
+                    f"host-RAM KV tier: the arena lock path {path} is a "
+                    f"symbolic link ({_arena_lock_owner(path)}); refusing to "
+                    "follow it. Its owner can replace it with a regular file "
+                    "when no host-tier server is running.",
+                    path,
+                ) from e
+            raise
+        try:
+            fd = os.open(path, base | os.O_CREAT | os.O_EXCL, 0o644)
+            created = True
+            break
+        except FileExistsError:
+            continue  # another rank created it between the two opens
+        except PermissionError as e:
+            raise RuntimeError(
+                f"host-RAM KV tier: cannot create the arena lock file {path} "
+                f"(this process runs as uid {uid}): creating it needs write "
+                "permission on its directory. Ask an administrator to make "
+                "that directory writable for this account, or to create the "
+                "file once with mode 644."
+            ) from e
+    if fd < 0:
+        raise RuntimeError(
+            f"host-RAM KV tier: the arena lock file {path} kept appearing and "
+            "disappearing while it was being opened; something on this host is "
+            "removing it. Find that process and stop it."
+        )
+    try:
+        if created:
+            _widen_new_file(fd, path)
+        mode = os.fstat(fd).st_mode
+        if not stat.S_ISREG(mode):
+            raise RuntimeError(
+                f"host-RAM KV tier: the arena lock path {path} is not a regular "
+                f"file (st_mode {mode:o}, {_arena_lock_owner(path)}); refusing "
+                "to lock it. Its owner can replace it with a regular file when "
+                "no host-tier server is running."
+            )
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def _fd_names_path(fd: int, path: str) -> bool:
+    """True when ``path`` still names the file ``fd`` is open on."""
+    import os
+
+    try:
+        named = os.lstat(path)
+    except FileNotFoundError:
+        return False
+    held = os.fstat(fd)
+    return (named.st_dev, named.st_ino) == (held.st_dev, held.st_ino)
+
+
+def _acquire_arena_lock(fcntl: Any, path: str, timeout_s: float) -> int:
+    """Open the lock file and flock it exclusively, polling until
+    ``timeout_s`` has passed; return the locked descriptor.
+
+    The deadline is monotonic and spans every step; a wait interrupted by a
+    signal carries on to the same deadline. Winning the flock proves nothing if
+    the path was deleted or replaced while this rank waited (a later rank would
+    then lock the new file and run beside this one), so after the lock is won
+    the descriptor must still be the file the path names; if it is not, it is
+    closed and the path opened again, up to ARENA_LOCK_REOPEN_ROUNDS times.
+    The descriptor is closed on every error. What this cannot prevent: a file
+    removed while a holder is already inside its critical section lets a rank
+    that arrives afterwards create a new file and enter beside that holder, so
+    nothing may remove the file while a host-tier server is starting.
+    """
+    import os
+    import time
+
+    start = time.monotonic()
+    deadline = start + timeout_s
+    note_at: float | None = start + ARENA_LOCK_NOTE_S
+    for _ in range(ARENA_LOCK_REOPEN_ROUNDS):
+        fd = _open_arena_lock(path)
+        try:
+            while True:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except (BlockingIOError, InterruptedError):
+                    pass
+                now = time.monotonic()
+                if now >= deadline:
+                    raise TimeoutError(
+                        f"host-RAM KV tier: waited {timeout_s:.0f} s for the "
+                        f"arena lock {path} ({_arena_lock_owner(path)}); "
+                        "another process on this host holds it, either a "
+                        "server still allocating its arena or a stuck one. "
+                        f"Find the holder with `fuser -v {path}` or "
+                        f"`lsof {path}`; a healthy slow host can raise "
+                        f"{ARENA_LOCK_TIMEOUT_ENV} (seconds)."
+                    )
+                if note_at is not None and now >= note_at:
+                    note_at = None
+                    _logger().info(
+                        "host-RAM KV tier: waiting for the host-tier arena lock "
+                        "held by another process: %s, deadline %d s",
+                        path, timeout_s,
+                    )
+                time.sleep(min(ARENA_LOCK_POLL_S, deadline - now))
+            if _fd_names_path(fd, path):
+                return fd
+        except BaseException:
+            os.close(fd)
+            raise
+        os.close(fd)  # the path names another file now: lock that one instead
+    raise RuntimeError(
+        f"host-RAM KV tier: the arena lock file {path} was deleted or replaced "
+        f"{ARENA_LOCK_REOPEN_ROUNDS} times while this rank was taking the lock "
+        "(the lock file keeps being replaced); something on this host is "
+        "removing it. Find that process and stop it."
+    )
 
 
 class arena_reservation:
@@ -577,29 +815,25 @@ class arena_reservation:
         self.arena_bytes = arena_bytes
         self._fd: int | None = None
         self._held_local = False
+        self._held_since = 0.0
 
     def __enter__(self) -> "arena_reservation":
-        import os
         import threading
+        import time
 
         try:
             import fcntl
         except ImportError:
             fcntl = None  # type: ignore[assignment]
         if fcntl is not None:
-            # O_NOFOLLOW: a symlink planted at the shared path is refused,
-            # not followed; O_CLOEXEC: no child inherits the lock fd. The
-            # creation mode is left to the user's umask so servers on the
-            # same host keep serialising on the one path.
-            flags = (os.O_RDONLY | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
-                     | getattr(os, "O_CLOEXEC", 0))
-            fd = os.open(ARENA_LOCK_PATH, flags, 0o666)
-            try:
-                fcntl.flock(fd, fcntl.LOCK_EX)
-            except BaseException:
-                os.close(fd)
-                raise
-            self._fd = fd
+            # One shared path, so servers of every user serialise on it:
+            # opened without O_CREAT when it exists (no symlink followed, no
+            # inherited descriptor), then locked with a deadline instead of
+            # blocking for as long as any holder lives. The setting is read
+            # before the file is opened, so a bad value leaves nothing open.
+            timeout_s = arena_lock_timeout_s()
+            self._fd = _acquire_arena_lock(fcntl, ARENA_LOCK_PATH, timeout_s)
+            self._held_since = time.monotonic()
         else:
             if arena_reservation._local is None:
                 arena_reservation._local = threading.Lock()
@@ -617,13 +851,21 @@ class arena_reservation:
 
     def _release(self) -> None:
         import os
+        import time
 
+        held_s = None
         if self._fd is not None:
+            held_s = time.monotonic() - self._held_since
             os.close(self._fd)  # closing the only descriptor drops the flock
             self._fd = None
         if self._held_local:
             arena_reservation._local.release()
             self._held_local = False
+        if held_s is not None:
+            _logger().info(
+                "host-RAM KV tier: arena lock held %.1f s for a %.2f GiB arena",
+                held_s, self.arena_bytes / float(1 << 30),
+            )
 
 
 def mlock_refused(device: Any, nbytes: int) -> RuntimeError:

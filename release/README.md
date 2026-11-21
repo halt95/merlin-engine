@@ -1,6 +1,6 @@
-# Merlin 3.0.2.1 install and release tooling
+# Merlin 3.0.2.2 install and release tooling
 
-Merlin 3.0.2.1 builds this checkout on **vLLM 0.33.0**. All recipes under
+Merlin 3.0.2.2 builds this checkout on **vLLM 0.33.0**. All recipes under
 [`models/`](../models/README.md) share one environment installer and dependency
 lock. Engine bundles and per-model engine patch series are historical artifacts.
 
@@ -15,10 +15,9 @@ wheel's compiled library needs glibc 2.38, so running Merlin from the wheel need
 |---|---|
 | [`install-env.sh`](install-env.sh), [`install-0.33.md`](install-0.33.md) | Creates a new Python 3.13 venv with uv, installs the single hash lock, applies the FlashInfer tile patch and installs this checkout editable with no dependency resolution or build isolation, taking the compiled engine from the release wheel (`MERLIN_WHEEL`) or building it for sm_80, sm_86 and sm_89. Verifies the checkout's commit and tree identity, source/import identity, dependency versions and native product hashes. Creates CUDA library links and the launcher build-product markers. `--verify` checks an existing install; `--check` adds live tile selection proof from a server log. |
 | [`requirements-0.33.lock`](requirements-0.33.lock) | Exact serving, CUDA toolkit and build-tool pins, including torch 2.14.0, triton 3.8.0, FlashInfer 0.7.2.post1, humming-kernels 0.1.19, Pillow 13.0.0, Transformers 5.20.2 and instanttensor 0.2.2. Every package carries artifact SHA-256 hashes; the closure resolves on CPython 3.13 / Linux x86_64. Excludes vllm itself and flashinfer-jit-cache. |
-| [`build-wheel.sh`](build-wheel.sh), [`wheel.py`](wheel.py), `merlin-wheel.sha256` | The engine wheel: one build for sm_80, sm_86 and sm_89 from a clean HEAD against the release lock, with build-host paths mapped out and audited (`wheel.py audit`). `merlin-wheel.sha256` names the one wheel a checkout accepts; `install-env.sh` refuses any other wheel, and one whose commit's native sources differ from the checkout's. |
+| [`build-wheel.sh`](build-wheel.sh), [`wheel.py`](wheel.py), `merlin-wheel.sha256` | The engine wheel: one native build for sm_80, sm_86 and sm_89 from a clean HEAD against the release lock, with build-host paths mapped out and audited (`wheel.py audit`). The 3.0.2.2 wheel is a repack of the 3.0.2.1 build wheel (built at commit c56eeed392): its compiled CUDA libraries are that build's, byte for byte, the Rust frontend is rebuilt only for the new version string, and the Python files are the release commit's. `merlin-wheel.sha256` names the one wheel a checkout accepts; `install-env.sh` refuses any other wheel, and one whose commit's native sources differ from the checkout's. |
 | [`apply-flashinfer-patch.sh`](apply-flashinfer-patch.sh), [`check-tile-proof.sh`](check-tile-proof.sh), [`patches/flashinfer-0.7.2.post1/`](patches/flashinfer-0.7.2.post1/README.md) | Version-specific 0.7.2.post1 small-query FP8 verify tile (a port of the 0.7.0.post1 series, kept under `patches/flashinfer-0.7.0.post1/` for history). Checks pristine/patched hashes, serializes idempotent application and uses JIT suffix `_sm8x_smallq_072_v1`. Installation leaves the knob off; launchers select it with `FLASHINFER_SM8X_FP8_SMALLQ=cta32`. The proof checker requires a current-boot selection line for every TP rank after a completed MTP request; it does not prove numerical correctness. |
 | [`apply-flashinfer-workload-patch.py`](apply-flashinfer-workload-patch.py) | Opt-in, 27B only, default off: with `MERLIN_FLASHINFER_WORKLOAD_TILE=1`, `install-env.sh` applies FlashInfer patch 0002 (workload-aware tile) after 0001; see the [patch notes](patches/flashinfer-0.7.2.post1/README.md) |
-| [`make_manifest.py`](make_manifest.py) | Generates `PACKAGE-MANIFEST.md` and `SHA256SUMS` from all staged Git blobs and modes, including each recipe's checkpoint checksum list. Generate these on the final release tree after cleanup; downloaded checkpoint bytes are verified separately. |
 
 Use Linux x86_64, Python 3.13 headers, uv, Git (a clean checkout; a shallow clone is fine for installing and for building
 the wheel, which is named after the checkout's commit),
@@ -36,16 +35,40 @@ The lock is complete: 223 exact pins with SHA-256 hashes, resolved with uv, and
 a dry-run `--require-hashes` install resolves. From the repository root:
 
 ```bash
-curl -LO https://github.com/halt95/merlin-engine/releases/download/merlin-v3.0.2.1/vllm-0.33.0+merlin.c56eeed392-cp313-cp313-linux_x86_64.whl
-MERLIN_WHEEL="$PWD/vllm-0.33.0+merlin.c56eeed392-cp313-cp313-linux_x86_64.whl"   bash release/install-env.sh "$PWD/venv"
+curl -LO https://github.com/halt95/merlin-engine/releases/download/merlin-v3.0.2.2/vllm-0.33.0+merlin3.0.2.2.c56eeed392-cp313-cp313-linux_x86_64.whl
+MERLIN_WHEEL="$PWD/vllm-0.33.0+merlin3.0.2.2.c56eeed392-cp313-cp313-linux_x86_64.whl"   bash release/install-env.sh "$PWD/venv"
 bash release/install-env.sh --verify "$PWD/venv"
 ```
 
 Without `MERLIN_WHEEL` the installer compiles the engine (about 1.5 hours on 8 cores).
 `release/build-wheel.sh` builds the wheel itself.
 
+Every model family's launcher checks the selected TREE's installed native-source
+identity and recorded FlashInfer patch targets. A tree with no `.build-source`
+is refused until `./setup.sh` records the build; older installs without
+`.build-native` recover native IDs from the saved source commit when it is
+available. The checker uses the current launcher's helper even with an older
+TREE. Python-only updates preserve native IDs and keep starting.
+
+For dirty native inputs, the refusal lists the files: commit or remove those
+inputs before running `./setup.sh`. Setup alone cannot clear an untracked file.
+Source builds can leave untracked files such as a regenerated `rust/Cargo.lock`
+or other files under the native source directories; these remain checked rather
+than being silently ignored. For Git ownership refusals with container
+`--user`, use the checkout owner's UID, or explicitly trust that checkout with
+Git's `safe.directory` setting, then retry. The refusal includes Git's error.
+
+For a deliberately unverified install, including a hand-copied or relocated TREE
+without Git metadata, verified source-build leftovers, or restricted Git access,
+set `MERLIN_SKIP_NATIVE_CHECK=1` in the environment used to launch Merlin
+(for example, `MERLIN_SKIP_NATIVE_CHECK=1 merlin serve ...`). Only the exact value
+`1` bypasses native-source and FlashInfer provenance checks, with a warning on
+every start: stale native code may fail or serve incorrectly. Build-product
+checksum checks remain enabled. Unset the variable after repairing provenance
+or rebuilding in a usable Git checkout.
+
 A fresh install from the 3.0.0 release wheel on the 0.32 lock was verified on the reference host and on
-a second host with 4× RTX 4090 (2026-10-20); a fresh install of the 3.0.2 or 3.0.2.1 wheel on this lock has not been done; the container image is not yet qualified. A tile
+a second host with 4× RTX 4090 (2026-10-20); a fresh install from the 3.0.2.1 release wheel on this lock passed on the reference host (2026-11-12: install, verify and identity checks); a fresh install of the 3.0.2 or 3.0.2.2 wheel on this lock has not been done; the container image is not yet qualified. A tile
 hash check or import check does not replace a successful model request and the
 separate live tile proof. See [install-0.33.md](install-0.33.md) for the full
 procedure.

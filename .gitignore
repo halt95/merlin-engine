@@ -250,3 +250,5 @@ csrc/cpu/cpu_attn_dispatch_generated.h
 .build-source
 .build-products
 .build-products.sha256
+.build-native
+.build-flashinfer.sha256

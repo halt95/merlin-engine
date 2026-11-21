@@ -346,6 +346,17 @@ class CacheConfig:
     # Set after KV cache initialization.
     effective_attention_block_size: int | None = field(default=None, init=False)
     """Full-attention block size in tokens, including DCP, or None if unavailable."""
+    # Set by the frontend's engine client.
+    kv_cache_capacity_tokens: int | None = field(default=None, init=False)
+    """Total KV cache tokens shared by all requests (the engine's KV pool):
+    the minimum of each engine's kv_cache_size_tokens over the engines this
+    frontend currently routes to. Sized in max_model_len-length requests, so
+    on hybrid models it varies with max_model_len, and many shorter requests
+    hold fewer tokens in total. A single request is limited by max_model_len;
+    occupancy does not shrink it. None until a routed engine with KV cache
+    groups reports. Under DP with unequal pools it can differ from this
+    frontend's kv_cache_size_tokens, which keeps the first engine's value.
+    """
     kv_cache_size_tokens: int | None = field(default=None, init=False)
     """Per-DP-engine KV cache capacity in tokens (group-aware). Uses
     group-aware capacity since num_gpu_blocks * block_size can be wrong
@@ -428,6 +439,7 @@ class CacheConfig:
             "num_cpu_blocks",
             "simple_cpu_offload_num_blocks",
             "effective_attention_block_size",
+            "kv_cache_capacity_tokens",
             "kv_cache_size_tokens",
             "kv_cache_max_concurrency",
             "hash_block_size",

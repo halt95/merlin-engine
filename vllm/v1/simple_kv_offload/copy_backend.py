@@ -509,11 +509,19 @@ class DmaCopyBackend:
             except Exception:
                 if failed_events is None:
                     raise
-                logger.exception(
-                    "SimpleCPUOffload: restore copy for event %d failed; its "
-                    "requests will recompute",
-                    event_idx,
-                )
+
+                if fault_kind == "store":
+                    logger.exception(
+                        "SimpleCPUOffload: store copy for event %d failed; "
+                        "the host copy is dropped",
+                        event_idx,
+                    )
+                else:
+                    logger.exception(
+                        "SimpleCPUOffload: restore copy for event %d failed; its "
+                        "requests will recompute",
+                        event_idx,
+                    )
                 # Before the event is published: whoever sees it complete
                 # also sees the failure. The event follows every chunk that
                 # was enqueued, so the destination blocks are released only

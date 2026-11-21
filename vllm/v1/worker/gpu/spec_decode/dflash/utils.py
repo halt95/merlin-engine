@@ -148,7 +148,10 @@ def _maybe_load_target_embed_on_pp(
     old = draft_inner.embed_tokens
     if isinstance(old, PinnedHostVocabParallelEmbedding):
         embed = old
-    elif should_use_host_embed_table():
+    elif should_use_host_embed_table(
+        # The drafter's architecture, not the target's
+        vllm_config.speculative_config.draft_model_config.architecture
+    ):
         embed = PinnedHostVocabParallelEmbedding(
             old.org_vocab_size,
             old.embedding_dim,

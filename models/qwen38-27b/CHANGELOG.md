@@ -7,6 +7,36 @@ Release notes, newest first. To install and run the current release, see the [RE
 (scripts, serve-script variables and knobs, capacity, known behaviours, measurement method) is in
 [docs/reference.md](docs/reference.md); v1.0.0 and its numbers are in [docs/history.md](docs/history.md).
 
+## Merlin 3.0.2.2
+
+The recipe runs on **vLLM 0.33.0**, as in 3.0.2.1; the recipe version stays 3.0.0. See the
+[engine changelog](../../docs/CHANGELOG.md#merlin-3022) for the full release.
+
+- **Qwen3 parser:** the end-of-output hang with tools offered is fixed; content starts at its first visible
+  character after the reasoning, streamed or not (`"\n\nAnswer"` becomes `"Answer"`); non-streaming replies keep
+  the whitespace beside tool calls and return text written after a call; streamed content after whitespace that
+  follows the reasoning no longer depends on where the stream is cut; forced and strict tool calls open with the tool-call token.
+- **A Qwen3 tool call opens only at a line start** (the start of the answer, a line start after optional
+  whitespace, or right after a call) and never inside a code fence or an inline code span; elsewhere the opener
+  is text (`MERLIN_QWEN3_LITERAL_SPANS=0` leaves this as in 3.0.2.1).
+- **Strict and free-form tool-call grammars** bound each string from a length table, write one whitespace run
+  per gap, and a slow-fill guard ends a tool-call request whose mask fills keep taking long (see the engine
+  changelog's known limits for the two value shapes that still hit it).
+- **KV RAM cache defaults** (engines booted with the host tier): duplicates-first and waiting-last eviction are on,
+  8 units assemble at once and 64 copy credits are in flight; the restore-start and seat-hold switches stay off.
+- **The rejection-sampler residual repair is on by default** (`VLLM_SPEC_STABLE_RESIDUAL`; `0` restores the
+  3.0.2.1 residual). On this lane with the same seeds, one request at a time, it changed no output token.
+- **Four RTX 3090s with P2P on (`27b-tp4-3090`)** set `VLLM_DRAFT_BOUNDED_PLAN`, `VLLM_GDN_DECODE_FASTPATH`,
+  `VLLM_GDN_SHARED_ALIGN_INDEX` and `VLLM_TARGET_SEQ_LENS_ASYNC` to 1, as the two-card row does: one-stream ms per
+  output token 13.0 to 17.9 % lower on five of six cells, eight streams unchanged, output identical. Your own values
+  are kept.
+- **The four-card 24 GB and 80 GB sm_80 profiles** advertise 14 and 62 sessions of 131K (were 15 and 63), the counts
+  that fit the pool.
+- **`--disable-chunked-mm-input` with a long-prefill cap (`LPT`) is refused** at launch.
+- **The `--swarm` KV RAM cache stays at 48g.** On a busy 144-session trace (TP4) it served 11.4 % of the trace's
+  ceiling, against 87.5 % at `--kv-ram-cache 96g` (about 121 GiB peak host memory); see the [README](README.md).
+  These figures were measured before the new eviction defaults above.
+
 ## Merlin 3.0.2.1
 
 See the [engine changelog](../../docs/CHANGELOG.md#merlin-3021) for the full release. The recipe still runs

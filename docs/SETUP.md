@@ -8,14 +8,17 @@ git clone https://github.com/halt95/merlin-engine.git && cd merlin-engine && ./s
 finds), shows every download with its size, installs the engine from the prebuilt release wheel (about 1.5 minutes;
 nothing system-wide, no sudo), downloads and verifies the checkpoint, and starts the server in the foreground.
 Ctrl+C stops it; `./setup.sh` again starts it straight away with the saved answers and asks nothing;
-`git pull && ./setup.sh` updates the engine without re-downloading the model.
+To update, stop the server, then `git pull && ./setup.sh`: the engine updates without re-downloading the model.
+A checkout of a release tag (for example `git clone --depth 1 --branch merlin-v3.0.2.2 ...`) is on no branch, so
+`git pull` cannot move it: fetch the new tag and check it out instead, then run setup:
+`git fetch --depth 1 origin tag merlin-v3.0.2.2 && git checkout merlin-v3.0.2.2 && ./setup.sh`.
 
 New to serving? [How to serve](how-to-serve.md) walks through it end to end, from the first run to a networked endpoint.
 
 ## What a run looks like
 
 ```
-Merlin 3.0.2.1 setup (by Halt95)
+Merlin 3.0.2.2 setup (by Halt95)
   repo     ~/merlin-engine
   host     GPUs 4 x NVIDIA GeForce RTX 3090 (24 GB), P2P on, driver 610.43.02, RAM 96 GiB
 
@@ -60,7 +63,7 @@ Change an answer? (Enter = no, or 1-5) [no]:
 
 Downloads
   engine wheel                                                  217 MB
-    github.com/halt95/merlin-engine release merlin-v3.0.2.1
+    github.com/halt95/merlin-engine release merlin-v3.0.2.2
   Python packages (223 from release/requirements-0.33.lock)    3.4 GiB
     PyPI via uv (cached after the first install); about 10.2 GiB installed
   checkpoint flash-next                                      115.3 GiB
@@ -114,8 +117,9 @@ before the Python checks because the checks are written in Python; a `--dry-run`
 | layout | what `merlin serve` picks (the largest tested layout that fits), with every other tensor-parallel size and every `--instances N` partition the host allows listed; one exception: a single-card 27B pick on a multi-card class without P2P recommends `--tp 1 --instances N` over all idle cards, with the measured reason (4 x CMP 170HX: TP1 x 4 = 873 tok/s, TP2 x 2 = 523, TP4 = 371; each single-card server takes images up to 4 MP, the multi-card layouts 8 MP) -- this is setup's recommendation only, `merlin serve`'s own default is unchanged | `--tp N`, `--instances N` |
 | drafter (Flash-Next family) | asked only on the rows with a qualified DFlash2 geometry (the three 4 x 3090 P2P rows: Flash-Next, Swift1.5, Swift1.5-Huihui): `mtp` (recommended; the bigger pool: 6 x 131K or 3 x 262K) or `dflash2` (+5-18 % decode, 3 x 262K only; downloads the drafter); `--yes`, a piped run and every other row take `mtp` | `--spec mtp\|dflash2` |
 | swarm (Flash-Next 4 x 3090 and 27B quad-card rows) | asked only on the rows that have a swarm cap: no (the default session cap, 8 on Flash-Next and 24 on the 27B quad card); yes serves up to 24 / 32 sessions with the KV RAM cache set to 48g (experimental); `--yes`, a piped run and every other row take no | `--swarm` / `--no-swarm` |
+| Engram pack (Hy4 Flash) | not asked: FP8 Engram tables (about 60 GiB pinned in host RAM). The BF16 Engram tables (about 118 GiB pinned, about 198 GiB of host RAM available) are chosen with the flag; setup sizes the host RAM, memlock and disk checks for the pack and starts the launcher with `ENGRAM` set to match | `--engram fp8\|bf16` |
 | models folder | `~/models/<model>` (with `--ple int6` still the FP8 checkpoint; the INT6 overlay is `<folder>-int6`); an existing folder is reused and skipped when its checksums pass | `--models-dir DIR` |
-| access | this machine only (127.0.0.1); network (0.0.0.0) generates an API key, shows it once, and keeps it in `.merlin/api-key` (mode 0600); clients send `Authorization: Bearer <key>` | `--host 127.0.0.1\|0.0.0.0`, `--api-key KEY` |
+| access | this machine only (127.0.0.1); network (0.0.0.0) generates an API key, shows it once, and keeps it in `.merlin/api-key` (mode 0600); clients send `Authorization: Bearer <key>`; any other saved bind (a specific address such as `192.0.2.10` or `fd00::5`, the IPv6 wildcard `::`, the IPv6 loopback `::1`) is offered as a third choice, `keep`, and is the default, so Enter or `--yes --reconfigure` never changes it; only the literal loopback addresses 127.0.0.1 and ::1 serve without an API key: `localhost` is a name, and setup saves it as 127.0.0.1 (and says so) | `--host 127.0.0.1\|0.0.0.0`, `--api-key KEY` |
 | port | the model's default: 8000 for Flash-Next / Super VL, 8100 for 27B | `--port P` |
 
 After the last question setup lists the answers. A number asks that question again (another model also asks its own layout, folder and port again); Enter, or `n`, carries on. Answers given by flags are listed but not offered. Nothing is downloaded or saved before the download confirmation, so `n` there, or Ctrl+C at any point before it, leaves nothing behind.
@@ -189,7 +193,7 @@ on `merlin serve` alike (so the cache can be turned on without running setup aga
   tokens, any sliding-window tail, and one recurrent (GDN/PLE) state per recurrent group; the QSA ring slots never
   move. The unit size comes from the resolved KV layout, so it differs per profile (about 4 GiB over four ranks on
   `fn-swift1.5-quad-3090`; the engine logs the exact figure). The cache needs room for at least one 262K restore
-  unit. Sizes below the minimum above are refused. Sizes above 48g are untested ⚫ and the plan says so (48g is the largest size with a recorded run).
+  unit. Sizes below the minimum above are refused. Sizes above 48g are untested ⚫ and the plan says so. 48g is the largest size qualified as a default; the 27B also has recorded runs at 96g (hit rate and host memory in the CHANGELOG Known limits), which do not qualify that size.
   The cache locks its memory and fails closed when it cannot (the refusal says so): under systemd set
   `LimitMEMLOCK=infinity`; in a container run `ulimit -l unlimited`, or use a privileged LXC or CAP_IPC_LOCK.
 - `--context SIZE` (experimental) serves this many tokens per request (`512k` = 524,288) and is saved per model; Enter
@@ -276,9 +280,14 @@ with a qualified DFlash2 geometry, the three 4 x 3090 P2P rows; every other row,
 their own MTP head), refuse it, as does the launcher for a raw `SPEC=dflash2`. On cards that report a little less VRAM
 than their class the DFlash2 pin is lowered the same way as the MTP one and the plan marks it untested ⚫.
 `./setup.sh --spec dflash2` downloads `incoai/Qwen3.8-Flash-Next-DFlash2` at its pinned revision (about 1.2 GB) to
-`~/models/flash-next-dflash2` (or `DFLASH2_MODEL`), checks `config.json` and `model.safetensors` against
-`models/flash-next/dflash2.sha256`, and starts the server with `DFLASH2_MODEL` set. `merlin serve --spec dflash2` takes
-`DFLASH2_MODEL`, else that folder, and refuses before boot when the drafter is not there.
+`flash-next-dflash2` beside the checkpoint folder (`~/models/flash-next-dflash2` with the default `~/models/<model>`;
+`<parent of DIR>/flash-next-dflash2` with `--models-dir DIR`), checks `config.json` and `model.safetensors` against
+`models/flash-next/dflash2.sha256`, and starts the server with `DFLASH2_MODEL` set. Both setup and
+`merlin serve --spec dflash2` take the drafter from, in order: `DFLASH2_MODEL` when set; `flash-next-dflash2` beside
+the checkpoint folder when it holds the drafter; `~/models/flash-next-dflash2` when it holds one (where earlier
+releases put it with any `--models-dir`, so an existing copy is not downloaded again); otherwise the folder beside the
+checkpoint, where setup downloads it. The start-up note names the folder taken. `merlin serve` refuses before boot when
+the drafter is not there.
 
 ## Flags
 
@@ -343,9 +352,17 @@ driver or compiler check, no serving choice. It uses the engine venv's `hf` when
 - `./setup.sh` again: the saved answers (`.merlin/setup.json`) are used, nothing is asked (not even the download
   confirmation), the venv is reused when `.merlin/state.json` records the same wheel sha, lock hash and commit, the
   checkpoint is skipped when its marker is current, and the server starts.
-- `git pull && ./setup.sh`: a moved commit, changed lock or changed wheel reinstalls the engine: the working venv is
-  moved aside, the new one is installed and verified, then the old one is removed; if the install or the verify
-  fails, the old venv comes back and the engine still serves. The packages come from uv's cache; the model is never
+- Stop the server first, then `git pull && ./setup.sh`: the engine is installed editable, so `git pull` already
+  changes the Python source a running server imports, before setup starts. Every server started from this checkout
+  holds `.merlin/serve.lock`; a reinstall stops at once, with nothing changed, while one runs (a server started
+  by an older launcher does not hold it: restart it once after updating). A moved commit, changed lock or changed
+  wheel reinstalls the engine: the working venv is
+  moved aside and the build products the install writes into the checkout (`vllm/*.so`, the flash-attn and
+  third_party trees, `vllm/vllm-rs`, `vllm/_version.py`, `.build-products*`, `.build-source`) are copied to
+  `.merlin/products-old-*`; the new venv is installed and verified, then both copies are removed. If the install or
+  the verify fails, the old venv and the old products come back and setup checks the products as the launcher does
+  before it says the previous install is restored (a copy that cannot be restored or checked is kept and named). The
+  copy needs free disk the size of the products for the length of the install. The packages come from uv's cache; the model is never
   re-downloaded. The install holds `.merlin/setup.lock`: a second `./setup.sh` in the same checkout stops at
   once with a message instead of moving the first one's venv. A `.merlin/venv-old-*` left by an
   install that was killed is named at the end of the next successful install and kept until you remove it.
@@ -362,9 +379,10 @@ driver or compiler check, no serving choice. It uses the engine venv's `hf` when
 | `.merlin/api-key` | the API key for network access, mode 0600 (`.merlin/` itself is 0700) |
 | `.merlin/state.json` | the install record (wheel sha, lock hash, commit, venv) |
 | `.merlin/setup.lock` | held while the engine installs, so two `./setup.sh` runs never install over each other |
+| `.merlin/serve.lock` | held shared by every running server of this checkout and exclusively by an install, so an install never moves a running server's venv |
 | `.merlin/hf/` | the download-only `hf` environment (`merlin pull` without the engine) |
 | `venv/` | the engine environment `release/install-env.sh` created |
-| `.build-source`, `.build-products`, `.build-products.sha256` | install-env's provenance and product hashes, in the checkout |
+| `.build-source`, `.build-products`, `.build-products.sha256`, `.build-native`, `.build-flashinfer.sha256` | install-env's provenance, product hashes, native-source identity and FlashInfer patch record, in the checkout; the launchers check them at every start |
 | `.vllm-cache/` | compile / Triton caches the launcher writes |
 | `~/.cache/uv/` | uv's package cache (about 3.4 GiB; `uv cache clean` empties it) |
 | `<models folder>` | the checkpoint and its `.merlin-verified.json` marker |
@@ -373,9 +391,25 @@ driver or compiler check, no serving choice. It uses the engine venv's `hf` when
 
 ## Uninstall
 
-Delete `.merlin/`, `venv/`, `.vllm-cache/` and the `.build-*` files inside the checkout, the models folder
-(`~/models/<model>` by default), and `~/.cache/uv` if you do not use uv otherwise. Nothing else was written: no
-packages, services, shell profiles or system paths.
+Delete:
+
+- inside the checkout: `.merlin/`, `venv/`, `.vllm-cache/` and the `.build-*` files;
+- the models folder (`~/models/<model>` by default, or your `--models-dir`);
+- with `--ple int6`: the INT6 PLE overlay next to it (`<folder>-int6`) and the INT6 PLE pack beside it
+  (`flash-next-ple-int6`, unless `MERLIN_PLE_PACK_DIR` pointed at your own copy);
+- with `--spec dflash2`: the DFlash2 drafter (`flash-next-dflash2` beside the models folder, plus
+  `~/models/flash-next-dflash2` if an earlier release put it there, or the folder `DFLASH2_MODEL` names);
+- `~/models` itself once it is empty;
+- uv's package cache, `~/.cache/uv` (`$UV_CACHE_DIR`, or `$XDG_CACHE_HOME/uv`, when set), if you do not use uv
+  otherwise;
+- the Hugging Face folder that `hf download` writes, `~/.cache/huggingface` (`$HF_HOME`, or
+  `$XDG_CACHE_HOME/huggingface`, when set). Setup's downloads go straight into the models folder, so here they leave
+  only `hf`'s update-check stamps (`.check_for_update_done` and similar dot files) and its `xet/` folder (the Xet
+  transfer cache and one log per download; `$HF_XET_CACHE` when set); the `hub/` model cache (`$HF_HUB_CACHE`) is not
+  used. The folder is shared with every other Hugging Face tool, so removing it is your choice: delete `xet/` and the
+  stamps if you use other Hugging Face tools, the whole folder if you use none.
+
+Setup installs no system packages, services or shell profiles and writes no system paths.
 
 ## Manual route
 

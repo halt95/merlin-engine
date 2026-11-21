@@ -84,17 +84,35 @@ from .mtp_kv_scales import maybe_load_mtp_qsa_static_kv_scales
 logger = init_logger(__name__)
 
 
+# One normaliser for weights and ignore lists.
+def _strip_checkpoint_prefix(name: str) -> str:
+    """Drop the checkpoint's wrapper prefix and spell an MTP path ``mtp.``."""
+    for checkpoint_prefix in (
+        "model.language_model.",
+        "language_model.",
+    ):
+        if name.startswith(checkpoint_prefix):
+            name = name.removeprefix(checkpoint_prefix)
+            break
+    if name.startswith("model.mtp."):
+        name = name.removeprefix("model.")
+    return name
+
+
 def _remap_ignored_layers(
     ignored_layers: list[str],
     mtp_start_layer_idx: int,
 ) -> list[str]:
     remapped: list[str] = []
     for name in ignored_layers:
-        if name.startswith("mtp."):
+        # Every checkpoint spelling of an
+        # MTP entry shifts like ``mtp.``; other entries stay as written.
+        mtp_name = _strip_checkpoint_prefix(name)
+        if mtp_name.startswith("mtp."):
             new_name = re.sub(
                 r"(?<=\.layers\.)\d+",
                 lambda m: str(mtp_start_layer_idx + int(m.group(0))),
-                name,
+                mtp_name,
             )
             remapped.append(new_name)
         else:
@@ -115,18 +133,11 @@ def _remap_quantized_layers(
 
 def _remap_mtp_weight_name(name: str) -> str | None:
     """Map Qwen4Exp checkpoint paths into the standalone draft model."""
-    for checkpoint_prefix in (
-        "model.language_model.",
-        "language_model.",
-    ):
-        if name.startswith(checkpoint_prefix):
-            name = name.removeprefix(checkpoint_prefix)
-            break
-
+    # Shared with the ignore-list remap.
+    name = _strip_checkpoint_prefix(name)
     if name.startswith("embed_tokens."):
         name = f"model.{name}"
-    if name.startswith("model.mtp."):
-        name = name.removeprefix("model.")
+    # ``model.mtp.`` is stripped above.
     if name.startswith("mtp.shared_head.head."):
         return name.replace("mtp.shared_head.head.", "lm_head.", 1)
     if name.startswith("model.shared_head.head."):
@@ -220,7 +231,8 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
         self.hidden_size = config.hidden_size
         self.hc_count = config.hc_count
 
-        self.uses_host_embed_table = should_use_host_embed_table()
+        # Resolved for the family's MTP drafter.
+        self.uses_host_embed_table = should_use_host_embed_table("Qwen4ExpMTP")
         if self.uses_host_embed_table and getattr(
             config, "tie_word_embeddings", False
         ):

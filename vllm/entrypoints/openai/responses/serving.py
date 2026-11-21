@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by the Merlin project; see NOTICE.
 
 import asyncio
 import time
@@ -76,12 +77,22 @@ from vllm.entrypoints.serve.utils.request_logger import RequestLogger
 from vllm.entrypoints.serve.utils.tool_calls_utils import (
     maybe_filter_parallel_tool_calls,
 )
-from vllm.exceptions import GenerationError, VLLMValidationError
+from vllm.exceptions import (
+    VLLMError,
+    VLLMValidationError,
+)
 from vllm.inputs import EngineInput
 from vllm.logger import init_logger
 from vllm.logprobs import Logprob as SampleLogprob
 from vllm.logprobs import SampleLogprobs
 from vllm.lora.request import LoRARequest
+from vllm.merlin.bg_stream import (
+    BackgroundStream,
+    mark_failed,
+)
+from vllm.merlin.responses_errors import (
+    error_event,
+)
 from vllm.outputs import CompletionOutput
 from vllm.parser import Parser, ParserManager
 from vllm.renderers import TokenizeParams
@@ -95,6 +106,9 @@ from vllm.renderers.online_renderer import (
 )
 from vllm.sampling_params import SamplingParams, StructuredOutputsParams
 from vllm.tokenizers import TokenizerLike
+from vllm.tool_parsers.utils import (
+    find_aliased_tool_name,
+)
 from vllm.utils import random_uuid
 from vllm.utils.collection_utils import as_list
 
@@ -193,9 +207,8 @@ class OpenAIServingResponses(GenerateBaseServing):
         # HACK(wuhang): This is a hack. We should use a better store.
         # FIXME: If enable_store=True, this may cause a memory leak since we
         # never remove events from the store.
-        self.event_store: dict[
-            str, tuple[deque[StreamingResponsesResponse], asyncio.Event]
-        ] = {}
+
+        self.event_store: dict[str, BackgroundStream] = {}
 
         self.background_tasks: dict[str, asyncio.Task] = {}
 
@@ -282,6 +295,19 @@ class OpenAIServingResponses(GenerateBaseServing):
                 "`previous_response_id` can be set.",
                 status_code=HTTPStatus.BAD_REQUEST,
                 param="previous_response_id",
+            )
+
+        aliased_name = find_aliased_tool_name(request.tools)
+        if aliased_name is not None:
+            return self.create_error_response(
+                err_type="invalid_request_error",
+                message=(
+                    f"tools: two different tools are shown to the model as "
+                    f"'{aliased_name}' (a namespace function is shown as "
+                    "<namespace>__<name>). Rename one of them."
+                ),
+                status_code=HTTPStatus.BAD_REQUEST,
+                param="tools",
             )
         return None
 
@@ -557,6 +583,9 @@ class OpenAIServingResponses(GenerateBaseServing):
 
             # Run the request in the background.
             if request.stream:
+                # The state exists before
+                # the task; a task cancelled before its first step still ends it.
+                stream = self.event_store[request.request_id] = BackgroundStream()
                 task = asyncio.create_task(
                     self._run_background_request_stream(
                         request,
@@ -570,6 +599,8 @@ class OpenAIServingResponses(GenerateBaseServing):
                     ),
                     name=f"create_{request.request_id}",
                 )
+
+                task.add_done_callback(lambda _: stream.end())
             else:
                 task = asyncio.create_task(
                     self._run_background_request(
@@ -1091,15 +1122,28 @@ class OpenAIServingResponses(GenerateBaseServing):
         *args,
         **kwargs,
     ):
-        event_deque: deque[StreamingResponsesResponse] = deque()
-        new_event_signal = asyncio.Event()
-        self.event_store[request.request_id] = (event_deque, new_event_signal)
+        # The producer records how it
+        # ended, so a reader with nothing left to drain can stop.
+        stream = self.event_store.setdefault(request.request_id, BackgroundStream())
+        event_deque: deque[StreamingResponsesResponse] = stream.events
+        new_event_signal = stream.signal
         generator = self.responses_stream_generator(request, *args, **kwargs)
         try:
             async for event in generator:
                 event_deque.append(event)
                 new_event_signal.set()  # Signal new event available
+            # A generator that returns
+            # without a completed/incomplete event reported a generation error.
+            if not stream.completed():
+                await mark_failed(self, request.request_id)
+        except asyncio.CancelledError:
+            raise
+        except BaseException as e:
+            stream.failure = e
+            await mark_failed(self, request.request_id)
+            raise
         finally:
+            stream.done = True
             new_event_signal.set()
 
     async def _run_background_request(
@@ -1131,7 +1175,9 @@ class OpenAIServingResponses(GenerateBaseServing):
                 value=response_id,
             )
 
-        event_deque, new_event_signal = self.event_store[response_id]
+
+        stream = self.event_store[response_id]
+        event_deque, new_event_signal = stream.events, stream.signal
         start_index = 0 if starting_after is None else starting_after + 1
         current_index = start_index
 
@@ -1149,6 +1195,12 @@ class OpenAIServingResponses(GenerateBaseServing):
                     return
                 current_index += 1
 
+            # No await between the drain
+            # and this check, so an ended producer cannot be missed.
+            if stream.done:
+                if stream.failure is not None:
+                    raise stream.failure
+                return
             await new_event_signal.wait()
 
     async def retrieve_responses(
@@ -1415,8 +1467,11 @@ class OpenAIServingResponses(GenerateBaseServing):
                     _increment_sequence_number_and_return,
                 ):
                     yield event_data
-            except GenerationError as e:
-                error_json = self._convert_generation_error_to_streaming_response(e)
+            # A typed failure after
+            # response.created (engine error, or a request the engine refused as
+            # a client fault) ends the stream with an error event.
+            except VLLMError as e:
+                error_json = error_event(e).model_dump_json()
                 yield _increment_sequence_number_and_return(
                     TypeAdapter(StreamingResponsesResponse).validate_json(error_json)
                 )

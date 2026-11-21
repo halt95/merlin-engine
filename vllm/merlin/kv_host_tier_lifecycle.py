@@ -48,6 +48,8 @@ class TxnAcks:
     ranks: dict[int, tuple[bool, bool]] = field(default_factory=dict)
 
     def report(self, rank: int, success: bool, quiescent: bool) -> None:
+        if not 0 <= rank < self.world_size:
+            raise ValueError(f"rank {rank} outside world size {self.world_size}")
         old = self.ranks.get(rank)
         if old is not None:
             success = old[0] and success

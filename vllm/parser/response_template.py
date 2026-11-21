@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by the Merlin project; see NOTICE.
 """Unified vLLM parser backed by checkpoint `response_template` metadata."""
 
 from __future__ import annotations
@@ -23,6 +24,7 @@ from vllm.entrypoints.openai.chat_completion.protocol import (
 )
 from vllm.exceptions import VLLMValidationError
 from vllm.logger import init_logger
+from vllm.merlin.content_start import ContentStart
 from vllm.parser.abstract_parser import Parser
 from vllm.parser.chat_parsing import ResponseParser
 from vllm.parser.chat_parsing.response_templates import (
@@ -484,6 +486,12 @@ class _ResponseStream:
         self._finalized = False
         self._open_region: dict[str, Any] | None = None
         self._track(self.parser.initial_events)
+        # A prompt closer is not an output boundary.
+        self._content_start = ContentStart(
+            self._open_region is not None
+            and self._open_region["field"] == THINKING_FIELD
+            and parse_reasoning
+        )
 
     def feed(self, text: str, *, finished: bool) -> DeltaMessage | None:
         if self._finalized:
@@ -524,14 +532,24 @@ class _ResponseStream:
     def _route(self, events: Sequence[dict[str, Any]], delta: _DeltaBuilder) -> None:
         for event in events:
             field = event.get("field")
+
+            if field == THINKING_FIELD and self.parse_reasoning:
+                if event["type"] in ("region_open", "region_chunk"):
+                    self._content_start.reasoning_open()
+                elif event["type"] == "region_close":
+                    self._content_start.reasoning_ended()
             if field == TOOL_FIELD:
+                self._content_start.tool_call()
                 self._route_tool_event(event, delta)
             elif event["type"] == "region_chunk":
                 if field == THINKING_FIELD and self.parse_reasoning:
                     if self.include_reasoning:
                         delta.reasoning.append(event["text"])
                 elif field in (THINKING_FIELD, CONTENT_FIELD):
-                    delta.content.append(event["text"])
+
+                    text = self._content_start.take(event["text"])
+                    if text:
+                        delta.content.append(text)
 
     def _route_tool_event(self, event: dict[str, Any], delta: _DeltaBuilder) -> None:
         """Emit the calls of a tool region once it ends and parses; a region cut

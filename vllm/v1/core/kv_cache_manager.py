@@ -721,8 +721,7 @@ class KVCacheManager:
         if full_shortfall:
             # Coherent yields only: the cleanup may have freed blocks, so
             # measure the full gate again.
-            full_shortfall = max(
-                0,
+            full_need = (
                 self.coordinator.get_num_blocks_to_allocate(
                     request_id=request.request_id,
                     num_tokens=full_num_slot_tokens,
@@ -735,7 +734,11 @@ class KVCacheManager:
                     prefill_end=prefill_end,
                 )
                 + watermark_blocks
-                + full_reserved_blocks
+            )
+            full_shortfall = max(
+                0,
+                full_need
+                + (full_reserved_blocks if full_need else 0)
                 - self.block_pool.get_num_free_blocks(),
             )
         # the eviction check counts the whole prompt
@@ -792,9 +795,12 @@ class KVCacheManager:
         # New requests never reclaim un-copied
         # blocks; running requests are never gated.
         self.last_alloc_demotion_wait = False
-        if self.admission_gate is not None and request.status in (
-            RequestStatus.WAITING,
-            RequestStatus.PREEMPTED,
+        # Inspect the raw need before cached-free
+        # adoption can mask a same-step CoW refusal as ordinary demand.
+        if (
+            self.admission_gate is not None
+            and num_blocks_to_allocate <= self.block_pool.num_gpu_blocks
+            and request.status in (RequestStatus.WAITING, RequestStatus.PREEMPTED)
         ):
             shortfall, self.last_alloc_demotion_wait = self.admission_gate(
                 # The fresh pops: restore

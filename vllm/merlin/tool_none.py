@@ -48,12 +48,21 @@ def offered_tools(request: Any) -> list | None:
     return list(tools)
 
 
+def grammar_calls(request: Any) -> bool:
+    """Whether a structural tag constrains this request's calls (named,
+    required or strict auto): the opener token then always starts a call, so
+    the Qwen engine's position rules for an opener do not apply to it."""
+    params = getattr(request, "structured_outputs", None)
+    return getattr(params, "structural_tag", None) is not None
+
+
 def set_mode(engine: Any, request: Any) -> None:
     """Set the mode from the request, on a ``StreamingParserEngine`` that has it."""
     if hasattr(engine, "literal_tool_markup"):
         engine.literal_tool_markup = literal_tool_markup(request)
         engine.keep_think_tags = keep_think_tags(request)
         engine.offered_tools = offered_tools(request)
+        engine.grammar_calls = grammar_calls(request)
 
 
 def copy_mode(source: Any, target: Any) -> None:
@@ -62,6 +71,7 @@ def copy_mode(source: Any, target: Any) -> None:
         target.literal_tool_markup = source.literal_tool_markup
         target.keep_think_tags = source.keep_think_tags
         target.offered_tools = source.offered_tools
+        target.grammar_calls = source.grammar_calls
 
 
 def mark_delegates(parser: Any, request: Any) -> None:

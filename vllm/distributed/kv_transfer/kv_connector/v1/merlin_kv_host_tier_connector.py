@@ -47,7 +47,7 @@ if TYPE_CHECKING:
         PromMetric,
         PromMetricT,
     )
-    from vllm.v1.core.kv_cache_manager import KVCacheManager
+    from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
     from vllm.v1.kv_cache_interface import KVCacheConfig
     from vllm.v1.request import Request
 
@@ -102,6 +102,54 @@ class MerlinKVHostTierConnector(SimpleCPUOffloadConnector):
         units = getattr(runtime, "units", None)
         if units is not None:
             units.record_finished(request)
+            # A preempted request goes back to the front of the waiting
+            # queue: it claims its computed prefix again, ahead of arrivals.
+            units.claim_waiting(request, front=True)
+
+    def _units(self) -> Any:
+        manager = getattr(self, "scheduler_manager", None)
+        runtime = getattr(manager, "tier_runtime", None)
+        return getattr(runtime, "units", None)
+
+    # Queue claims (``UnitTable.claim_waiting``): a request claims its
+    # prompt's host units on arrival and gives them up when it is admitted
+    # or leaves the queue (finish, abort).
+    def on_new_request(self, request: "Request") -> None:
+        super().on_new_request(request)
+        units = self._units()
+        if units is not None:
+            units.claim_waiting(request)
+
+    def update_state_after_alloc(
+        self,
+        request: "Request",
+        blocks: "KVCacheBlocks",
+        num_external_tokens: int,
+    ) -> None:
+        units = self._units()
+        if units is not None:
+            units.release_waiting(request.request_id, admitted=True)
+        super().update_state_after_alloc(request, blocks, num_external_tokens)
+
+    def request_finished(
+        self,
+        request: "Request",
+        block_ids: list[int],
+    ) -> tuple[bool, dict[str, Any] | None]:
+        units = self._units()
+        if units is not None:
+            units.release_waiting(request.request_id, admitted=False)
+        return super().request_finished(request, block_ids)
+
+    def request_finished_all_groups(
+        self,
+        request: "Request",
+        block_ids: tuple[list[int], ...],
+    ) -> tuple[bool, dict[str, Any] | None]:
+        units = self._units()
+        if units is not None:
+            units.release_waiting(request.request_id, admitted=False)
+        return super().request_finished_all_groups(request, block_ids)
 
     def has_pending_block_frees(self) -> bool:
         """Only transfers whose completion frees a GPU block: a

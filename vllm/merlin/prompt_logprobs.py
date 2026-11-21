@@ -38,8 +38,8 @@ class PromptLogprobsBudget:
     logits_mode: bool = False
     rows: int = field(init=False)
     workspace: int = field(init=False)
-    # ``chunk_size`` when its workspace fits; otherwise the largest row count
-    # (>= 1) whose top-20 bound fits, so FP32 heads and huge vocabularies boot.
+    # ``chunk_size`` when its top-20 bound fits; otherwise the largest row
+    # count (>= 1) whose bound fits, or one row if no row fits.
     effective_chunk_size: int = field(init=False)
 
     def _workspace(self, rows: int) -> int:
@@ -75,7 +75,7 @@ class PromptLogprobsBudget:
     def __post_init__(self) -> None:
         rows = min(self.chunk_size, self.max_num_batched_tokens)
         effective = self.chunk_size
-        if self._workspace(rows) > self.tensor_budget_bytes:
+        if self._bound(rows, FIT_NUM_LOGPROBS, 0) > self.tensor_budget_bytes:
             # Monotonic in rows. If one row does not fit, validate() refuses
             # scoring per request; startup never fails.
             lo, hi = 1, rows
@@ -149,11 +149,11 @@ def prompt_logprobs_budget_from_config(
     )
     if budget.chunk_reduced:
         logger.warning_once(
-            "Prompt-scoring chunk reduced from %d to %d rows so the %d-byte "
-            "workspace fits the %d-byte tensor budget (vocab %d, %d-byte head).",
+            "Prompt-scoring chunk reduced from %d to %d rows for the top-20 "
+            "tensor bound (%d bytes; budget %d bytes, vocab %d, %d-byte head).",
             budget.chunk_size,
             budget.effective_chunk_size,
-            budget.workspace,
+            budget.memory_bound(FIT_NUM_LOGPROBS),
             budget.tensor_budget_bytes,
             budget.vocab_size,
             budget.logits_element_size,

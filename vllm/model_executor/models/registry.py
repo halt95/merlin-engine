@@ -142,6 +142,8 @@ _TEXT_GENERATION_MODELS = {
     "HrmTextForCausalLM": ("hrm_text", "HrmTextForCausalLM"),
     "HYV3ForCausalLM": ("hy_v3", "HYV3ForCausalLM"),
     "HYV4ForCausalLM": ("vllm.models.hy_v4", "HYV4ForCausalLM"),
+
+    "HYV4FlashForCausalLM": ("vllm.models.hy_v4_flash", "HYV4FlashForCausalLM"),
     "HCXVisionV2ForCausalLM": ("hyperclovax_vision_v2", "HCXVisionV2ForCausalLM"),
     "HyperCLOVAXForCausalLM": ("hyperclovax", "HyperCLOVAXForCausalLM"),
     "InternLM2ForCausalLM": ("internlm2", "InternLM2ForCausalLM"),
@@ -760,6 +762,8 @@ _SPECULATIVE_DECODING_MODELS = {
     "InternS2MobiusMTP": ("interns2_mobius", "InternS2MobiusMTP"),
     "HYV3MTPModel": ("hy_v3_mtp", "HYV3MTP"),
     "HYV4MTPModel": ("vllm.models.hy_v4", "HYV4MTP"),
+    # The DFly2 draft of a Hy4 Flash checkpoint
+    "HYV4DFlyModel": ("vllm.models.hy_v4.nvidia.dfly", "HYV4DFlyForCausalLM"),
     "KimiK3MTPModel": ("vllm.models.kimi_k3", "KimiK3MTP"),
 }
 

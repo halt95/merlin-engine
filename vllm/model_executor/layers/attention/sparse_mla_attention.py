@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by the Merlin project; see NOTICE.
 """Shared MHA implementation and metadata builder for sparse MLA backends."""
 
 import math
@@ -203,6 +204,10 @@ class SparseMLACommonMetadataBuilder(AttentionMetadataBuilder[T]):
             self.dcp_world_size = get_dcp_group().world_size
         except AssertionError:
             # DCP might not be initialized in testing
+            self.dcp_world_size = 1
+        # A group whose cache is replicated across the
+        # DCP ranks (Hy4 Flash SWA layers) builds DCP-free metadata.
+        if not getattr(kv_cache_spec, "dcp_sharded", True):
             self.dcp_world_size = 1
         self.cp_kv_cache_interleave_size = parallel_config.cp_kv_cache_interleave_size
         self.dcp_local_block_size = self.cp_kv_cache_interleave_size

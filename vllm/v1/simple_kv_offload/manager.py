@@ -299,7 +299,16 @@ class SimpleCPUOffloadScheduler:
         )
         # The tier uses resolved lookup dependencies.
         if kv_host_tier.is_active(vllm_config):
-            min_rows = kv_host_tier.min_tier_rows(self.cpu_kv_cache_config)
+            # DCP-sharded rows hold block x DCP
+            # tokens; without DCP the call is unchanged.
+            min_rows = (
+                kv_host_tier.min_tier_rows(
+                    self.cpu_kv_cache_config,
+                    self.cpu_coordinator.group_block_sizes,
+                )
+                if dcp_world_size > 1
+                else kv_host_tier.min_tier_rows(self.cpu_kv_cache_config)
+            )
             data_rows = self.num_cpu_blocks - 1  # the pool reserves its null row
             if data_rows < min_rows:
                 raise RuntimeError(
@@ -1848,11 +1857,11 @@ class SimpleCPUOffloadScheduler:
         for req_id in list(self._load_event_to_reqs.get(event, ())):
             # A non-final credit batch of a
             # plan restore committed: the next batch issues, the receive goes on.
-            state = self._reqs_to_load.get(req_id)
+            req_state = self._reqs_to_load.get(req_id)
             if (
                 self.tier_plans is not None
-                and state is not None
-                and self.tier_plans.batch_committed(req_id, state, event, failed)
+                and req_state is not None
+                and self.tier_plans.batch_committed(req_id, req_state, event, failed)
             ):
                 continue
             if self.tier_runtime is not None:

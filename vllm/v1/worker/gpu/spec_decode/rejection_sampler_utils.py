@@ -3,6 +3,8 @@
 # Modified by the Merlin project; see NOTICE.
 import torch
 
+from vllm.merlin.spec_residual_diag import ResidualDiag
+
 from vllm.merlin.spec_verify_fast_paths import guard_spec_verify_fast_paths
 from vllm.triton_utils import tl, tldevice, triton
 from vllm.v1.spec_decode.fly import compute_fly_entropy
@@ -1295,6 +1297,8 @@ def rejection_sample(
     # use_block_verification; standard/synthetic keying is never changed.
     step_keyed_rng: bool = False,
     stable_residual: bool = False,
+    # Observe-only counters (default None).
+    residual_diag: ResidualDiag | None = None,
     all_greedy: bool = False,
     skip_masked_vocab_blocks: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -1622,5 +1626,24 @@ def rejection_sample(
         temperature,
         PADDED_RESAMPLE_NUM_BLOCKS=padded_resample_num_blocks,
         all_greedy=all_greedy,
+        # vllm#66048
+        # The kernel reads and updates num_sampled in place. Multiple warps can
+        # observe the increment before loading the original resampling index.
+        num_warps=1,
     )
+    # Reads the outputs above, writes none.
+    if residual_diag is not None:
+        residual_diag.observe(
+            target_logits,
+            draft_sampled,
+            cu_num_logits,
+            pos,
+            expanded_idx_mapping,
+            temperature,
+            sampled,
+            num_sampled,
+            resampled_local_max,
+            vocab_size,
+            all_greedy,
+        )
     return sampled, num_sampled

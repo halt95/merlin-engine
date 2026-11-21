@@ -319,6 +319,8 @@ for pattern in (
     if not list(package.glob(pattern)):
         sys.exit(f"source build did not produce vllm/{pattern}")
 products = set(package.rglob("*.so")) | set(package.rglob("*.so.*"))
+if (package / "vllm-rs").is_file():  # the Rust frontend executable is a native product too
+    products.add(package / "vllm-rs")
 for name in ("triton_kernels", "vllm_flash_attn", "third_party"):
     products.update(
         p for p in (package / name).rglob("*")
@@ -336,6 +338,10 @@ PY
 fi
 
 if [ "$MODE" = install ]; then
+  # Both wheel and source installs record the inputs and selected, verified patch targets.
+  "$PY" -I "$REPO/release/wheel.py" native-snapshot "$ENGINE" > "$ENGINE/.build-native"
+  PURELIB="$("$PY" -I -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')"
+  "$PY" -I "$REPO/release/wheel.py" flashinfer-ids "$PURELIB" "$TILE_SERIES" > "$ENGINE/.build-flashinfer.sha256"
   printf '%s\n' "$SOURCE_ID" > "$ENGINE/.build-source"
 else
   (cd "$ENGINE" && sha256sum -c --quiet --strict .build-products.sha256)

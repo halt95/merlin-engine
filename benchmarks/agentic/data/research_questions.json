@@ -1,0 +1,14 @@
+[
+  {"id": "q01", "question": "In what year did the railway station in the founding chair's birthplace open?", "accept": ["1896"]},
+  {"id": "q02", "question": "How many platforms did the stations in the harbour town have in total?", "accept": ["4", "four"]},
+  {"id": "q03", "question": "By how many metres did the length of the Lume Viaduct change when it was rebuilt?", "accept": ["19"]},
+  {"id": "q04", "question": "What was the top speed, in km/h, of the locomotive class built at the works in the junction town?", "accept": ["88"]},
+  {"id": "q05", "question": "By what factor did the tonnage handled at Oarside harbour grow from 1890 to 1910? Give it to one decimal place.", "accept": ["2.3"]},
+  {"id": "q06", "question": "Who chaired the cooperative when Kestrel Wood station opened?", "accept": ["achterberg"]},
+  {"id": "q07", "question": "What share of the members made a general meeting quorate when the 1902 timetable came into force?", "accept": ["quarter", "1/4", "25%", "25 percent", "25 per cent"]},
+  {"id": "q08", "question": "How many minutes did the express from Brennick Central to Oarside Quay take under the 1902 timetable?", "accept": ["112"]},
+  {"id": "q09", "question": "How many steam locomotives did the cooperative have built across all its classes before 1920?", "accept": ["30", "thirty"]},
+  {"id": "q10", "question": "How many years after the cooperative was founded did its line reach the harbour town?", "accept": ["9", "nine"]},
+  {"id": "q11", "question": "For how many years did the founding chair lead the cooperative?", "accept": ["15", "fifteen"]},
+  {"id": "q12", "question": "Counting from Brennick Central, at what kilometre post is Fallowmere station (main-line post plus branch distance)?", "accept": ["56.3"]}
+]

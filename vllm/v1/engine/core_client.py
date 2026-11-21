@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by the Merlin project; see NOTICE.
 import asyncio
 import contextlib
 import queue
@@ -29,6 +30,7 @@ from vllm.distributed.elastic_ep.external_elastic_ep import (
 from vllm.envs import VLLM_ENGINE_READY_TIMEOUT_S
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
+from vllm.merlin.kv_pool_routing import RoutedKVPool
 from vllm.renderers import BaseRenderer
 from vllm.tasks import SupportedTask
 from vllm.tracing import instrument
@@ -620,6 +622,8 @@ class MPClient(EngineCoreClient):
         self._renderer: BaseRenderer | None = renderer
         self._effective_attention_block_sizes: set[int | None] = set()
         self._kv_event_sources: dict[int, KVEventsConfig] = {}
+        # Each engine's reported KV pool by rank.
+        self._kv_pools = RoutedKVPool()
 
         # ZMQ setup.
         sync_ctx = zmq.Context(io_threads=2)
@@ -881,6 +885,11 @@ class MPClient(EngineCoreClient):
         cache_config = vllm_config.cache_config
         cache_config.block_size = response.block_size
         cache_config.mamba_block_size = response.mamba_block_size
+        # Min over routed engines, never a sum.
+        self._kv_pools.report(
+            response.data_parallel_rank, response.kv_cache_size_tokens
+        )
+        self._kv_pools.publish(cache_config, self.core_engines)
         # Keep these as per-engine cache_config_info values; do not sum across DP.
         cache_config.kv_cache_size_tokens = (
             getattr(cache_config, "kv_cache_size_tokens", None)
@@ -2068,6 +2077,8 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
             raise
 
         self.core_engines.extend(new_core_engines)
+        # The new engines are routed from here.
+        self._kv_pools.publish(self.vllm_config.cache_config, self.core_engines)
         # Update the parallel config
         parallel_config = self.vllm_config.parallel_config
         parallel_config.data_parallel_size = new_data_parallel_size
@@ -2122,6 +2133,9 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
         self.engine_ranks_managed = self.engine_ranks_managed[:new_data_parallel_size]
         for rank in range(new_data_parallel_size, cur_data_parallel_size):
             self._kv_event_sources.pop(rank, None)
+        # The removed engines no longer bound it.
+        self._kv_pools.forget(range(new_data_parallel_size, cur_data_parallel_size))
+        self._kv_pools.publish(self.vllm_config.cache_config, self.core_engines)
         removed_dp_size = cur_data_parallel_size - new_data_parallel_size
         eep_mode = self._eep_commit_pause_mode()
         pause_modes = [eep_mode] * new_data_parallel_size + ["abort"] * removed_dp_size

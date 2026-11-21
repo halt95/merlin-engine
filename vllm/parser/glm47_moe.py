@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by the Merlin project; see NOTICE.
 """GLM-4.7 parser for reasoning and tool calls.
 
 GLM-4.7 uses XML-like tool calls::
@@ -225,6 +226,7 @@ def glm47_moe_config(thinking: bool = True) -> ParserEngineConfig:
         },
         turn_boundary_tokens=GLM_TURN_BOUNDARIES,
         arg_converter=_glm47_arg_converter,
+        args_raw_text=True,
         arg_value_extender=_glm47_arg_value_extender,
         stream_arg_deltas=True,
         tool_args_json=False,

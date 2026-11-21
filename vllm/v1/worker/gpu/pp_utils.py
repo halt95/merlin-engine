@@ -45,7 +45,7 @@ class PendingRecv:
     # Recorded after the token and count
     # broadcasts, before the draft broadcast (`event` covers all three). None:
     # one event (no drafts received, or VLLM_RECOVERSSM_PP_SPLIT_RECV off).
-    counts_event: torch.cuda.Event | None = None
+    counts_event: "torch.cuda.Event | None" = None
 
 
 def compute_need_sampled_mask(input_batch: InputBatch) -> np.ndarray | None:

@@ -3,7 +3,7 @@
 When the server is up, `merlin serve` prints one line with everything a client needs:
 
 ```text
-merlin: Ready: http://127.0.0.1:8100/v1 · model qwen38-27b · context 262144 · key in /home/you/merlin-engine/.merlin/api-key (started in 3m12s)
+merlin: Ready: http://127.0.0.1:8100/v1 · model qwen38-27b · context 262144 · key in <checkout>/.merlin/api-key (started in 3m12s)
 merlin:   Anthropic-compatible endpoint: http://127.0.0.1:8100/v1/messages (same model and key)
 ```
 

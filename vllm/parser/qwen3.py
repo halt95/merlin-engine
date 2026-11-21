@@ -19,12 +19,13 @@ from __future__ import annotations
 
 import functools
 import json
-import os
+import weakref
 from collections.abc import Callable, Sequence
 from typing import TYPE_CHECKING
 
 import regex as re
 
+import vllm.envs as envs
 from vllm.merlin.tool_call_index import renumber_accepted_calls
 from vllm.parser.engine.events import EventType, SemanticEvent
 from vllm.parser.engine.parser_engine import ParserEngine
@@ -42,6 +43,8 @@ from vllm.parser.engine.token_id_scanner import (
 from vllm.tool_parsers.utils import find_tool_name
 
 if TYPE_CHECKING:
+
+    from vllm.entrypoints.generate.base.protocol import DeltaMessage
     from vllm.entrypoints.openai.chat_completion.protocol import (
         ChatCompletionRequest,
     )
@@ -521,6 +524,7 @@ def qwen3_config(
             ),
         },
         arg_converter=_qwen3_arg_converter,
+        args_raw_text=True,
         arg_value_extender=_qwen3_arg_value_extender,
         stream_arg_deltas=True,
         strip_trailing_reasoning_whitespace=False,
@@ -528,6 +532,46 @@ def qwen3_config(
         # No calls outside request.tools.
         validate_tool_names=True,
     )
+
+
+# The texts of the tokenizer's added tokens
+# flagged special, but for the given ones (they keep their own handling): never
+# text on a line, whether or not the decode keeps them. Built once per
+# tokenizer, held no longer than the tokenizer is.
+_SPECIAL_TEXTS: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+
+
+def _special_texts(tokenizer, named: frozenset[str]):
+    try:
+        built = _SPECIAL_TEXTS.setdefault(tokenizer, {})
+    except TypeError:  # a tokenizer that cannot be a weak key
+        return _special_text_pattern(tokenizer, named)
+    if named not in built:
+        built[named] = _special_text_pattern(tokenizer, named)
+    return built[named]
+
+
+def _special_text_pattern(tokenizer, named: frozenset[str]):
+    # A tokenizer without added tokens gives no set: the line test as before.
+    # Any other error is raised: a parser built without the set is not the
+    # parser served.
+    decoder = getattr(tokenizer, "added_tokens_decoder", None)
+    if not isinstance(decoder, dict):
+        return None
+    texts = {
+        token.content
+        for token in decoder.values()
+        if getattr(token, "special", False) and token.content not in named
+    }
+    texts.discard("")
+    if not texts:
+        return None
+    # The lexer may hand a token's text over in pieces (``<|im_start|`` then
+    # ``>``): a line ending in the start of one has not settled yet.
+    starts = frozenset(t[:n] for t in texts for n in range(1, len(t)))
+    longest_first = sorted(texts, key=lambda t: (-len(t), t))
+    pattern = re.compile("|".join(map(re.escape, longest_first)))
+    return pattern, starts
 
 
 class Qwen3StreamingParserEngine(StreamingParserEngine):
@@ -571,13 +615,33 @@ class Qwen3StreamingParserEngine(StreamingParserEngine):
     # The tool-name gate: the request's tools when it may
     # get calls (set per request, vllm/merlin/tool_none.py); None leaves the gate off.
     offered_tools: list | None = None
+    # The request's grammar opens the calls
+    # (a structural tag: named, required, strict auto); set per request
+    grammar_calls = False
+    # Calls start only at the answer's start,
+    # a line start or right after a call: the Qwen3 parser itself (set there);
+    # the families built on it keep their own call positions
+    line_start_calls = False
+    # A tool block opened in reasoning is held
+    # until the output shows whether it was quoted: the Qwen3 parser itself (set
+    # there); the families built on it stream such a call as it comes
+    quote_reasoning_calls = False
+    # Special token texts, never text on a line
+    special_texts = None
     # Literal-span rules, default on
-    # (MERLIN_QWEN3_LITERAL_SPANS=0 turns them off): fenced spans and
-    # tool blocks quoted in closed reasoning stay text.
-    literal_spans = os.environ.get("MERLIN_QWEN3_LITERAL_SPANS", "1") != "0"
+    # (MERLIN_QWEN3_LITERAL_SPANS=0 turns them off): an opener inside a code
+    # fence, inside an inline code span closed on its line, or in content
+    # anywhere but the start of the answer, of a line or right after a call,
+    # stays text, and so do tool blocks quoted in closed reasoning. None until the first
+    # engine is built: reset() then takes the registry value once per process
+    # (a value other than 0 or 1 raises there), so a change needs a restart.
+    literal_spans: bool | None = None
     _HEADER_MAX = 512  # a header longer than this is not a name to judge
 
     def reset(self, initial_state: ParserState | None = None) -> None:
+
+        if Qwen3StreamingParserEngine.literal_spans is None:
+            Qwen3StreamingParserEngine.literal_spans = envs.MERLIN_QWEN3_LITERAL_SPANS
         super().reset(initial_state=initial_state)
         # Items of an opener held until the
         # function name is complete; ("term", terminal, value, tokens) or
@@ -585,14 +649,23 @@ class Qwen3StreamingParserEngine(StreamingParserEngine):
         self._gate: list[tuple[str, str, str | None, int]] = []
         self._quote: list[tuple[str, str, str | None, int]] = []
         self._quote_closed = False  # a ``</think>`` is the last held terminal
-        self._fence_items: list[tuple[str, str, str | None, int]] = []
-        self._bypass = {"gate": 0, "quote": 0, "fence": 0}
-        self._line_start, self._indent = True, 0
-        self._run_char: str | None = None
-        self._run_len, self._run_at_start = 0, False
-        self._fence_char: str | None = None
-        self._fence_len = 0
-        self._close_pending = False
+        # An opener inside an open inline
+        # code span, and what follows it on its line
+        self._code_items: list[tuple[str, str, str | None, int]] = []
+        self._code_mark: tuple = ()  # the fence tracking when that hold began
+        self._untracked = 0  # replaying items the code hold already tracked
+        self.code_flushed = False  # the end of output replayed an unclosed span
+        self._bypass = {"gate": 0, "quote": 0, "code": 0}
+        # Visible content written on the
+        # current line of the answer since its start or the last call
+        self._line_has_text = False
+        # an opener kept as text, with only whitespace after it so far: a bare
+        # ``<function=`` header here is the rest of that quoted block
+        self._quoted_opener = False
+        # What the two above have not
+        # settled yet (a special token's text so far)
+        self._line_tail = self._quote_tail = ""
+        self._reset_fence_tracking()
         self._held_terminal: str | None = None
         self._held: list[tuple[str, int]] = []
         # Deferred ``</function>``: items ("term", terminal, value, tokens) or
@@ -646,8 +719,8 @@ class Qwen3StreamingParserEngine(StreamingParserEngine):
             self.opened_held_call = terminal == "TOOL_START"
         else:
             events = super()._emit_for_state(tag, tag_tokens)
-        for text, token_count in rest:
-            events.extend(self._emit_for_state(text, token_count))
+        for text, token_count in rest:  # fence-tracked when they were held
+            events.extend(self._emit_for_state(text, token_count, tracked=True))
         return events
 
     def _replay(self, items: list, literal: bool) -> list[SemanticEvent]:
@@ -764,7 +837,7 @@ class Qwen3StreamingParserEngine(StreamingParserEngine):
     def holding_opener(self) -> bool:
         """A ``<tool_call>`` seen in reasoning has not been settled yet."""
         return self._held_terminal == "TOOL_START" or bool(
-            self._gate or self._quote or self._fence_items
+            self._gate or self._quote or self._code_items
         )
 
     def _opens_call(self, terminal: str) -> bool:
@@ -845,39 +918,89 @@ class Qwen3StreamingParserEngine(StreamingParserEngine):
             self._quote_closed = True
         return []
 
-    def _track(self, text: str) -> None:
+    def _reset_fence_tracking(self) -> None:
+        self._line_start, self._indent = True, 0
+        self._run_char: str | None = None
+        self._run_len, self._run_at_start = 0, False
+        self._fence_char: str | None = None
+        self._fence_len = 0
+        self._close_pending = False
+        # after a kept line start (see _on_terminal): a run there, and the fence
+        # it opens, stand only if the marker's line ends before the next terminal
+        self._kept = self._run_tentative = self._fence_tentative = False
+        # Inline code outside a fence: a run
+        # of backticks being read, the length of the run that opened the span
+        # still open on this line (0: none), and whether a span closed
+        self._tick, self._code_open, self._code_closed = 0, 0, False
+
+    _TRACKING = ("_line_start", "_indent", "_run_char", "_run_len", "_run_at_start",
+                 "_fence_char", "_fence_len", "_close_pending", "_kept",
+                 "_run_tentative", "_fence_tentative", "_tick", "_code_open")
+
+    def _track(self, text: str) -> bool:
         """Follow CommonMark code fences (a line-start run of 3+ backticks or
         tildes, closed by a run of the same character at least as long with
-        only whitespace after it on its line)."""
+        only whitespace after it on its line), and, outside a fence, inline
+        code spans closed on the line they open on (a run of backticks closed
+        by the next run of exactly as many). True when a fence closed in
+        ``text``, even if another one opened after it."""
+        closed = False
         for ch in text:
             if self._run_char is not None:
                 if ch == self._run_char:
                     self._run_len += 1
                     continue
                 self._end_run()
+            if self._tick:
+                if ch == "`":
+                    self._tick += 1
+                    continue
+                self._end_tick()
             if ch == "\n":
                 if self._close_pending:
                     self._fence_char, self._fence_len = None, 0
-                self._close_pending = False
+                    closed = True
+                self._close_pending = self._kept = self._fence_tentative = False
                 self._line_start, self._indent = True, 0
+                self._code_open = 0  # an inline span ends with its line
                 continue
             if self._close_pending and ch not in " \t\r":
                 self._close_pending = False
             if self._line_start and ch in "`~":
                 self._run_char, self._run_len, self._run_at_start = ch, 1, True
+                self._run_tentative, self._kept = self._kept, False
                 continue
             if self._line_start and ch == " " and self._indent < 3:
                 self._indent += 1
                 continue
-            self._line_start = False
+            if ch == "`":
+                self._tick = 1
+            self._line_start = self._kept = False
+        return closed
+
+    def _end_tick(self) -> None:
+        length, self._tick = self._tick, 0
+        self._inline_run(length)
+
+    def _inline_run(self, length: int) -> None:
+        if self._fence_char is not None:  # backticks in a fence are fence text
+            return
+        if not self._code_open:
+            self._code_open = length
+        elif length == self._code_open:
+            self._code_open, self._code_closed = 0, True
 
     def _end_run(self) -> None:
         char, length, at_start = self._run_char, self._run_len, self._run_at_start
         self._run_char, self._run_len, self._line_start = None, 0, False
+        tentative, self._run_tentative = self._run_tentative, False
+        if length < 3 and char == "`":  # a line-start run too short for a fence
+            self._inline_run(length)
         if length < 3 or not at_start:
             return
         if self._fence_char is None:
             self._fence_char, self._fence_len = char, length
+            self._fence_tentative = tentative
         elif char == self._fence_char and length >= self._fence_len:
             self._close_pending = True
 
@@ -886,65 +1009,110 @@ class Qwen3StreamingParserEngine(StreamingParserEngine):
             self._end_run()
         return self._fence_char is not None
 
-    def _hold_in_fence(self, item: tuple, tracked: bool = False) -> list[SemanticEvent]:
-        """Hold an opener written inside an open fence, and what follows, until
-        the fence closes (all text) or the output ends (trailing-run rule)."""
-        kind, a, b, token_count = item
-        if kind == "term" and a == "THINK_END" and self.state == ParserState.REASONING:
-            items, self._fence_items = self._fence_items, []
-            self._fence_char, self._fence_len, self._close_pending = None, 0, False
-            events = self._replay_items(items, "fence", literal=True)
-            return events + self._on_terminal(a, b, token_count)
-        self._fence_items.append(item)
-        if not tracked:
-            self._track(a if kind == "text" else b)
-        if self._fence_char is None:
-            items, self._fence_items = self._fence_items, []
-            return self._replay_items(items, "fence", literal=True)
-        return []
+    # An opener the span rules keep as text
+    def _opener_as_text(self, value: str, token_count: int) -> list[SemanticEvent]:
+        self._untracked += 1  # the opener's text is already tracked
+        try:
+            return self._emit_for_state(value, token_count)
+        finally:
+            self._untracked -= 1
+            # Nothing after it yet
+            self._quoted_opener, self._quote_tail = True, ""
 
-    def _flush_fence(self) -> list[SemanticEvent]:
-        items, self._fence_items = self._fence_items, []
+    # An opener written inside an inline code
+    # span is held with what follows it until the span closes (all text) or
+    # its line, the reasoning or the turn ends first (the path it took before).
+    def _code_span_open(self) -> bool:
         if self._run_char is not None:
             self._end_run()
-        if self._close_pending:  # closed on the output's last line
-            return self._replay_items(items, "fence", literal=True)
-        # Trailing-run rule: complete or truncated ``<tool_call>``
-        # blocks that end the output, with only whitespace between them, are
-        # calls; anything before them in the fence is text.
-        start, inside = None, False
-        for i, (kind, a, b, _) in enumerate(items):
-            if kind == "term" and a == "TOOL_START" and not inside:
-                start = i if start is None else start
-                inside = True
-            elif kind == "term" and a == "TOOL_END":
-                inside = False
-            elif not inside and kind == "text" and a.strip():
-                # Text after a block (markers such as a turn end do not count).
-                start = None
-        if start is None:
-            return self._replay_items(items, "fence", literal=True)
-        events = self._replay_items(items[:start], "fence", literal=True)
-        events.extend(self._replay_items(items[start:], "fence", literal=False))
-        return events
+        if self._tick:
+            self._end_tick()
+        return self._fence_char is None and bool(self._code_open)
+
+    def _code_span_closed(self) -> bool:
+        if self._tick:
+            self._end_tick()
+        return self._code_closed
+
+    def _release_code(self, literal: bool) -> list[SemanticEvent]:
+        items, self._code_items = self._code_items, []
+        self._code_closed = False
+        if literal:  # every item is text, already tracked in order
+            self._untracked += 1
+            try:
+                return self._replay_items(items, "code", literal=True)
+            finally:
+                self._untracked -= 1
+        # not a span: the items take their own path, tracked from where the
+        # hold began, as if never held
+        if self._finishing:  # released by what the end of output flushed
+            self.code_flushed = True
+        for name, value in zip(self._TRACKING, self._code_mark):
+            setattr(self, name, value)
+        return self._replay_items(items, "code", literal=False)
+
+    def _hold_in_code(self, item: tuple) -> list[SemanticEvent]:
+        kind, a, b, token_count = item
+        if kind == "term":
+            if self._tick:
+                self._end_tick()
+            if self._code_closed:  # the span closed before this terminal
+                events = self._release_code(literal=True)
+                return events + self._on_terminal(a, b, token_count)
+            if a == "THINK_END" or a == DROP_TERMINAL:
+                events = self._release_code(literal=False)
+                self._code_open = self._tick = 0
+                return events + self._on_terminal(a, b, token_count)
+            self._code_items.append(item)
+            self._track(b)
+            return []
+        for i, ch in enumerate(a):
+            if self._tick and ch != "`":
+                self._end_tick()
+            if self._code_closed or ch == "\n":
+                head, rest = a[:i], a[i:]
+                if head:
+                    self._code_items.append(("text", head, None, token_count))
+                    token_count = 0
+                events = self._release_code(literal=self._code_closed)
+                return events + self._emit_for_state(rest, token_count)
+            self._track(ch)
+        self._code_items.append(item)
+        return []
 
     def _flush_spans(self) -> list[SemanticEvent]:
+        """End of output: each hold layer applies its end rule once. A flushed
+        layer stays bypassed for the rest of the flush, so text it released and
+        another layer re-held cannot come back to it (no more output can change
+        its decision); with three layers this takes at most three passes."""
         events: list[SemanticEvent] = []
-        while self._fence_items or self._quote or self._gate:
-            if self._fence_items:
-                events.extend(self._flush_fence())
-            elif self._quote:
-                items, self._quote, self._quote_closed = self._quote, [], False
-                events.extend(self._replay_items(items, "quote", literal=False))
-            else:
-                items, self._gate = self._gate, []
-                events.extend(self._replay_items(items, "gate", literal=False))
+        closed: list[str] = []
+        bypass = dict(self._bypass)  # restored as a whole, however the flush exits
+        try:
+            while self._code_items or self._quote or self._gate:
+                layer = "code" if self._code_items else "quote" if self._quote else "gate"
+                if layer in closed:  # a bypassed layer took items: a bug, not a hang
+                    raise RuntimeError(f"qwen3 flush: the {layer} hold re-held at end of output")
+                if layer == "code":  # closed by the output's last characters, or not
+                    literal = self._code_span_closed()
+                    self.code_flushed = self.code_flushed or not literal
+                    events.extend(self._release_code(literal=literal))
+                elif layer == "quote":
+                    items, self._quote, self._quote_closed = self._quote, [], False
+                    events.extend(self._replay_items(items, "quote", literal=False))
+                else:
+                    items, self._gate = self._gate, []
+                    events.extend(self._replay_items(items, "gate", literal=False))
+                closed.append(layer)
+                self._bypass[layer] += 1
+        finally:
+            self._bypass = bypass
         return events
 
     def _capture(self, item: tuple) -> list[SemanticEvent] | None:
         """Route an item into a pending hold; None when nothing is held."""
-        if self._fence_items and not self._bypass["fence"]:
-            return self._hold_in_fence(item)
+        if self._code_items and not self._bypass["code"]:
+            return self._hold_in_code(item)
         if self._quote and not self._bypass["quote"]:
             return self._hold_quote(item)
         if self._gate and not self._bypass["gate"]:
@@ -960,13 +1128,39 @@ class Qwen3StreamingParserEngine(StreamingParserEngine):
             # The reasoning pass after ``</think>``: the tool pass decides.
             return None
         item = ("term", terminal, value, token_count)
+        # Under a call grammar the opener
+        # token is the grammar's trigger: a call follows it wherever it is
+        free = not (self.grammar_calls and self._ever_had_token_ids)
         if (
             self.literal_spans
-            and not self._bypass["fence"]
+            and free
             and self.state in self._PLAIN_STATES
             and self._fence_open()
         ):
-            return self._hold_in_fence(item, tracked=True)
+            # Inside a code fence, even one
+            # the output ends inside
+            return self._opener_as_text(value, token_count)
+        if (
+            self.literal_spans
+            and free
+            and self.line_start_calls
+            and self.state == ParserState.CONTENT
+            and (self._line_has_text or self._quoted_opener)
+        ):
+            # In a Qwen3 answer a call starts
+            # only at its start, at a line start or right after a call
+            return self._opener_as_text(value, token_count)
+        if (
+            self.literal_spans
+            and not self._bypass["code"]
+            and self.state in self._PLAIN_STATES
+            and self._code_span_open()
+        ):
+            # The opener is already tracked
+            self._code_mark = tuple(getattr(self, name) for name in self._TRACKING)
+            self._code_closed = False
+            self._code_items = [item]
+            return []
         if (
             self.offered_tools is not None
             and self.config.validate_tool_names
@@ -976,6 +1170,7 @@ class Qwen3StreamingParserEngine(StreamingParserEngine):
             return self._gate_add(item)
         if (
             self.literal_spans
+            and self.quote_reasoning_calls
             and not self._bypass["quote"]
             and terminal == "TOOL_START"
             and self.state == ParserState.REASONING
@@ -994,10 +1189,31 @@ class Qwen3StreamingParserEngine(StreamingParserEngine):
             return held
         if (
             self.literal_spans
-            and not self._bypass["fence"]
+            and not self._untracked
             and self.state in self._PLAIN_STATES
         ):
+            if terminal == "THINK_END":
+                self._code_open = self._tick = 0  # no span runs on past reasoning
+            if self._run_tentative or self._fence_tentative:
+                # a terminal on the marker's line: no fence after a kept line start
+                self._run_char, self._run_len, self._run_tentative = None, 0, False
+                if self._fence_tentative:
+                    self._fence_char, self._fence_len, self._fence_tentative = None, 0, False
+            # In reasoning, with no fence
+            # open, a ``<tool_call>`` at a line start keeps the line start: if it
+            # stays text, a fence marker right after it opens a fence once its
+            # line ends, as 3.0.2.1 read it (it tracked the releasing text twice).
+            keep = (
+                terminal == "TOOL_START"
+                and self.state == ParserState.REASONING
+                and self._fence_char is None
+                and self._line_start
+                and self._run_char is None
+            )
+            indent = self._indent
             self._track(value)
+            if keep:
+                self._line_start, self._indent, self._kept = True, indent, True
         held = self._start_hold(terminal, value, token_count)
         if held is not None:
             return held
@@ -1029,15 +1245,23 @@ class Qwen3StreamingParserEngine(StreamingParserEngine):
             self._bare_call = self.state != ParserState.TOOL_PREAMBLE
         events = super()._on_terminal(terminal, value, token_count)
         self._track_value(terminal)
+        if terminal == "THINK_END" and self.state == ParserState.CONTENT:
+            # A ``</think>`` kept in the
+            # content (no reasoning parser) still starts the answer
+            self._line_has_text = self._quoted_opener = False
+            self._line_tail = self._quote_tail = ""
         return events
 
-    def _emit_for_state(self, text: str, token_count: int = 0) -> list[SemanticEvent]:
+    def _emit_for_state(
+        self, text: str, token_count: int = 0, tracked: bool = False
+    ) -> list[SemanticEvent]:
         held = self._capture(("text", text, None, token_count))
         if held is not None:
             return held
         if (
-            self.literal_spans
-            and not self._bypass["fence"]
+            not tracked  # text is fence-tracked once, however it was delivered
+            and self.literal_spans
+            and not self._untracked
             and self.state in self._PLAIN_STATES
         ):
             self._track(text)
@@ -1052,32 +1276,77 @@ class Qwen3StreamingParserEngine(StreamingParserEngine):
                 self._held.append((text, token_count))
                 return []
             events = self._release(structural=False)
-            events.extend(self._emit_for_state(text, token_count))
+            events.extend(self._emit_for_state(text, token_count, tracked=True))
             return events
         if self._value_closed and self.state == ParserState.TOOL_ARGS and text.strip():
             # Text after ``</parameter>``: that closer was literal value text.
             self._value_open, self._value_closed = True, False
+        if self.state == ParserState.CONTENT:
+            if self._quoted_opener:
+                shown, self._quote_tail = self._settle(self._quote_tail + text)
+                self._quoted_opener = not shown or bool(self._quote_tail)
+            _, newline, rest = text.rpartition("\n")
+            if newline:
+                self._line_has_text, self._line_tail = False, ""
+            if self._line_tail or not self._line_has_text:
+                self._line_has_text, self._line_tail = self._settle(
+                    self._line_tail + rest
+                )
         return super()._emit_for_state(text, token_count)
+
+    # Special tokens are never text on a line
+    def _settle(self, tail: str) -> tuple[bool, str]:
+        """Whether ``tail`` shows text, and the part of it to keep while it
+        ends in the start of a special token's text with nothing shown before."""
+        if self.special_texts is None:
+            return bool(tail.strip()), ""
+        pattern, starts = self.special_texts
+        seen = pattern.sub("", tail)
+        at = seen.rfind("<")
+        if at >= 0 and seen[at:] in starts and not seen[:at].strip():
+            return True, tail
+        return bool(seen.strip()), ""
+
+    # The answer starts, or a call ends: a
+    # new call may start here
+    def _apply_transition(self, transition, value: str, token_count: int = 0):
+        before = self.state
+        events = super()._apply_transition(transition, value, token_count)
+        if self.state == ParserState.CONTENT and before != ParserState.CONTENT:
+            self._line_has_text = self._quoted_opener = False
+            self._line_tail = self._quote_tail = ""
+        return events
 
     def finish(self) -> list[SemanticEvent]:
         self._finishing = True
-        pending = self._scanner.flush_pending()
-        # A marker still deferred here never
-        # lined up with text. Its text, if any, is already in the pending text, so
-        # returning it as text as well would write what the model did not.
-        if self.literal_tool_markup:
-            pending = [p for p in pending if not isinstance(p, PreLexedTerminal)]
-        events = self._process_scanner_items(pending)
-        events.extend(self._process_lex_tokens(self._lexer.flush()))
-        self._finishing = False
-        events.extend(self._flush_spans())
-        if self._held_terminal is not None:
-            events.extend(self._release(structural=True))
-        while self._defer:
-            # the output ended with no later closer: the first deferred </function> was real
-            events.extend(self._resolve(0))
-        self._record_reasoning_tokens(events)
-        events.extend(super().finish())
+        try:
+            pending = self._scanner.flush_pending()
+            # A marker still deferred here never
+            # lined up with text. Its text, if any, is already in the pending text, so
+            # returning it as text as well would write what the model did not.
+            if self.literal_tool_markup:
+                pending = [p for p in pending if not isinstance(p, PreLexedTerminal)]
+            events = self._process_scanner_items(pending)
+            events.extend(self._process_lex_tokens(self._lexer.flush()))
+            self._finishing = False
+            events.extend(self._flush_spans())
+            if self._held_terminal is not None:
+                events.extend(self._release(structural=True))
+            while self._defer:
+                # the output ended with no later closer: the first deferred </function> was real
+                events.extend(self._resolve(0))
+            self._record_reasoning_tokens(events)
+            events.extend(super().finish())
+        except BaseException:
+            # Leave nothing half-flushed
+            self._gate, self._quote, self._defer = [], [], []
+            self._code_items, self._untracked = [], 0
+            self._quote_closed, self._held_terminal, self._held = False, None, []
+            raise
+        finally:
+            self._finishing = False
+            self._bypass = {"gate": 0, "quote": 0, "code": 0}
+            self._reset_fence_tracking()
         return events
 
 
@@ -1128,6 +1397,15 @@ class Qwen3Parser(ParserEngine):
             tools,
             **kwargs,
         )
+        # This parser's own call positions
+        self._engine.line_start_calls = type(self) is Qwen3Parser
+        self._engine.quote_reasoning_calls = type(self) is Qwen3Parser
+        # Special token texts, built once
+        if self._engine.line_start_calls:
+            named = frozenset(
+                (self.THINK_START, self.THINK_END, self.TOOL_START, self.TOOL_END)
+            )
+            self._engine.special_texts = _special_texts(tokenizer, named)
 
     # A held ``<tool_call>`` can end
     # reasoning one or more deltas after its token. The DelegatingParser hands
@@ -1168,6 +1446,25 @@ class Qwen3Parser(ParserEngine):
         events = _merge_arg_chunks(events)
         delta = super()._events_to_delta(events, finished=finished)
         return renumber_accepted_calls(delta, self._tool_slots)
+
+    # The end of output replayed an inline
+    # code span that never closed: a call it opens and the text after it come
+    # in one batch of events, and that text is held, as text after a call in
+    # one delta is, with no later delta to take it. Before the span hold the
+    # same text left in a delta of its own, so it leaves now. Whitespace alone
+    # is dropped, as before.
+    def finish_streaming(self) -> DeltaMessage | None:
+        delta = super().finish_streaming()
+        flushed = getattr(self._engine, "code_flushed", False)
+        if not (flushed and self._deferred_content.strip()):
+            return delta
+        rest = self._events_to_delta([], finished=True)
+        if rest is None or not rest.content:
+            return delta
+        if delta is None:
+            return rest
+        delta.content = (delta.content or "") + rest.content
+        return delta
 
     def extract_content_ids(self, input_ids: list[int]) -> list[int]:
         prefix, self._content_ids_prefix = self._content_ids_prefix, []

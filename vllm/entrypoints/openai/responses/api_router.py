@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by the Merlin project; see NOTICE.
 
 
 from collections.abc import AsyncGenerator
@@ -20,7 +21,11 @@ from vllm.entrypoints.serve.utils.api_utils import (
     validate_json_request,
     with_cancellation,
 )
+from vllm.entrypoints.serve.utils.sse_keep_alive import (  # noqa: E501
+    with_sse_keep_alive,
+)
 from vllm.logger import init_logger
+from vllm.merlin.sse_source import closing_source
 
 logger = init_logger(__name__)
 
@@ -72,9 +77,12 @@ async def create_responses(request: ResponsesRequest, raw_request: Request):
     elif isinstance(generator, ResponsesResponse):
         return JSONResponse(content=generator.model_dump(mode="json", by_alias=True))
 
-    return StreamingResponse(
-        content=_convert_stream_to_sse_events(generator), media_type="text/event-stream"
-    )
+    # Comment frames while the stream idles.
+    args = getattr(raw_request.app.state, "args", None)
+    keep_alive_interval = float(getattr(args, "sse_keep_alive_interval", 0))
+    sse = closing_source(_convert_stream_to_sse_events(generator), generator)
+    sse = with_sse_keep_alive(sse, keep_alive_interval)
+    return StreamingResponse(content=sse, media_type="text/event-stream")
 
 
 @router.get("/v1/responses/{response_id}")
@@ -102,9 +110,12 @@ async def retrieve_responses(
         )
     elif isinstance(response, ResponsesResponse):
         return JSONResponse(content=response.model_dump(mode="json", by_alias=True))
-    return StreamingResponse(
-        content=_convert_stream_to_sse_events(response), media_type="text/event-stream"
-    )
+    # Comment frames while the stream idles.
+    args = getattr(raw_request.app.state, "args", None)
+    keep_alive_interval = float(getattr(args, "sse_keep_alive_interval", 0))
+    sse = closing_source(_convert_stream_to_sse_events(response), response)
+    sse = with_sse_keep_alive(sse, keep_alive_interval)
+    return StreamingResponse(content=sse, media_type="text/event-stream")
 
 
 @router.post("/v1/responses/{response_id}/cancel")

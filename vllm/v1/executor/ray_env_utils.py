@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by the Merlin project; see NOTICE.
 import os
 
 from vllm.ray.ray_env import RAY_NON_CARRY_OVER_ENV_VARS

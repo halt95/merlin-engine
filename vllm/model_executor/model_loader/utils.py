@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by the Merlin project; see NOTICE.
 """Utilities for selecting and loading models."""
 
 import inspect
@@ -222,9 +223,10 @@ def process_weights_after_loading(
         model.process_weights_after_loading()
 
     # Split the profile's MoE layers
-    from vllm.merlin import cold_experts
+    from vllm.merlin import cold_experts, expert_hot_counts
 
     cold_experts.attach(model, model_config.model)
+    expert_hot_counts.attach(model)  # (opt-in, off)
 
     # Needed for torchao model reloading via model.reload_weights
     # @kylesayrs @jerryzh168 this can be removed if callers move to `reload_weights`

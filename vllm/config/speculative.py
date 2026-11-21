@@ -76,6 +76,7 @@ EagleModelTypes = Literal[
 SpeculativeMethod = Literal[
     "ngram",
     "draft_model",
+    "dfly",
     "suffix",
     "custom_class",
     EagleModelTypes,
@@ -1024,16 +1025,19 @@ class SpeculativeConfig:
             # same `mtp_num_hidden_layers` field as the multimodal ones.
             is_moe = hf_config.model_type in qwen35_family.moe_model_types()
             hf_config.model_type = "qwen3_5_mtp"
-            n_predict = getattr(hf_config, "mtp_num_hidden_layers", None)
-            if n_predict is None:
-                text_config = get_hf_text_config(hf_config)
-                n_predict = getattr(text_config, "mtp_num_hidden_layers", None)
+            # One count for the module selector,
+            # the multi-module routing and the capture key; conflicts refuse.
+            n_predict = qwen35_family.mtp_module_count(
+                hf_config, get_hf_text_config(hf_config)
+            )
             hf_config.update(
                 {
                     "n_predict": n_predict,
                     "architectures": ["Qwen3_5MoeMTP" if is_moe else "Qwen3_5MTP"],
                 }
             )
+            if n_predict and n_predict > 1:
+                hf_config.num_nextn_predict_layers = n_predict
         if hf_config.model_type in ("intern_s2_preview", "interns2_mobius"):
             is_mobius = hf_config.model_type == "interns2_mobius"
             text_config = getattr(hf_config, "text_config", None)
@@ -1278,6 +1282,14 @@ class SpeculativeConfig:
             )
             self.method = "mtp"
 
+        # DFly2 weights ship in the target checkpoint, and
+        # the draft resolves its own width, so default the model without
+        # num_speculative_tokens (#68296 speculative.py:1505-1512).
+        if self.method == "dfly" and self.model is None:
+            from vllm.v1.worker.gpu.spec_decode.dfly.config import default_dfly_model
+
+            self.model = default_dfly_model(self)
+
         if self.model is None and self.num_speculative_tokens is not None:
             if self.method == "mtp":
                 if self.target_model_config is None:
@@ -1432,6 +1444,15 @@ class SpeculativeConfig:
                 draft_hf_overrides = SpeculativeConfig.compose_draft_hf_overrides(
                     self.target_model_config.hf_overrides, transformers_mtp_overrides
                 )
+                dfly_config_cls = None
+                if self.method == "dfly":
+                    from vllm.v1.worker.gpu.spec_decode.dfly.config import (
+                        get_dfly_config_class,
+                    )
+
+                    dfly_config_cls = get_dfly_config_class(self)
+                    # The combined checkpoint's config becomes the draft's.
+                    draft_hf_overrides = dfly_config_cls.draft_hf_overrides(self)
                 self.draft_model_config = ModelConfig(
                     model=self.model,
                     runner="draft",
@@ -1464,6 +1485,7 @@ class SpeculativeConfig:
                     "eagle3",
                     "dflash",
                     "dspark",
+                    "dfly",
                 ):
                     pass
                 # examples:
@@ -1556,7 +1578,8 @@ class SpeculativeConfig:
                         draft_text, draft_mpe, self.target_model_config.max_model_len
                     )
                     if (
-                        self.method in ("mtp", "dflash", "dspark")
+                        # Dfly shares target positions too
+                        self.method in ("mtp", "dflash", "dspark", "dfly")
                         and isinstance(draft_len, int)
                         and cap is not None
                         and draft_len < cap
@@ -1639,7 +1662,7 @@ class SpeculativeConfig:
                     ):
                         hf.dspark_target_layer_ids = hf.target_layer_ids
 
-                if self.method in ("dflash", "dspark"):
+                if self.method in ("dflash", "dspark", "dfly"):
                     self.parallel_drafting = True
 
                 n_predict = getattr(
@@ -1650,7 +1673,9 @@ class SpeculativeConfig:
                     and self.num_speculative_tokens not in (None, 1)
                 ):
                     raise ValueError("Parse 3.5 has only one trained MTP step")
-                if self.use_dspark():
+                if dfly_config_cls is not None:
+                    dfly_config_cls.resolve_num_speculative_tokens(self)
+                elif self.use_dspark():
                     if self.num_speculative_tokens is None:
                         # DSpark's parallel width is independent of MTP stages.
                         hf_config = self.draft_model_config.hf_config
@@ -1761,6 +1786,9 @@ class SpeculativeConfig:
                         draft_model_config=self.draft_model_config,
                     )
                 )
+                if dfly_config_cls is not None:
+                    dfly_config_cls.apply_options(self)
+                    dfly_config_cls.adapt_draft_model_config(self)
 
         if self.index_share_for_mtp_iteration is not None:
             if self.method != "mtp" or self.draft_model_config is None:
@@ -2165,7 +2193,8 @@ class SpeculativeConfig:
         """
         num_draft_tokens = self.num_speculative_tokens
 
-        if self.use_dflash() or self.use_dspark():
+        # DFly2 drafts in its own query pass too
+        if self.use_dflash() or self.use_dspark() or self.use_dfly():
             return 0
 
         if self.parallel_drafting:
@@ -2203,7 +2232,8 @@ class SpeculativeConfig:
         # NOTE: This method is usually a stand-in for "speculative decoding using
         # target model hidden states"
         # TODO(ben): Refactor this so the naming is clearer
-        return self.method in ("eagle", "eagle3", "mtp", "dflash", "dspark")
+        # DFly2 drafts from the target's hidden states
+        return self.method in ("eagle", "eagle3", "mtp", "dflash", "dspark", "dfly")
 
     def needs_eagle_block_drop(self) -> bool:
         """Whether draft KV at a position depends on the next token.
@@ -2212,7 +2242,10 @@ class SpeculativeConfig:
         and the next token. DFlash/DSpark build it from the target hidden state
         alone, so only EAGLE/EAGLE3/MTP require the trailing-block drop.
         """
-        return self.use_eagle() and not (self.use_dflash() or self.use_dspark())
+        # DFly2's query KV is overwritten by verification
+        return self.use_eagle() and not (
+            self.use_dflash() or self.use_dspark() or self.use_dfly()
+        )
 
     def is_xpress(self) -> bool:
         """Whether the dflash draft carries an XPress refiner.
@@ -2252,6 +2285,10 @@ class SpeculativeConfig:
 
     def use_dspark(self) -> bool:
         return self.method == "dspark"
+
+
+    def use_dfly(self) -> bool:
+        return self.method == "dfly"
 
     def uses_dynamic_speculative_decoding(self) -> bool:
         return self.num_speculative_tokens_per_batch_size is not None

@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by the Merlin project; see NOTICE.
 """This file contains the command line arguments for the vLLM's online server.
 It is kept in a separate file for documentation purposes.
 """
@@ -162,8 +163,9 @@ class BaseFrontendArgs:
     enable_force_include_usage: bool = False
     """If set to True, including usage on every request."""
     sse_keep_alive_interval: int = 0
-    """Send an SSE keep-alive comment line every this many seconds when a
-    `/v1/chat/completions` or `/v1/completions` streaming response is idle
+    """Send an SSE keep-alive comment line every this many seconds while a
+    streaming response is idle on `/v1/chat/completions`, `/v1/completions`,
+    `/v1/messages`, `/v1/responses` or `GET /v1/responses/{id}?stream=true`
     (queued, prefill, or between tokens), to prevent reverse proxies/tunnels
     with read timeouts from closing the connection. Defaults to 0, which
     disables keep-alive comments entirely.

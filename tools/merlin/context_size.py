@@ -29,6 +29,10 @@ def vllm_size(value: str) -> int:
     match = re.fullmatch(r"([0-9]+(?:\.[0-9]+)?)([kKmMgGtT])", value)
     if match:
         number, suffix = match.groups()
+        if suffix.isupper() and "." in number:
+            raise ValueError(
+                f"{value!r}: an upper-case suffix (K, M, G, T) means binary units and takes a whole number; "
+                f"{number}{suffix.lower()} (lower case) is the decimal figure")
         power = "kmgt".index(suffix.lower()) + 1
         return (int(number) * 1024**power if suffix.isupper()
                 else int(float(number) * 1000**power))

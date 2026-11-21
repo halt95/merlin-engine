@@ -26,11 +26,15 @@ their own ports and caches, see ``plan_instances``). Standard library only.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import shlex
+import stat
 import subprocess
 import sys
+import tempfile
+from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from itertools import combinations
 from pathlib import Path
@@ -380,6 +384,50 @@ def _disjoint_cliques(
     return search(kept, n)
 
 
+def _pick_ipc_subset(
+    inv: pf.Inventory,
+    prof: dict[str, Any],
+    pool: list[pf.Gpu],
+    need: int,
+    want_p2p: str,
+    budget: _Budget | None = None,
+) -> list[int] | None:
+    """``need`` idle cards for P2P=ipc on ``prof``, in rank order.
+
+    ipc needs peer access (and BAR1 >= 1 GiB) inside each TP group only. The set the
+    other modes pick comes first when its TP groups qualify; else the first
+    ``need / tp`` disjoint peer-connected TP groups in ``_order``; else the cards in
+    order, so preflight names the pair or card that fails. None only when too few
+    idle cards exist.
+    """
+    layout = prof.get("layout") or {"tp": prof["serve"].get("tensor_parallel", 1)}
+    tp = int(layout.get("tp") or 1)
+    peer = _peer_test(inv)
+    first = _pick_subset(inv, prof, pool, need, want_p2p, budget)
+    if first is not None and all(peer(s) for s in pf.tp_groups(layout, first)):
+        return first
+    idx = [g.index for g in _order(inv, prof, _idle(pool), need)]
+    if need > len(idx):
+        return None
+    if tp >= 2 and need % tp == 0:
+        try:
+            sets = _disjoint_cliques(inv, idx, tp, need // tp, peer, budget)
+        except _SearchBudget:
+            sets = None
+        if sets:
+            return [c for s in sets for c in s]
+    return first if first is not None else sorted(idx[:need])
+
+
+def _p2p_request(env_in: Mapping[str, str]) -> str:
+    """The P2P mode profile selection checks: ``ipc`` when asked for, else ``auto``.
+
+    ipc's TP-group checks then run at selection. P2P=on / off keep their meaning:
+    the caller's value replaces the derived P2P.
+    """
+    return "ipc" if (env_in.get("P2P") or "").strip() == "ipc" else "auto"
+
+
 def _no_p2p_twin(p: dict[str, Any]) -> bool:
     """A 27B row for hosts without peer-to-peer (match p2p "off"): the untested no-P2P twin of a tested 3090 row, same
     layout and pin. It is ranked with the tested rows, so the 27B default on a no-P2P host stays the largest layout
@@ -430,10 +478,14 @@ class Choice:
 def choose(
     reg: dict[str, Any], name: str, inv: pf.Inventory, profile: str | None, tp: int | None, want_cards: int | None = None,
     groups: list[list[pf.Gpu]] | None = None,
+    p2p: str = "auto",
+    ipc_subsets: bool = False,
 ) -> Choice:
     """Pick a profile and a card set for ``name`` on ``inv``: the largest TESTED layout that fits a homogeneous card
     group, else the largest fitting untested row; smaller layouts take a subset. ``groups`` restricts the card groups
     considered (``--instances`` plans one class at a time). Raises CliError when nothing fits."""
+    # p2p: the requested mode (ipc or auto); ipc_subsets: an ipc row's cards are picked
+    # as peer-connected TP groups instead of the usual sets
     groups = _groups(inv) if groups is None else groups
     reasons: list[str] = []
     for status_pass in ("tested", "untested"):
@@ -458,13 +510,26 @@ def choose(
                     reasons.append(f"{p['id']}: needs {need} idle {cls} cards; GPUs {','.join(map(str, busy))} already hold more than "
                                    f"1 GiB (skipped; GPUS={','.join(str(g.index) for g in group[:need])} forces them)")
                     continue
-                cards = _pick_subset(inv, p, group, need, _want_p2p(reg, p, inv, group))
+                want = _want_p2p(reg, p, inv, group)
+                modes = (p.get("interconnect") or {}).get("modes") or {}
+                if ipc_subsets and "ipc" in modes:
+                    cards = _pick_ipc_subset(inv, p, group, need, want)
+                else:
+                    cards = _pick_subset(inv, p, group, need, want)
                 if cards is None:
                     reasons.append(f"{p['id']}: needs {need} P2P-connected {cls} cards (peer-to-peer is {inv.p2p_among([g.index for g in group])} among them)")
                     continue
                 if not profile and _no_p2p_twin(p) and inv.p2p_among(cards) == "on":
                     continue  # automatic selection: cards with peer-to-peer run the P2P row of the same layout
-                rep = pf.evaluate(inv, reg, model=reg["model"], want_profile=p["id"], gpus=cards)
+                rep = pf.evaluate(
+                    inv,
+                    reg,
+                    model=reg["model"],
+                    want_profile=p["id"],
+                    gpus=cards,
+                    p2p=p2p,
+                    control="P2P=",
+                )
                 if rep.exit_code != 0 or not rep.profile_id:
                     reasons += [f"{p['id']}: {f.text}" for f in rep.findings if f.level == "FAIL"]
                     continue
@@ -664,6 +729,7 @@ def resolve(
     if profile and profile not in ids:
         raise CliError(f"--profile {profile!r} does not belong to {name}; its profiles: {', '.join(ids)}")
     notes: list[str] = [emulation] if emulation else []
+    p2p = _p2p_request(env_in)  # P2P=ipc is checked at selection, else auto
     if sel is not None:
         # GPUS / CUDA_VISIBLE_DEVICES: exactly those cards (preflight checks the set it is given)
         picked = [g for g in inv.gpus if g.index in sel]
@@ -680,11 +746,27 @@ def resolve(
         rep = None
         if profile or tp is not None or reg["model"] == "flash-next" and name != "flash-next":
             for pid in order:
-                rep = pf.evaluate(inv, reg, model=reg["model"], want_profile=pid, gpus=sel)
+                rep = pf.evaluate(
+                    inv,
+                    reg,
+                    model=reg["model"],
+                    want_profile=pid,
+                    gpus=sel,
+                    p2p=p2p,
+                    control="P2P=",
+                )
                 if rep.exit_code == 0:
                     break
         else:
-            rep = pf.evaluate(inv, reg, model=reg["model"], gpus=sel, checkpoint=name)
+            rep = pf.evaluate(
+                inv,
+                reg,
+                model=reg["model"],
+                gpus=sel,
+                checkpoint=name,
+                p2p=p2p,
+                control="P2P=",
+            )
             if rep.exit_code == 0 and rep.profile_id not in ids:
                 raise CliError(f"auto-selected {rep.profile_id} is not a {name} profile; pass --profile")
         if rep is None or rep.exit_code != 0 or not rep.profile_id:
@@ -696,7 +778,14 @@ def resolve(
         p = R.get_profile(reg, rep.profile_id)
         cards, free, skipped = [g.index for g in rep.inventory.gpus], [], []
     else:
-        ch = choose(reg, name, inv, profile, tp)
+        try:
+            ch = choose(reg, name, inv, profile, tp, p2p=p2p)
+        except CliError:
+            if p2p != "ipc":
+                raise
+            # P2P=ipc needs peer access inside each TP group only: when no usual set
+            # passes, the ipc rows try peer-connected TP groups (refusals name pairs)
+            ch = choose(reg, name, inv, profile, tp, p2p=p2p, ipc_subsets=True)
         rep, p, cards, free, skipped = ch.rep, ch.prof, ch.cards, ch.free, ch.skipped
         if skipped:
             notes.append(f"GPUs {','.join(map(str, skipped))} skipped: another GPU class than the chosen set (a layout never spans classes; "
@@ -718,10 +807,27 @@ def resolve(
                              f"with --profile {larger['id']}")
             notes.append(_free_hint(reg, name, ckpt, inv, p, group, free, int(env_in.get("PORT") or _default_port(reg)) + 1,
                                     tp, profile, repo))
+    return _plan_from_report(name, ckpt, reg, rep, inv, extra, repo, env_in,
+                             free=free, skipped=skipped, notes=notes, selected=sel is not None)
+
+
+def _plan_from_report(
+    name: str, ckpt: str, reg: dict[str, Any], rep: pf.Report, inv: pf.Inventory,
+    extra: list[str], repo: Path, env_in: dict[str, str], *,
+    free: list[int] | tuple[int, ...] = (), skipped: list[int] | tuple[int, ...] = (),
+    notes: list[str] | tuple[str, ...] = (),
+    selected: bool = True, check_live_ram: bool = True,
+) -> Plan:
+    """Build a command from an evaluated selection without selecting again."""
+    if rep.exit_code != 0 or not rep.profile_id:
+        raise CliError("preflight did not produce a usable plan", rep.exit_code or 3)
+    p = R.get_profile(reg, rep.profile_id)
+    cards = [g.index for g in rep.inventory.gpus]
+    free, skipped, notes = list(free), list(skipped), list(notes)
     names = sorted({g.name for g in rep.inventory.gpus})
     status = rep.status or p["status"]
     if reg["model"] == "27b" and len(cards) > 1 and rep.effective_p2p != "on":
-        n_class = len(cards) if sel is not None else len(cards) + len(_idle([g for g in inv.gpus if g.index in free]))
+        n_class = len(cards) if selected else len(cards) + len(_idle([g for g in inv.gpus if g.index in free]))
         notes.append(_throughput_note(reg, name, ckpt, inv, p, cards, n_class))
     if len(names) > 1:
         notes.append(f"mixed cards in one layout ({' + '.join(names)}): it runs at the slower card's pace; P2P {rep.effective_p2p} across the set")
@@ -735,7 +841,7 @@ def resolve(
     busy = [g.index for g in rep.inventory.gpus if (g.mem_used_mib or 0) > pf.BUSY_MIB]
     if busy:  # only reachable through GPUS / CUDA_VISIBLE_DEVICES: the selector skips busy cards
         notes.append(f"GPUs {','.join(map(str, busy))} already hold more than 1 GiB (another process?); the pinned pool may not fit")
-    if model == "flash-next" and inv.source == "probe":
+    if check_live_ram and model == "flash-next" and inv.source == "probe":
         avail = _mem_available_mib()
         if avail is not None and pf._gib(avail) < pf.ram_floor_gib(len(cards), inv.kv_tier_gib, inv.ple_table_gib):
             raise CliError(pf.ram_available_text(len(cards), avail, inv.kv_tier_gib, inv.ple_table_gib) + ". Nothing started.")
@@ -1293,7 +1399,11 @@ def _identify(args: argparse.Namespace) -> tuple[str, str | None, list[str]]:
 # dflash2_why(): 3 x 262K, not 6 x 131K). The launcher's SPEC=none (no drafter, a reference setting) is not offered here.
 SPEC_CHOICES = ("mtp", "dflash2")
 DFLASH2_REPO = "incoai/Qwen3.8-Flash-Next-DFlash2"
-DFLASH2_DEFAULT_DIR = "~/models/flash-next-dflash2"  # setup.sh --spec dflash2 downloads it here
+# The drafter's folder name, beside the checkpoint folder (like the INT6 PLE pack).
+DFLASH2_DIRNAME = "flash-next-dflash2"
+# Where 3.0.2.1 and earlier always put it, whatever --models-dir said; still found
+# there (see dflash2_location()).
+DFLASH2_DEFAULT_DIR = "~/models/" + DFLASH2_DIRNAME
 DFLASH2_FILES = ("config.json", "model.safetensors")  # what serving reads (the checksum list's files)
 
 
@@ -1310,18 +1420,57 @@ def dflash2_why(strict: bool = True) -> str:
     return f"+5-18 % decode vs MTP on 4 x 3090; its {pool}pool holds 3 x 262K, not 6 x 131K"
 
 
-def dflash2_dir(environ: dict[str, str] | None = None) -> Path:
-    """The DFlash2 drafter's folder: DFLASH2_MODEL, else the default models folder's copy."""
+def dflash2_location(
+    base: Path | str | None = None, environ: dict[str, str] | None = None
+) -> tuple[Path, str]:
+    """The DFlash2 drafter's folder and why it was chosen, in this order:
+
+    1. ``DFLASH2_MODEL`` when set;
+    2. ``flash-next-dflash2`` beside the checkpoint folder ``base`` (setup's
+       --models-dir, merlin serve's checkpoint; ``~/models/flash-next-dflash2`` for
+       the default ``~/models/<model>``) when it holds the drafter, also when the old
+       location holds one too;
+    3. the old location ``~/models/flash-next-dflash2`` when it holds the drafter (an
+       install from before the drafter followed the models folder keeps working and
+       nothing is downloaded twice);
+    4. otherwise the folder of step 2, where setup downloads it.
+
+    Without ``base`` step 2's folder is the old location. "Holds the drafter" means
+    the DFLASH2_FILES are present."""
     env = os.environ if environ is None else environ
-    return Path(env.get("DFLASH2_MODEL") or DFLASH2_DEFAULT_DIR).expanduser()
+    if env.get("DFLASH2_MODEL"):
+        return Path(env["DFLASH2_MODEL"]).expanduser(), "DFLASH2_MODEL"
+    old = Path(os.path.abspath(os.path.expanduser(DFLASH2_DEFAULT_DIR)))
+    new = old
+    if base:
+        new = Path(os.path.abspath(os.path.expanduser(str(base)))).parent
+        new = new / DFLASH2_DIRNAME
+    new_has = not dflash2_missing(new)
+    old_has = new != old and not dflash2_missing(old)
+    if new_has:
+        unused = f"; the copy in {old} is not used" if old_has else ""
+        return new, "beside the checkpoint folder" + unused
+    if old_has:
+        return old, f"the copy in the old location; none beside the checkpoint ({new})"
+    return new, "beside the checkpoint folder (not there yet)"
+
+
+def dflash2_dir(
+    environ: dict[str, str] | None = None, base: Path | str | None = None
+) -> Path:
+    """The DFlash2 drafter's folder (dflash2_location())."""
+    return dflash2_location(base, environ)[0]
 
 
 def dflash2_missing(d: Path) -> list[str]:
     return [f for f in DFLASH2_FILES if not (d / f).is_file()]
 
 
-def _spec_env(args: argparse.Namespace, name: str) -> dict[str, str]:
-    """``--spec`` as the launcher's environment (SPEC, and DFLASH2_MODEL for dflash2); {} without the flag."""
+def _spec_env(
+    args: argparse.Namespace, name: str, ckpt: str | None = None
+) -> dict[str, str]:
+    """``--spec`` as the launcher's environment (SPEC, and DFLASH2_MODEL for dflash2,
+    found from the checkpoint folder ``ckpt`` by dflash2_location()); {} without it."""
     spec = getattr(args, "spec", None)
     if spec is None:
         return {}
@@ -1332,7 +1481,7 @@ def _spec_env(args: argparse.Namespace, name: str) -> dict[str, str]:
         return {"SPEC": "mtp"}  # what it runs anyway
     if spec == "mtp":
         return {"SPEC": "mtp"}
-    return {"SPEC": "dflash2", "DFLASH2_MODEL": str(dflash2_dir())}
+    return {"SPEC": "dflash2", "DFLASH2_MODEL": str(dflash2_dir(base=ckpt))}
 
 
 def _serve_flags(args: argparse.Namespace, name: str, path: str | None) -> int | None:
@@ -1561,7 +1710,7 @@ def cmd_serve(args: argparse.Namespace, extra: list[str], out: Any) -> int:
         hint = verification_hint(name, ckpt, args.ple) if ckpt else None
         if hint:
             id_notes.append(hint)
-        spec_env = _spec_env(args, name)
+        spec_env = _spec_env(args, name, ckpt)
         launch_env = {**spec_env, **swarm_env}  # what the launcher is told (SPEC, SWARM); the plan env gets it at exec
         if args.ple_store:
             launch_env["PLE_STORE"] = args.ple_store
@@ -1599,12 +1748,14 @@ def cmd_serve(args: argparse.Namespace, extra: list[str], out: Any) -> int:
             p.env.update(launch_env)
         if spec_env.get("SPEC") == "dflash2":
             d = Path(spec_env["DFLASH2_MODEL"])
+            where = dflash2_location(ckpt)[1]  # which place was taken, for the note
             gone = dflash2_missing(d)
             fix = (f"the DFlash2 drafter is not in {d} (missing {', '.join(gone)}): ./setup.sh --spec dflash2 downloads "
                    f"{DFLASH2_REPO} there, or set DFLASH2_MODEL to your copy")
             if gone and not args.dry_run:
                 raise CliError(fix + ". Nothing started.")
-            plans[0].notes.append(f"--spec dflash2: drafter {d}; {dflash2_why()}")
+            plans[0].notes.append(
+                f"--spec dflash2: drafter {d} ({where}); {dflash2_why()}")
             if gone:
                 plans[0].warnings.append("dflash2: " + fix)
     except CliError as e:
@@ -1706,17 +1857,17 @@ def _stop_instances(procs: list[subprocess.Popen], grace: float = 10.0) -> list[
     return [p.pid for p in wait_gone(left, time.monotonic() + 5)]
 
 
-def _health_ok(host: str, port: int) -> bool:
-    import urllib.request
-
+def _url_host(host: str, *, probe: bool = False) -> str:
     h = host.strip("[]")
-    h = "127.0.0.1" if h in ("", "0.0.0.0") else h
-    h = f"[{h}]" if ":" in h else h
+    if probe:
+        h = "127.0.0.1" if h in ("", "0.0.0.0") else "::1" if h == "::" else h
+    return f"[{h}]" if ":" in h else h
+
+
+def _health_ok(host: str, port: int, scheme: str = "http") -> bool:
     try:
-        # never through an http_proxy from the environment: a missed answer here stops every instance at the deadline
-        with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(f"http://{h}:{port}/health", timeout=2) as r:
-            return r.status == 200
-    except Exception:  # noqa: BLE001 - not up yet
+        return L._health_ok(f"{scheme}://{_url_host(host, probe=True)}:{port}/health")
+    except Exception:  # noqa: BLE001 - malformed or incomplete responses mean not ready yet
         return False
 
 
@@ -1729,6 +1880,8 @@ def launch_instances(plans: list[Plan], log_dir: Path, wait_ready: float = 0.0) 
     import time
 
     hosts = [L.effective_host_port(p.vllm.args, p.vllm.extra)[0] for p in plans]  # type: ignore[union-attr]
+    seqs = [[*p.vllm.args, *p.vllm.extra] for p in plans]  # type: ignore[union-attr]
+    schemes = [L._ready_scheme(seq) for seq in seqs]
     try:
         for i, (plan, host) in enumerate(zip(plans, hosts)):
             for label, port in _plan_ports(plan):
@@ -1739,6 +1892,22 @@ def launch_instances(plans: list[Plan], log_dir: Path, wait_ready: float = 0.0) 
     except L.LaunchError as e:
         print(f"merlin: {e}; nothing started", file=sys.stderr)
         return e.code
+    if wait_ready > 0:
+        for i, seq in enumerate(seqs):
+            reason = L._no_ready_probe(seq)
+            if reason:
+                print(f"merlin: instance {i}: --wait-ready cannot ask /health: {reason}; nothing started", file=sys.stderr)
+                return 2
+    # After every refusal above (ports, --wait-ready probe): a refused start takes no lock and creates no lock file.
+    # The serve lock goes to every instance with pass_fds (Popen closes other descriptors): each one holds it from
+    # its spawn, so a killed parent cannot release it while instances, in their own sessions, still run. Its number goes
+    # in MERLIN_SERVE_LOCK_FD: the instance's launcher adopts it, so its ready watcher closes the one copy there is.
+    try:
+        lock_fd = L.hold_serve_lock(getattr(plans[0].vllm, "repo", None) or REPO)
+    except L.LaunchError as e:
+        print(f"merlin: {e}; nothing started", file=sys.stderr)
+        return e.code
+    pass_fds = (lock_fd,) if lock_fd is not None else ()
     spawned: list[tuple[int, Plan, int, subprocess.Popen, Path]] = []
     interrupted = 0
     previous_handlers = {}
@@ -1760,13 +1929,17 @@ def launch_instances(plans: list[Plan], log_dir: Path, wait_ready: float = 0.0) 
             for i, plan in enumerate(plans):
                 check_interrupted()
                 env = {**os.environ, **plan.env}
+                env.pop(L.SERVE_LOCK_FD_ENV, None)
+                if lock_fd is not None:  # the child's launcher adopts this descriptor rather than opening its own
+                    env[L.SERVE_LOCK_FD_ENV] = str(lock_fd)
                 port = _plan_ports(plan)[0][1]
                 log = log_dir / f"merlin-{plan.profile_id}-{port}.log"
                 with open(log, "ab") as fh:
-                    proc = subprocess.Popen(plan.argv, env=env, stdout=fh, stderr=subprocess.STDOUT, start_new_session=True)
+                    proc = subprocess.Popen(plan.argv, env=env, stdout=fh, stderr=subprocess.STDOUT, start_new_session=True,
+                                            pass_fds=pass_fds)
                     spawned.append((i, plan, port, proc, log))
                 check_interrupted()
-                print(f"merlin: instance {i}: {plan.profile_id} [{plan.status}] GPUs {','.join(map(str, plan.cards))} -> http://{hosts[i]}:{port} pid {proc.pid} (own process group) log {log}", file=sys.stderr)
+                print(f"merlin: instance {i}: {plan.profile_id} [{plan.status}] GPUs {','.join(map(str, plan.cards))} -> {schemes[i]}://{_url_host(hosts[i])}:{port} pid {proc.pid} (own process group) log {log}", file=sys.stderr)
                 for n in plan.notes:
                     print(f"merlin: NOTE {n}", file=sys.stderr)
         except (OSError, ValueError, subprocess.SubprocessError) as e:
@@ -1790,12 +1963,12 @@ def launch_instances(plans: list[Plan], log_dir: Path, wait_ready: float = 0.0) 
                     break
                 for item in list(pending):
                     check_interrupted()
-                    if _health_ok(hosts[item[0]], item[2]):
+                    if _health_ok(hosts[item[0]], item[2], schemes[item[0]]):
                         pending.remove(item)
                         answered.add(item[0])
                 if not pending:
                     # ready only when every instance answers in one pass and every process is still running after it
-                    pending = [s for s in spawned if not _health_ok(hosts[s[0]], s[2])]
+                    pending = [s for s in spawned if not _health_ok(hosts[s[0]], s[2], schemes[s[0]])]
                     if any(s[3].poll() is not None for s in spawned):
                         continue  # the exit is reported at the top of the loop
                     if not pending:
@@ -1808,9 +1981,9 @@ def launch_instances(plans: list[Plan], log_dir: Path, wait_ready: float = 0.0) 
                 print(f"merlin: {failure}; stopping this command's instances", file=sys.stderr)
                 return 1
             check_interrupted()
-            print("merlin: ready: " + " ".join(f"http://{hosts[i]}:{port}" for i, _, port, _, _ in spawned), file=sys.stderr)
+            print("merlin: ready: " + " ".join(f"{schemes[i]}://{_url_host(hosts[i])}:{port}" for i, _, port, _, _ in spawned), file=sys.stderr)
         else:
-            print("merlin: spawned (not yet ready; poll /health, load takes minutes): " + " ".join(f"http://{hosts[i]}:{port}" for i, _, port, _, _ in spawned), file=sys.stderr)
+            print("merlin: spawned (not yet ready; poll /health, load takes minutes): " + " ".join(f"{schemes[i]}://{_url_host(hosts[i])}:{port}" for i, _, port, _, _ in spawned), file=sys.stderr)
         print("merlin: running in foreground; Ctrl+C stops all instances", file=sys.stderr)
         while spawned:
             check_interrupted()
@@ -1903,6 +2076,24 @@ def _tail(path: Path, n: int) -> str:
         return "".join(deque(fh, maxlen=n))
 
 
+def _report_target_problem(path: Path) -> str | None:
+    """Why ``--report`` must not write at ``path``, or None. The report is swapped in with a rename, which would replace
+    whatever is there: only a regular file, a symlink to one (the link is replaced, its target is left alone), a link
+    to nothing, or a free name is acceptable. A directory, a device (``/dev/null``, ``/dev/stdout``), a FIFO or a
+    socket, or a link to one, is refused and never touched."""
+    try:
+        mode = os.lstat(path).st_mode
+        if stat.S_ISLNK(mode):
+            mode = os.stat(path).st_mode
+    except FileNotFoundError:
+        return None  # a free name, or a link to nothing: the report becomes a regular file there
+    except OSError as e:
+        return f"cannot be examined ({e.strerror or e})"
+    if stat.S_ISREG(mode):
+        return None
+    return "is a directory" if stat.S_ISDIR(mode) else "is not a regular file (a device, FIFO or socket)"
+
+
 def doctor_report(rest: list[str], out: Any) -> int:
     """``merlin doctor --report [FILE] [--log FILE] [--lines N] [preflight args]``: preflight (host, GPUs, driver,
     topology, RAM), the resolved serve plan (profile and command, a dry run), and the server log's last lines, redacted,
@@ -1926,9 +2117,12 @@ def doctor_report(rest: list[str], out: Any) -> int:
         else:
             fwd.append(a)
         i += 1
-    model = next((fwd[j + 1] for j, a in enumerate(fwd[:-1]) if a == "--model"), "flash-next")
     stamp = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
     path = path or Path(os.getcwd()) / f"merlin-report-{stamp}.txt"
+    not_a_file = _report_target_problem(path)
+    if not_a_file:
+        print(f"merlin: {path} {not_a_file}; give a file name: merlin doctor --report FILE", file=sys.stderr)
+        return 2
     parts = [f"# merlin doctor --report ({stamp} UTC)",
              f"python {platform.python_version()} \u00b7 {platform.platform()} \u00b7 engine tree {REPO}"]
     for name in sorted(CHECKPOINTS):
@@ -1936,19 +2130,57 @@ def doctor_report(rest: list[str], out: Any) -> int:
         if v is not None and v.is_file():
             parts.append(f"{name} recipe version {v.read_text().strip()}")
     buf, err = io.StringIO(), io.StringIO()
-    with contextlib.redirect_stderr(err):
+    rep = reg = inv = None
+    with contextlib.redirect_stderr(err), contextlib.redirect_stdout(buf):
         try:
-            rc = pf.main(fwd, stdout=buf)
-        except SystemExit as e:  # argparse, on an argument preflight does not know: the report still gets written
+            args = pf.build_parser().parse_args(fwd)
+            nonplanning = [
+                flag for flag, enabled in (
+                    ("--list", args.list), ("--emit", args.emit is not None),
+                    ("--write-launchers", args.write_launchers is not None), ("--kv", args.kv is not None),
+                ) if enabled
+            ]
+            if nonplanning:
+                raise ValueError("not a report planning mode: " + ", ".join(nonplanning)
+                                 + "; run preflight separately for this operation")
+            reg = R.with_kv_dtype(R.load_registry(args.model), os.environ.get("KV_DTYPE"))
+            gpus = pf.selected_gpus(args)
+            inv = pf.inventory_from_args(args)
+            rep = pf.evaluate_args(args, reg, inv, gpus)
+            buf.write(json.dumps(pf.report_dict(rep), indent=1) + "\n" if args.json else pf.render_text(rep, reg))
+            rc = rep.exit_code
+        except SystemExit as e:
             rc = e.code if isinstance(e.code, int) else 2
+        except (ValueError, OSError, KeyError, TypeError, R.ProfileError) as e:
+            print(f"preflight: {e}", file=err)
+            rc = 2
     parts += ["", f"## preflight (exit {rc})", buf.getvalue().rstrip(), err.getvalue().rstrip()]
     buf, err = io.StringIO(), io.StringIO()
     with contextlib.redirect_stderr(err):
         try:
-            sim = next((fwd[j + 1] for j, a in enumerate(fwd[:-1]) if a == "--simulate"), None)
-            rc = main(["serve", pf.CHECKPOINT_NAMES.get(model, model), "--dry-run", *(["--simulate", sim] if sim else [])], buf)
-        except SystemExit as e:  # argparse
-            rc = e.code if isinstance(e.code, int) else 2
+            if rep is None or rc != 0 or not rep.profile_id:
+                buf.write("not built: preflight did not produce a usable planning result\n")
+                rc = rc or 2
+            else:
+                prof = R.get_profile(reg, rep.profile_id)
+                name = prof.get("checkpoint") or pf.CHECKPOINT_NAMES[args.model]
+                # The report's evaluated selectors win over ambient serve selectors.
+                # Copy the environment; never mutate it or probe hardware again.
+                env = dict(os.environ)
+                for key in ("GPUS", "CUDA_VISIBLE_DEVICES", "P2P"):
+                    env.pop(key, None)
+                ckpt = env.get("MERLIN_CHECKPOINT_DIR") or PLACEHOLDER
+                plan = _plan_from_report(name, ckpt, reg, rep, inv, [], REPO, env, check_live_ram=False)
+                cards = ",".join(map(str, plan.cards))
+                plan.env["GPUS"] = cards
+                _print_plan(plan, buf, f"{plan.checkpoint} -> {plan.profile_id} [{plan.status}] on GPUs {cards} -> {plan.launcher}")
+                rc = 0
+        except CliError as e:
+            print(f"merlin: {e}", file=err)
+            rc = e.code
+        except (ValueError, OSError, KeyError, TypeError, R.ProfileError) as e:
+            print(f"merlin: {e}", file=err)
+            rc = 2
     parts += ["", f"## serve plan, dry run (exit {rc})", err.getvalue().rstrip(), buf.getvalue().rstrip()]
     log = log or _newest_log()
     if log is not None and log.is_file():
@@ -1956,12 +2188,24 @@ def doctor_report(rest: list[str], out: Any) -> int:
     else:
         parts += ["", "## server log", "none found (merlin-*.log in MERLIN_LOG_DIR or here); give --log FILE"]
     text = redact("\n".join(p for p in parts if p is not None) + "\n", _secret_literals())
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT, 0o600)  # mode applies only on create: force it before any secret lands
-    if hasattr(os, "fchmod"):
-        os.fchmod(fd, 0o600)
-    os.ftruncate(fd, 0)
-    with os.fdopen(fd, "w", encoding="utf-8") as fh:
-        fh.write(text)
+    # A private temp file (mkstemp creates it 0600, before any secret lands) in the report's own directory, then an
+    # atomic replace: the directory entry is swapped, so a symlink at `path` is replaced, never followed, and its
+    # target is neither truncated nor chmod-ed.
+    try:
+        fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
+    except OSError as e:
+        print(f"merlin: cannot write the report next to {path}: {e.strerror or e}", file=sys.stderr)
+        return 2
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
     print(f"merlin: report written to {path} (secrets redacted; read it before you share it)", file=out)
     return 0
 
@@ -2002,7 +2246,7 @@ def main(argv: list[str] | None = None, out: Any = None) -> int:
                    "disk (experimental: read from the checkpoint's own files, on NVMe; frees the table's host RAM, but first reads are much "
                    "slower; see docs/how-to-serve.md). Other storage warns and runs")
     s.add_argument("--spec", choices=SPEC_CHOICES, help="the drafter: mtp (default) or dflash2 (Flash-Next family, rows "
-                   f"with a DFlash2 geometry; {dflash2_why(strict=False).replace(chr(37), chr(37) * 2)}; the drafter from DFLASH2_MODEL or {DFLASH2_DEFAULT_DIR})")
+                   f"with a DFlash2 geometry; {dflash2_why(strict=False).replace(chr(37), chr(37) * 2)}; the drafter from DFLASH2_MODEL, else {DFLASH2_DIRNAME} beside the checkpoint folder, else {DFLASH2_DEFAULT_DIR})")
     s.add_argument("--kv-ram-cache", metavar="SIZE", help="Flash-Next (experimental, MTP only), 27B (experimental) and Ornith 1.5: a host-RAM cache for prefix KV blocks the GPU pool evicts "
                    "(restored instead of recomputed; adds no context and does not change the session cap (--swarm does); RAM only, never disk; ~66K tokens/GiB on Flash-Next TP2xPP2; needs memlock: LimitMEMLOCK=infinity or ulimit -l unlimited). SIZE = host RAM per "
                    f"server (24g, 24gib or 24 = GiB; 0 = off), split over its TP x PP ranks into {KV_HOST_TIER_ENV} (rounded down to whole GiB per rank)")

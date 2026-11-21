@@ -1,0 +1,6 @@
+{
+  "id": "cart",
+  "title": "Cart totals: shared items, crash on empty cart, wrong rounding",
+  "issue": "Several bugs in cart.Cart. Two carts created without arguments share the same item list, so adding to one adds to the other. total() on an empty cart raises instead of returning Decimal('0.00'). Totals must round half-up to whole cents (0.125 becomes 0.13), but they currently use banker's rounding. A discount_percent outside 0..100 must raise ValueError. The tests in tests/ describe the expected behaviour.",
+  "test_dir": "tests"
+}

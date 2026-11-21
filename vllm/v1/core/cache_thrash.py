@@ -549,8 +549,12 @@ class SessionYield:
     _STATE_RANK = {"complete": 0, "in_flight": 1, "dirty": 2}
 
     def _unit_state(self, copyq, unit: list[Holder]) -> str:
-        """The worst grace state of a yield unit (a waiter pin alone is a
-        live request's hit, nothing the host tier copies: ``complete``)."""
+        """The worst grace state of a yield unit. A unit with no grace holder
+        (a waiter pin alone: a live request's hit, which the host tier never
+        copies) is ``dirty``: breaking it loses content the host does not
+        have."""
+        if not any(kind == "grace" for kind, _ in unit):
+            return "dirty"
         worst = "complete"
         for kind, request_id in unit:
             if kind != "grace":
@@ -559,6 +563,16 @@ class SessionYield:
             if self._STATE_RANK[state] > self._STATE_RANK[worst]:
                 worst = state
         return worst
+
+    def _backed(self, copyq, unit: list[Holder]) -> bool:
+        """Whether every grace holder of ``unit`` has verified host backing
+        (``CopyQueue.grace_backed``: a live restore unit, host-complete), and
+        the unit holds at least one grace. A waiter pin is never backed."""
+        graces = [rid for kind, rid in unit if kind == "grace"]
+        backed = getattr(copyq, "grace_backed", None)
+        if not graces or backed is None:
+            return False
+        return all(backed(rid) for rid in graces)
 
     def grace_yield_order(self) -> list[str]:
         """Grace request ids in the order a running request's one-pin yield
@@ -594,6 +608,7 @@ class SessionYield:
             if block.ref_cnt == n and block_id not in hit_ids
         )
 
+
     def yield_need_sized(
         self,
         shortfall: int,
@@ -602,8 +617,12 @@ class SessionYield:
     ) -> int:
         """Need-sized yield for a waiting head short of ``shortfall`` blocks.
 
-        Release the smallest session that covers the shortfall on its own
-        (its grace and waiter pin together), keeping yield order for ties.
+        Release the first session in yield order that covers the shortfall
+        on its own (its grace and waiter pin together): the oldest finished
+        turn first. A hybrid session is lost whole either way, and a newer
+        turn is the likelier next hit, so a newer smaller session is never
+        broken while an older covering one stays pinned (the sessions-held
+        rows; the earlier best-fit choice is given up).
         If none does, sessions are taken in yield order, and a session with a
         waiting follow-up is taken only if it is needed for at least half of
         what it frees: it is never broken to cover a small remainder (a
@@ -633,13 +652,10 @@ class SessionYield:
         copyq = self._copy_scheduler()
         if copyq is not None:
             return self._yield_host_aware(copyq, units, shortfall, hit_ids)
-        best = min(
-            ((unit, freeable) for unit, freeable in units if freeable >= shortfall),
-            key=lambda candidate: candidate[1],
-            default=None,
-        )
-        if best is not None:
-            return self.release_for_yield(best[0])
+
+        for unit, freeable in units:
+            if freeable >= shortfall:
+                return self.release_for_yield(unit)
         # No single session covers it: the head needs several sessions' worth.
         chosen: list[list[Holder]] = []
         covered = 0
@@ -667,17 +683,23 @@ class SessionYield:
     ) -> int:
         """``yield_need_sized`` with the host tier's copy state.
 
-        Single session: the smallest HOST-COMPLETE one that covers the
-        shortfall; else the smallest covering one, unless one of its graces
-        has a copy in flight and the bounded wait (``CopyQueue.may_wait_for``:
+        Single session: the smallest covering one whose host backing is
+        verified (``_backed``: its release demotes, nothing is lost); else the
+        first covering one in yield order (the tier-less rule), unless one of
+        its graces has a copy in flight and the bounded wait
+        (``CopyQueue.may_wait_for``:
         YIELD_WAIT_STEPS / YIELD_WAIT_S) has not run out, in which case
         nothing is released this time and the head waits (the scheduler's
         own fallbacks still bound it). Several sessions: the same walk as the
         tier-less rule, over host-complete sessions first."""
         states = {id(unit): self._unit_state(copyq, unit) for unit, _ in units}
         covering = [(u, f) for u, f in units if f >= shortfall]
-        complete = [(u, f) for u, f in covering if states[id(u)] == "complete"]
-        best = min(complete or covering, key=lambda c: c[1], default=None)
+        # Best
+        # fit only where the victim is verified host-backed (lossless).
+        backed = [(u, f) for u, f in covering if self._backed(copyq, u)]
+        best = min(backed, key=lambda c: c[1]) if backed else (
+            covering[0] if covering else None
+        )
         if best is not None:
             unit = best[0]
             if states[id(unit)] == "in_flight" and any(

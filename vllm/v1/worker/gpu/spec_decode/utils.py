@@ -53,13 +53,14 @@ def get_pp_safe_draft_load_config(load_config: LoadConfig) -> LoadConfig:
     return load_config
 
 
+# Quoted event type: a CPU torch build has a function there.
 @dataclass
 class _DraftSnapshot:
     step_id: int | None
     req_ids: list[str]
     num_draft_tokens: int
     draft_tokens_np: np.ndarray | None
-    copy_event: torch.cuda.Event | None
+    copy_event: "torch.cuda.Event | None"
 
     def to_draft_token_ids(self) -> DraftTokenIds:
         if self.draft_tokens_np is not None:
@@ -78,6 +79,7 @@ class DraftTokensHandler:
         max_snapshots: int = _DEFAULT_MAX_SNAPSHOTS,
     ):
         self.device = device
+
         self.copy_stream: torch.cuda.Stream | None = None
         if device is not None and device.type == "cuda":
             self.copy_stream = torch.cuda.Stream(device)
@@ -90,7 +92,7 @@ class DraftTokensHandler:
 
     def _copy_drafts(
         self, draft_tokens: torch.Tensor
-    ) -> tuple[np.ndarray, torch.cuda.Event | None]:
+    ) -> tuple[np.ndarray, "torch.cuda.Event | None"]:
         if self.copy_stream is None:
             return draft_tokens.detach().cpu().numpy(), None
 

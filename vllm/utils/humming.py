@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by the Merlin project; see NOTICE.
 """Lazy facade for the optional ``humming`` package.
 
 vLLM code should import humming symbols from here so that ``import humming``
@@ -109,10 +110,26 @@ def create_humming_locks(device: torch.device | str) -> torch.Tensor:
     )
 
 
+_CUDA_MATCHED = False
+
+
+def _match_torch_cuda() -> None:
+    global _CUDA_MATCHED
+    if _CUDA_MATCHED:
+        return
+    _CUDA_MATCHED = True
+    from vllm.merlin.humming_cuda import install
+
+    install()
+
+
 def __getattr__(name: str) -> Any:
     spec = _EXPORTS.get(name)
     if spec is None:
         raise AttributeError(f"module 'vllm.utils.humming' has no attribute {name!r}")
+    # Before humming's JIT can choose a CUDA:
+    # keep it on torch's major.minor (never a system CUDA of another minor).
+    _match_torch_cuda()
     if ":" in spec:
         mod_path, attr = spec.split(":", 1)
         obj = getattr(importlib.import_module(mod_path), attr)

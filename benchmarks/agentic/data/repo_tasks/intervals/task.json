@@ -1,0 +1,6 @@
+{
+  "id": "intervals",
+  "title": "merge() drops coverage and misses touching intervals",
+  "issue": "intervals.merge is supposed to merge overlapping or touching closed intervals and return them sorted by start, without changing the caller's list. Today it assumes the input is already sorted, does not merge intervals that only touch (such as (1, 3) and (3, 5)), and when one interval contains the next it shrinks the merged end. total_length is wrong as a consequence. The tests in tests/ describe the expected behaviour.",
+  "test_dir": "tests"
+}

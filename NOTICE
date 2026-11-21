@@ -1,4 +1,4 @@
-NOTICE — Merlin 3.0.2.1
+NOTICE — Merlin 3.0.2.2
 Copyright 2026 halt95 (Merlin modifications)
 
 Upstream attribution
@@ -65,7 +65,11 @@ tests are not shipped in this release.
 
 Merlin-specific additions include csrc/merlin/, vllm/merlin/,
 vllm/v1/ple_offload/, vllm_ple_offload_bootstrap/, tools/merlin/,
-docs/merlin/, models/, release/ and container/. The paths above describe the
+docs/merlin/, models/, release/ and container/. The Hy4 Flash lane
+(vllm/models/hy_v4_flash/ and the vllm/merlin/hy4* modules) builds on the vLLM
+Hy4 Flash port in vllm-project/vllm#68296 (Apache-2.0), and
+vllm/merlin/hy4_kernels.py adapts the tiled attention/MQA kernel structure of
+vllm-project/vllm#68633 (Apache-2.0). The paths above describe the
 change scope; they are not an exhaustive per-release inventory. For the complete
 added, modified, deleted and renamed file record of a checkout, fetch the upstream
 base and compare:
@@ -74,7 +78,7 @@ base and compare:
   git diff --name-status --no-renames 4ba787ec99 HEAD
   git diff 4ba787ec99 HEAD -- <path>
 
-For the published release, use the merlin-v3.0.2.1 tag in place of HEAD. Source
+For the published release, use the merlin-v3.0.2.2 tag in place of HEAD. Source
 files retain their applicable notices. Each modified upstream file, including
 CMakeLists.txt and the modified csrc/ files, carries the line "Modified by the Merlin
 project; see NOTICE." This central record supplements those notices.
@@ -123,6 +127,14 @@ copyright and licence notices.
 The vendored froggeric Qwen-Fixed-Chat-Templates v22.5 template and Qwen's
 underlying template retain their Apache-2.0 attribution:
   models/qwen38-27b/templates/NOTICE
+models/flash-next/templates/chat_template.jinja is Qwen's Qwen3.8 chat template
+(Alibaba Cloud), copied from the chat_template.jinja of
+halt95/Qwen3.8-Flash-Next-W4A16-Merlin at revision
+cec53e9f90e5995b81691604ec0b32191debf797 (its SHA-256 is listed in
+models/flash-next/checkpoint.sha256). This repository's copy is distributed as part
+of the Flash-Next checkpoint, under the Qwen Community License 1.0
+(models/flash-next/licenses/). The Qwen3.8-27B checkpoint ships a file with the same
+bytes.
 Other bundled third-party code retains its own headers and licence terms.
 
 Model weights

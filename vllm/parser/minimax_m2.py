@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by the Merlin project; see NOTICE.
 """MiniMax M2 parser for XML-style tool calls.
 
 MiniMax M2 tool call format::
@@ -240,6 +241,7 @@ def minimax_m2_config() -> ParserEngineConfig:
             },
         },
         arg_converter=_minimax_m2_arg_converter,
+        args_raw_text=True,
         arg_value_extender=_minimax_m2_arg_value_extender,
         stream_arg_deltas=True,
         tool_args_json=False,

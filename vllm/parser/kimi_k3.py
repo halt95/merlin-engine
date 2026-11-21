@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by the Merlin project; see NOTICE.
 
 from __future__ import annotations
 
@@ -9,6 +10,10 @@ from typing import TYPE_CHECKING
 from vllm.entrypoints.generate.base.protocol import (
     DeltaMessage,
     FunctionCall,
+)
+from vllm.merlin.content_start import (
+    content_after_reasoning,
+    content_start_of,
 )
 from vllm.parser.abstract_parser import DelegatingParser
 from vllm.reasoning.kimi_k3_reasoning_parser import KimiK3ReasoningParser
@@ -23,6 +28,9 @@ if TYPE_CHECKING:
 class KimiK3Parser(DelegatingParser):
     """Compose the Kimi K3 reasoning and tool parsers for XTML output."""
 
+    # Strip after the content wrapper is removed.
+    _defer_content_start = True
+
     # TODO: Switch Kimi K3 to the parser engine once its XTML reasoning/tool
     # path is covered there.
     def _extract_tool_calls(
@@ -30,10 +38,16 @@ class KimiK3Parser(DelegatingParser):
         content: str | None,
         request: ChatCompletionRequest | ResponsesRequest,
         enable_auto_tools: bool = False,
+        after_reasoning: bool = False,
     ) -> tuple[list[FunctionCall] | None, str | None]:
         if self._tool_parser is None or not enable_auto_tools:
-            return super()._extract_tool_calls(content, request, enable_auto_tools)
 
+            return super()._extract_tool_calls(
+                content, request, enable_auto_tools, after_reasoning
+            )
+
+        # This legacy tool pass takes text only.
+        content = content_after_reasoning(content, after_reasoning)
         tool_call_info = self.extract_tool_calls(content or "", request=request)
         if request.tool_choice == "none":
             return [], tool_call_info.content
@@ -118,7 +132,8 @@ class KimiK3Parser(DelegatingParser):
             or not state.reasoning_ended
             or delta_message is None
         ):
-            return delta_message
+
+            return content_start_of(self).take_delta(delta_message, finished)
 
         stripped = self._reasoning_parser.strip_content_streaming(
             previous_text=previous_content,
@@ -132,4 +147,5 @@ class KimiK3Parser(DelegatingParser):
             and not delta_message.tool_calls
         ):
             return None
-        return delta_message
+
+        return content_start_of(self).take_delta(delta_message, finished)

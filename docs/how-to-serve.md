@@ -41,7 +41,7 @@ Nothing is installed system-wide and nothing needs sudo: uv and Python 3.13 live
 | Later | Command |
 |---|---|
 | Start again (no questions) | `./setup.sh` |
-| Update the engine (the model is not downloaded again) | `git pull && ./setup.sh` |
+| Update the engine (the model is not downloaded again) | stop the server (Ctrl+C), then `git pull && ./setup.sh` |
 | Change your answers | `./setup.sh --reconfigure` |
 | See the plan, change nothing | `./setup.sh --dry-run` |
 | No questions at all | `./setup.sh --yes --model 27b --port 8100` |
@@ -141,8 +141,15 @@ New in 3.0.2: `P2P=on` or `P2P=off` now also picks the Ornith 1.5 row (without i
 
 `P2P=ipc` (new in 3.0.2, Flash-Next family rows with tensor parallelism, **untested**): NCCL runs without its P2P transport
 (shared memory between ranks, as with `P2P=off`) while the PCIe-IPC all-reduce still uses CUDA peer access. It is for
-hosts where NCCL's P2P bootstrap hangs but peer access works; the cards still need P2P and BAR1 of 1 GiB or more
-(`merlin doctor --p2p ipc` checks both). It is never a default, a row without it refuses it, and the Ready line names it.
+hosts where NCCL's P2P bootstrap hangs but peer access works. Since 3.0.2.2 it needs CUDA peer access and BAR1 of 1 GiB or
+more only between the cards of each tensor-parallel group (on the TP2 x PP2 quads, GPUs 0-1 and 2-3 in rank order), not
+between every pair: the pipeline stages talk through shared memory in this mode. `merlin serve` checks this when it picks
+the row and `merlin doctor --p2p ipc` reports it; a refusal names the pair ("TP pair (GPU 2, GPU 3) has no CUDA peer
+access") or the card ("GPU 5 BAR1 256 MiB < 1 GiB"). When the usual cards fail the check, `merlin serve` can take
+peer-connected TP groups out of order (`CUDA_VISIBLE_DEVICES=0,2,1,3`). We have not run ipc mode, and a rig with peer access
+on its TP pairs only cannot be verified without that hardware. It is never a default, a row without it refuses it, and the
+Ready line names it. The checks are in `tools/merlin/` of the Merlin-engine checkout, which the `merlin` command runs
+(the wheel carries only that entry point), so they need no new wheel.
 
 ### Longer context with YaRN (Flash-Next)
 
@@ -226,8 +233,8 @@ Started by hand instead (`merlin serve`, step 2), set `HOST=0.0.0.0` and `VLLM_A
 warns that every client that can reach the machine gets in. Merlin is meant for your own network: put a reverse
 proxy with TLS in front before you open it to anything wider.
 
-Streams send a keep-alive comment every 15 s while they wait (a queued request, a long prefill), so proxies with a
-30–60 s timeout keep the connection open. `merlin serve <model> -- --sse-keep-alive-interval 0` turns it off; any
+Streams (chat completions, completions, Messages and Responses) send a keep-alive comment every 15 s while they wait
+(a queued request, a long prefill), so proxies with a 30–60 s timeout keep the connection open. `merlin serve <model> -- --sse-keep-alive-interval 0` turns it off; any
 other number of seconds replaces the 15.
 
 ## 5. Choose your GPUs

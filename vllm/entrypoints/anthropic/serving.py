@@ -432,6 +432,35 @@ class AnthropicServingMessages(OpenAIServingChat):
                 parts.append(block.text)
         return "".join(parts) if parts else None
 
+
+    @staticmethod
+    def _coalesce_same_role_turns(messages: list) -> list:
+        """Join adjacent user or adjacent assistant turns into one turn.
+
+        The Anthropic API treats consecutive same-role turns as one turn. The
+        blocks are concatenated in order (a string becomes one text block, no
+        separator is added), so a split history converts to exactly what the
+        same blocks in a single turn convert to. System turns are boundaries.
+        The request's own messages are not modified.
+        """
+        merged: list = []
+        for msg in messages:
+            prev = merged[-1] if merged else None
+            if prev is not None and msg.role == prev.role and msg.role != "system":
+                blocks: list[AnthropicContentBlock] = []
+                for part in (prev, msg):
+                    if isinstance(part.content, str):
+                        if part.content:
+                            blocks.append(
+                                AnthropicContentBlock(type="text", text=part.content)
+                            )
+                    else:
+                        blocks.extend(part.content)
+                merged[-1] = prev.model_copy(update={"content": blocks})
+            else:
+                merged.append(msg)
+        return merged
+
     @classmethod
     def _convert_messages(
         cls,
@@ -441,7 +470,8 @@ class AnthropicServingMessages(OpenAIServingChat):
         merge_inline_system: bool = False,
     ) -> None:
         """Convert Anthropic messages to OpenAI format."""
-        for msg in messages:
+
+        for msg in cls._coalesce_same_role_turns(messages):
             # Handle system messages in-place: extract text, strip billing
             # headers, and only emit if there is real content.  This avoids
             # going through _convert_block / _convert_message_content which

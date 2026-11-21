@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by the Merlin project; see NOTICE.
 
 from __future__ import annotations
 
@@ -40,6 +41,10 @@ from vllm.entrypoints.openai.parser.harmony_utils import (
 )
 from vllm.entrypoints.openai.responses.protocol import ResponsesRequest
 from vllm.logger import init_logger
+from vllm.merlin.content_start import (
+    ContentStart,
+    content_start_of,
+)
 from vllm.parser.abstract_parser import DelegatingParser, structured_outputs_to_format
 from vllm.reasoning.gptoss_reasoning_parser import GptOssReasoningParser
 from vllm.renderers.chat_utils import make_tool_call_id
@@ -196,6 +201,7 @@ class HarmonyParser(DelegatingParser):
         reasoning_parts: list[str] = []
         content_parts: list[str] = []
         tool_calls: list[FunctionCall] = []
+        boundary = ContentStart()
 
         for segment in result.segments:
             msg = segment.completed_message
@@ -207,12 +213,19 @@ class HarmonyParser(DelegatingParser):
             segment_type = _SegmentType.from_channel_and_recipient(
                 msg.channel, msg.recipient
             )
+            # An empty analysis block counts too.
+            if segment_type is _SegmentType.REASONING and self.reasoning_parser:
+                boundary.reasoning_open()
+                boundary.reasoning_ended()
             match segment_type:
                 case _SegmentType.REASONING if self.reasoning_parser and text:
                     reasoning_parts.append(text)
                 case _SegmentType.CONTENT if text:
-                    content_parts.append(text)
+
+                    if kept := boundary.take(text):
+                        content_parts.append(kept)
                 case _SegmentType.TOOL if self.tool_parser:
+                    boundary.tool_call()
                     recipient = msg.recipient
                     content_type = msg.content_type
                     assert recipient is not None
@@ -255,8 +268,14 @@ class HarmonyParser(DelegatingParser):
         combined_reasoning = ""
         tool_messages: list[DeltaToolCall] = []
 
+        boundary = content_start_of(self)
         for segment in result.segments:
             if segment.completed_message is not None:
+                # An empty analysis block counts too.
+                msg = segment.completed_message
+                if self.reasoning_parser and msg.channel == "analysis":
+                    boundary.reasoning_open()
+                    boundary.reasoning_ended()
                 prev_recipient = None
                 continue
 
@@ -265,10 +284,13 @@ class HarmonyParser(DelegatingParser):
             )
             match segment_type:
                 case _SegmentType.REASONING if self.reasoning_parser:
+                    boundary.reasoning_open()
                     combined_reasoning += segment.delta
                 case _SegmentType.CONTENT:
-                    combined_content += segment.delta
+
+                    combined_content += boundary.take(segment.delta) or ""
                 case _SegmentType.TOOL if self.tool_parser:
+                    boundary.tool_call()
                     assert segment.recipient is not None
                     if prev_recipient != segment.recipient:
                         tool_name = extract_function_from_recipient(segment.recipient)

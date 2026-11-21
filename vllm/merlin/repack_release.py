@@ -10,26 +10,27 @@ NVML reports) dips with it. After each
 module, when cached-but-unused bytes reach ``_MIN_RELEASE_BYTES``, this
 synchronises and calls ``empty_cache`` so the driver dip is bounded by the
 live peak. No effect on weights or numerics. Default on;
-``MERLIN_REPACK_RELEASE=0`` restores stock behaviour.
+``MERLIN_REPACK_RELEASE=0`` restores stock behaviour; a value other than
+``0`` or ``1`` is refused when the first module is processed.
 """
 
 from __future__ import annotations
 
-import os
-
 import torch
+
+import vllm.envs as envs
 
 _MIB = 1 << 20
 _MIN_RELEASE_BYTES = 256 * _MIB
 
 
 def enabled() -> bool:
-    return os.environ.get("MERLIN_REPACK_RELEASE", "1") != "0"
+    return envs.MERLIN_REPACK_RELEASE
 
 
 def release_after_repack(device: torch.device) -> int:
     """Return the cached bytes released (0 when nothing was done)."""
-    if device.type != "cuda" or not enabled():
+    if not enabled() or device.type != "cuda":
         return 0
     cached = torch.cuda.memory_reserved(device) - torch.cuda.memory_allocated(device)
     if cached < _MIN_RELEASE_BYTES:

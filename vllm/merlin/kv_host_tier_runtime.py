@@ -210,8 +210,6 @@ class TierCounters:
     host_rows_provisional: int = 0
     host_rows_idle: int = 0
     host_rows_leased: int = 0
-    host_rows_duplicate_running: int = 0
-    host_rows_duplicate_imminent: int = 0
     grace_pins_active: int = 0
     flat_store_s: int = 0
     worker: dict = field(default_factory=dict)
@@ -314,6 +312,9 @@ class TierRuntime:
         self._metrics_prev_flat: dict = {}
         self._admission_route_warned = False
         self.last_metrics_line = ""
+        # The queue-claim diag line.
+        self.last_waiting_line = ""
+        self._waiting_prev: dict[str, int] = {}
         # Restore units and host order (kv_host_tier_units.UnitTable), bound
         # with the GPU pool; None until then.
         self.units: UnitTable | None = None
@@ -378,6 +379,12 @@ class TierRuntime:
             (getattr(getattr(units, "policy", None), "counters", None), "slru_"),
             # Planner work, observational.
             (getattr(units, "plan_cost", None), "plancost_"),
+            # None with the switch off, so the
+            # line carries these names only with duplicates first on.
+            (getattr(units, "dup_first_counters", None), ""),
+            # None unless the switch or
+            # the census is on.
+            (getattr(units, "waiting_counters", None), ""),
         )
         for src, prefix in sources:
             if src is None:
@@ -418,6 +425,39 @@ class TierRuntime:
         # Idempotent: a failed load already retired through
         # ``invalidate_failed_load`` (it runs before this).
         self.ledger.restore_retired(req_id, True)
+
+    def finish_restore(
+        self, req_id: str, failed: bool, *, cancelled: bool = False
+    ) -> tuple[int, int] | None:
+        """Settle one admitted attempt with diagnostics on or off.
+
+        Observe the full transaction/lease predicate without changing
+        publication, refs, copy issue, or the worker's result. A repeated
+        completion has no pending attempt and cannot count twice.
+        """
+        pending = self.census.pending_loads.pop(req_id, None)
+        if pending is None:
+            return None
+        if cancelled:
+            self.counters.restore_cancelled += 1
+            return None
+        sched = self.census.scheduler
+        if not failed and sched is not None:
+            state = (getattr(sched, "_reqs_to_load", {}).get(req_id)
+                     or getattr(sched, "_abandoned_reqs_to_load", {}).get(req_id))
+            if state is not None:
+                failed = state.failed or state.finished
+                lease = state.lease
+                if lease is not None:
+                    failed = (failed or lease.epoch != sched.cache_epoch
+                              or not lease.sources_valid(self.cpu_block_pool))
+        if failed:
+            self.counters.restore_failed += 1
+            writeback = getattr(sched, "writeback", None)
+            if writeback is not None:
+                writeback.counters.restore_failed = self.counters.restore_failed
+            return None
+        return pending
 
     # -- request history and outcomes --------------------------------
     def bind_geometry(
@@ -597,6 +637,11 @@ class TierRuntime:
             if delta > 0:
                 stats.increase_counter(MetricName.BLOCKS, delta, (event,))
         for name in EVENTS:
+            if not self.census.enabled and name in (
+                "restore_completed_requests", "restore_completed_tokens",
+                "restore_completed_blocks",
+            ):
+                continue
             delta = getattr(cur, name) - getattr(prev, name)
             if delta > 0:
                 stats.increase_counter(MetricName.CENSUS_EVENTS, delta, (name,))
@@ -646,9 +691,7 @@ class TierRuntime:
         ``idle``: free rows no unit owns (``UnitTable._idle_ownerless`` when the
         table has it, else free and unkeyed); ``leased``: a reader holds a ref;
         ``published``/``provisional``: keyed rows a lookup can / cannot serve
-        yet (staged for an assembling unit). The duplicate classes come from
-        ``UnitTable.duplicate_row_counts()`` when the eviction code provides it
-        (``{"running": n, "imminent": n}``), else stay 0."""
+        yet (staged for an assembling unit)."""
         c = self.counters
         pool = self.cpu_block_pool
         units = self.units
@@ -678,11 +721,6 @@ class TierRuntime:
                 idle += 1 if free else 0
         c.host_rows_published, c.host_rows_provisional = published, provisional
         c.host_rows_idle, c.host_rows_leased = idle, leased
-        dup = getattr(units, "duplicate_row_counts", None) if units is not None else None
-        if callable(dup):
-            counts = dup()
-            c.host_rows_duplicate_running = int(counts.get("running", 0))
-            c.host_rows_duplicate_imminent = int(counts.get("imminent", 0))
         sched = self.census.scheduler
         mgr = getattr(sched, "kv_cache_manager", None)
         c.grace_pins_active = int(getattr(mgr, "num_grace_pins", 0) or 0)
@@ -774,7 +812,7 @@ class TierRuntime:
             logger.warning(
                 "SimpleCPU tier host flush: cached rows fell %d -> %d (capacity "
                 "%d) between two samples",
-                self.flush_detector.events[-1][1], self.cached_blocks,
+                self.flush_detector.last_event[1], self.cached_blocks,
                 self.capacity_blocks,
             )
         if self._metrics_prev_t is not None and now - self._metrics_prev_t < self.metrics_every_s:
@@ -861,11 +899,33 @@ class TierRuntime:
         logger.info(line)
         self.last_metrics_line = line
         self._emit_v3_counters(merged)
+        self._emit_waiting_line()
         self._metrics_prev, self._metrics_prev_t, self._metrics_prev_cpu = settled, now, cpu
         self._metrics_prev_flat = {
             "restored": restored, "step": step, "select_us": merged.get("select_us", 0),
         }
         return line
+
+    def _emit_waiting_line(self) -> None:
+        """``SimpleCPU tier waiting:`` - per metrics window, the queue
+        claims on host units (``WaitingCounters``, as deltas over the
+        window) and, now, the live claims and the host rows and tokens of
+        the units they hold (``UnitTable.waiting_resident``). ``order=on``
+        when the switch orders the victims, ``order=off`` when the census
+        alone keeps the claims (counted, the order unchanged)."""
+        units = self.units
+        wc = getattr(units, "waiting_counters", None)
+        if wc is None:
+            return
+        now = {k: v for k, v in vars(wc).items() if isinstance(v, int)}
+        prev = self._waiting_prev
+        parts = [f"order={'on' if units.waiting_last else 'off'}"]
+        parts += [f"{k}={v - prev.get(k, 0)}" for k, v in now.items()]
+        parts += [f"{k}={v}" for k, v in units.waiting_resident().items()]
+        line = "SimpleCPU tier waiting: " + " ".join(parts)
+        logger.info(line)
+        self.last_waiting_line = line
+        self._waiting_prev = now
 
     def _emit_v3_counters(self, merged: dict) -> None:
         """``SimpleCPU tier counters:`` - the cumulative eviction, supersede,

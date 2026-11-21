@@ -116,6 +116,13 @@ class Host:
     iommu_cmdline: list[str] | None = None  # requested settings, not proof of the effective mode
     iommu_groups: int | None = None  # visible groups; zero does not prove IOMMU is disabled
     iommu_group_types: list[str] | None = None  # kernel-reported domain types (e.g. identity, DMA)
+    # the memlock limit in bytes (MEMLOCK_UNLIMITED: no limit); None = not read. Only
+    # --simulate sets it: setup reads a probed host's limit from its own process (the
+    # server it starts inherits it)
+    memlock_bytes: int | None = None
+    # free disk bytes setup's plan sees on every path it installs or downloads to; None
+    # = read the real filesystem. Only --simulate sets it (:disk=GIB)
+    disk_free_bytes: int | None = None
 
 
 @dataclass
@@ -789,7 +796,8 @@ _SIM_RE = re.compile(
     r"^(?P<n>\d+)x(?P<card>[a-z0-9-]+)(?P<opts>(?::[a-z0-9=._]+)*)$", re.IGNORECASE
 )
 SIM_MAX_CARDS = 32
-_SIM_HOST_OPTS = ("ram", "shm", "virt", "numa", "switch", "p2p")
+_SIM_HOST_OPTS = ("ram", "shm", "virt", "numa", "switch", "p2p", "memlock", "disk")
+MEMLOCK_UNLIMITED = -1
 _SIM_CARD_OPTS = ("bar1", "used")
 
 
@@ -801,7 +809,10 @@ def simulate(spec: str) -> Inventory:
     ``:nop2p`` (the driver's peer access for those cards; the card's stock default otherwise), ``:bar1=MIB``,
     ``:used=MIB``. Host options (on any part, the last wins): ``:ram=GIB``, ``:shm=MIB``, ``:virt=vm|lxc|bare``,
     ``:numa=K`` (K NUMA nodes, the cards in K consecutive blocks), ``:switch=S`` (S consecutive cards per PCIe switch),
-    ``:p2p=node`` / ``:p2p=switch`` (peer access only inside one node / one switch). With ``numa`` or ``switch`` the
+    ``:p2p=node`` / ``:p2p=switch`` (peer access only inside one node / one switch),
+    ``:memlock=MIB`` or ``:memlock=unlimited`` (the pinned-memory limit; unlimited by
+    default), ``:disk=GIB`` (the free space setup's plan sees on its install and
+    download paths; the real filesystems' otherwise). With ``numa`` or ``switch`` the
     inventory carries ``nvidia-smi topo -m``-style links (PIX inside a switch, PHB inside a node, SYS across nodes)."""
     parts: list[tuple[int, str, dict[str, str]]] = []
     host_opts: dict[str, str] = {}
@@ -845,6 +856,17 @@ def simulate(spec: str) -> Inventory:
         raise ValueError("--simulate numa= and switch= take whole numbers") from None
     if numa < 1 or numa > total or switch < 0:
         raise ValueError(f"--simulate numa= must be 1..{total} and switch= a positive card count")
+    lock = host_opts.get("memlock", "unlimited")
+    if lock != "unlimited" and not (lock.isascii() and lock.isdigit()):
+        raise ValueError("--simulate memlock= takes MiB (a whole number) or unlimited")
+    memlock = MEMLOCK_UNLIMITED if lock == "unlimited" else int(lock) * MIB
+    disk = host_opts.get("disk")
+    try:
+        disk_free = None if disk is None else int(float(disk) * GIB)
+    except ValueError:
+        raise ValueError("--simulate disk= takes GiB (a number)") from None
+    if disk_free is not None and disk_free < 0:
+        raise ValueError("--simulate disk= takes GiB (a number >= 0)")
     gpus: list[Gpu] = []
     p2p_cap: list[bool] = []
     for n, card, opts in parts:
@@ -910,6 +932,8 @@ def simulate(spec: str) -> Inventory:
         virt=host_opts.get("virt", "container").replace("lxc", "container"),
         driver="595.84",
         system="linux",
+        memlock_bytes=memlock,
+        disk_free_bytes=disk_free,
     )
     return Inventory(
         gpus=gpus, host=host, p2p=p2p_state if total > 1 else "unknown", source=f"simulate:{spec}",
@@ -946,8 +970,103 @@ def load_inventory(path: str) -> Inventory:
 # --------------------------------------------------------------------------------------------
 # Selection
 # --------------------------------------------------------------------------------------------
-def effective_p2p(inv: Inventory, forced: str, report: Report) -> str:
+def _pairs_text(pairs: list[tuple[int, int]]) -> str:
+    return ", ".join(f"(GPU {a}, GPU {b})" for a, b in pairs)
+
+
+def missing_peer_pairs(
+    inv: Inventory, cards: list[int]
+) -> list[tuple[int, int]] | None:
+    """The pairs among ``cards`` (in that order) without driver peer access.
+
+    None when the per-pair matrix was not read. The driver's own view: BAR1 is
+    checked on its own.
+    """
+    if inv.p2p_ok is None:
+        return None
+    ok = {(a, b) for a, b in inv.p2p_ok} | {(b, a) for a, b in inv.p2p_ok}
+    return [
+        (a, b) for i, a in enumerate(cards) for b in cards[i + 1 :] if (a, b) not in ok
+    ]
+
+
+def tp_groups(layout: dict[str, Any], cards: list[int]) -> list[list[int]]:
+    """The tensor-parallel groups of a row's layout over ``cards`` in rank order.
+
+    The engine's ranks run TP fastest (rank = stage x tp + tp rank), so each group
+    is a contiguous run of ``tp`` cards: TP2 x PP2 over 0,1,2,3 gives (0,1) and
+    (2,3); TP4 over four cards gives all four.
+    """
+    tp = int(layout.get("tp") or 1)
+    if tp < 2:
+        return []
+    return [cards[i : i + tp] for i in range(0, len(cards), tp)]
+
+
+def ipc_gaps(
+    inv: Inventory, layout: dict[str, Any], control: str = "--p2p "
+) -> list[tuple[str, str]]:
+    """What P2P=ipc lacks on these cards for this layout, as (code, text) findings.
+
+    ipc mode exports NCCL_P2P_DISABLE=1, so every NCCL transfer (pipeline send /
+    recv between stages, the expert-parallel traffic) goes through host shared
+    memory; only the PCIe-IPC all-reduce, which runs on the TP group alone, maps
+    peer buffers. So CUDA peer access and BAR1 >= 1 GiB are needed between the
+    cards of each TP group, not across stages.
+    """
+    asked = f"{control}ipc was requested but"
+    out: list[tuple[str, str]] = []
+    bar1 = {g.index: g.bar1_mib for g in inv.gpus}
+    for group in tp_groups(layout, [g.index for g in inv.gpus]):
+        if len(group) < 2:
+            continue
+        cards = ",".join(map(str, group))
+        for c in group:
+            b = bar1.get(c)
+            if b is not None and b < BAR1_MIN_MIB:
+                text = (
+                    f"{asked} GPU {c} BAR1 {b} MiB < 1 GiB (TP group GPUs {cards}): "
+                    "the PCIe-IPC all-reduce maps its peers' buffers through BAR1"
+                )
+                out.append(("bar1", text))
+        gaps = missing_peer_pairs(inv, group)
+        if gaps is None:
+            if inv.p2p in ("off", "partial"):
+                text = (
+                    f"{asked} P2P is '{inv.p2p}' among the selected GPUs and the "
+                    f"per-pair matrix was not read: TP group GPUs {cards} has no "
+                    "confirmed CUDA peer access"
+                )
+                out.append(("p2p", text))
+            continue
+        for a, b in gaps:
+            text = f"{asked} TP pair (GPU {a}, GPU {b}) has no CUDA peer access"
+            out.append(("p2p", text))
+    return out
+
+
+def _unknown_p2p_hint(model: str, control: str) -> str:
+    """The override to name when the driver's P2P state is unreadable."""
+    if control != "P2P=":
+        return "Pass --p2p on if peer-to-peer is known to work on this host"
+    if model == "flash-next":
+        return (
+            "Set P2P=ipc if CUDA peer access is known to work inside each TP group "
+            "on this host (opt-in, untested)"
+        )
+    if model == "ornith":
+        return (
+            "models/ornith1.5/serve.sh takes P2P=on if peer-to-peer is known to "
+            "work on this host"
+        )
+    return "Set P2P=on if peer-to-peer is known to work on this host"
+
+
+def effective_p2p(
+    inv: Inventory, forced: str, report: Report, control: str = "--p2p "
+) -> str:
     """The interconnect mode the launcher will use: the driver's view, narrowed by BAR1, or the user's override."""
+    # control names the override in messages: "--p2p " (doctor), "P2P=" (merlin serve)
     n = len(inv.gpus)
     if n < 2:
         return "n/a"
@@ -958,23 +1077,29 @@ def effective_p2p(inv: Inventory, forced: str, report: Report) -> str:
         if g.bar1_mib is not None and g.bar1_mib < BAR1_MIN_MIB
     ]
     driver = inv.p2p
-    # Ipc keeps NCCL off its P2P transport, but the
-    # PCIe-IPC all-reduce maps peer buffers, so it needs the same peer access as on.
-    if forced in ("on", "off", "ipc"):
-        if forced in ("on", "ipc") and driver in ("off", "partial"):
+    # Ipc keeps NCCL off its P2P transport; only
+    # the PCIe-IPC all-reduce maps peer buffers, inside each TP group: evaluate checks
+    # those groups once the row (so the layout) is known (ipc_gaps). Selection runs on
+    # the P2P rows, as for on.
+    if forced == "ipc":
+        return "on"
+    if forced in ("on", "off"):
+        if forced == "on" and driver in ("off", "partial"):
+            gaps = missing_peer_pairs(inv, [g.index for g in inv.gpus])
             report.add(
                 "FAIL",
                 "p2p",
-                f"--p2p {forced} was requested but the driver reports P2P '{driver}' between the selected GPUs",
+                f"--p2p {forced} was requested but the driver reports P2P '{driver}' between the selected GPUs"
+                + (f": no CUDA peer access on {_pairs_text(gaps)}" if gaps else ""),
             )
-        if forced in ("on", "ipc") and small:
+        if forced == "on" and small:
             report.add(
                 "FAIL",
                 "bar1",
                 f"--p2p {forced} was requested but GPU(s) {small} have BAR1 below 1 GiB: NCCL hangs at warmup on any "
                 "P2P pair that includes them",
             )
-        return "on" if forced == "ipc" else forced
+        return forced
     raw = inv.p2p_among([g.index for g in inv.gpus], driver_view=True)
     if small and raw != "off":
         report.add(
@@ -997,10 +1122,12 @@ def effective_p2p(inv: Inventory, forced: str, report: Report) -> str:
             )
         return "on"
     if driver == "partial":
+        gaps = missing_peer_pairs(inv, [g.index for g in inv.gpus])
         report.add(
             "WARN",
             "p2p",
-            "P2P works between some GPU pairs only; treating P2P as off (the TP pairs must all have it)",
+            "P2P works between some GPU pairs only; treating P2P as off (the TP pairs must all have it)"
+            + (f"; no CUDA peer access on {_pairs_text(gaps)}" if gaps else ""),
         )
         return "off"
     if driver == "off":
@@ -1009,7 +1136,7 @@ def effective_p2p(inv: Inventory, forced: str, report: Report) -> str:
         "WARN",
         "p2p",
         "the driver's P2P state could not be read (nvidia-smi topo -p2p r); assuming off. "
-        "Pass --p2p on if peer-to-peer is known to work on this host",
+        + _unknown_p2p_hint(report.model, control),
     )
     return "off"
 
@@ -1249,7 +1376,10 @@ def evaluate(
     prefer_latency: bool = False,
     kv_dtype: str | None = None,
     checkpoint: str | None = None,
+    control: str = "--p2p ",
 ) -> Report:
+    # control: how the caller names the P2P override in messages (merlin doctor
+    # "--p2p ", merlin serve "P2P=").
     # checkpoint: a derived Flash-Next checkpoint (swift1.5, swift1.5-huihui) limits the automatic pick to its own rows;
     # unset, the pick is over the model's own rows (the vanilla rows on the Flash-Next registry). A named
     # want_profile is taken as given.
@@ -1330,7 +1460,7 @@ def evaluate(
         return rep
     rep.add("PASS", "arch", f"{n} x {inv.gpus[0].name}, {arch}, VRAM class {vclass} GB")
 
-    rep.effective_p2p = effective_p2p(inv, p2p, rep)
+    rep.effective_p2p = effective_p2p(inv, p2p, rep, control)
 
     if want_profile:
         try:
@@ -1386,6 +1516,11 @@ def evaluate(
         rep.no_profile_reason = explain_no_profile(model, n, arch, vclass, total_gib)
         if model not in STRICT_P2P_MODELS and n >= 2 and rep.effective_p2p != "on" and _p2p_qualified_rows(reg, n, arch, vclass):
             rep.no_profile_reason = no_p2p_hint(reg, model, arch, vclass, [g.index for g in inv.gpus], rep.effective_p2p, inv)
+        cards = [g.index for g in inv.gpus]
+        gaps = missing_peer_pairs(inv, cards) if inv.p2p == "partial" else None
+        if gaps:  # a partial matrix: name the pairs that lack peer access
+            no_peer = _pairs_text(gaps)
+            rep.no_profile_reason += f" (P2P is partial: no peer access on {no_peer})"
         rep.add(
             "FAIL", "profile", "no profile fits this hardware: " + rep.no_profile_reason
         )
@@ -1432,6 +1567,12 @@ def evaluate(
         if p2p == "ipc" and n >= 2:
             if "ipc" in prof["interconnect"]["modes"]:
                 rep.p2p_mode = "ipc"
+                layout = prof.get("layout") or {
+                    "tp": prof["serve"]["tensor_parallel"],
+                    "pp": 1,
+                }
+                for code, text in ipc_gaps(inv, layout, control):
+                    rep.add("FAIL", code, text)
             else:
                 rep.add("FAIL", "p2p", ipc_refusal(reg, prof))
     else:
@@ -2094,7 +2235,49 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="DIR",
         help="regenerate the checked-in launchers (default tools/merlin/launchers)",
     )
+    ap.add_argument(
+        "--parser-selftest",
+        metavar="CKPT_DIR",
+        help="instead of the host check: round-trip a fixed reasoning + tool-call turn through the checkpoint's chat "
+        "template and the parsers (tokenizer files only; needs the install's python). Warn-only; the server runs "
+        "the same probe at every boot. --model picks the lane's recipe parsers. Takes --reasoning-parser, --tool-call-parser, --chat-template, "
+        "--chat-template-kwargs",
+    )
+    ap.add_argument("--reasoning-parser", help="with --parser-selftest (default: the --model lane's recipe parser; none = off)")
+    ap.add_argument("--tool-call-parser", help="with --parser-selftest (default: the --model lane's recipe parser; none = off)")
+    ap.add_argument("--chat-template", help="with --parser-selftest: template file (default: the checkpoint's own)")
+    ap.add_argument(
+        "--chat-template-kwargs",
+        default='{"enable_thinking": true, "reasoning_effort": "medium"}',
+        help="with --parser-selftest: JSON (default: the Qwen3.8 lanes' served defaults; pass the lane's own for others)",
+    )
     return ap
+
+
+# The (reasoning, tool-call) parser pair each lane's launcher passes (launch.py _build_<lane> -> _parsers).
+LANE_PARSERS = {
+    "flash-next": ("qwen3", "qwen3_coder"),
+    "27b": ("qwen3", "qwen3_coder"),
+    "svl": ("nemotron_v3", "qwen3_coder"),
+    "ornith": ("qwen3", "qwen3_coder"),
+}
+
+
+def parser_selftest_args(args: argparse.Namespace) -> list[str]:
+    reasoning, tool = LANE_PARSERS[args.model]
+    argv = [
+        "--model", args.parser_selftest,
+        "--reasoning-parser", args.reasoning_parser or reasoning,
+        "--tool-call-parser", args.tool_call_parser or tool,
+        "--chat-template-kwargs", args.chat_template_kwargs,
+    ]
+    if args.chat_template:
+        argv += ["--chat-template", args.chat_template]
+    if args.strict:
+        argv.append("--strict")
+    if args.json:
+        argv.append("--json")
+    return argv
 
 
 def serve_choice(reg: dict[str, Any], model: str, inv: Inventory, profile: str | None) -> list[int] | None:
@@ -2116,12 +2299,105 @@ def serve_choice(reg: dict[str, Any], model: str, inv: Inventory, profile: str |
         return None
 
 
+def selected_gpus(args: argparse.Namespace) -> list[int] | None:
+    """Parse the preflight selection once, preserving explicit rank order."""
+    if args.gpus:
+        try:
+            return [int(x) for x in args.gpus.split(",")]
+        except ValueError:
+            raise ValueError("--gpus must be a comma-separated list of integers") from None
+    import serve_cli as S
+
+    try:
+        return S._gpu_selection(dict(os.environ))
+    except S.CliError as e:
+        raise ValueError(str(e)) from None
+
+
+def inventory_from_args(
+    args: argparse.Namespace, run: Runner = default_runner,
+    read: Callable[[str], str | None] = _read,
+) -> Inventory:
+    """Acquire the inventory once using preflight's offline/source semantics."""
+    if args.simulate:
+        inv = simulate(args.simulate)
+    elif args.inventory:
+        inv = load_inventory(args.inventory)
+    elif args.dry_run:
+        inv = reference_host()
+    else:
+        inv = probe(run, read)
+    inv.kv_tier_gib = kv_host_tier_gib()
+    inv.ple_table_gib = saved_ple_table_gib(args.model, _saved_setup(Path(__file__).resolve().parents[2]))
+    return inv
+
+
+def evaluate_args(
+    args: argparse.Namespace, reg: dict[str, Any], inv: Inventory,
+    gpus: list[int] | None, read: Callable[[str], str | None] = _read,
+) -> Report:
+    """Evaluate the parsed planning inputs, including diagnostic checks."""
+    picked = None
+    if gpus is None and not args.latency and args.p2p == "auto":
+        picked = serve_choice(reg, args.model, inv, args.profile)
+    rep = evaluate(
+        inv,
+        reg,
+        model=args.model,
+        want_profile=args.profile,
+        p2p=args.p2p,
+        gpus=gpus if picked is None else picked,
+        prefer_latency=args.latency,
+    )
+    if picked is not None and len(picked) < len(inv.gpus):
+        rep.add("INFO", "selection", f"merlin serve would use GPUs {','.join(map(str, picked))} of "
+                f"{len(inv.gpus)}; the report covers that set (--gpus checks another)")
+    if inv.source == "probe" and rep.inventory.gpus:  # read-only and informational: it never changes the exit code
+        cards = [(g.index, sysfs_bus_id(g.bus_id) if g.bus_id else None) for g in rep.inventory.gpus]
+        try:
+            rep.gpu_unlock = U.probe(cards, rep.inventory.host.virt, read, system=rep.inventory.host.system)
+        except Exception as e:  # noqa: BLE001 - informational: doctor must never fail here
+            rep.gpu_unlock = U.failed(cards, e)
+    if inv.source == "probe":
+        import launch as L
+
+        try:
+            L.check_cache_links(L.cache_root_for(args.model, dict(os.environ)))
+        except L.LaunchError as e:
+            rep.add("FAIL", "cache-link", str(e))
+            rep.exit_code = rep.exit_code or 1
+    if inv.source == "probe" and rep.profile_id and args.model == "flash-next":
+        # the same live gate merlin serve applies (serve_cli.resolve): what the host has left now, against this layout
+        avail, tier, ple = mem_available_mib(read), rep.inventory.kv_tier_gib, rep.inventory.ple_table_gib
+        if avail is not None and _gib(avail) < ram_floor_gib(len(rep.inventory.gpus), tier, ple):
+            rep.add("FAIL", "ram-available", ram_available_text(len(rep.inventory.gpus), avail, tier, ple)
+                    + "; merlin serve refuses to start")
+            rep.exit_code = rep.exit_code or 1
+    for text in dflash2_tier_conflicts(args.model, dict(os.environ), _saved_setup(Path(__file__).resolve().parents[2])):
+        rep.add("FAIL", "kv-tier", text)
+        rep.exit_code = rep.exit_code or 1
+    if (
+        args.strict
+        and rep.exit_code == 0
+        and any(f.level == "WARN" for f in rep.findings)
+    ):
+        rep.exit_code = 1
+    return rep
+
+
 def main(
     argv: list[str] | None = None, run: Runner = default_runner, stdout: Any = None,
     read: Callable[[str], str | None] = _read,
 ) -> int:
     out = stdout or sys.stdout
     args = build_parser().parse_args(argv)
+    if args.parser_selftest is not None:
+        try:
+            from vllm.merlin.parser_selftest import main as parser_selftest_main
+        except ImportError as e:
+            print(f"preflight: --parser-selftest needs the install's python with vllm importable ({e})", file=sys.stderr)
+            return 2
+        return parser_selftest_main(parser_selftest_args(args))
     try:
         reg = R.load_registry(args.model)
     except (R.ProfileError, OSError, json.JSONDecodeError) as e:
@@ -2168,35 +2444,11 @@ def main(
         return 0
     reg = serving_reg
     try:
-        gpus = [int(x) for x in args.gpus.split(",")] if args.gpus else None
-    except ValueError:
-        print(
-            "preflight: --gpus must be a comma-separated list of integers",
-            file=sys.stderr,
-        )
-        return 2
-    if gpus is None:  # GPUS / CUDA_VISIBLE_DEVICES win for merlin serve, so doctor reports that set
-        import serve_cli as S
-
-        try:
-            gpus = S._gpu_selection(dict(os.environ))
-        except S.CliError as e:
-            print(f"preflight: {e}", file=sys.stderr)
-            return 2
-    try:
-        if args.simulate:
-            inv = simulate(args.simulate)
-        elif args.inventory:
-            inv = load_inventory(args.inventory)
-        elif args.dry_run:
-            inv = reference_host()
-        else:
-            inv = probe(run, read)
+        gpus = selected_gpus(args)
+        inv = inventory_from_args(args, run, read)
     except (ValueError, OSError, KeyError, TypeError, json.JSONDecodeError) as e:
         print(f"preflight: {e}", file=sys.stderr)
         return 2
-    inv.kv_tier_gib = kv_host_tier_gib()  # the RAM gates count the KV host tier merlin serve would start with
-    inv.ple_table_gib = saved_ple_table_gib(args.model, _saved_setup(Path(__file__).resolve().parents[2]))
     if args.emit == "inventory":
         out.write(
             json.dumps(
@@ -2213,51 +2465,7 @@ def main(
             + "\n"
         )
         return 0
-    picked = None
-    if gpus is None and not args.latency and args.p2p == "auto":
-        picked = serve_choice(reg, args.model, inv, args.profile)
-    rep = evaluate(
-        inv,
-        reg,
-        model=args.model,
-        want_profile=args.profile,
-        p2p=args.p2p,
-        gpus=gpus if picked is None else picked,
-        prefer_latency=args.latency,
-    )
-    if picked is not None and len(picked) < len(inv.gpus):
-        rep.add("INFO", "selection", f"merlin serve would use GPUs {','.join(map(str, picked))} of "
-                f"{len(inv.gpus)}; the report covers that set (--gpus checks another)")
-    if inv.source == "probe" and rep.inventory.gpus:  # read-only and informational: it never changes the exit code
-        cards = [(g.index, sysfs_bus_id(g.bus_id) if g.bus_id else None) for g in rep.inventory.gpus]
-        try:
-            rep.gpu_unlock = U.probe(cards, rep.inventory.host.virt, read, system=rep.inventory.host.system)
-        except Exception as e:  # noqa: BLE001 - informational: doctor must never fail here
-            rep.gpu_unlock = U.failed(cards, e)
-    if inv.source == "probe":
-        import launch as L
-
-        try:
-            L.check_cache_links(L.cache_root_for(args.model, dict(os.environ)))
-        except L.LaunchError as e:
-            rep.add("FAIL", "cache-link", str(e))
-            rep.exit_code = rep.exit_code or 1
-    if inv.source == "probe" and rep.profile_id and args.model == "flash-next":
-        # the same live gate merlin serve applies (serve_cli.resolve): what the host has left now, against this layout
-        avail, tier, ple = mem_available_mib(read), rep.inventory.kv_tier_gib, rep.inventory.ple_table_gib
-        if avail is not None and _gib(avail) < ram_floor_gib(len(rep.inventory.gpus), tier, ple):
-            rep.add("FAIL", "ram-available", ram_available_text(len(rep.inventory.gpus), avail, tier, ple)
-                    + "; merlin serve refuses to start")
-            rep.exit_code = rep.exit_code or 1
-    for text in dflash2_tier_conflicts(args.model, dict(os.environ), _saved_setup(Path(__file__).resolve().parents[2])):
-        rep.add("FAIL", "kv-tier", text)
-        rep.exit_code = rep.exit_code or 1
-    if (
-        args.strict
-        and rep.exit_code == 0
-        and any(f.level == "WARN" for f in rep.findings)
-    ):
-        rep.exit_code = 1
+    rep = evaluate_args(args, reg, inv, gpus, read)
     out.write(
         json.dumps(report_dict(rep), indent=1) + "\n"
         if args.json

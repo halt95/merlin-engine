@@ -21,6 +21,7 @@ import argparse
 import contextlib
 import hashlib
 import io
+import ipaddress
 import json
 import os
 import platform
@@ -36,6 +37,7 @@ from pathlib import Path
 from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import native_build as NB  # noqa: E402
 import ple_store as PS  # noqa: E402
 import registry as R  # noqa: E402
 import context_size as C  # noqa: E402
@@ -52,7 +54,15 @@ CHECKPOINTS: dict[str, tuple[str, str]] = {
     "nemotron-super-vl": ("svl", "models/nemotron-super-vl"),
     "ornith1.5": ("ornith", "models/ornith1.5"),
 }
-FAMILY = {"flash-next": "flash-next", "27b": "27b", "svl": "svl", "ornith": "ornith"}
+FAMILY = {"flash-next": "flash-next", "27b": "27b", "svl": "svl", "ornith": "ornith",
+          "hy4flash": "hy4flash"}
+# launch.py-only checkpoints: boot attempts by --profile, not
+# listed by merlin serve / setup (which enumerate CHECKPOINTS) until the lane has a
+# measured fit and a pinned public checkpoint.
+# Only the family is read: the lane has no models/ folder (no recipe or checksum list).
+LAUNCH_ONLY_CHECKPOINTS: dict[str, tuple[str, ...]] = {
+    "hy4flash": ("hy4flash",)
+}
 
 # Family constants: values no profile or checkpoint has ever varied (the engine's CLI contract per family).
 FN_GENERATION = '{"temperature":1.0,"top_p":0.95,"top_k":20,"min_p":0.0,"presence_penalty":0.0,"repetition_penalty":1.0}'
@@ -90,12 +100,14 @@ KV_TIER_EXPERIMENTAL_27B = ("WARNING: KV RAM cache on the 27B is experimental: a
 FN_MARLIN_MOE_CFG = "MERLIN_MARLIN_MOE_CFG"  # per-shape Marlin MoE kernel choice; the engine parses it (vllm/merlin/marlin_moe_cfg.py)
 FN_LPT_DEFAULT = "512"  # Flash-Next --long-prefill-token-threshold default; LPT=0 = off
 # Flash-Next prefill runs (vllm/merlin/prefill_runs.py), on by default; PREFILL_RUNS=0 = off. The decode share and the
-# per-step cost constants were measured on fn-quad-3090 (box A/B 2026-11-11); the other rows use the same values.
+# per-step cost constants were measured on fn-quad-3090 (A/B runs, 2026-11-11); the other rows use the same values, except
+# that SPEC=dflash2 takes the DFlash2 tuple the profile carries (base.spec_tick_costs), at the chunk it was measured at.
 FN_PREFILL_RUNS = "VLLM_MERLIN_PREFILL_RUNS"
 FN_PREFILL_RUNS_SHARE = "0.30"
 FN_PREFILL_RUNS_LAUNCHER = (FN_PREFILL_RUNS, "VLLM_MERLIN_PREFILL_RUNS_CHUNK_TOKENS")  # set by the launcher only
+FN_PREFILL_RUNS_TICK_COSTS = "VLLM_MERLIN_PREFILL_RUNS_TICK_COSTS"
 FN_PREFILL_RUNS_TUNABLES = ("VLLM_MERLIN_PREFILL_RUNS_DECODE_SHARE", "VLLM_MERLIN_PREFILL_RUNS_CHUNKS",
-                            "VLLM_MERLIN_PREFILL_RUNS_TICK_COSTS")  # an exported value passes through, with a note
+                            FN_PREFILL_RUNS_TICK_COSTS)  # an exported value passes through, with a note
 # Static cold-expert offload: profile path + optional layer / hot-fraction overrides; vllm/merlin/cold_experts_plan.py
 FN_COLD_EXPERTS = ("MERLIN_COLD_EXPERTS", "MERLIN_COLD_EXPERTS_LAYERS", "MERLIN_COLD_EXPERTS_HOT_FRAC")
 # MERLIN_COLD_EXPERTS values that mean off: the engine's OFF_VALUES (cold_experts_plan.py), held here so turning the
@@ -118,10 +130,30 @@ FN_KV_HOST_TIER_GATES = ("MERLIN_KV_HOST_TIER__COPY_CREDITS", "MERLIN_KV_HOST_TI
                          # Opt-in cap on distinct copy-source blocks (0 = off).
                          "MERLIN_KV_HOST_TIER__MAX_PENDING_STORE_BLOCKS",
                          # The fallback-boundary switch: exactly 0 or 1 (0 = off).
-                         "MERLIN_KV_HOST_TIER__FALLBACK_BOUNDARY")
+                         "MERLIN_KV_HOST_TIER__FALLBACK_BOUNDARY",
+                         # Shared row copied alone: 0 or 1 (unset = off).
+                         "MERLIN_KV_HOST_TIER__SHARED_ROW_LONE",
+                         # Duplicates-first host eviction: 0 or 1 (unset = on).
+                         "MERLIN_KV_HOST_TIER__EVICT_DUPLICATES_FIRST",
+                         # Waiting-last host eviction: 0 or 1 (unset = on).
+                         "MERLIN_KV_HOST_TIER__EVICT_WAITING_LAST",
+                         # Required keys guarded: 0 or 1 (unset = on).
+                         "MERLIN_KV_HOST_TIER__GUARD_REQUIRED_KEYS",
+                         # Restore start with seats full: 0 or 1 (unset = off).
+                         "MERLIN_KV_HOST_TIER__RESTORE_START_ANY_STEP",
+                         # Restore credits per slot: 0 or 1 (unset = on).
+                         "MERLIN_KV_HOST_TIER__RESTORE_CREDITS_PER_SLOT",
+                         # Restore seat hold: 0 or 1 (unset = off).
+                         "MERLIN_KV_HOST_TIER__RESTORE_SEAT_HOLD",
+                         # Seconds a rank waits for the host-wide arena lock (positive whole number).
+                         "MERLIN_KV_HOST_TIER__ARENA_LOCK_TIMEOUT_S")
 FN_KV_HOST_TIER_CENSUS = "MERLIN_KV_HOST_TIER_CENSUS"
 # Debug diagnosis log lines of the KV tiers (FGPC junctions, first turns, host eviction victims): passed through when 1.
 FN_KV_TIER_DIAG = "MERLIN_KV_TIER_DIAG"
+# Debug rejection-sampler residual counters and their per-rank JSON directory:
+# passed through when the switch is 1.
+SPEC_RESIDUAL_DIAG = "MERLIN_SPEC_RESIDUAL_DIAG"
+SPEC_RESIDUAL_DIAG_OUT = "MERLIN_SPEC_RESIDUAL_DIAG_OUT"
 FN_WORKLOAD_TILE = "MERLIN_FLASHINFER_WORKLOAD_TILE"  # the opt-in FlashInfer prefill tile; not used on Flash-Next
 # Every knob that is refused unless the tier is on: a layout pass that plans with the tier off leaves them out.
 FN_KV_HOST_TIER_NEEDS_ON = (*FN_KV_HOST_TIER_FAULTS, *FN_KV_HOST_TIER_GATES, FN_KV_HOST_TIER_CENSUS)
@@ -193,6 +225,7 @@ class Plan:
     scales_recipe: str | None = None  # Flash-Next: the checkpoint name whose recipe FP8 KV scales are in use
     topo: dict[str, Any] = field(default_factory=dict)  # Flash-Next: AUTO_TOPO decision inputs
     caller_env: dict[str, str] = field(default_factory=dict)  # the environment as the caller gave it
+    engram: str | None = None  # Hy4 Flash: the Engram table variant served (fp8 or bf16, the ENGRAM knob)
 
     @property
     def family(self) -> str:
@@ -280,7 +313,14 @@ def distributed_ports(port: str) -> tuple[int, int]:
 FN_KV_HOST_TIER_GATES_NONNEG = ("MERLIN_KV_HOST_TIER__COPY_BYTES_D_MIB",
                                 "MERLIN_KV_HOST_TIER__MAX_PENDING_STORE_BLOCKS")
 # On/off gate knobs: exactly 0 or 1, as the engine's _e2_strict_switch takes them.
-FN_KV_HOST_TIER_GATES_SWITCH = ("MERLIN_KV_HOST_TIER__FALLBACK_BOUNDARY",)
+FN_KV_HOST_TIER_GATES_SWITCH = ("MERLIN_KV_HOST_TIER__FALLBACK_BOUNDARY",
+                                "MERLIN_KV_HOST_TIER__SHARED_ROW_LONE",
+                                "MERLIN_KV_HOST_TIER__EVICT_DUPLICATES_FIRST",
+                                "MERLIN_KV_HOST_TIER__EVICT_WAITING_LAST",
+                                "MERLIN_KV_HOST_TIER__GUARD_REQUIRED_KEYS",
+                                "MERLIN_KV_HOST_TIER__RESTORE_START_ANY_STEP",
+                                "MERLIN_KV_HOST_TIER__RESTORE_CREDITS_PER_SLOT",
+                                "MERLIN_KV_HOST_TIER__RESTORE_SEAT_HOLD")
 
 
 def _kv_tier_gates(environ_in: dict[str, str], env: dict[str, str]) -> None:
@@ -316,6 +356,24 @@ def _restore_unit_gate(model: str, p: dict[str, Any], tier_gib: int) -> None:
         raise LaunchError(f"{FN_KV_HOST_TIER}={tier_gib} GiB per rank cannot hold one 262K restore unit on {p['id']}; it "
                           f"needs at least {minimum} GiB per rank (merlin serve --kv-ram-cache {minimum * ranks}g). "
                           f"Increase {FN_KV_HOST_TIER} or set it to 0 to disable the KV RAM cache.", 1)
+
+
+def _spec_residual_diag(environ_in: dict[str, str], env: dict[str, str]) -> None:
+    """The rejection-sampler residual counters, the same on every family: 1 is
+    exported (with the dump directory when one is given), 0 or blank exports
+    neither, anything else is refused before the boot."""
+    diag = (environ_in.get(SPEC_RESIDUAL_DIAG) or "").strip()
+    if diag not in ("", "0", "1"):
+        raise LaunchError(
+            f"{SPEC_RESIDUAL_DIAG} must be 0 or 1 (got {diag!r})", 1
+        )
+    out = (environ_in.get(SPEC_RESIDUAL_DIAG_OUT) or "").strip()
+    env.pop(SPEC_RESIDUAL_DIAG, None)
+    env.pop(SPEC_RESIDUAL_DIAG_OUT, None)
+    if diag == "1":
+        env[SPEC_RESIDUAL_DIAG] = "1"
+        if out:
+            env[SPEC_RESIDUAL_DIAG_OUT] = out
 
 
 def _kv_tier_census(environ_in: dict[str, str], env: dict[str, str]) -> str | None:
@@ -555,7 +613,12 @@ def load_profile(
 def default_checkpoint(model: str, profile: dict[str, Any]) -> str:
     if model == "flash-next":
         return profile.get("checkpoint") or "flash-next"
-    return {"27b": "27b", "svl": "nemotron-super-vl", "ornith": "ornith1.5"}[model]
+    return {
+        "27b": "27b",
+        "svl": "nemotron-super-vl",
+        "ornith": "ornith1.5",
+        "hy4flash": "hy4flash",
+    }[model]
 
 
 def build(
@@ -586,7 +649,8 @@ def build(
     if blocked:
         raise LaunchError(f"profile {p.get('variant_of') or p['id']} is blocked and does not start: {blocked}", 2)
     checkpoint = checkpoint or default_checkpoint(model, p)
-    if checkpoint not in CHECKPOINTS or CHECKPOINTS[checkpoint][0] != model:
+    known = {**CHECKPOINTS, **LAUNCH_ONLY_CHECKPOINTS}
+    if checkpoint not in known or known[checkpoint][0] != model:
         raise LaunchError(f"checkpoint {checkpoint!r} does not belong to the {model} registry", 2)
     if model == "flash-next" and (p.get("checkpoint") or "flash-next") != checkpoint:
         raise LaunchError(f"profile {profile_id} serves {p.get('checkpoint') or 'flash-next'}, not {checkpoint}", 2)
@@ -600,6 +664,8 @@ def build(
             if len(flag) > 2 and flag.startswith("--") and name.startswith(flag):
                 raise LaunchError(f"{name} is unsupported by Merlin: tokenizer initialization is required "
                                   "to validate prompt token IDs; remove this flag from the extra arguments", 2)
+    if model == "hy4flash":
+        _hy4_refuse_kv_tier(env)
     # --swarm (SWARM=1): checked before any builder runs, on every family; sets the KV RAM cache when unset
     swarm_note = _swarm_prepare(p, env) if swarm_requested(env) else None
     # The other families pass the caller's MERLIN_ exports to the engine as they are, the cold-expert knobs included:
@@ -607,15 +673,26 @@ def build(
     # must parse and match this checkpoint's config.json) so a Flash-Next profile fails here, not at weight load.
     ce_notes: list[str] = []
     if model != "flash-next":
-        _cold_experts_env(environ, env, ce_notes, ckpt, repo)
+        # A hy4flash row's env cold-expert default (the TP4 DIAG
+        # row) applies unless the caller sets MERLIN_COLD_EXPERTS, as on the Flash-Next rows
+        ce_knobs, ce_row_note = (
+            _row_cold_experts(p, environ, repo) if model == "hy4flash" else (environ, None)
+        )
+        _cold_experts_env(ce_knobs, env, ce_notes, ckpt, repo)
+        if ce_row_note and env.get(FN_COLD_EXPERTS[0]):
+            ce_notes.append(ce_row_note)
         if env.get(FN_COLD_EXPERTS[0]):
             ce_notes.append(f"{FN_COLD_EXPERTS[0]}: static cold-expert offload has not been measured on the {model} lane")
+        if model == "hy4flash":
+            _row_hy4_speed_defaults(p, environ, env, ce_notes)
     if model == "flash-next":
         plan = _build_flash_next(reg, p, checkpoint, ckpt, env, extra, repo)
     elif model == "27b":
         plan = _build_27b(reg, p, checkpoint, ckpt, env, extra, repo)
     elif model == "ornith":
         plan = _build_ornith(reg, p, checkpoint, ckpt, env, extra, repo)
+    elif model == "hy4flash":
+        plan = _build_hy4flash(reg, p, checkpoint, ckpt, env, extra, repo)
     else:
         plan = _build_svl(reg, p, checkpoint, ckpt, env, extra, repo)
     # vLLM's dev routers sit outside the API-key prefixes
@@ -1385,12 +1462,18 @@ def _fn_prefill_runs_final(plan: Plan) -> None:
 
 
 def _fn_prefill_runs_env(env: dict[str, str], environ_in: dict[str, str], extra: list[str], runs: bool, chunk: str,
-                         seqs: str, k: int, notes: list[str]) -> str:
+                         seqs: str, k: int, notes: list[str],
+                         spec_ticks: tuple[int, tuple[float, float, float]] | None = None) -> str:
     """The engine's step budget (--max-num-batched-tokens) and the prefill runs exports.
 
     On: CHUNK stays the prefill chunk and the budget gains one verify row per sequence (seqs x (1 + k) tokens), so
     decode rows never shrink a chunk (1024 + 8 x 4 = 1056 on fn-quad-3090). Off: the budget is CHUNK and none of the
-    prefill runs variables reach the engine, as before the runs existed."""
+    prefill runs variables reach the engine, as before the runs existed.
+
+    spec_ticks: the selected drafter's measured tick costs from the profile as (chunk they were measured at, costs)
+    (DFlash2 only; None for MTP and SPEC=none, which keep the engine default). The first cost is one full-chunk step,
+    so they are exported only when the effective CHUNK equals the measured one, and only when the caller has not
+    exported VLLM_MERLIN_PREFILL_RUNS_TICK_COSTS, which always wins; the note says which source the engine got."""
     for name in FN_PREFILL_RUNS_LAUNCHER:
         mine = environ_in.get(name)
         if mine is not None and (not runs or mine != {FN_PREFILL_RUNS: "1"}.get(name, chunk)):
@@ -1405,9 +1488,22 @@ def _fn_prefill_runs_env(env: dict[str, str], environ_in: dict[str, str], extra:
     env["VLLM_MERLIN_PREFILL_RUNS_CHUNK_TOKENS"] = chunk
     for name in FN_PREFILL_RUNS_TUNABLES:
         mine = (environ_in.get(name) or "").strip()
+        measured = spec_ticks if spec_ticks and name == FN_PREFILL_RUNS_TICK_COSTS else None
+        profile = ",".join(repr(v) for v in measured[1]) if measured else None
         if mine:
-            notes.append(f"note: {name}={mine!r} from your environment overrides the prefill runs' default")
+            notes.append(f"note: {name}={mine!r} from your environment overrides the prefill runs' default"
+                         + (f" (the SPEC=dflash2 profile value {profile} is not used)" if profile else ""))
             env[name] = mine
+        elif measured and int(chunk) != measured[0]:
+            notes.append(f"note: the measured SPEC=dflash2 tick costs ({profile}) apply only at CHUNK={measured[0]}; "
+                         f"CHUNK={chunk} here, so the engine default {name} is in use and the decode window is not "
+                         f"calibrated for this chunk (export {name} to set your own)")
+            env.pop(name, None)
+        elif profile:
+            notes.append(f"note: {name}={profile} from the SPEC=dflash2 profile values, measured at CHUNK={measured[0]} "
+                         "(a longer decode window during a long ingest, so the cold first token comes about 18 to 19 "
+                         f"percent later; MTP is unchanged); export {name} to override")
+            env[name] = profile
         else:
             env.pop(name, None)
     env.setdefault("VLLM_MERLIN_PREFILL_RUNS_DECODE_SHARE", FN_PREFILL_RUNS_SHARE)
@@ -1441,6 +1537,23 @@ def emulated_vram_class(environ: dict, vram_mibs: list[int]) -> tuple[int, str] 
                  "not a supported configuration")
 
 
+def _row_hy4_speed_defaults(p: dict, environ_in: dict, env: dict, notes: list[str]) -> None:
+    """a hy4flash row's speed-flag defaults
+    (registry ROW_HY4_SPEED): each applies unless the caller exports
+    the name; a non-blank caller value wins, so NAME=0 opts out of one flag. The
+    row's MERLIN_COLD_EXPERTS_ADAPTIVE applies only with the cold-expert offload on
+    (it moves the offload's hot rows; without one it has nothing to do)."""
+    for k, v in R.row_env(p).items():
+        if k not in R.ROW_HY4_SPEED:
+            continue
+        if k == "MERLIN_COLD_EXPERTS_ADAPTIVE" and not env.get(FN_COLD_EXPERTS[0]) and k not in environ_in:
+            continue
+        mine = (environ_in.get(k) or "").strip()
+        if mine and mine != v:
+            notes.append(f"note: {k}={mine!r} from your environment overrides the {p['id']} row's {k}={v}")
+        env[k] = mine or v
+
+
 def _row_cold_experts(p: dict, environ_in: dict, repo: Path) -> tuple[dict, str | None]:
     """The cold-expert knobs for ``_cold_experts_env``: the caller's, over the row's ``env`` defaults (the row's profile
     is relative to the repo). A caller's MERLIN_COLD_EXPERTS replaces the row's profile, and blank or 0 turns the offload
@@ -1448,7 +1561,17 @@ def _row_cold_experts(p: dict, environ_in: dict, repo: Path) -> tuple[dict, str 
     row = {k: v for k, v in R.row_env(p).items() if k in FN_COLD_EXPERTS}
     if not row.get(FN_COLD_EXPERTS[0]) or FN_COLD_EXPERTS[0] in environ_in:
         return environ_in, None  # no row default, or the caller decides (a path, or blank / 0 = off)
-    knobs = {FN_COLD_EXPERTS[0]: str(Path(repo) / row[FN_COLD_EXPERTS[0]])}
+    # The row's profile from ``repo``, else from this
+    # checkout (as _cold_experts_plan_module reads the checker)
+    rel = row[FN_COLD_EXPERTS[0]]
+    # The BF16 Engram pack has its own config.json, so the
+    # row's profile has a sibling bound to it (same expert counts; the experts are identical)
+    if (environ_in.get(HY4_ENGRAM_ENV) or "").strip().lower() == "bf16" and rel.endswith(".json"):
+        alt = rel[: -len(".json")] + "-bf16.json"
+        if (Path(repo) / alt).is_file() or (REPO / alt).is_file():
+            rel = alt
+    where = Path(repo) / rel
+    knobs = {FN_COLD_EXPERTS[0]: str(where if where.is_file() else REPO / rel)}
     for k in FN_COLD_EXPERTS[1:]:
         knobs[k] = (environ_in.get(k) or "").strip() or row.get(k, "")
     return knobs, (f"{FN_COLD_EXPERTS[0]}: the {p['id']} row's default (export {FN_COLD_EXPERTS[0]}=0 to turn the offload "
@@ -1707,6 +1830,7 @@ def _build_flash_next(reg, p, checkpoint, ckpt, env, extra, repo: Path) -> Plan:
     # strip above). Tier on only.
     _kv_tier_gates(environ_in, env)
     census_note = _kv_tier_census(environ_in, env)
+    _spec_residual_diag(environ_in, env)
     if census_note:
         notes.append(census_note)
     # Preserve scoring limits verbatim, including invalid values for the engine's positive-integer validation.
@@ -1805,7 +1929,11 @@ def _build_flash_next(reg, p, checkpoint, ckpt, env, extra, repo: Path) -> Plan:
         spec = f'{{"method":"mtp","num_speculative_tokens":{R.MTP_K},"draft_sample_method":"probabilistic"{draft_spec}}}'
     capture = _seqs_capture(srv["capture_sizes"], seqs, str(srv["max_num_seqs"]), 0 if spec is None else R.MTP_K)
     # SPEC=none keeps the MTP lane's budget (the reference boots the same step size); DFlash2 verifies K tokens too
-    budget = _fn_prefill_runs_env(env, environ_in, extra, runs, chunk, seqs, R.MTP_K, notes)
+    try:
+        spec_ticks = R.spec_tick_costs(reg, spec_method)
+    except R.ProfileError as e:
+        raise LaunchError(str(e), 2) from None
+    budget = _fn_prefill_runs_env(env, environ_in, extra, runs, chunk, seqs, R.MTP_K, notes, spec_ticks)
     args = [
         "--served-model-name", *names,
         "--host", env.get("HOST") or "127.0.0.1", "--port", env.get("PORT") or str(base.get("port", 8000)),
@@ -1862,6 +1990,27 @@ def _build_flash_next(reg, p, checkpoint, ckpt, env, extra, repo: Path) -> Plan:
     plan.caller_env = dict(environ_in)
     plan.notes += [f"WARNING: {w}" for w in dflash2_override_warnings(p, environ_in)]
     return plan
+
+
+def _vision_prefill_guard(plan: Plan) -> None:
+    """Refuse whole-image scheduling with a cap that can split an image."""
+    # Avoid parsing unrelated extra flags unless whole-image scheduling is requested.
+    if not any(
+        len(flag) > 2 and "--disable-chunked-mm-input".startswith(flag)
+        for a in plan.extra
+        for flag in (a.partition("=")[0].replace("_", "-"),)
+    ):
+        return
+    user = _fn_prefill_runs_extra(plan.args + plan.extra)
+    if user.get("disable_chunked_mm_input") is not True:
+        return
+    lpt = user.get("long_prefill_token_threshold", 0)
+    if lpt > 0:
+        raise LaunchError(
+            f"--disable-chunked-mm-input cannot be combined with LPT / --long-prefill-token-threshold {lpt}: "
+            "an image longer than the cap can stall scheduling; remove --disable-chunked-mm-input "
+            "or set LPT=0 (and remove any extra threshold override)", 2
+        )
 
 
 def _build_27b(reg, p, checkpoint, ckpt, env, extra, repo: Path) -> Plan:
@@ -1996,6 +2145,7 @@ def _build_27b(reg, p, checkpoint, ckpt, env, extra, repo: Path) -> Plan:
     _kv_tier_gates(environ_in, env)
     # The debug census: checked as on Flash-Next.
     census_note = _kv_tier_census(environ_in, env)
+    _spec_residual_diag(environ_in, env)
     extra_flags: list[str] = []
     if chat_template:
         extra_flags += ["--chat-template", chat_template]
@@ -2050,6 +2200,7 @@ def _build_27b(reg, p, checkpoint, ckpt, env, extra, repo: Path) -> Plan:
         env["TRITON_CACHE_DIR"] = f"{cache_root}/triton"
     plan = Plan("27b", checkpoint, p, ckpt, env, args, extra, repo, venv, None, cache_root,
                 R.label_text(reg, p), p2p_mode, notes=notes)
+    _vision_prefill_guard(plan)
     plan.caller_env = environ_in
     if env.get(FN_KV_HOST_TIER):
         plan.notes.append(KV_TIER_EXPERIMENTAL_27B)
@@ -2107,6 +2258,7 @@ def _build_svl(reg, p, checkpoint, ckpt, env, extra, repo: Path) -> Plan:
     env.pop(FN_KV_HOST_TIER, None)
     _kv_tier_gates(environ_in, env)
     _kv_tier_census(environ_in, env)
+    _spec_residual_diag(environ_in, env)
     env["CUDA_VISIBLE_DEVICES"] = gpus
     env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
     # a no-P2P row (svl-quad-3090-nop2p) defaults to P2P off; the others default to on and take P2P=on|off
@@ -2162,6 +2314,7 @@ def _build_svl(reg, p, checkpoint, ckpt, env, extra, repo: Path) -> Plan:
         *p2p_args, "--host", host, "--port", port,
     ]
     plan = Plan("svl", checkpoint, p, ckpt, env, args, extra, repo, venv, tree, cache_root, R.label_text(reg, p), p2p_mode)
+    _vision_prefill_guard(plan)
     plan.caller_env = environ_in
     plan.notes.extend(parser_notes)
     comm_note = _comm_note(svl_comm_inherited, env, p2p_mode)
@@ -2258,6 +2411,7 @@ def _build_ornith(reg, p, checkpoint, ckpt, env, extra, repo: Path) -> Plan:
     # like the 27B).
     _kv_tier_gates(environ_in, env)
     census_note = _kv_tier_census(environ_in, env)
+    _spec_residual_diag(environ_in, env)
     if census_note:
         notes.append(census_note)
     env["VLLM_USE_V2_MODEL_RUNNER"] = "1"
@@ -2312,6 +2466,580 @@ def _build_ornith(reg, p, checkpoint, ckpt, env, extra, repo: Path) -> Plan:
     return plan
 
 
+# The hy4flash lane
+HY4_LAYERS = 42  # HYV4FlashConfig.num_hidden_layers; PP_PARTITION must sum to it
+# private TP-local pinned host tables
+HY4_ENGRAM_CONFIG = '{"cpu_offload":true,"dp_shared_memory":false}'
+# the text lane of a checkpoint naming the VL class
+HY4_ARCH_OVERRIDE = '{"architectures":["HYV4FlashForCausalLM"]}'
+# The KV RAM cache is refused on every hy4flash row: on
+# 4 x RTX 3090 its host copies were written but never restored, so it gave no hits
+HY4_KV_TIER_UNSUPPORTED = (
+    "the KV RAM cache is not supported on Hy4 Flash yet (--kv-ram-cache, --swarm, "
+    "SWARM=1 or MERLIN_KV_HOST_TIER_GIB above 0): unset it, or set "
+    "MERLIN_KV_HOST_TIER_GIB=0"
+)
+# DFly2 is on by default: the drafter's weights ship in
+# the target checkpoint (BF16 draft head; no int8 drafter variant), K from SPEC_K within
+# the engine's range (DFlyConfig resolve_num_speculative_tokens). DFLY=0 turns it off.
+# HY4_DFLY_K: the default num_speculative_tokens, set from a DFly K sweep
+# 3 since 3.0.2.2 (5 before)
+HY4_DFLY_K = 3
+# The IndexPool logits cap (MiB) on the hy4flash rows
+HY4_LOGITS_CAP_ENV = "VLLM_SPARSE_INDEXER_MAX_LOGITS_MB"
+HY4_LOGITS_CAP_MB = "64"
+# The served default effort: the Hy4 chat
+# template accepts only no_think / high, and the hy_v4 reasoning parser defaults to
+# high (vllm/reasoning/hy_v4_reasoning_parser.py DEFAULT_REASONING_EFFORT).
+HY4_REASONING_EFFORT = "high"
+HY4_DFLY_K_RANGE = (1, 16)  # the engine's num_speculative_tokens range for method dfly
+# The static cold-expert offload on hy4flash
+# (vllm/merlin/cold_experts.py): MERLIN_COLD_EXPERTS + _LAYERS / _HOT_FRAC as on
+# Flash-Next, plus COLD_STAGE = the PP stage the named layers must sit on (default:
+# the last, which carries DFly2 and the lm head). The repo's placeholder profile has a
+# uniform (identity) ranking: Hy4's aux-free balancing bias leaves no ranking to read
+# from the checkpoint.
+HY4_COLD_PROFILE = "tools/merlin/profiles/expert_hot/hy4flash-uniform.json"
+HY4_COLD_STAGE = "COLD_STAGE"
+HY4_DENSE_LAYERS = (0,)  # HYV4FlashConfig's mlp_layer_types default: layer 0 is dense
+HY4_EXPERTS = 512
+HY4_TOPK = 16
+# One routed expert's packed W4 weights (scales stay on the GPU): w13 1536 x 3072 +
+# w2 1536 x 1536 at half a byte; the row buffer is [CHUNK x top-k, latent 1536] bf16.
+HY4_EXPERT_PACKED_BYTES = (1536 * 3072 + 1536 * 1536) // 2
+HY4_EXPERT_SCALE_BYTES = (1536 // 128) * (3072 + 1536) * 2
+HY4_ROUTED_LATENT = 1536
+# Two Hy4 Flash packs: FP8 Engram tables (the default)
+# and BF16 Engram tables. ENGRAM=fp8|bf16 names the one served; the checkpoint's
+# config.json must agree (engram_fp8_embedding true = FP8; false or absent = BF16). The
+# engine loads the tables in the checkpoint's own dtype (hy_v4_flash/nvidia/engram.py),
+# so the knob is a launcher check and never reaches the engine.
+HY4_ENGRAM_ENV = "ENGRAM"
+HY4_ENGRAM_DEFAULT = "fp8"
+# GiB of Engram tables pinned in host RAM, all four tables over every rank's part:
+# 660,006,416 rows (engram_layer_head_vocab_sizes summed over the four Engram layers) of
+# 96 values (engram_n_embed_per_ngram 768 / 8 heads). FP8: 96 E4M3 bytes + one BF16
+# scale = 98 B per row, 64,680,628,768 B (60.24 GiB, as the FP8 pack measured). BF16:
+# 96 x 2 = 192 B per row, 126,721,231,872 B (118.02 GiB).
+HY4_ENGRAM_GIB = {"fp8": 60.0, "bf16": 118.0}
+# Host RAM available before the start: the 4-card FP8 boots needed 140 GiB (the tables
+# plus about 18 GiB of engine processes and the load's own peak); another variant adds
+# its tables' difference from FP8 to that measured need.
+HY4_RAM_AVAIL_MIN_GIB = 140.0
+HY4_ENGINE_PROCS_GIB = 18.0
+
+
+def hy4_ram_need_gib(engram: str = HY4_ENGRAM_DEFAULT, tier_total_gib: int = 0) -> float:
+    """Host RAM a hy4flash server needs available for the ``engram`` variant: the measured
+    FP8 need moved by the tables' size difference (never under tables + engine
+    processes), plus the KV RAM cache when asked."""
+    tables = HY4_ENGRAM_GIB[engram]
+    measured = HY4_RAM_AVAIL_MIN_GIB + tables - HY4_ENGRAM_GIB[HY4_ENGRAM_DEFAULT]
+    return max(measured, tables + HY4_ENGINE_PROCS_GIB) + tier_total_gib
+
+
+def hy4_ckpt_engram(ckpt) -> str | None:
+    """The Engram variant the checkpoint's config.json declares: ``fp8`` when
+    engram_fp8_embedding is true (top level or text_config), else ``bf16``; None when
+    there is no readable config.json (nothing downloaded yet)."""
+    cfg = _read_config(str(ckpt)) if ckpt else None
+    if cfg is None:
+        return None
+    text = cfg.get("text_config") if isinstance(cfg.get("text_config"), dict) else {}
+    flag = cfg.get("engram_fp8_embedding", text.get("engram_fp8_embedding"))
+    return "fp8" if flag is True else "bf16"
+
+
+def hy4_engram(environ: dict[str, str], ckpt) -> str:
+    """ENGRAM (unset or blank = fp8), checked against
+    the checkpoint's config.json when there is one. Refuses (rc 2) any other value and a
+    variant the checkpoint does not carry."""
+    raw = (environ.get(HY4_ENGRAM_ENV) or "").strip()
+    want = raw.lower() or HY4_ENGRAM_DEFAULT
+    if want not in HY4_ENGRAM_GIB:
+        shown = raw if len(raw) <= 40 else f"{raw[:20]}...({len(raw)} characters)"
+        raise LaunchError(
+            f"{HY4_ENGRAM_ENV} must be fp8 (the FP8 Engram pack, the default) or bf16 "
+            f"(the BF16 Engram pack), got {shown!r}",
+            2,
+        )
+    have = hy4_ckpt_engram(ckpt)
+    if have is not None and have != want:
+        said = f"{HY4_ENGRAM_ENV}={want}" + ("" if raw else " (the default)")
+        flag = "true" if have == "fp8" else "false or absent"
+        raise LaunchError(
+            f"{said} serves the {want.upper()} Engram pack, but {ckpt} is the "
+            f"{have.upper()} Engram pack (config.json engram_fp8_embedding {flag}): "
+            f"set {HY4_ENGRAM_ENV}={have}, or point at the {want.upper()} pack",
+            2,
+        )
+    return want
+
+
+def _hy4_memory_warnings(engram: str, read=None) -> list[str]:
+    """the host RAM and memlock checks sized for the
+    variant served, as warnings (the installer's checks are the refusals): MemAvailable
+    under hy4_ram_need_gib, and a memlock limit under the variant's Engram tables."""
+    def _read(path):
+        try:
+            with open(path, encoding="utf-8") as f:
+                return f.read()
+        except OSError:
+            return None
+
+    read = read or _read
+    out: list[str] = []
+    need = hy4_ram_need_gib(engram)
+    tables = HY4_ENGRAM_GIB[engram]
+    m = re.search(r"(?m)^MemAvailable:\s*(\d+)\s*kB", read("/proc/meminfo") or "")
+    if m and int(m.group(1)) / 1048576 < need:
+        out.append(
+            f"WARNING: host memory available now is {int(m.group(1)) // 1048576} GiB "
+            f"(MemAvailable); Hy4 Flash with the {engram.upper()} Engram tables needs "
+            f"~{need:.0f} GiB (tables ~{tables:.0f} GiB pinned + engine processes); the "
+            "load is expected to be OOM-killed"
+        )
+    try:
+        import resource
+    except ImportError:  # no such limit on this platform
+        return out
+    soft, _ = resource.getrlimit(resource.RLIMIT_MEMLOCK)
+    if soft == resource.RLIM_INFINITY:
+        return out
+    cap = re.search(r"(?m)^CapEff:\s*([0-9a-fA-F]+)", read("/proc/self/status") or "")
+    if cap and (int(cap.group(1), 16) >> 14) & 1:  # CAP_IPC_LOCK
+        return out
+    if soft < tables * 2**30:
+        out.append(
+            f"WARNING: the memlock limit is {soft / 2**30:.2f} GiB; the {engram.upper()} "
+            f"Engram tables (~{tables:.0f} GiB) are pinned in host RAM (ulimit -l "
+            "unlimited; systemd LimitMEMLOCK=infinity; docker --ulimit memlock=-1)"
+        )
+    return out
+
+
+def hy4_stage_bounds(partition: list[int] | None, pp: int) -> list[tuple[int, int]]:
+    """[start, stop) decoder layers per PP stage: the explicit partition, else the
+    engine's even split (get_pp_indices: the remainder goes to the stages before the
+    last)."""
+    counts = list(partition) if partition else [HY4_LAYERS // pp] * pp
+    if not partition:
+        for i in range(2, HY4_LAYERS % pp + 2):
+            counts[-i] += 1
+    out, at = [], 0
+    for n in counts:
+        out.append((at, at + n))
+        at += n
+    return out
+
+
+def _hy4_dense_layers(ckpt) -> tuple[int, ...]:
+    """The checkpoint's dense decoder layers (config.json mlp_layer_types, top level or
+    text_config), else the config default (layer 0)."""
+    try:
+        cfg = json.loads((Path(ckpt) / "config.json").read_text(encoding="utf-8"))
+    except (OSError, TypeError, ValueError):
+        return HY4_DENSE_LAYERS
+    kinds = cfg.get("mlp_layer_types") or (cfg.get("text_config") or {}).get("mlp_layer_types")
+    if not isinstance(kinds, list):
+        return HY4_DENSE_LAYERS
+    return tuple(i for i, k in enumerate(kinds) if k == "dense")
+
+
+def hy4_cold_freed_bytes(n_layers: int, hot_frac: float, local_experts: int, chunk: int) -> int:
+    """GPU bytes the split frees per rank: the cold experts' packed weights, less the
+    hot scale copies and the shared [CHUNK x top-k, latent] bf16 row buffer
+    (cold_experts.py; hot count as in cold_experts_plan.plan_layer)."""
+    hot = max(0, min(int(round(hot_frac * local_experts)), local_experts))
+    cold = local_experts - hot
+    rows = chunk * HY4_TOPK * HY4_ROUTED_LATENT * 2
+    return n_layers * (cold * HY4_EXPERT_PACKED_BYTES - hot * HY4_EXPERT_SCALE_BYTES) - rows
+
+
+def _hy4_refuse_kv_tier(env: dict[str, str]) -> None:
+    """refuse the KV RAM cache on hy4flash before --swarm
+    sets it: SWARM=1, or MERLIN_KV_HOST_TIER_GIB above 0. Blank or 0 is off; a value
+    that is not a whole number is refused as on the other families."""
+    tier = (env.get(FN_KV_HOST_TIER) or "").strip()
+    if tier and not (tier.isascii() and tier.isdigit() and len(tier) <= 6):
+        shown = tier if len(tier) <= 40 else f"{tier[:20]}...({len(tier)} characters)"
+        raise LaunchError(
+            f"{FN_KV_HOST_TIER} must be a whole number of GiB per rank (0 = off), "
+            f"got {shown!r}",
+            2,
+        )
+    if swarm_requested(env) or (tier and int(tier) > 0):
+        raise LaunchError(HY4_KV_TIER_UNSUPPORTED, 2)
+
+
+def _hy4_cold_experts(environ_in, env, parts, pp, tp, ep, chunk, ckpt, repo, notes) -> None:
+    """Hold the named cold-expert layers to one PP stage and to MoE layers. The
+    generic check (_cold_experts_env, before the builder) has validated and exported
+    the profile and knobs already; off = nothing exported, COLD_STAGE then ignored."""
+    stage_raw = (environ_in.get(HY4_COLD_STAGE) or "").strip()
+    if not (env.get(FN_COLD_EXPERTS[0]) or "").strip():
+        if stage_raw:
+            notes.append(f"note: {HY4_COLD_STAGE} set but {FN_COLD_EXPERTS[0]} is off: ignored")
+        return
+    if stage_raw and not (stage_raw.isascii() and stage_raw.isdigit() and int(stage_raw) < pp):
+        raise LaunchError(f"{HY4_COLD_STAGE} must be a PP stage 0..{pp - 1} (got {stage_raw!r})", 2)
+    stage = int(stage_raw) if stage_raw else pp - 1
+    st = _cold_experts_plan_module(repo).settings_from_env(env)
+    lo, hi = hy4_stage_bounds([int(x) for x in parts] if parts else None, pp)[stage]
+    dense = sorted(set(st.layers) & set(_hy4_dense_layers(ckpt)))
+    if dense:
+        raise LaunchError(f"{FN_COLD_EXPERTS[1]}: layer(s) {','.join(map(str, dense))} are dense "
+                          "(no routed experts to offload)", 2)
+    off = [x for x in st.layers if not lo <= x < hi]
+    if off:
+        raise LaunchError(f"{FN_COLD_EXPERTS[1]}: layer(s) {','.join(map(str, off))} are not on PP{stage} "
+                          f"(layers {lo}-{hi - 1} at this partition; {HY4_COLD_STAGE} picks the stage)", 2)
+    local = HY4_EXPERTS // tp if ep else HY4_EXPERTS
+    freed = hy4_cold_freed_bytes(len(st.layers), st.hot_frac, local, int(chunk))
+    if not ep:
+        freed = None  # TP-sharded experts: the per-expert size above does not apply
+    notes.append(f"note: hy4flash cold experts on PP{stage}: layers {','.join(map(str, st.layers))} at hot "
+                 f"{st.hot_frac:g}" + ("" if freed is None else
+                                        f", about {freed / 2**20:.0f} MiB freed per PP{stage} rank "
+                                        "(net of the row buffer)"))
+
+# Marlin MoE token slice on the hy4flash lane, an
+# opt-in candidate (not bit-identical, prefill cost unmeasured): with
+# MERLIN_MOE_CHUNK_TOKENS=512 exported the topk-16 caches are sized for 512 tokens
+# instead of the whole CHUNK (2048: 288 MiB per rank -> 78 MiB). Unset or 0 is the
+# stock path, the default.
+HY4_MOE_CHUNK_TOKENS = 0
+
+
+def hy4_query_gather_bytes(
+    chunk: int, attention_heads: int, tp: int, dcp: int, bytes_per_head: int
+) -> int:
+    """Transient bytes of one sparse layer's DCP query all-gather at prefill: forced
+    sparse MQA gathers the chunk's queries over the DCP group, [chunk, heads / TP *
+    DCP, 576] bf16."""
+    return chunk * (attention_heads // tp) * dcp * bytes_per_head
+
+
+def _build_hy4flash(reg, p, checkpoint, ckpt, env, extra, repo: Path) -> Plan:
+
+    """Hy4 Flash (HYV4FlashForCausalLM): TP x PP2 + EP with DCP2 over the TP pair,
+    fp8_ds_mla KV, Engram and the token embedding in host RAM, the hy_v4 parsers. A
+    launch.py --profile lane: hy4flash-quad-3090 is testing (full-model runs passed, pool
+    measured), the TP4 and 8-card rows are untested (pool estimates). DFly2
+    (method dfly, K = SPEC_K, default HY4_DFLY_K) is on by default; DFLY=0 turns it
+    off. The KV RAM cache and --swarm are refused before the builder runs
+    (_hy4_refuse_kv_tier). An extra --speculative-config merges into the lane's
+    (_merge_speculative_config: no method or K change)."""
+    environ_in = dict(env)
+    notes: list[str] = []
+    L = reg["launch"]
+    srv = p["serve"]
+    lay = p["layout"]
+    cwd = os.getcwd()
+    root = repo.as_posix()
+    # DFLY: unset or 1 = on, 0 = off. SPEC_K and an
+    # extra --speculative-config need DFly2 on; an abbreviation of the flag is never
+    # merged or checked, so it is refused.
+    dfly_raw = (environ_in.get("DFLY") or "").strip()
+    if dfly_raw not in ("", "0", "1"):
+        raise LaunchError(
+            f"DFLY must be 1 (DFly2 on, the default) or 0 (off), got {dfly_raw!r}", 2
+        )
+    alias = next(
+        (a.partition("=")[0] for a in extra if _speculative_config_alias(a)), None
+    )
+    if alias:
+        raise LaunchError(
+            f"extra {alias}: an abbreviation the engine reads as --speculative-config, "
+            "which the launcher does not merge or check; spell it --speculative-config "
+            "(DFly2 is on by default, SPEC_K sets K)",
+            2,
+        )
+    # A launcher knob, checked against config.json;
+    # the engine reads the tables' dtype from the checkpoint
+    engram = hy4_engram(environ_in, ckpt)
+    env.pop(HY4_ENGRAM_ENV, None)
+    if engram != HY4_ENGRAM_DEFAULT:
+        notes.append(
+            f"note: {HY4_ENGRAM_ENV}={engram}: the {engram.upper()} Engram tables, "
+            f"~{HY4_ENGRAM_GIB[engram]:.0f} GiB pinned in host RAM (~"
+            f"{hy4_ram_need_gib(engram):.0f} GiB available needed); not benched yet"
+        )
+    # The tier is refused before the builder runs
+    # (_hy4_refuse_kv_tier); an exported 0 is off and not passed on
+    env.pop(FN_KV_HOST_TIER, None)
+    # DFly2 on unless DFLY=0
+    user_spec = any(_speculative_config_arg(a) is not None for a in extra)
+    spec_k_set = (environ_in.get("SPEC_K") or "") != ""
+    if dfly_raw == "0" and (spec_k_set or user_spec):
+        raise LaunchError(
+            "DFLY=0 turns DFly2 off: drop SPEC_K and --speculative-config, "
+            "or unset DFLY",
+            2,
+        )
+    dfly = dfly_raw != "0"
+    dfly_k = 0
+    if dfly:
+        k_raw = _knob(env, "SPEC_K", str(HY4_DFLY_K), True)
+        lo, hi = HY4_DFLY_K_RANGE
+        dfly_k = _small_whole(k_raw) if len(k_raw) < 6 else None
+        if dfly_k is None or not lo <= dfly_k <= hi:
+            shown = (
+                k_raw
+                if len(k_raw) <= 40
+                else f"{k_raw[:20]}...({len(k_raw)} characters)"
+            )
+            raise LaunchError(
+                f"SPEC_K must be a whole number from {lo} to {hi} on hy4flash "
+                f"(the DFly2 draft length; {HY4_DFLY_K} is the default), "
+                f"got {shown!r}",
+                2,
+            )
+        # the merge after the build refuses a K change and a malformed object; name
+        # the method here
+        if user_spec:
+            try:
+                given = _extra_speculative_config(extra) or {}
+            except LaunchError:
+                given = {}  # not a JSON object: _merge_speculative_config refuses it
+            method = given.get("method", "dfly")
+            if method != "dfly":
+                raise LaunchError(
+                    f"--speculative-config method {method!r}: hy4flash drafts with "
+                    "DFly2 only (method 'dfly', on by default; the engine refuses any "
+                    "other method). Drop the method, or DFLY=0 for no drafter",
+                    2,
+                )
+    _kv_tier_gates(environ_in, env)
+    census_note = _kv_tier_census(environ_in, env)
+    if census_note:
+        notes.append(census_note)
+    tp, pp = int(lay["tp"]), int(lay["pp"])
+    dcp, interleave = (
+        int(srv["decode_context_parallel_size"]),
+        int(srv["cp_kv_cache_interleave_size"]),
+    )
+    cards = tp * pp
+    gpus = _knob(
+        env,
+        "GPUS",
+        env.get("CUDA_VISIBLE_DEVICES") or ",".join(map(str, range(cards))),
+        True,
+    )
+    port = _knob(env, "PORT", str(L["port"]), True)
+    host = _knob(env, "HOST", "127.0.0.1", True)
+    served = _knob(env, "SERVED", L["served"], True)
+    venv = _abs(_knob(env, "VENV", f"{root}/venv", True), cwd)
+    if "VENV" in env:
+        env["VENV"] = venv
+    cache_root = _knob(env, "CACHE_ROOT", f"{root}/.vllm-cache", True)
+    kv_bytes = _knob(env, "KV_BYTES", str(srv["kv_cache_memory"]), True)
+    chunk = _int_knob(env, "CHUNK", True, str(srv["max_num_batched_tokens"]), 2)
+    # The row's cap (no swarm cap: --swarm is refused)
+    seqs, maxlen = _shape_knobs(
+        env, _session_cap(p, environ_in, notes), str(srv["max_model_len"]), 2, notes
+    )
+    capture = _seqs_capture(L["capture_sizes"], seqs, str(srv["max_num_seqs"]), 0)
+    # The row's list is sized spec-off: cover SEQS x (K
+    # + 1) decode tokens
+    if dfly:
+        capture = R.capture_sizes_for(int(seqs), dfly_k)
+    block = _int_knob(env, "BLOCK_SIZE", True, str(srv["block_size"]), 2)
+    partition = _knob(
+        env, "PP_PARTITION", ",".join(map(str, lay["partition"])), True, keep_empty=True
+    )
+    eager = _knob(env, "EAGER", "0", True)
+    if not _digits(kv_bytes) or int(kv_bytes) < 1073741824:
+        raise LaunchError(
+            "KV_BYTES must be integer bytes >= 1 GiB (never a util fraction): "
+            f"{kv_bytes}",
+            2,
+        )
+    if len(gpus.split(",")) != cards:
+        raise LaunchError(
+            f"GPUS must name {cards} cards for TP{tp} x PP{pp} (got '{gpus}')", 2
+        )
+    if tp % dcp:
+        raise LaunchError(f"DCP{dcp} must divide TP{tp}", 2)
+    # The DCP interleave must divide the block (vllm validate_block_size).
+    if block is None or int(block) < interleave or int(block) % interleave:
+        raise LaunchError(
+            f"BLOCK_SIZE must be a multiple of the DCP interleave {interleave} "
+            f"(got {block})",
+            2,
+        )
+    parts = partition.split(",") if partition else []
+    if partition and not (len(parts) == pp and all(_small_whole(x) for x in parts)
+                          and sum(map(int, parts)) == HY4_LAYERS):
+        raise LaunchError(
+            f"PP_PARTITION must be empty or {pp} positive layer counts that sum to "
+            f"{HY4_LAYERS}, e.g. 21,21 (got '{partition}')",
+            2,
+        )
+    if eager not in ("0", "1"):
+        raise LaunchError(f"EAGER must be 1 or 0 (got '{eager}')", 2)
+    if int(chunk) < int(seqs):
+        raise LaunchError(f"CHUNK={chunk} must be at least SEQS={seqs}", 2)
+    # Named layers on one stage, MoE layers only
+    _hy4_cold_experts(environ_in, env, parts, pp, tp, bool(lay.get("ep")), chunk, ckpt, repo, notes)
+    # Forced sparse MQA under DCP gathers each sparse layer's chunk queries (transient,
+    # one layer at a time): the row's CHUNK keeps it inside the stage-1 margin; the
+    # ceiling is the 302 MB-at-8K figure the fit names.
+    gather = hy4_query_gather_bytes(
+        int(chunk), L["sparse_attention_heads"], tp, dcp, L["mla_query_bytes_per_head"]
+    )
+    if gather > L["max_query_gather_bytes"]:
+        raise LaunchError(
+            f"CHUNK={chunk} gathers {gather / 1e6:.0f} MB of queries per sparse layer "
+            f"under DCP{dcp}; the lane's ceiling is "
+            f"{L['max_query_gather_bytes'] / 1e6:.0f} MB (lower CHUNK)",
+            2,
+        )
+    if int(chunk) != int(srv["max_num_batched_tokens"]):
+        notes.append(
+            f"note: CHUNK={chunk} is off the row ({srv['max_num_batched_tokens']}): "
+            f"the DCP query gather is {gather / 1e6:.0f} MB per sparse layer at this "
+            "chunk, outside the fit estimate"
+        )
+    env["CUDA_VISIBLE_DEVICES"] = gpus
+    env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+    p2p_mode = _knob(env, "P2P", "on", True)
+    if p2p_mode != "on":
+        raise LaunchError(
+            f"P2P={p2p_mode}: the hy4flash rows are P2P-on only (no no-P2P twin yet)",
+            2,
+        )
+    # The mode decides the set
+    comm_inherited = _clear_comm_env(env)
+    env["VLLM_SKIP_P2P_CHECK"], env["NCCL_P2P_LEVEL"], env["NCCL_PROTO"] = (
+        "1",
+        "SYS",
+        "Simple",
+    )
+    env["VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC"] = "1"
+    comm_note = _comm_note(comm_inherited, env, p2p_mode)
+    if comm_note:
+        notes.append(comm_note)
+    # Model Runner V2: its DeepSeek-V4.1 model state supplies the Engram lookback ids
+    # the Flash hash needs on every stage that owns an Engram layer.
+    env["VLLM_USE_V2_MODEL_RUNNER"] = "1"
+    env["VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS"] = "0"
+    # The IndexPool scoring logits of one prefill step
+    # are rows x (local groups) FP32: 64 MiB at 130K, 128 MiB at 262K at chunk 1024,
+    # under the engine's 512 MiB default cap. 64 MiB scores a longer context in more
+    # row slices instead (same per-token selection: slice bounds are equal on every
+    # DCP rank), so the prefill transient stops growing with context. A non-blank
+    # export wins.
+    mine = (environ_in.get(HY4_LOGITS_CAP_ENV) or "").strip()
+    if mine and mine != HY4_LOGITS_CAP_MB:
+        notes.append(f"note: {HY4_LOGITS_CAP_ENV}={mine} from your environment replaces the hy4flash "
+                     f"default {HY4_LOGITS_CAP_MB}")
+    env[HY4_LOGITS_CAP_ENV] = mine or HY4_LOGITS_CAP_MB
+    # Opt-in: only an exported value is passed on
+    # (checked here so a typo fails before the boot); unset = the stock path
+    moe_chunk = (env.get("MERLIN_MOE_CHUNK_TOKENS") or "").strip()
+    if moe_chunk or "MERLIN_MOE_CHUNK_TOKENS" in env:
+        moe_chunk = moe_chunk or str(HY4_MOE_CHUNK_TOKENS)
+        if not (moe_chunk.isascii() and moe_chunk.isdigit()) or len(moe_chunk) > 6:
+            raise LaunchError(
+                "MERLIN_MOE_CHUNK_TOKENS must be a whole number of tokens (0 = one MoE "
+                f"call per step), got {moe_chunk[:40]!r}",
+                2,
+            )
+        env["MERLIN_MOE_CHUNK_TOKENS"] = moe_chunk
+    env["VLLM_CACHE_ROOT"] = cache_root
+    env["TRITON_CACHE_DIR"] = f"{cache_root}/triton"
+    master, dist = distributed_ports(port)
+    env["MASTER_PORT"], env["VLLM_PORT"] = str(master), str(dist)
+    env["VLLM_NO_USAGE_STATS"] = _knob(env, "VLLM_NO_USAGE_STATS", "1", True)
+    env["DO_NOT_TRACK"] = _knob(env, "DO_NOT_TRACK", "1", True)
+    env["HF_HUB_OFFLINE"] = _knob(env, "HF_HUB_OFFLINE", "1", True)
+    if partition:
+        env["VLLM_PP_LAYER_PARTITION"] = partition
+    else:
+        # PP_PARTITION="" = the engine's even split, never an inherited value
+        env.pop("VLLM_PP_LAYER_PARTITION", None)
+    tree = env.get("TREE") or None
+    if tree:
+        env["PYTHONPATH"] = tree + (
+            ":" + env["PYTHONPATH"] if env.get("PYTHONPATH") else ""
+        )
+    reasoning_args, tool_args = _parsers(env, "hy_v4", "hy_v4", notes)
+    args = [
+        "--served-model-name", served,
+        "--hf-overrides", HY4_ARCH_OVERRIDE,
+        "--tensor-parallel-size", str(tp), "--pipeline-parallel-size", str(pp),
+        "--decode-context-parallel-size", str(dcp),
+        "--cp-kv-cache-interleave-size", str(interleave),
+        "--disable-custom-all-reduce",
+        "--max-model-len", maxlen, "--max-num-seqs", seqs,
+        "--max-num-batched-tokens", chunk,
+        "--gpu-memory-utilization", "0.96", "--kv-cache-memory-bytes", kv_bytes,
+        "--kv-cache-dtype", srv["kv_cache_dtype"], "--block-size", block,
+        # Engram tables in pinned host RAM; the token embedding follows the runner's
+        # host-embed default for HYV4FlashForCausalLM (on unless
+        # VLLM_HOST_EMBED_TABLE=0: vllm/merlin/envs.py host_embed_archs).
+        "--engram-config", HY4_ENGRAM_CONFIG,
+        "--enable-prompt-tokens-details",
+        *tool_args, *reasoning_args,
+        *_generation_override(env, "", notes),
+        "--default-chat-template-kwargs",
+        json.dumps(
+            {"reasoning_effort": HY4_REASONING_EFFORT}, separators=(",", ":")
+        ),
+        "--shutdown-timeout", "60",
+    ]
+    if lay.get("ep"):
+        args.append("--enable-expert-parallel")
+    # Extra speculative settings merge into it
+    # (_merge_speculative_config)
+    if dfly:
+        args += [
+            "--speculative-config",
+            json.dumps(
+                {"method": "dfly", "num_speculative_tokens": dfly_k},
+                separators=(",", ":"),
+            ),
+        ]
+    if eager == "1":
+        args.append("--enforce-eager")
+        notes.append(
+            "note: EAGER=1: CUDA graphs off (the DCP collectives under graph capture "
+            "are untested on this lane)"
+        )
+    else:
+        args += [
+            "--compilation-config",
+            '{"cudagraph_capture_sizes":[' + ",".join(map(str, capture)) + "]}",
+        ]
+    args += ["--host", host, "--port", port]
+
+    notes.append(
+        f"note: {p['id']} is "
+        + ("testing (KV pool measured); " if p.get("status") == "testing"
+           else "untested on hardware (KV pool is an estimate); ")
+        + (f"DFly2 on, K={dfly_k}" if dfly else "DFly2 off")
+    )
+    plan = Plan(
+        "hy4flash",
+        checkpoint,
+        p,
+        ckpt,
+        env,
+        args,
+        extra,
+        repo,
+        venv,
+        tree,
+        cache_root,
+        R.label_text(reg, p),
+        p2p_mode,
+        notes=notes,
+        engram=engram,
+    )
+    plan.caller_env = environ_in
+    return plan
+
 # --------------------------------------------------------------------------------------------
 # Host phase: checks, toolchain, topology, then exec
 # --------------------------------------------------------------------------------------------
@@ -2327,26 +3055,281 @@ def _verify_products(tree: str) -> None:
     sums = f"{tree}/.build-products.sha256"
     if not os.path.isfile(f"{tree}/.build-products") or not (os.path.isfile(sums) and os.path.getsize(sums) > 0):
         raise LaunchError(f"TREE={tree} has no verified build products (release/install-env.sh)", 1)
-    ok = True
-    with open(f"{tree}/.build-products.sha256", encoding="utf-8") as f:
-        lines = [ln.rstrip("\n") for ln in f if ln.strip()]
-    for ln in lines:  # sha256sum -c --strict: every line must parse and match
-        m = re.fullmatch(r"([0-9a-fA-F]{64}) [ *](.+)", ln)
-        if not m:
-            ok = False
-            break
-        path = os.path.join(tree, m.group(2))
-        try:
-            with open(path, "rb") as fh:
-                digest = hashlib.sha256(fh.read()).hexdigest()
-        except OSError:
-            ok = False
-            break
-        if digest.lower() != m.group(1).lower():
-            ok = False
-            break
-    if not ok:
-        raise LaunchError(f"TREE={tree}: build products changed since release/install-env.sh verified them", 1)
+    try:
+        NB.verify_hashes(Path(tree), Path(sums))
+    except (OSError, ValueError) as error:
+        raise LaunchError(f"TREE={tree}: build products changed since release/install-env.sh verified them", 1) from error
+
+
+def _installed_engine(tree: str, venv: str, env: dict[str, str] | None = None) -> dict:
+    """Use the serving interpreter and environment, without the -c current-directory import entry. The server starts
+    as the VENV/bin/vllm script, so its directory comes first on the import path unless PYTHONSAFEPATH is set: the
+    query puts it there too (nothing is imported from it)."""
+    code = (
+        "import csv,json,os,runpy,sys\n"
+        "from pathlib import Path\n"
+        "ns=runpy.run_path(sys.argv[1])\n"
+        "if os.path.isfile(sys.argv[4]) and not os.environ.get('PYTHONSAFEPATH'):\n"
+        "    sys.path.insert(0,os.path.dirname(os.path.realpath(sys.argv[4])))\n"
+        "try:\n"
+        "    result=ns['installed_engine'](Path(sys.argv[2]),Path(sys.argv[3]))\n"
+        "except ns['BuildError'] as error:\n"
+        "    result={'error':str(error),'remedy':error.remedy}\n"
+        "except (OSError,ValueError,TypeError,AttributeError,csv.Error) as error:\n"
+        "    result={'kind':'unknown','gap':'installed metadata is unreadable: '+str(error)}\n"
+        "print(json.dumps(result))\n"
+    )
+    try:
+        cp = subprocess.run(
+            [f"{venv}/bin/python", "-P", "-c", code, str(Path(NB.__file__).resolve()), tree, venv, f"{venv}/bin/vllm"],
+            env=env, capture_output=True, text=True, timeout=30,
+        )
+        result = json.loads(cp.stdout) if cp.returncode == 0 else None
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        result = None
+    if not isinstance(result, dict):
+        return {"kind": "unknown", "gap": "installed engine metadata could not be read"}
+    if "error" in result:
+        remedy = result.get("remedy")
+        raise NB.BuildError(str(result["error"]), remedy if isinstance(remedy, str) and remedy else "run ./setup.sh")
+    return result
+
+
+_FLASHINFER_STATE_GAPS = {
+    "pristine": "the FlashInfer patch (VENV has the unpatched FlashInfer release files)",
+    None: "the FlashInfer patch (VENV's FlashInfer files match no authenticated patch state)",
+}
+
+
+def _verify_native(tree: str, venv: str, env: dict[str, str] | None = None) -> dict:
+    """Check installed provenance for every family; Python-only updates still pass.
+
+    Returns what the serving interpreter will import (empty under MERLIN_SKIP_NATIVE_CHECK=1)."""
+    if os.environ.get("MERLIN_SKIP_NATIVE_CHECK") == "1":
+        _say("merlin: warning: MERLIN_SKIP_NATIVE_CHECK=1 skips native source and FlashInfer checks; "
+             "native modules were not checked against a build record; "
+             "stale native code may fail or serve incorrectly; run ./setup.sh to record build provenance")
+        return {}
+    try:
+        imported = _installed_engine(tree, venv, env)
+        wheel = imported.get("kind") == "wheel"
+        gaps = NB.verify_native(Path(tree), imported.get("native") if wheel else None, imported.get("kind"))
+        if imported.get("kind") == "source":
+            _check_source_modules(tree, imported, gaps)
+        if imported.get("kind") not in ("source", "wheel"):
+            gap = f"imported engine metadata unavailable ({imported.get('gap', 'unknown metadata')})"
+            if not any("native modules were not checked against a build record" in item for item in gaps):
+                gap = "native modules were not checked against a build record for the imported engine; " + gap
+            gaps.append(gap)
+        sums = Path(tree) / ".build-flashinfer.sha256"
+        if not sums.is_file():
+            if (Path(tree) / ".build-native").is_file():
+                raise NB.BuildError("installed FlashInfer patch record is missing")
+            if not wheel:
+                gaps.append("FlashInfer patch identity (no FlashInfer patch record)")
+            elif imported.get("flashinfer_unverified"):
+                gaps.append(_unverified_flashinfer(imported["flashinfer_unverified"]))
+            elif not imported.get("flashinfer"):
+                gaps.append("the FlashInfer patch (FlashInfer is not importable from VENV)")
+            else:
+                # A pip-only venv has no patch record: compare its FlashInfer files with the authenticated table.
+                state = NB.flashinfer_state(Path(imported["flashinfer"]))
+                if state not in ("v1", "v2"):
+                    gaps.append(_FLASHINFER_STATE_GAPS.get(state, _FLASHINFER_STATE_GAPS[None]))
+        else:
+            cp = _venv_python(venv, 'import sysconfig; print(sysconfig.get_paths()["purelib"])')
+            if cp.returncode or not cp.stdout.strip():
+                raise NB.BuildError(f"cannot read VENV={venv} purelib: {cp.stderr.strip()}")
+            purelib = Path(cp.stdout.strip())
+            NB.verify_flashinfer(purelib, sums)
+            gap = _served_flashinfer_gap(imported, purelib, sums)
+            if gap:
+                gaps.append(gap)
+        serving_env = os.environ if env is None else env
+        external = _external_rust_frontend(serving_env)
+        if external is not None:
+            gap = _external_rust_frontend_gap(external, serving_env, venv, _trusted_frontend_hashes(tree, imported))
+            if gap:
+                gaps.append(gap)
+        if gaps:
+            _say("merlin: warning: could not verify: " + "; ".join(gaps)
+                 + "; run ./setup.sh to record build provenance")
+        return imported
+    except (OSError, ValueError) as error:
+        remedy = getattr(error, "remedy", "run ./setup.sh")
+        raise LaunchError(
+            f"TREE={tree}: {error}; {remedy}. "
+            "For an intentionally unverified install (native edits, build leftovers, copied trees or Git access "
+            "restrictions), MERLIN_SKIP_NATIVE_CHECK=1 skips native source and FlashInfer checks "
+            "(stale native code may fail or serve incorrectly).", 1) from error
+
+
+def _unverified_flashinfer(reason: str) -> str:
+    return f"which FlashInfer the engine will import ({reason})"
+
+
+def _served_flashinfer_gap(imported: dict, purelib: Path, sums: Path) -> str | None:
+    """The patch record describes VENV's FlashInfer. When the serving interpreter imports another copy (for example
+    one earlier on PYTHONPATH or beside bin/vllm), check the recorded targets at that copy; name it if they do not
+    match, and name what it would import when that is not one package directory (a module, an archive)."""
+    if imported.get("flashinfer_unverified"):
+        return _unverified_flashinfer(imported["flashinfer_unverified"])
+    served = imported.get("flashinfer")
+    if not served:
+        return None  # nothing found by the serving query (or no query result): VENV's copy was verified above
+    package = Path(served)
+    if package.resolve() == (purelib / "flashinfer").resolve():
+        return None
+    try:
+        if package.name != "flashinfer":
+            raise NB.BuildError(f"{package} is not a flashinfer package directory")
+        NB.verify_flashinfer(package.parent, sums)
+    except (OSError, ValueError):
+        return (f"the FlashInfer patch (the serving interpreter imports FlashInfer from {package}, not VENV's "
+                "recorded copy, and its files do not match .build-flashinfer.sha256)")
+    return None
+
+
+def _external_rust_frontend(env) -> str | None:
+    """The Rust frontend executable the serving environment selects instead of the packaged one, or None. Mirrors
+    the engine's resolution (VLLM_USE_RUST_FRONTEND, VLLM_RUST_FRONTEND_PATH) without importing it."""
+    try:
+        enabled = bool(int(env.get("VLLM_USE_RUST_FRONTEND", "0")))
+    except ValueError:
+        return None  # the engine rejects the value itself
+    raw = env.get("VLLM_RUST_FRONTEND_PATH", "auto")
+    if not enabled or not raw or raw.lower() in ("auto", "1", "true"):
+        return None  # off, or the packaged frontend (checked with the engine's native products)
+    return raw
+
+
+def _trusted_frontend_hashes(tree: str, imported: dict) -> set[str]:
+    """sha256 values of Rust frontends already verified: the installed wheel's RECORD entry, and the product record's
+    entry (the host phase verifies every product hash before this check)."""
+    trusted = set()
+    if imported.get("kind") == "wheel" and isinstance(imported.get("frontend_sha256"), str):
+        trusted.add(imported["frontend_sha256"].lower())
+    sums = Path(tree) / ".build-products.sha256"
+    if sums.is_file():
+        frontend = NB._wheel_helper()["FRONTEND"]
+        for line in sums.read_text(encoding="utf-8").splitlines():
+            fields = line.split(None, 1)
+            if len(fields) == 2 and fields[1].lstrip("*").strip() == frontend:
+                trusted.add(fields[0].lower())
+    return trusted
+
+
+def _serving_path(cuda_home: str, venv: str, path: str) -> str:
+    """The PATH the engine is started with: the CUDA tools, then the venv's bin, then the caller's PATH."""
+    return f"{cuda_home}/bin:{venv}/bin:" + path
+
+
+def _final_path(env, venv: str) -> str:
+    """The PATH _toolchain will give the engine (it runs later in the host phase), from the environment as it is now."""
+    cuda_home = env.get("CUDA_HOME")
+    if not cuda_home:
+        cp = _venv_python(venv, 'import sysconfig; print(sysconfig.get_paths()["purelib"])')
+        lines = cp.stdout.strip().splitlines() if cp.returncode == 0 else []
+        if not lines:
+            return f"{venv}/bin:" + env.get("PATH", "")  # _toolchain refuses the start without a purelib
+        cuda_home = lines[-1] + "/nvidia/cu13"
+    return _serving_path(cuda_home, venv, env.get("PATH", ""))
+
+
+def _external_rust_frontend_gap(raw: str, env, venv: str, trusted: set[str]) -> str | None:
+    """Check the selected external frontend against verified hashes; name it in the warning if none matches."""
+    if os.sep in raw or (os.altsep and os.altsep in raw):
+        candidates = [Path(raw)]
+    else:  # the engine starts it as a command: a bare name is looked up on the PATH the engine will have
+        candidates = [Path(d or ".") / raw for d in _final_path(env, venv).split(":")]
+    found = next((p for p in candidates if p.is_file() and os.access(p, os.X_OK)), None)
+    label = f"the Rust frontend {raw} selected by VLLM_RUST_FRONTEND_PATH"
+    if found is None:
+        return f"{label} (no executable file found there)"
+    try:
+        digest = hashlib.sha256(found.read_bytes()).hexdigest()
+    except OSError as error:
+        return f"{label} ({found} is unreadable: {error})"
+    if digest in trusted:
+        return None
+    return (f"{label} ({found.resolve()}: not the packaged {NB._wheel_helper()['FRONTEND']}, and no verified product "
+            "hash records it)")
+
+
+_BUILD_RECORDS = (".build-products.sha256", ".build-products", ".build-native", ".build-source")
+
+
+def _check_source_modules(tree: str, imported: dict, gaps: list[str]) -> None:
+    """For an engine imported from TREE: each required extension the serving interpreter resolves must be a file the
+    product record hashes, and the Rust frontend must be hashed too, or named as unverified."""
+    modules = imported.get("modules")
+    sums = Path(tree) / ".build-products.sha256"
+    recorded: set[str] = set()
+    if sums.is_file():
+        for line in sums.read_text(encoding="utf-8").splitlines():
+            fields = line.split(None, 1)
+            if len(fields) == 2:
+                recorded.add(fields[1].lstrip("*").strip())
+        for module, path in (modules or {}).items():
+            if path is not None and path not in recorded:
+                stem = module.rsplit(".", 1)[-1]
+                hashed = sorted(p for p in recorded if p.rsplit("/", 1)[-1].split(".", 1)[0] == stem)
+                raise NB.BuildError(
+                    f"{module}: the serving interpreter would import {path}, which .build-products.sha256 does not "
+                    f"hash (it hashes {', '.join(hashed) or 'no file for this module'})")
+    frontend = NB._wheel_helper()["FRONTEND"]
+    if (Path(tree) / frontend).is_file() and frontend not in recorded:
+        gaps.append(f"the Rust frontend {frontend} (no product hash records it)")
+
+
+def _flash_next_engine_source(plan: Plan) -> None:
+    """Flash-Next puts its checkout first on PYTHONPATH unless TREE is given. A record-less checkout in which none of
+    the compiled engine modules resolves is only the launcher: serve the engine installed in VENV instead (as every
+    other family does), so the same checkout and venv give the same result. With no engine in VENV either, the
+    checkout stays and _refuse_unbuilt_tree names the cause."""
+    if plan.family != "flash-next" or plan.caller_env.get("TREE") or plan.env.get("PYTHONPATH") is None:
+        return
+    tree = plan.tree or plan.repo.as_posix()
+    if any((Path(tree) / name).exists() for name in _BUILD_RECORDS):
+        return
+    try:
+        probe = _installed_engine(tree, plan.venv, plan.env)
+    except (OSError, ValueError):
+        return  # _verify_native reports it
+    modules = probe.get("modules")
+    if probe.get("kind") != "source" or not modules or any(path is not None for path in modules.values()):
+        return
+    installed = {k: v for k, v in plan.env.items() if k != "PYTHONPATH"}
+    try:
+        found = _installed_engine(tree, plan.venv, installed)
+    except (OSError, ValueError):
+        found = {"kind": "wheel"}  # an installed engine whose metadata refuses: _verify_native reports it
+    if found.get("kind") == "source" or found.get("gap") in (
+        "no installed engine import location", "installed engine metadata could not be read",
+    ):
+        return
+    plan.env.pop("PYTHONPATH")
+    plan.tree = None
+
+
+def _refuse_unbuilt_tree(tree: str, repo: Path, imported: dict) -> None:
+    """Flash-Next imports the engine from TREE. A record-less TREE in which none of the required compiled extensions
+    resolves (in the serving interpreter, any extension suffix) was never built, and vLLM would otherwise fail later
+    without naming the cause."""
+    modules = imported.get("modules")
+    if imported.get("kind") != "source" or not modules:
+        return
+    if any((Path(tree) / name).exists() for name in _BUILD_RECORDS):
+        return  # recorded installs are judged by their records
+    if any(path is not None for path in modules.values()):
+        return
+    msg = (f"TREE={tree} is not a built tree: none of the compiled engine modules ({', '.join(modules)}) can be "
+           "imported from it, and it has no build records; run ./setup.sh (release/install-env.sh builds them or "
+           "installs the release wheel)")
+    if os.path.exists(f"{repo.as_posix()}/vllm-v2.5"):
+        msg += (f"\n       ({repo.as_posix()}/vllm-v2.5 is an older build of the v2.5.1 source and is not used; "
+                "see release/install-env.sh)")
+    raise LaunchError(msg, 1)
 
 
 def _check_shadow(tree: str) -> None:
@@ -2400,7 +3383,7 @@ def _toolchain(plan: Plan, full: bool) -> None:
     else:
         check_inherited_cuda_home(env["CUDA_HOME"])
     cuda_home = env["CUDA_HOME"]
-    env["PATH"] = f"{cuda_home}/bin:{venv}/bin:" + env.get("PATH", "")
+    env["PATH"] = _serving_path(cuda_home, venv, env.get("PATH", ""))
     if not full:
         return
     import shutil
@@ -2898,6 +3881,7 @@ def host_phase(plan: Plan) -> None:
     """Every check that touches the host; raises LaunchError instead of starting."""
     for n in plan.notes:
         print(n, file=sys.stderr)
+    _flash_next_engine_source(plan)
     banner(plan)
     warn_retired(plan.caller_env)
     wsl_pin_memory(plan.env, plan.family)
@@ -2905,16 +3889,16 @@ def host_phase(plan: Plan) -> None:
     check_cache_links(env["VLLM_CACHE_ROOT"])
     fam = plan.family
     ple = None
-    if fam == "flash-next":
-        tree = plan.tree or plan.repo.as_posix()
-        if not os.path.isfile(f"{tree}/vllm/__init__.py"):
-            msg = f"TREE={tree} is not a built tree (release/install-env.sh)"
-            if os.path.exists(f"{plan.repo.as_posix()}/vllm-v2.5"):
-                msg += f"\n       ({plan.repo.as_posix()}/vllm-v2.5 is an older build of the v2.5.1 source and is not used; see release/install-env.sh)"
-            raise LaunchError(msg, 1)
+    tree = plan.tree or plan.repo.as_posix()
+    # Every family uses the same migration path. Existing/modern product records
+    # still fail closed; a completely record-less install reaches the warning.
+    if (Path(tree) / ".build-products.sha256").exists() or (Path(tree) / ".build-native").exists():
         _verify_products(tree)
-        if not os.access(f"{venv}/bin/python", os.X_OK):
-            raise LaunchError(f"VENV={venv} has no bin/python (release/install-env.sh creates it)", 1)
+    if not os.access(f"{venv}/bin/python", os.X_OK):
+        raise LaunchError(f"VENV={venv} has no bin/python (release/install-env.sh creates it)", 1)
+    imported = _verify_native(tree, venv, env)
+    if fam == "flash-next":
+        _refuse_unbuilt_tree(tree, plan.repo, imported)
         marker = plan.profile.get("checkpoint") and R.load_registry("flash-next")["checkpoints"][plan.profile["checkpoint"]].get("checkpoint_marker")
         if marker and not os.path.isfile(os.path.join(plan.ckpt, marker)):
             raise LaunchError(f"wrong checkpoint: missing {marker} in {plan.ckpt}", 1)
@@ -2925,8 +3909,6 @@ def host_phase(plan: Plan) -> None:
         _toolchain(plan, full=True)
         _topology(plan)
     else:
-        if not os.access(f"{venv}/bin/python", os.X_OK):
-            raise LaunchError(f"VENV={venv} has no bin/python (release/install-env.sh creates it)", 1)
         if fam == "svl":
             check_remote_code(plan.ckpt, plan.repo / CHECKPOINTS["nemotron-super-vl"][1] / "remote-code.sha256")
         _toolchain(plan, full=False)
@@ -2941,7 +3923,10 @@ def host_phase(plan: Plan) -> None:
                                         0.0 if env.get("VLLM_E2_PLE_STORE") == "disk" else ple_table_gib(ple))
         if refusal and os.environ.get("MERLIN_SKIP_RAM_CHECK") != "1":  # =1 keeps the warning only
             raise LaunchError(refusal, 1)
-    if fam in ("svl", "ornith"):
+    if fam == "hy4flash":  # sized for the variant served
+        for w in _hy4_memory_warnings(plan.engram or HY4_ENGRAM_DEFAULT):
+            print(w, file=sys.stderr)
+    if fam in ("svl", "ornith", "hy4flash"):
         os.makedirs(env["VLLM_CACHE_ROOT"], exist_ok=True)
         os.makedirs(env["TRITON_CACHE_DIR"], exist_ok=True)
 
@@ -3012,11 +3997,43 @@ def print_hook(plan: Plan) -> None:
         _say(a)
 
 
+_LOOPBACK_IPS = (ipaddress.ip_address("127.0.0.1"), ipaddress.ip_address("::1"))
+
+
+def _bind_ip(host: Any) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
+    """``host`` as an IP address, or None for a name (``localhost``), an empty or a malformed value. An IPv6 literal
+    may carry a URL's brackets (``[::1]``); a bracketed IPv4 address is malformed."""
+    if not isinstance(host, str):
+        return None
+    if host.startswith("[") and host.endswith("]") and ":" in host:
+        host = host[1:-1]
+    try:
+        return ipaddress.ip_address(host)
+    except ValueError:
+        return None
+
+
+def is_loopback(host: Any) -> bool:
+    """Whether a bind on ``host`` may serve without an API key: only the literal loopback addresses 127.0.0.1 and ::1
+    (any spelling of ::1, such as ``0:0:0:0:0:0:0:1`` or ``[::1]``). The one rule setup and the launcher share. Not
+    ``localhost`` (a name: the resolver decides what it binds; setup saves it as 127.0.0.1), not the rest of 127/8,
+    not ``::ffff:127.0.0.1`` (an IPv4-mapped bind depends on the socket's dual-stack setting), not a scoped ``::1%if``:
+    each of those needs a key like any other address."""
+    return _bind_ip(host) in _LOOPBACK_IPS
+
+
+def is_wildcard(host: Any) -> bool:
+    """Whether a bind on ``host`` listens on every address of this machine: ``0.0.0.0`` (IPv4) or ``::`` (IPv6), in
+    any spelling."""
+    ip = _bind_ip(host)
+    return ip is not None and ip.is_unspecified
+
+
 def unauthenticated_exposure(host: str, env: dict[str, str], args: list[str], extra: list[str]) -> str:
     """A warning when the API listens beyond loopback with no key; empty otherwise. Inside a container the
     in-container bind (HOST=0.0.0.0) is expected and the published port decides the exposure, which the launcher
     cannot see, so the container wording names the port mapping instead of HOST."""
-    if host in ("127.0.0.1", "::1", "localhost"):
+    if is_loopback(host):
         return ""
     if env.get("VLLM_API_KEY") or "--api-key" in args or any(a.startswith("--api-key") for a in extra):
         return ""
@@ -3045,7 +4062,12 @@ def _no_ready_probe(seq: list[str]) -> str | None:
         return "the server listens on a unix socket"
     if _flag_values(seq).get("--headless", "off") != "off":
         return "--headless runs no API server"
-    if _ready_scheme(seq) == "https" and _last_flag(seq, "--ssl-cert-reqs") == "2":
+    reqs = _last_flag(seq, "--ssl-cert-reqs")
+    try:
+        required = reqs is not None and int(reqs) == 2
+    except ValueError:
+        required = False
+    if _ready_scheme(seq) == "https" and required:
         return "the server requires client certificates"
     return None
 
@@ -3054,7 +4076,7 @@ def ready_banner(plan: Plan, host: str, port: int) -> list[str]:
     """The Ready lines: the URL, model, context and key as vllm actually serves them (the profile's flags with the
     caller's overrides), never stored in a profile. The key itself is never printed."""
     seq = [*plan.args, *plan.extra]
-    shown = host if host not in ("0.0.0.0", "::", "") else "<this-host>"
+    shown = host if not (is_wildcard(host) or host == "") else "<this-host>"
     shown = f"[{shown}]" if ":" in shown and not shown.startswith("[") else shown  # an IPv6 literal, as a URL needs it
     served = _last_flag(seq, "--served-model-name") or plan.ckpt
     ctx = _last_flag(seq, "--max-model-len") or "the model's default"
@@ -3153,6 +4175,80 @@ def hold_as_pid1_orphan(server_pid: int, *, alive=_pid_alive, sleep=None) -> boo
     return True
 
 
+SERVE_LOCK = "serve.lock"  # .merlin/serve.lock: shared by every server of a checkout, exclusive while setup installs
+SERVE_LOCK_FD_ENV = "MERLIN_SERVE_LOCK_FD"  # an --instances child: the descriptor number its parent passed (pass_fds)
+_SERVE_LOCK_FD: int | None = None  # this process's shared hold (inheritable: it survives the exec into vllm)
+
+
+def _adopt_inherited_serve_lock(path: Path) -> int | None:
+    """The descriptor an ``--instances`` parent handed this process, when it is still open on ``path`` (same device
+    and inode); None otherwise. The variable is removed either way, so nothing started from here inherits the claim.
+    An unknown descriptor is left alone: it is not ours to close."""
+    raw = os.environ.pop(SERVE_LOCK_FD_ENV, None)
+    if raw is None:
+        return None
+    try:
+        fd = int(raw)
+        held, there = os.fstat(fd), os.stat(path)
+    except (ValueError, OSError):
+        return None
+    if fd < 0 or (held.st_dev, held.st_ino) != (there.st_dev, there.st_ino):
+        return None
+    return fd
+
+
+def hold_serve_lock(repo: str | Path) -> int | None:
+    """Take a shared ``flock`` on ``<repo>/.merlin/serve.lock`` for this server's life, so ``./setup.sh`` refuses to
+    move or delete the venv under it. The descriptor is inheritable: the exec into vllm keeps it, and the kernel
+    drops the lock when the server exits however it exits. vllm's own engine and worker processes need no lock of
+    their own: they live and die with the API server, which holds this one. An ``--instances`` child adopts the
+    descriptor its parent passed (``MERLIN_SERVE_LOCK_FD``) instead of opening a second one, so the ready watcher's
+    close drops every copy it inherited. An install holding it exclusively stops the start (LaunchError). A filesystem
+    or platform without ``flock`` never blocks serving: no lock, one note; a checkout this user cannot write (a
+    read-only image) gets no lock and no note, since ``./setup.sh`` cannot install there either.
+    Returns the descriptor, or None when no lock is held."""
+    global _SERVE_LOCK_FD
+    if _SERVE_LOCK_FD is not None:
+        return _SERVE_LOCK_FD
+    try:
+        import fcntl
+    except ImportError:  # not Linux: only the CPU tests get here
+        return None
+    import errno
+
+    path = Path(repo) / ".merlin" / SERVE_LOCK
+    fd = _adopt_inherited_serve_lock(path)
+    if fd is None:
+        try:
+            path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+        except OSError as e:
+            if e.errno not in (errno.EROFS, errno.EACCES, errno.EPERM):
+                _say(f"merlin: note: no serve lock ({path}: {e}); ./setup.sh cannot tell this server is running")
+            return None
+    try:
+        fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(fd)
+        raise LaunchError(f"./setup.sh is installing the engine in this checkout ({path} is held); wait for it to "
+                          "finish, then start the server again", 1) from None
+    except OSError as e:  # ENOLCK and friends (some NFS / overlay mounts)
+        os.close(fd)
+        _say(f"merlin: note: no serve lock ({path}: {e}); ./setup.sh cannot tell this server is running")
+        return None
+    os.set_inheritable(fd, True)
+    _SERVE_LOCK_FD = fd
+    return fd
+
+
+def release_serve_lock() -> None:
+    """Drop this process's hold (a start that fails before the exec)."""
+    global _SERVE_LOCK_FD
+    if _SERVE_LOCK_FD is not None:
+        fd, _SERVE_LOCK_FD = _SERVE_LOCK_FD, None
+        os.close(fd)
+
+
 def start_ready_watcher(plan: Plan, host: str, port: int) -> int | None:
     """Fork the side watcher just before vllm replaces this process: vllm keeps
     this PID and its signals; the watcher only prints. MERLIN_READY_BANNER=0 turns it off. In the parent, returns the
@@ -3182,6 +4278,8 @@ def start_ready_watcher(plan: Plan, host: str, port: int) -> int | None:
         _say(f"merlin: warning: no Ready line ({e}); the server starts anyway")
         return None
     try:  # pragma: no cover - the forked children
+        if _SERVE_LOCK_FD is not None:  # the watcher must not keep the serve lock after the server is gone
+            os.close(_SERVE_LOCK_FD)
         if os.fork():
             os._exit(0)
         import signal
@@ -3194,15 +4292,27 @@ def start_ready_watcher(plan: Plan, host: str, port: int) -> int | None:
 
 
 def run(plan: Plan) -> int:
-    host_phase(plan)
     if os.environ.get("SERVE_PRINT_ENV_AND_EXIT", "0") == "1":
+        host_phase(plan)
         print_hook(plan)
         return 0
+    # Before host_phase: an install that starts while the host checks run must find this server already holding it.
+    hold_serve_lock(plan.repo)
+    plan.env.pop(SERVE_LOCK_FD_ENV, None)  # vllm and what it starts never claim the parent's descriptor
+    try:
+        return _run_locked(plan)
+    except BaseException:
+        release_serve_lock()
+        raise
+
+
+def _run_locked(plan: Plan) -> int:
+    host_phase(plan)
     host, port = effective_host_port(plan.args, plan.extra)
     unauth = unauthenticated_exposure(host, plan.env, plan.args, plan.extra)
     if unauth:
         _say(unauth)
-    if host not in ("127.0.0.1", "::1", "localhost"):
+    if not is_loopback(host):
         _say(f"merlin: warning: HOST={host}: VLLM_API_KEY/--api-key does not guard /invocations "
              "(SageMaker generation) or ops routes (/metrics, /version, /health, /ping). "
              "Keep HOST=127.0.0.1 behind an authenticating reverse proxy or restrict network access; "
@@ -3443,7 +4553,12 @@ def select_p2p_twin(profile_id: str, environ: dict[str, str],
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="launch.py", description=__doc__.split("\n\n")[0])
-    ap.add_argument("--model", choices=("flash-next", "27b", "svl", "ornith"), help="registry (default: the profile's)")
+
+    ap.add_argument(
+        "--model",
+        choices=("flash-next", "27b", "svl", "ornith", "hy4flash"),
+        help="registry (default: the profile's)",
+    )
     ap.add_argument("--profile", required=True, help="profile id (tools/merlin/profiles/*.json)")
     ap.add_argument("--kv", choices=("fp8", "bf16"), help="KV variant of the profile")
     ap.add_argument("--checkpoint", choices=list(CHECKPOINTS), help="checkpoint name (default: the profile's)")
@@ -3456,7 +4571,10 @@ def main(argv: list[str] | None = None) -> int:
     a = ap.parse_args(argv)
     rest = a.rest[1:] if a.rest[:1] == ["--"] else a.rest
     model = a.model or ("27b" if a.profile.startswith("27b-") else "svl" if a.profile.startswith("svl-")
-                        else "ornith" if a.profile.startswith("ornith-") else "flash-next")
+                        else "ornith" if a.profile.startswith("ornith-")
+
+                        else "hy4flash" if a.profile.startswith("hy4flash-")
+                        else "flash-next")
     # <checkpoint-dir> positional, or MODEL= from the environment (then every argument is an extra vllm arg)
     if rest and not rest[0].startswith("-"):
         ckpt, extra = rest[0], rest[1:]

@@ -317,8 +317,8 @@ class OpenAIServingCompletion(GenerateBaseServing):
         previous_texts = [""] * num_choices * num_prompts
         has_echoed = [False] * num_choices * num_prompts
         num_prompt_tokens = [0] * num_prompts
-        num_cached_tokens = None
-        first_iteration = True
+
+        cached_by_prompt: dict[int, int] = {}
 
         stream_options = request.stream_options
         include_usage, include_continuous_usage = should_include_usage(
@@ -332,9 +332,9 @@ class OpenAIServingCompletion(GenerateBaseServing):
                 prompt_token_ids = res.prompt_token_ids
                 prompt_logprobs = res.prompt_logprobs
 
-                if first_iteration:
-                    num_cached_tokens = res.num_cached_tokens
-                    first_iteration = False
+
+                if res.num_cached_tokens is not None:
+                    cached_by_prompt[prompt_idx] = res.num_cached_tokens
 
                 prompt_text = res.prompt
                 if prompt_text is None:
@@ -509,6 +509,10 @@ class OpenAIServingCompletion(GenerateBaseServing):
                 total_tokens=total_prompt_tokens + total_completion_tokens,
             )
 
+
+            num_cached_tokens = (
+                sum(cached_by_prompt.values()) if cached_by_prompt else None
+            )
             if self.enable_prompt_tokens_details and num_cached_tokens is not None:
                 final_usage_info.prompt_tokens_details = PromptTokenUsageInfo(
                     cached_tokens=num_cached_tokens
@@ -574,6 +578,9 @@ class OpenAIServingCompletion(GenerateBaseServing):
         choices: list[CompletionResponseChoice] = []
         num_prompt_tokens = 0
         num_generated_tokens = 0
+
+        cached = 0
+        has_cached = False
         kv_transfer_params = None
         ec_transfer_params = None
         last_final_res = None
@@ -663,20 +670,19 @@ class OpenAIServingCompletion(GenerateBaseServing):
 
             num_prompt_tokens += len(prompt_token_ids)
 
+            if final_res.num_cached_tokens is not None:
+                cached += final_res.num_cached_tokens
+                has_cached = True
+
         usage = UsageInfo(
             prompt_tokens=num_prompt_tokens,
             completion_tokens=num_generated_tokens,
             total_tokens=num_prompt_tokens + num_generated_tokens,
         )
 
-        if (
-            self.enable_prompt_tokens_details
-            and last_final_res
-            and last_final_res.num_cached_tokens is not None
-        ):
-            usage.prompt_tokens_details = PromptTokenUsageInfo(
-                cached_tokens=last_final_res.num_cached_tokens
-            )
+
+        if self.enable_prompt_tokens_details and has_cached:
+            usage.prompt_tokens_details = PromptTokenUsageInfo(cached_tokens=cached)
 
         request_metadata.final_usage_info = usage
 

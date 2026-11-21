@@ -34,6 +34,8 @@ The wrappers select the ThinkingCap checkpoint and forward the other variables; 
 
 ## Merlin 3.0.2.1 bench card (2026-11-12)
 
+Merlin 3.0.2.2 re-measured the four-card rows: [3.0.2.2 bench card](benchmarks/2026-11-21/BENCH-CARD.md). The four-card (TP4) cells below are the 3.0.2.1 figures.
+
 Maintainer measurements on 4× RTX 3090 (220 W, PCIe Gen4) with P2P (the aikitoria patched driver) and the Zagitta [gpu-unlock](https://github.com/Zagitta/gpu-unlock) kernel module, on vLLM 0.33.0, fresh `merlin serve` boots, 2026-11-10 and 2026-11-11, on the previous build of the 3.0.2.1 wheel (built on 2026-11-10, before the prefill runs change; not re-measured on the published wheel); method and every cell in the [bench card](benchmarks/2026-11-12/BENCH-CARD.md). Decode is one stream with thinking on at reasoning effort medium, the server default (tok/s after the first streamed token); prefill is one cold request. With thinking on, a 512-token agent follow-up may end inside the reasoning, and reasoning tokens count. Sessions held at once and the 8 MP image panels were not re-run; they stay on the earlier cards below.
 
 | Measurement | 2× RTX 3090 (TP2) | 4× RTX 3090 (TP4) | 1× RTX 3090 |
@@ -120,6 +122,11 @@ sessions instead of 24 (experimental), setting this cache to the tested 48g when
 **experimental** on the 27B in 3.0.1; see [SETUP](../../docs/SETUP.md). Under heavy concurrent prefill a session may
 recompute instead of restoring (output identical).
 
+**Hit rate at 48g and 96g (measured 2026-11-15 on Merlin 3.0.2.2).** On a busy 144-session multi-turn agent trace on 4 × RTX 3090 (TP4, GPU pool
+2,012,105 tokens), the server served from cache 11.4 % of the trace's ceiling with the `--swarm` default of 48g and 87.5 % with
+`--kv-ram-cache 96g`. At 96g the engine's processes peaked at about 121 GiB of host memory (about 73 GiB at 48g). The
+default stays 48g in 3.0.2.2; the 3.0.2.2 defaults give up copies the GPU still holds first and keep the waiting queue's sessions until last (`MERLIN_KV_HOST_TIER__EVICT_DUPLICATES_FIRST` and `MERLIN_KV_HOST_TIER__EVICT_WAITING_LAST`, both on), and the figures above were measured before them.
+
 **Multi-session behaviour on TP4 (3.0.1).** While one session prefills a long prompt, the other sessions' decode slows
 sharply and a burst of new sessions waits longer for its first token, with the KV RAM cache off or on. Long prefills
 are not interleaved fairly with decode yet.
@@ -136,10 +143,10 @@ The archived v1.3.x engine bundle and separate 27B series describe the historica
 Once the shared environment and tile patch are installed, run from the Merlin-engine repository root:
 
 ```bash
-HF_HUB_DISABLE_TELEMETRY=1 venv/bin/hf download halt95/Qwen3.8-27B-W4A16-Merlin --local-dir ./ckpt
+HF_HUB_DISABLE_TELEMETRY=1 venv/bin/hf download halt95/Qwen3.8-27B-W4A16-Merlin --revision 7a0af39f63dd4fb0733c23d3ec126762074a503f --local-dir ./ckpt
 (cd ckpt && sha256sum -c ../models/qwen38-27b/checkpoint.sha256)
 # Or download ThinkingCap (its weights have a separate licence):
-HF_HUB_DISABLE_TELEMETRY=1 venv/bin/hf download halt95/ThinkingCap-Qwen3.8-27B-W4A16-Merlin --local-dir ./ckpt-thinkingcap
+HF_HUB_DISABLE_TELEMETRY=1 venv/bin/hf download halt95/ThinkingCap-Qwen3.8-27B-W4A16-Merlin --revision 916246dd9059f3eee5d27b9c49b67f04bce363fb --local-dir ./ckpt-thinkingcap
 (cd ckpt-thinkingcap && sha256sum -c ../models/thinkingcap/checkpoint.sha256)
 
 # Explicitly select the launchers' 8 MP default:

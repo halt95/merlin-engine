@@ -258,7 +258,7 @@
     "basis": "TP4 geometry (release bench card PASS): 2,011 whole blocks per card of 8,912,896 B (17 attention layers x 1,024 tokens x 512 B) = 17,923,833,856 B; vLLM logged 2,012,105 tokens (floor(blocks x 262,144 / D), D = 262), 7.68 x 262K; 7 x 262K or 14 x 131K resident (15 x 134 = 2,010 would use every usable block).",
     "kv_blocks": 2011
    },
-   "p2p": "Required for the tested numbers (four-way P2P); same environment lines as TP2.",
+   "p2p": "Required for the tested numbers (four-way P2P). P2P=on also sets the four host-sync settings (p2p_on_env); the all-reduce settings of the TP2 row are not set on this row.",
    "evidence": [
     "Qualified on the reference host: 4 x RTX 3090 at 220 W, PCIe Gen4 x16, with peer-to-peer (bench card models/qwen38-27b/benchmarks/2026-10-20).",
     "Merlin 3.0.0 release bench card (2026-10-20, release wheel, RecoverSSM on; models/qwen38-27b/benchmarks/2026-10-20, four cards): pool 2,012,105, decode 252.4 / 235.4 / 224.0 tok/s at 32K / 131K / 259K (thinking on), 7 x 262K and 14 x 131K resident with 0 preemptions, 8 agents 752 tok/s, GSM8K-200 197/200, needles 5/5 at 131K and 12/12 at 262K; 8 MP image headroom at chunk 4096: 862 MiB lowest free (one image, two at once, four in one prompt).",
@@ -266,8 +266,15 @@
    ],
    "notes": [
     "ThinkingCap serves on this row too (merlin serve 27b-thinkingcap; models/thinkingcap/serve*.sh): the same shape, pin and reasoning effort (medium).",
-    "RecoverSSM: the TP4 launcher serves --use-replayssm with --mamba-cache-mode align on Model Runner V2, block 1024 (--block-size) and chunk 4096 (--max-num-batched-tokens); the 1024-token block and 2,011-block pin are RecoverSSM-on K=4 figures (prefill +0.9 % against the RecoverSSM-off layout; all correctness checks passed)."
+    "RecoverSSM: the TP4 launcher serves --use-replayssm with --mamba-cache-mode align on Model Runner V2, block 1024 (--block-size) and chunk 4096 (--max-num-batched-tokens); the 1024-token block and 2,011-block pin are RecoverSSM-on K=4 figures (prefill +0.9 % against the RecoverSSM-off layout; all correctness checks passed).",
+    "P2P=on also sets four host-sync settings (p2p_on_env): the bounded draft plan, the GDN decode fast path, the shared align index and async target seq_lens (measured 2026-11-13 on 4 x RTX 3090 with the 27B checkpoint: one-stream ms per output token down 13.0 to 17.9 % on five of six cells and 11.6 % on the sixth (inside its band), eight streams inside the run-to-run band, T=0 output identical on 28 of 28 prompts, pool, 262K concurrency and image floor unchanged; the ThinkingCap checkpoint, which shares this row, was measured the same day: T=0 output identical on 28 of 28 prompts, one-stream ms per output token about 16.6 % lower with thinking on and 16.8 % lower with thinking off, pools equal, verification boot with 0 mismatches; not measured: the other TP4 rows, 16 or more streams, the earlier 28-prompt identity set, agent workloads)."
    ],
+   "p2p_on_env": {
+    "VLLM_DRAFT_BOUNDED_PLAN": "1",
+    "VLLM_GDN_DECODE_FASTPATH": "1",
+    "VLLM_GDN_SHARED_ALIGN_INDEX": "1",
+    "VLLM_TARGET_SEQ_LENS_ASYNC": "1"
+   },
    "launch_shape": "tp4"
   },
   {
@@ -390,9 +397,10 @@
     "basis": "Measured under emulation, not on a 20 GB card: the 20 GB emulation run on the reference host (2026-11-06): 4 x RTX 3090 each holding 4,096 MiB of ballast so it looks like a 20 GB card, vLLM started with --gpu-memory-utilization 0.80 on the 24 GB cards to pass the startup check a 20 GB card passes at the shipped 0.96. The 27b-tp2-3090 profile as it was on that date (the earlier capture list, which this row keeps) with only the KV pin cut to 561 whole blocks of 16,711,680 B (960 tokens, fp8_e4m3 KV) = 9,375,252,480 B booted and served a 262K prefill, 8 x 32K and a c1 decode with 1,617 MiB minimum free per card; vLLM logged 525,224 tokens (floor(blocks x 262,144 / 280)). Resident by this registry's rule (D = 280 / 143 blocks per session + 1 null block) the pin holds 2 x 262K or 3 x 131K. Text-only maximum measured, not the default: 605 blocks (10,110,566,400 B, pool 566,418, 2 x 262K / 4 x 131K) served the same requests with only 897 MiB free per card, too little for the 8 MP image headroom; the 2.4x pin (629,145 tokens, 11,230,248,960 B) ran out of memory.",
     "kv_blocks": 561
    },
-   "p2p": "Not required: the launcher takes P2P=on|off from merlin serve / preflight.",
+   "p2p": "The launcher takes P2P=on|off from merlin serve / preflight. Community-measured on 2 x modded RTX 3080 20 GB (2026-11-15, models/qwen38-27b/benchmarks/2026-11-15-2x3080-20g/BENCH-CARD.md): P2P=on over the dynamic-BAR1 615.71.09 driver route (noon-at-cgn/geforce-dynbar1-p2p) gains +17-58% decode and +42-79% cold prefill vs the NCCL host route; on a 595-era static-BAR1 stack NCCL P2P hangs the first warmup allreduce, so keep it off there. The dynamic-BAR1 driver (noon-at-cgn/geforce-dynbar1-p2p) is a patched third-party stack that Merlin does not ship or test; P2P stays off on the static-BAR1 595-era stack, as reported.",
    "evidence": [
-    "None on a 20 GB card. Emulated: the 20 GB emulation run on the reference host (2026-11-06): 4 x RTX 3090 each holding 4,096 MiB of ballast so it looks like a 20 GB card, vLLM started with --gpu-memory-utilization 0.80 on the 24 GB cards to pass the startup check a 20 GB card passes at the shipped 0.96; this row's pin served a 262K prefill, 8 x 32K and c1 decode (1,617 MiB minimum free per card); a text-only maximum of 605 blocks fit with 897 MiB free; the 2.4x pin ran out of memory."
+    "None on a 20 GB card. Emulated: the 20 GB emulation run on the reference host (2026-11-06): 4 x RTX 3090 each holding 4,096 MiB of ballast so it looks like a 20 GB card, vLLM started with --gpu-memory-utilization 0.80 on the 24 GB cards to pass the startup check a 20 GB card passes at the shipped 0.96; this row's pin served a 262K prefill, 8 x 32K and c1 decode (1,617 MiB minimum free per card); a text-only maximum of 605 blocks fit with 897 MiB free; the 2.4x pin ran out of memory.",
+    "Community-validated 2026-11-15 on 2 x modded RTX 3080 20 GB (GA102 10de:2206, TP2, P2P=on, 48 GiB RAM KV tier): full bench suite vs the same host on the static-BAR1 route; decode ladder 134.9/101.6/80.1 tok/s (4K/131K/262K), cold prefill 1585-864 tok/s (39K-236K), GSM8K-200 191/200 unchanged; see models/qwen38-27b/benchmarks/2026-11-15-2x3080-20g/BENCH-CARD.md."
    ],
    "notes": [
     "Images are capped at 8,388,608 pixels (8 MP) by default (MAX_PIXELS).",
@@ -790,7 +798,7 @@
    "p2p": "Not required: the launcher takes P2P=on|off; consumer Ada has no peer access by default, so preflight and merlin serve pass P2P=off (NCCL through host memory, custom all-reduce already off).",
    "evidence": [
     "4 x RTX 4090, measured 2026-10-18: 27b-tp4-sm89-24g, P2P off, pool 2,012,105 tokens, needles 4/4 exact.",
-    "4 x RTX 4090 on the release wheel, measured 2026-10-20: pool 2,012,105, needles 4/4 exact, 7 x 262K, 15 x 131K and 24 x 32K resident and exact, image pass (779 MiB minimum free). Testing: the runs above were on cloud-hosted hardware; kernel parity qualification is still to run."
+    "4 x RTX 4090 on the release wheel, measured 2026-10-20: pool 2,012,105, needles 4/4 exact, 7 x 262K, 15 needles of at most 130,628 tokens (not full 131,072-token contexts; no preemption check), and 24 x 32K resident and exact, image pass (779 MiB minimum free). Testing: the runs above were on cloud-hosted hardware; kernel parity qualification is still to run."
    ],
    "notes": [
     "ThinkingCap serves on this row too (merlin serve 27b-thinkingcap; models/thinkingcap/serve*.sh): the same shape, pin and reasoning effort (medium).",
@@ -1528,9 +1536,9 @@
     "estimate": true,
     "pool_tokens": 2012105,
     "fit_262k": 7,
-    "fit_131k": 15,
+    "fit_131k": 14,
     "kv_blocks": 2011,
-    "basis": "Estimate: usable 23.04 GiB = 24 GiB x 0.96; weights + overhead per card 6.35 GiB (what the 27b-tp4-3090 pin leaves out of 23.04 GiB); 2,011 whole blocks of 8,912,896 B (1024 tokens, fp8_e4m3 KV) = 17,923,833,856 B; pool = floor(2,011 x 262,144 / 262) = 2,012,105 tokens = 7 x 262K or 15 x 131K resident (D = 262 / 134 blocks per session + 1 null). Not measured on this card."
+    "basis": "Estimate: usable 23.04 GiB = 24 GiB x 0.96; weights + overhead per card 6.35 GiB (what the 27b-tp4-3090 pin leaves out of 23.04 GiB); 2,011 whole blocks of 8,912,896 B (1024 tokens, fp8_e4m3 KV) = 17,923,833,856 B; pool = floor(2,011 x 262,144 / 262) = 2,012,105 tokens = 7 x 262K or 14 x 131K resident (D = 262 / 135 blocks per full 131,072-token session: 129 attention blocks including K=4 lookahead + 6 recurrent-state blocks; + 1 null). Not measured on this card."
    },
    "p2p": "Not required: the launcher takes P2P=on|off from merlin serve / preflight.",
    "evidence": [
@@ -2287,9 +2295,9 @@
     "estimate": true,
     "pool_tokens": 8491664,
     "fit_262k": 32,
-    "fit_131k": 63,
+    "fit_131k": 62,
     "kv_blocks": 8487,
-    "basis": "Estimate: usable 76.80 GiB = 80 GiB x 0.96; weights + overhead per card 6.35 GiB (what the 27b-tp4-3090 pin leaves out of 23.04 GiB); 8,487 whole blocks of 8,912,896 B (1024 tokens, fp8_e4m3 KV) = 75,643,748,352 B; pool = floor(8,487 x 262,144 / 262) = 8,491,664 tokens = 32 x 262K or 63 x 131K resident (D = 262 / 134 blocks per session + 1 null). Not measured on this card."
+    "basis": "Estimate: usable 76.80 GiB = 80 GiB x 0.96; weights + overhead per card 6.35 GiB (what the 27b-tp4-3090 pin leaves out of 23.04 GiB); 8,487 whole blocks of 8,912,896 B (1024 tokens, fp8_e4m3 KV) = 75,643,748,352 B; pool = floor(8,487 x 262,144 / 262) = 8,491,664 tokens = 32 x 262K or 62 x 131K resident (D = 262 / 135 blocks per full 131,072-token session: 129 attention blocks including K=4 lookahead + 6 recurrent-state blocks; + 1 null). Not measured on this card."
    },
    "p2p": "Not required: the launcher takes P2P=on|off from merlin serve / preflight.",
    "evidence": [

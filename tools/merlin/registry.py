@@ -26,6 +26,7 @@ module and a test fails when one is stale.
 from __future__ import annotations
 
 import json
+import math
 import re
 import sys
 from pathlib import Path
@@ -60,6 +61,23 @@ N_LAYERS = (
     48  # Flash-Next decoder layers (the MTP layer is extra and rides the last stage)
 )
 MTP_K = 3
+# Derived 27B recurrent-state occupancy is six blocks per session.
+QWEN27B_STATE_BLOCKS_PER_SESSION = 6
+QWEN27B_DEFAULT_BLOCK_TOKENS = 960
+
+
+def _qwen27b_pool_fit(
+    kv_blocks: int,
+    block_tokens: int,
+    spec_k: int,
+    length: int,
+    max_model_len: int = 262144,
+) -> int:
+    """Return the 27B pool fit for a full context of the requested length."""
+    attention_blocks = -(-min(length + spec_k, max_model_len) // block_tokens)
+    return (kv_blocks - 1) // (attention_blocks + QWEN27B_STATE_BLOCKS_PER_SESSION)
+
+
 # The qualified DFlash2 FP8 geometry (TP2 x PP2, 24/24) uses this many bytes per block (measured 2026-10-22).
 DFLASH2_KV_BLOCK_BYTES = 14155776
 # KV blocks one 262,144-token request holds on that geometry with the prefill runs on (step budget 2,080): 64 for the
@@ -71,6 +89,61 @@ DFLASH2_BLOCKS_PER_262K_REQUEST = 82
 def _dflash2_pool(kv_blocks: int) -> int:
     """The engine's reported pool (tokens) for kv_blocks DFlash2 blocks with the prefill runs on."""
     return (kv_blocks - 1) * 262144 // DFLASH2_BLOCKS_PER_262K_REQUEST
+
+
+# The hy4flash TP x PP2 x DCP2 geometry (21/21 split, block 64, fp8_ds_mla, prefix
+# caching on): one KV block is 6 sparse layers x 656 B x 64 tokens per card, and a request holds, per rank, the
+# length-proportional MLA + indexer blocks (2,516 at 262,144 tokens) plus 9 sliding-window groups of
+# cdiv(511 + chunk, 64) blocks each. Solved from two measured boots on the same 1.75 GiB pin (7,459 blocks):
+# 715,714 tokens at chunk 1024 and 679,879 at chunk 2048 (2026-11-20); other lengths scale the first part linearly.
+HY4_KV_BLOCK_BYTES = 251904
+HY4_LINEAR_BLOCKS_262K = 2516
+HY4_SWA_GROUPS = 9
+HY4_SWA_WINDOW = 512
+# A KV pin is a round whole number of bytes (the style of 4,100,000,000), never a GiB-derived figure
+HY4_PIN_ROUND = 100_000_000
+
+
+def hy4_blocks_per_request(length: int, chunk: int) -> int:
+    """KV blocks one ``length``-token request holds per rank on the hy4flash PP2 x DCP2 geometry."""
+    swa = -(-(HY4_SWA_WINDOW - 1 + chunk) // 64)
+    return -(-HY4_LINEAR_BLOCKS_262K * length // 262144) + HY4_SWA_GROUPS * swa
+
+
+def hy4_fit(kv_blocks: int, length: int, chunk: int) -> int:
+    """Whole ``length``-token sessions the engine fits: (num_blocks - 1) // (blocks_per_request + 1)."""
+    return (kv_blocks - 1) // (hy4_blocks_per_request(length, chunk) + 1)
+
+
+def hy4_pool(kv_blocks: int, max_model_len: int, chunk: int) -> int:
+    """The engine's reported pool (tokens): concurrency x max_model_len, concurrency = blocks / per request."""
+    return int(kv_blocks / hy4_blocks_per_request(max_model_len, chunk) * max_model_len)
+
+
+def _check_hy4_capacity(p: dict[str, Any]) -> list[str]:
+    """every hy4flash pin is round; a row that records kv_blocks (the PP2 x DCP2 rows)
+    must state the engine fit for that pin, not pool / depth."""
+    pid, srv, cap = p.get("id"), p.get("serve") or {}, p.get("capacity") or {}
+    pin = srv.get("kv_cache_memory")
+    if type(pin) is not int or pin <= 0 or pin % HY4_PIN_ROUND:
+        return [f"{pid}: kv_cache_memory {pin!r} must be a round whole number of bytes "
+                f"(a multiple of {HY4_PIN_ROUND:,}), never a GiB-derived figure"]
+    if "kv_blocks" not in cap:
+        return []
+    errs = []
+    blocks, chunk, mml = cap["kv_blocks"], srv.get("max_num_batched_tokens"), srv.get("max_model_len")
+    if blocks != pin // HY4_KV_BLOCK_BYTES:
+        errs.append(f"{pid}: capacity kv_blocks {blocks} is not {pin:,} // {HY4_KV_BLOCK_BYTES:,} = "
+                    f"{pin // HY4_KV_BLOCK_BYTES}")
+        return errs
+    if cap.get("pool_tokens") != hy4_pool(blocks, mml, chunk):
+        errs.append(f"{pid}: capacity pool_tokens {cap.get('pool_tokens')} is not the engine's pool "
+                    f"{hy4_pool(blocks, mml, chunk):,} for {blocks} blocks at max_model_len {mml} and chunk {chunk}")
+    for key, length in (("fit_131k", 131072), ("fit_262k", 262144), ("fit_1m", 1048576)):
+        if key in cap and length <= mml and cap[key] != hy4_fit(blocks, length, chunk):
+            errs.append(f"{pid}: capacity {key} {cap[key]} is not the engine fit {hy4_fit(blocks, length, chunk)} "
+                        f"((blocks - 1) // (per request + 1))")
+    return errs
 
 
 def _dflash2_min_blocks(sessions_262k: int) -> int:
@@ -107,9 +180,12 @@ def load_registry(
         "27b": "qwen38-27b.json",
         "svl": "nemotron-super-vl.json",
         "ornith": "ornith.json",
+        "hy4flash": "hy4flash.json",  # (launch.py-only lane)
     }.get(model)
     if name is None:
-        raise ProfileError(f"unknown model {model!r} (flash-next, 27b, svl or ornith)")
+        raise ProfileError(
+            f"unknown model {model!r} (flash-next, 27b, svl, ornith or hy4flash)"
+        )
     path = (profiles_dir or PROFILES_DIR) / name
     with open(path, encoding="utf-8") as f:
         reg = json.load(f)
@@ -173,6 +249,13 @@ def _check_blocked(reg: dict[str, Any], p: dict[str, Any]) -> list[str]:
 # MERLIN_COLD_EXPERTS = a profile path relative to the repo, with the optional layer / hot-fraction overrides. A
 # caller's MERLIN_COLD_EXPERTS replaces the row's profile; blank or 0 turns the offload off.
 ROW_COLD_EXPERTS = ("MERLIN_COLD_EXPERTS", "MERLIN_COLD_EXPERTS_LAYERS", "MERLIN_COLD_EXPERTS_HOT_FRAC")
+# The Hy4 speed flags a hy4flash row may default on
+# (3.0.2.2); each is a 0/1 engine knob, and a caller's export wins (NAME=0 = off)
+ROW_HY4_SPEED = (
+    "MERLIN_HY4_INDEXER_FAST", "MERLIN_HY4_SWA_WINDOW_REUSE", "MERLIN_LATENT_IPC",
+    "MERLIN_HY4_DFLY_GRAPHS", "MERLIN_HY4_SPARSE_DECODE", "MERLIN_HY4_FUSED_ROUTER",
+    "MERLIN_HY4_INDEXER_SELECT", "MERLIN_COLD_EXPERTS_ADAPTIVE",
+)
 # Variables a row's env may not set: the layout / interconnect / GPU set decide them, and the memstats knobs are
 # instrumentation, never a serving setting.
 ROW_ENV_RESERVED = frozenset({
@@ -193,7 +276,20 @@ def _check_row_env(reg: dict[str, Any], p: dict[str, Any]) -> list[str]:
         return []
     pid = p.get("id")
     env = p["env"]
-    if reg.get("model") != "flash-next":
+    if not isinstance(env, dict) or not env:  # before any iteration: null / a number / a list
+        return [f"{pid}: env must be a non-empty object of NAME: string value"]
+    # A hy4flash row may carry the cold-expert defaults and
+    # (hy4-rel3022-defaults) the Hy4 speed flags, each "0" or "1"
+    hy4 = reg.get("model") == "hy4flash"
+    if hy4:
+        allowed = ROW_COLD_EXPERTS + ROW_HY4_SPEED
+        extra = sorted(k for k in env if k not in allowed)
+        if extra:
+            return [f"{pid}: a hy4flash row's env may set only {', '.join(allowed)}, not {', '.join(extra)}"]
+        bad = sorted(k for k in env if k in ROW_HY4_SPEED and env[k] not in ("0", "1"))
+        if bad:
+            return [f"{pid}: a hy4flash row's speed flags must be \"0\" or \"1\": {', '.join(bad)}"]
+    elif reg.get("model") != "flash-next":
         return [f"{pid}: env is for Flash-Next rows only"]
     if not isinstance(env, dict) or not env:
         return [f"{pid}: env must be a non-empty object of NAME: string value"]
@@ -203,7 +299,7 @@ def _check_row_env(reg: dict[str, Any], p: dict[str, Any]) -> list[str]:
             errs.append(f"{pid}: env {k!r} must be an upper-case name with a non-empty string value")
         elif k in ROW_ENV_RESERVED:
             errs.append(f"{pid}: env may not set {k} (the layout / interconnect / launcher decides it, or it is instrumentation)")
-        elif k.startswith("MERLIN_") and k not in ROW_COLD_EXPERTS:
+        elif k.startswith("MERLIN_") and k not in ROW_COLD_EXPERTS and not (hy4 and k in ROW_HY4_SPEED):
             errs.append(f"{pid}: env may set only {', '.join(ROW_COLD_EXPERTS)} among the MERLIN_ knobs, not {k}")
     prof = env.get(ROW_COLD_EXPERTS[0])
     if any(k in env for k in ROW_COLD_EXPERTS[1:]) and not prof:
@@ -215,6 +311,61 @@ def _check_row_env(reg: dict[str, Any], p: dict[str, Any]) -> list[str]:
         elif not (REPO_ROOT / rel).is_file():
             errs.append(f"{pid}: env {ROW_COLD_EXPERTS[0]} {prof} is not a file in the repo")
     return errs
+
+
+# Per-drafter prefill-runs tick costs: the profile's ``base.spec_tick_costs`` maps a SPEC to the measured
+# "prefill tick ms, decode round ms, fill ticks" the launcher exports as VLLM_MERLIN_PREFILL_RUNS_TICK_COSTS when
+# that drafter is selected, together with the prefill chunk they were measured at: the first number is the cost of one
+# full-chunk step, so the tuple is valid at that chunk only and the launcher applies it at no other. Only the drafters
+# named here may carry one; the MTP rows never do (they keep the engine's default).
+SPEC_TICK_COSTS_SPECS = ("dflash2",)
+SPEC_TICK_COSTS_KEYS = ("chunk", "tick_costs")
+
+
+def _check_spec_tick_costs(table: Any) -> list[str]:
+    """Problems with a ``base.spec_tick_costs`` table: a non-empty object of SPEC -> {chunk, tick_costs}, the chunk a
+    positive whole number of tokens and tick_costs three positive finite numbers."""
+    key = "base.spec_tick_costs"
+    if not isinstance(table, dict) or not table:
+        return [f"{key} must be a non-empty object of SPEC: {{\"chunk\": tokens, \"tick_costs\": "
+                f"[prefill tick ms, decode round ms, fill ticks]}}, got {table!r}"]
+    errs = []
+    for spec, entry in table.items():
+        where = f"{key}.{spec}"
+        if spec not in SPEC_TICK_COSTS_SPECS:
+            errs.append(f"{key}: {spec!r} is not a drafter that takes tick costs "
+                        f"({', '.join(SPEC_TICK_COSTS_SPECS)}); MTP keeps the engine default")
+            continue
+        if not isinstance(entry, dict) or set(entry) != set(SPEC_TICK_COSTS_KEYS):
+            errs.append(f"{where} must be an object with exactly {' and '.join(SPEC_TICK_COSTS_KEYS)}, got {entry!r}")
+            continue
+        chunk, costs = entry["chunk"], entry["tick_costs"]
+        if not isinstance(chunk, int) or isinstance(chunk, bool) or chunk <= 0:
+            errs.append(f"{where}.chunk must be a positive whole number of tokens, got {chunk!r}")
+        if (not isinstance(costs, list) or len(costs) != 3
+                or not all(isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) and v > 0
+                           for v in costs)):
+            errs.append(f"{where}.tick_costs must be three positive finite numbers "
+                        f"[prefill tick ms, decode round ms, fill ticks], got {costs!r}")
+    return errs
+
+
+def spec_tick_costs(reg: dict[str, Any], spec: str) -> tuple[int, tuple[float, float, float]] | None:
+    """The measured prefill-runs tick costs for a drafter (SPEC) from the profile as (chunk they are valid at, costs),
+    or None when it has none (MTP and every other SPEC keep the engine default). A table that is present but
+    malformed, null included, is a ProfileError."""
+    base = reg.get("base") or {}
+    if "spec_tick_costs" not in base:
+        return None
+    table = base["spec_tick_costs"]
+    errs = _check_spec_tick_costs(table)
+    if errs:
+        raise ProfileError("; ".join(errs))
+    entry = table.get(spec)
+    if entry is None:
+        return None
+    c = entry["tick_costs"]
+    return entry["chunk"], (float(c[0]), float(c[1]), float(c[2]))
 
 
 def _check_swarm_gate(p: dict[str, Any]) -> list[str]:
@@ -431,6 +582,37 @@ def _check_flash_next_profile(p: dict[str, Any], labels: dict[str, Any]) -> list
     return errs
 
 
+def _check_qwen27b_capacity(p: dict[str, Any]) -> list[str]:
+    """Check the main 27B pool estimate against its full-context block geometry."""
+    pid = p.get("id")
+    srv = p.get("serve") or {}
+    cap = p.get("capacity") or {}
+    kv_blocks = cap.get("kv_blocks")
+    block_tokens = srv.get("block_size") or QWEN27B_DEFAULT_BLOCK_TOKENS
+    spec_k = srv.get("spec_k")
+    max_model_len = srv.get("max_model_len", 262144)
+    if not (
+        type(kv_blocks) is int and kv_blocks > 0
+        and type(block_tokens) is int and block_tokens > 0
+        and type(spec_k) is int and spec_k >= 0
+        and type(max_model_len) is int and max_model_len > 0
+    ):
+        return []
+    errs = []
+    for key, length in (("fit_131k", 131072), ("fit_262k", 262144)):
+        advertised = cap.get(key)
+        if type(advertised) is int and advertised > 0:
+            fit = _qwen27b_pool_fit(
+                kv_blocks, block_tokens, spec_k, length, max_model_len
+            )
+            if advertised > fit:
+                errs.append(
+                    f"{pid}: capacity {key} {advertised} exceeds 27B pool fit {fit} "
+                    f"for a {length}-token session (E=6 derived)"
+                )
+    return errs
+
+
 def validate_registry(reg: dict[str, Any]) -> list[str]:
     errs: list[str] = []
     for key in ("schema", "model", "labels", "profiles"):
@@ -446,6 +628,8 @@ def validate_registry(reg: dict[str, Any]) -> list[str]:
         errs.append(
             "labels must be exactly " + " and ".join(repr(a) for a in sorted(allowed))
         )
+    if reg["model"] == "flash-next" and "spec_tick_costs" in (reg.get("base") or {}):
+        errs.extend(_check_spec_tick_costs(reg["base"]["spec_tick_costs"]))
     for p in reg["profiles"]:
         if p.get("status") not in labels:
             errs.append(
@@ -508,6 +692,10 @@ def validate_registry(reg: dict[str, Any]) -> list[str]:
                 if key not in p:
                     errs.append(f"{pid}: missing {key}")
             errs.extend(_check_swarm_gate(p))
+            if reg["model"] == "27b":
+                errs.extend(_check_qwen27b_capacity(p))
+            if reg["model"] == "hy4flash":
+                errs.extend(_check_hy4_capacity(p))
     if reg["model"] == "flash-next" and REFERENCE_ID not in seen:
         errs.append(f"reference profile {REFERENCE_ID} is missing")
     if "launch" not in reg:

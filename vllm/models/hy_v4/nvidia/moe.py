@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by the Merlin project; see NOTICE.
 """Dense FFN and MoE blocks for HY V4 (NVIDIA)."""
 
 import torch
@@ -9,8 +10,11 @@ from transformers import PreTrainedConfig
 from vllm.config import get_current_vllm_config
 from vllm.distributed import get_ep_group, get_tensor_model_parallel_world_size
 from vllm.logger import init_logger
+# The gate at the checkpoint dtype (hy4_router_gate)
+from vllm.merlin.hy4_router_gate import CheckpointDtypeGate as GateLinear
 from vllm.model_executor.layers.activation import SiluAndMul
-from vllm.model_executor.layers.fused_moe import FusedMoEFactory, GateLinear
+# GateLinear comes from hy4_router_gate (above)
+from vllm.model_executor.layers.fused_moe import FusedMoEFactory
 from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
     RowParallelLinear,
@@ -91,6 +95,11 @@ class HYV4MoEFused(nn.Module):
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
         enable_eplb: bool = False,
+
+        *,
+        routed_hidden_size: int | None = None,
+        routed_input_transform: nn.Module | None = None,
+        routed_output_transform: nn.Module | None = None,
     ):
         super().__init__()
         self.tp_size = get_tensor_model_parallel_world_size()
@@ -149,10 +158,21 @@ class HYV4MoEFused(nn.Module):
         use_swiglu_clamp = bool(raw_swiglu_limit) and float(raw_swiglu_limit) > 0
         moe_swiglu_limit = float(raw_swiglu_limit) if use_swiglu_clamp else None
 
+        # Register checkpoint paths before runner aliases.
+        if routed_input_transform is not None:
+            self.routed_expert_down_proj = routed_input_transform
+        if routed_output_transform is not None:
+            self.routed_expert_up_proj = routed_output_transform
+
         self.experts = FusedMoEFactory(
             num_experts=self.n_routed_experts,
             top_k=top_k,
-            hidden_size=config.hidden_size,
+
+            hidden_size=(
+                config.hidden_size if routed_hidden_size is None else routed_hidden_size
+            ),
+            routed_input_transform=routed_input_transform,
+            routed_output_transform=routed_output_transform,
             intermediate_size=intermediate_size,
             renormalize=config.route_norm,
             quant_config=quant_config,

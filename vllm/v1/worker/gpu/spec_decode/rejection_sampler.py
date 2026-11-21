@@ -10,6 +10,7 @@ import torch
 from vllm import envs
 from vllm.config import SpeculativeConfig
 from vllm.config.model import PROCESSED_LOGPROBS_MODES
+from vllm.merlin import spec_residual_diag
 from vllm.merlin.spec_verify_fast_paths import spec_verify_batch_flags
 from vllm.triton_utils import tl, triton
 from vllm.v1.outputs import LogprobsTensors
@@ -156,6 +157,8 @@ class RejectionSampler:
     # __init__; None (both shortcuts off) for a sampler built without them.
     _temperature_np: np.ndarray | None = None
     _may_mask_logits: np.ndarray | None = None
+    # None unless MERLIN_SPEC_RESIDUAL_DIAG=1.
+    residual_diag: spec_residual_diag.ResidualDiag | None = None
 
     def __init__(
         self,
@@ -193,6 +196,8 @@ class RejectionSampler:
             self.fly_window_size = spec_config.fly_window_size
         # The stable-residual switch is resolved once at init.
         self.stable_residual = bool(envs.VLLM_SPEC_STABLE_RESIDUAL)
+        # The in-process read-back line.
+        self.residual_diag = spec_residual_diag.at_init(self, spec_config, device)
         # The sampler's host
         # mirrors once here, not per verify step. Both are allocated once and
         # written in place (add_request), so the references stay current. A
@@ -327,6 +332,8 @@ class RejectionSampler:
             fly_entropy_threshold=self.fly_entropy_threshold,
             fly_entropy_top_k=self.fly_entropy_top_k,
             stable_residual=self.stable_residual,
+
+            residual_diag=self.residual_diag,
             step_keyed_rng=self.step_keyed_rng,
             **self._watermarking_kwargs(
                 draft_sampled, expanded_idx_mapping, expanded_local_pos
@@ -484,6 +491,11 @@ class RejectionSampler:
             input_batch.idx_mapping_np
         )
         chunk_logit_limit = get_max_chunk_logits(logits.shape[1])
+
+        if self.residual_diag is not None:
+            self.residual_diag.begin_step(
+                input_batch.req_ids, input_batch.idx_mapping_np
+            )
         (
             sampled,
             num_sampled,

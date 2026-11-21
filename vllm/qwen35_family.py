@@ -349,6 +349,63 @@ def canonicalize_config(config: Any) -> Any:
     return config
 
 
+#: Config fields that state how many MTP modules a Qwen3.5-lineage head has.
+MTP_MODULE_COUNT_FIELDS = ("mtp_num_hidden_layers", "num_nextn_predict_layers")
+
+
+def _positive_count(value: Any) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        return None
+    return value
+
+
+def mtp_module_count(config: Any, text_config: Any) -> int | None:
+    """The one MTP module count of a Qwen3.5-lineage draft config.
+
+    The speculative MTP rewrite sets ``n_predict`` from it, and for a count
+    above 1 the caller also writes it to ``num_nextn_predict_layers`` so that
+    the multi-module routing (``SpeculativeConfig.use_multi_module_mtp``) and
+    the speculator's capture key read the same value as the draft model's
+    module selector, which builds ``text_config.mtp_num_hidden_layers`` modules
+    (1 when the field is absent). A one-module config is left as it was: its
+    routing already reads the default 1, and its hash stays the same.
+
+    The count is ``mtp_num_hidden_layers`` of ``config``, else of
+    ``text_config`` (the historical rule). Missing or zero on both returns that
+    value unchanged (``None`` or ``0``), so the caller keeps today's behaviour.
+    Refused with ``ValueError``: two different positive counts among the two
+    fields of ``config`` and ``text_config``, or any positive count (a
+    routing-only ``num_nextn_predict_layers`` included) that differs from the
+    number of modules the selector builds.
+    """
+    count = getattr(config, "mtp_num_hidden_layers", None)
+    if count is None:
+        count = getattr(text_config, "mtp_num_hidden_layers", None)
+
+    seen: dict[str, int] = {}
+    owners = [("config", config)]
+    if text_config is not None and text_config is not config:
+        owners.append(("text_config", text_config))
+    for owner, cfg in owners:
+        for field in MTP_MODULE_COUNT_FIELDS:
+            value = _positive_count(getattr(cfg, field, None))
+            if value is not None:
+                seen[f"{owner}.{field}"] = value
+    if seen:
+        # Any stated count, routing-only ``num_nextn_predict_layers`` included,
+        # must match the modules the selector builds.
+        selector = getattr(text_config, "mtp_num_hidden_layers", 1)
+        seen["modules built (text_config.mtp_num_hidden_layers, default 1)"] = selector
+    if len(set(seen.values())) > 1:
+        stated = ", ".join(f"{name}={value}" for name, value in seen.items())
+        raise ValueError(
+            f"Conflicting MTP module counts in the draft config: {stated}. "
+            "The module selector, the multi-module routing and the capture key "
+            "must read one count; fix the checkpoint config so they agree."
+        )
+    return count
+
+
 def refuse_registered(names: Iterable[str], where: str, *registered: Mapping) -> None:
     """Refuse an ``alias=canonical`` architecture alias whose name is already a key
     of one of ``registered`` (the maps before the aliases join them): installing

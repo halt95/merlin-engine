@@ -40,8 +40,7 @@ GAUGES = (
     "readiness_observable", "manifest_members",
     # Host rows by class
     "host_rows_published", "host_rows_provisional", "host_rows_idle",
-    "host_rows_leased", "host_rows_duplicate_running",
-    "host_rows_duplicate_imminent", "grace_pins_active",
+    "host_rows_leased", "grace_pins_active",
     "flat_store_s",
 )
 EVENTS = (
@@ -705,41 +704,15 @@ class TierCensus:
         )
 
     def load_done(self, req_id, failed, cancelled=False):
-        pending = self.pending_loads.pop(req_id, None)
-        if pending is None:
+        # Retirement is always-on; only completion geometry is debug census.
+        pending = self.rt.finish_restore(req_id, failed, cancelled=cancelled)
+        if pending is None or not self.enabled:
             return
-        # A request that went away (cancel, abort, finish) cancelled its
-        # restore; that is not a transfer failure. Real failures:
-        # a failed transaction or an invalid lease/epoch/source.
-        if cancelled:
-            self.rt.counters.restore_cancelled += 1
-            return
-        # Read the lease only for accounting: never change publication, refs,
-        # copy issue, or the worker's result. A successful DMA can still belong
-        # to an invalidated plan or an old epoch.
-        sched = self.scheduler
-        if not failed and sched is not None:
-            state = (getattr(sched, "_reqs_to_load", {}).get(req_id)
-                     or getattr(sched, "_abandoned_reqs_to_load", {}).get(req_id))
-            if state is not None:
-                failed = state.failed or state.finished
-                lease = state.lease
-                if lease is not None:
-                    failed = (failed or lease.epoch != sched.cache_epoch
-                              or not lease.sources_valid(self.rt.cpu_block_pool))
-        if failed:
-            self.rt.counters.restore_failed += 1
-            # The write-back log enumerates this dataclass. Keep its cumulative
-            # mirror in sync without adding a scheduler/allocator hook.
-            writeback = getattr(sched, "writeback", None)
-            if writeback is not None:
-                writeback.counters.restore_failed = self.rt.counters.restore_failed
-        else:
-            tokens, blocks = pending
-            c = self.rt.counters
-            c.restore_completed_requests += 1
-            c.restore_completed_tokens += tokens
-            c.restore_completed_blocks += blocks
+        tokens, blocks = pending
+        c = self.rt.counters
+        c.restore_completed_requests += 1
+        c.restore_completed_tokens += tokens
+        c.restore_completed_blocks += blocks
 
     def gone(self, req_id):
         self.load_done(req_id, failed=False, cancelled=True)
@@ -780,7 +753,7 @@ def _census_debug_only(method):
 for _method_name in (
     "_bind_hooks", "prove", "remember", "_drain_remember", "_remember_now", "scan",
     "_unclassified", "superseded", "on_reclaim", "step", "_step_index",
-    "_holding", "_step_union", "lookup", "admission", "load_done", "gone",
+    "_holding", "_step_union", "lookup", "admission", "gone",
     "reset",
 ):
     setattr(
@@ -1481,7 +1454,8 @@ class HostFlushDetector:
     def __init__(self, frac: float = 0.5) -> None:
         self.frac = frac
         self.prev: int | None = None
-        self.events: list[tuple[float, int, int]] = []
+        self.count = 0
+        self.last_event: tuple[float, int, int] | None = None
         self.rearms = 0
 
     def threshold(self, capacity: int) -> float:
@@ -1496,6 +1470,7 @@ class HostFlushDetector:
         if prev is None or capacity <= 0:
             return False
         if prev - cached >= self.threshold(capacity):
-            self.events.append((t, prev, cached))
+            self.count += 1
+            self.last_event = (t, prev, cached)
             return True
         return False

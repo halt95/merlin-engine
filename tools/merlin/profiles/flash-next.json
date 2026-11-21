@@ -18,7 +18,18 @@
   "img_cap_note": "Merlin 3.0.0 value (8 MP), the same default as earlier Flash-Next releases.",
   "port": 8000,
   "block_size": 4096,
-  "scales": "scales/qsa_kv_scales_262k.json"
+  "scales": "scales/qsa_kv_scales_262k.json",
+  "spec_tick_costs": {
+   "dflash2": {
+    "chunk": 2048,
+    "tick_costs": [
+     289.0,
+     22.6,
+     0.4
+    ]
+   }
+  },
+  "spec_tick_costs_note": "SPEC=dflash2 only: the scheduler tick costs for the prefill runs (prefill tick ms, decode round ms, fill ticks), exported as VLLM_MERLIN_PREFILL_RUNS_TICK_COSTS only when the launch's prefill chunk equals the chunk they were measured at (the first number is the cost of one full-chunk step) and the caller has not exported their own; at any other chunk the engine default applies. Measured 2026-11-13 UTC on the reference host (4 x RTX 3090, DFlash2, chunk 2048): with the engine default 139 / 25 / 1 the sessions decode 0.16 of the time during a long ingest (target 0.30); with these values 0.296 (0.30 +/- 0.030), temperature-0 output identical on 28 of 28 prompts, pools unchanged, image floor held. Cost: a cold prompt's first token comes 18 to 19 percent later. Every MTP row keeps the engine default (139 / 25 / 1)."
  },
  "launchers": [
   "fn-octo-3090-tp2pp4",

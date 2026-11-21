@@ -334,6 +334,19 @@ def pull_transport_cpu_offload_default() -> bool:
     return False
 
 
+#: Architectures whose Engram tables live in the model's own pinned host
+#: storage (EngramConfig cpu_offload=True) and never use the PLE pull
+#: transport, so the double-offload guard below does not apply to them.
+ENGRAM_OWN_HOST_ARCHS = frozenset({"HYV4FlashForCausalLM"})
+
+
+def engram_pull_guard_applies(model_config) -> bool:
+    """Whether ``verify_engram_against_pull`` guards this model's Engram."""
+    if model_config is None:
+        return True
+    return getattr(model_config, "architecture", None) not in ENGRAM_OWN_HOST_ARCHS
+
+
 def verify_engram_against_pull(engram_config) -> None:
     """Refuse an explicit ``cpu_offload=True`` beside the pull transport.
 

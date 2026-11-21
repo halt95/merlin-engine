@@ -158,11 +158,18 @@ def get_kv_cache_spec(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
 
 
 def get_shared_kv_cache_layers(vllm_config: VllmConfig):
-    attn_layers = get_layers_from_vllm_config(vllm_config, Attention)
+    # MLA layers too: a DFly2 draft MLA layer aliases its
+    # target layer's latent cache while the cache is allocated and bound
+    # (models/hy_v4/nvidia/dfly_target_reuse.py). MLAAttention is not an
+    # Attention subclass and only carries the attribute when aliased.
+    attn_layers = get_layers_from_vllm_config(
+        vllm_config, cast(type[Any], AttentionLayerBase)
+    )
     return {
         layer_name: kv_tgt_layer
         for layer_name, attn_module in attn_layers.items()
-        if (kv_tgt_layer := attn_module.kv_sharing_target_layer_name)
+        # Only an aliased MLA layer carries the attribute
+        if (kv_tgt_layer := getattr(attn_module, "kv_sharing_target_layer_name", None))
     }
 
 
@@ -209,9 +216,11 @@ def init_attn_backend(
 
     # Add KV-sharing layers to their target's kv cache group so they are
     # discovered alongside the target layer in Phase 1 below.
-    add_kv_sharing_layers_to_kv_cache_groups(
-        get_shared_kv_cache_layers(vllm_config), kv_cache_config.kv_cache_groups
-    )
+    # Keep the pairing: a sharing layer has no entry
+    # of its own in a UniformTypeKVCacheSpecs group (get_kv_cache_spec skips it).
+    shared_kv_cache_layers = get_shared_kv_cache_layers(vllm_config)
+    kv_cache_groups = kv_cache_config.kv_cache_groups
+    add_kv_sharing_layers_to_kv_cache_groups(shared_kv_cache_layers, kv_cache_groups)
     fast_prefill_eligible_layers = get_kv_sharing_fast_prefill_eligible_layers(
         vllm_config, draft_layer_names
     )
@@ -250,7 +259,14 @@ def init_attn_backend(
 
             layer_kv_cache_spec: KVCacheSpec = kv_cache_group_spec.kv_cache_spec
             if isinstance(layer_kv_cache_spec, UniformTypeKVCacheSpecs):
-                layer_kv_cache_spec = layer_kv_cache_spec.kv_cache_specs[layer_name]
+                # A KV-sharing layer (a DFly2 draft
+                # MLA layer aliasing its target's latent cache) reads its
+                # target's storage, so it takes the target's spec, as
+                # v1/spec_decode/gemma4.py does for its shared layers.
+                specs = layer_kv_cache_spec.kv_cache_specs
+                layer_kv_cache_spec = specs.get(layer_name) or specs[
+                    shared_kv_cache_layers[layer_name]
+                ]
 
             # Split on per-rank num_heads_q so layers with different Q-head
             # counts (e.g. a spec-decode draft head and its target) get separate

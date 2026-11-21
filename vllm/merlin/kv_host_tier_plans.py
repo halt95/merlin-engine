@@ -88,6 +88,17 @@ RESTORE_LATENCY_EWMA = 0.5
 # not visible (x RESTORE_STALL_FACTOR = the RESTORE_STALL_MIN_S floor).
 RESTORE_LATENCY_PRIOR_S = 0.5
 RESTORE_H2D_BYTES_PER_S = 2 * (1 << 30)
+# MERLIN_KV_HOST_TIER__RESTORE_START_ANY_STEP: with every running seat taken, a
+# restore copy may start only for a request among the next
+# SEATLESS_LOADS_PER_SLOT x N_RESTORE to take a seat, counting the loads
+# already parked ahead of the seats (in flight or landed). N_RESTORE copies in
+# flight plus as many landed keep a loaded restore ready for each seat that
+# frees while the next copies run.
+SEATLESS_LOADS_PER_SLOT = 2
+# MERLIN_KV_HOST_TIER__RESTORE_SEAT_HOLD: the longest a freed running seat
+# waits for the seat-queue head's restore copy (on ``TierPlans._now``); then
+# that request gets no second hold and later arrivals may take the seat.
+SEAT_HOLD_SECONDS = 3.0
 
 logger = init_logger(__name__)
 
@@ -183,6 +194,23 @@ class _Inflight:
 class TierPlans:
     """Owned by ``SimpleCPUOffloadScheduler`` when the tier is active."""
 
+    # MERLIN_KV_TIER_DIAG's restore lifecycle (``__init__``); the class default
+    # keeps the hooks inert on instances built without ``__init__``.
+    life: RestoreLifecycle | None = None
+    # MERLIN_KV_HOST_TIER__RESTORE_START_ANY_STEP and
+    # MERLIN_KV_HOST_TIER__RESTORE_CREDITS_PER_SLOT (``__init__``), and whether
+    # the scheduler's pass is starting restores with every seat taken (set by
+    # the scheduler); class defaults keep instances built without ``__init__``
+    # on the switch-off path.
+    start_any_step: bool = False
+    credits_per_slot: bool = False
+    seatless_pass: bool = False
+    seatless_starts: int = 0
+    # MERLIN_KV_HOST_TIER__RESTORE_SEAT_HOLD (``__init__``) and the request
+    # whose last ``_admit`` waited for a restore slot (``hold_seat``).
+    seat_hold: bool = False
+    cap_waited: str | None = None
+
     def __init__(self, sched: SimpleCPUOffloadScheduler):
         self.sched = sched
         # Lookups that recompute a once-held session, by loss cause,
@@ -268,6 +296,40 @@ class TierPlans:
         # outcome and scoped touch, so a re-entered admission in the same
         # step (coalesced follower, retried pass) records and touches once.
         self._admitted_at: dict[str, int] = {}
+        # MERLIN_KV_TIER_DIAG=1: the per-restore lifecycle lines
+        # (``RestoreLifecycle``). Off it is None and no hook does any work.
+        self.life: RestoreLifecycle | None = (
+            RestoreLifecycle(self) if _tier_diag_on() else None
+        )
+        from vllm.merlin.kv_host_tier_writeback import (
+            n_restore,
+            restore_credits_per_slot,
+            restore_seat_hold,
+            restore_start_any_step,
+        )
+
+        self.start_any_step = restore_start_any_step()
+        self.credits_per_slot = restore_credits_per_slot()
+        # Restore copies started on a step with every running seat taken.
+        self.seatless_starts = 0
+        self.seat_hold = restore_seat_hold()
+        # The seat hold in force (request id, start on ``_now``), the requests
+        # whose hold timed out (no second hold), and the holds and timeouts.
+        self._seat_hold: tuple[str, float] | None = None
+        self._seat_hold_spent: set[str] = set()
+        self.seat_holds = 0
+        self.seat_hold_timeouts = 0
+        # The restore switches as this engine reads them, once at start.
+        logger.info(
+            "SimpleCPU tier plans config: restore_start_any_step=%d "
+            "restore_credits_per_slot=%d restore_seat_hold=%d seat_hold_s=%.1f "
+            "n_restore=%d",
+            self.start_any_step,
+            self.credits_per_slot,
+            self.seat_hold,
+            SEAT_HOLD_SECONDS,
+            n_restore(),
+        )
 
     # -- resolution -------------------------------------------------------------
     def bind(self, kv_cache_manager: KVCacheManager) -> None:
@@ -305,6 +367,78 @@ class TierPlans:
             callable(getattr(cap, name, None))
             for name in ("can_start", "start", "done")
         ) else None
+
+    # -- restore start with every seat taken ----------------------------------
+    def seatless_window(self, num_parked: int) -> int:
+        """How many waiting requests, in seat order, a pass with every running
+        seat taken may look at to start their restore copies: 0 with the
+        switch off or no restore slot free; else SEATLESS_LOADS_PER_SLOT x
+        N_RESTORE less the ``num_parked`` loads (in flight or landed, holding
+        their blocks) already ahead of them for the seats."""
+        if not self.start_any_step:
+            return 0
+        cap = self._restore_cap()
+        if cap is None or not cap.can_start():
+            return 0
+        slots = max(int(getattr(cap, "cap", 1)), 1)
+        return max(0, SEATLESS_LOADS_PER_SLOT * slots - num_parked)
+
+    def restore_slot_free(self) -> bool:
+        cap = self._restore_cap()
+        return cap is not None and cap.can_start()
+
+    def hold_seat(self, request_id: str, *, cap_wait: bool = False) -> bool:
+        """Whether the scheduler's pass, with a running seat free, ends at
+        ``request_id`` -- the seat-queue head, skipped because its restore
+        copy is in flight (blocked) or, ``cap_wait``, because the ``_admit``
+        just run waited for a restore slot -- instead of seating a later
+        arrival (the scheduler's pass then only starts restore copies, as
+        with every seat taken). One hold at a time, for at most
+        SEAT_HOLD_SECONDS; the head then gets no second hold. False with the
+        switch off, and without MERLIN_KV_HOST_TIER__RESTORE_START_ANY_STEP
+        (a held seat would stop the copies behind the head from starting)."""
+        if (
+            not (self.seat_hold and self.start_any_step)
+            or request_id in self._seat_hold_spent
+        ):
+            return False
+        waits = (
+            self.cap_waited == request_id
+            if cap_wait
+            else request_id in self._plan_loads
+        )
+        if not waits:
+            return False
+        now = self._now()
+        held = self._seat_hold
+        if held is None or held[0] != request_id:
+            # A new head: the previous one took its seat or left.
+            self._seat_hold = (request_id, now)
+            self.seat_holds += 1
+            return True
+        if now - held[1] < SEAT_HOLD_SECONDS:
+            return True
+        self._seat_hold = None
+        self._seat_hold_spent.add(request_id)
+        self.seat_hold_timeouts += 1
+        return False
+
+    def _end_seat_hold(self, request_id: str) -> None:
+        self._seat_hold_spent.discard(request_id)
+        if self._seat_hold is not None and self._seat_hold[0] == request_id:
+            self._seat_hold = None
+
+    def seatless_floor(self, num_running: int) -> int:
+        """Free GPU blocks a restore started with every seat taken must leave:
+        the running headroom bound the write-back walker keeps for its copy
+        pins (``WriteBack.reserve`` plus one block per running request per
+        alignment group), so one step of the running requests' growth never
+        meets a pool such a restore emptied. Without a walker, one block per
+        running request."""
+        wb = self.sched.writeback
+        if wb is None:
+            return num_running
+        return wb.reserve + num_running * wb.alignment_groups
 
     def coordinator(self):
         """The GPU coordinator the plan's group finders run on. Without a
@@ -765,6 +899,7 @@ class TierPlans:
         """
         s = self.sched
         req_id = request.request_id
+        self.cap_waited = None
         self.release(req_id)
         self._zero_hit.pop(req_id, None)
         self._fallback_pass.discard(req_id)  # set again by this pass's fallback
@@ -816,6 +951,8 @@ class TierPlans:
             self._zero_hit[req_id] = plan.shared_prefix_boundary
             return PlanHit(empty, 0, 0, plan.shared_prefix_boundary, False)
         restore = self.restore_slots(plan)
+        if restore and self.life is not None:
+            self.life.lease_ready(req_id, len(restore))
         # A follower whose host sources an
         # in-flight promotion already reads needs no restore slot of its own;
         # it coalesces BEFORE the cap gate, so a full cap never recomputes it.
@@ -834,6 +971,7 @@ class TierPlans:
             lease.release()
             if self._cap_wait_progressing(req_id):
                 self.counters.restore_cap_wait += 1
+                self.cap_waited = req_id
                 return None
             waited = self._cap_waits.pop(req_id, None)
             if req_id not in self._cap_fallback:
@@ -990,6 +1128,7 @@ class TierPlans:
         level = self.fallback.pop(req_id, UNION)
         self._plans.pop(req_id, None)
         self._looked_up.discard(req_id)  # the logical admission ends
+        self._end_seat_hold(req_id)
         pending = self._pending.pop(req_id, None)
         if pending is None:
             self._note_zero_hit_admission(request, level)
@@ -1172,6 +1311,10 @@ class TierPlans:
             zip(destinations, [src.block_id for src in sources])
         )
         self.counters.restore_admitted += 1
+        if self.seatless_pass:
+            self.seatless_starts += 1
+        if self.life is not None:
+            self.life.slot_start(req_id, len(sources))
         tokens = plan.boundary - plan.gpu_boundary
         if s.tier_runtime is not None:
             s._census().pending_loads[req_id] = (tokens, len(sources))
@@ -1201,23 +1344,39 @@ class TierPlans:
         # P (``waiting_for_credit``), so batches keep that size as stores
         # complete without the total ever passing P.
         in_flight = sum(self._issued.values())
-        cap = max(wb.credits_cap, 1)
+        cap = self.restore_credits()
         # The restore direction has its
         # own P_r; demotions in flight (``wb.in_flight``) do not reduce it.
         self._tick_budget = cap - in_flight
+
+    def restore_credits(self) -> int:
+        """The restore direction's row budget P_r: COPY_CREDITS (at least
+        one), or with MERLIN_KV_HOST_TIER__RESTORE_CREDITS_PER_SLOT=1 that many
+        rows per restore slot, so the restores in flight each issue a whole
+        COPY_CREDITS batch in one step instead of splitting one budget. The
+        rows are retained from the hand-off either way: the budget bounds only
+        what one step issues."""
+        wb = self.sched.writeback
+        cap = max(wb.credits_cap, 1) if wb is not None else 1
+        if self.credits_per_slot:
+            slots = self._restore_cap()
+            if slots is not None:
+                cap *= max(int(getattr(slots, "cap", 1)), 1)
+        return cap
 
     def waiting_for_credit(self) -> int:
         """Credits the walker must leave free for admitted restores."""
         unissued = sum(len(pairs) for pairs in self._unissued.values())
         if not unissued:
             return 0
-        wb = self.sched.writeback
-        cap = max(wb.credits_cap, 1) if wb is not None else 1
+        cap = self.restore_credits()
         return max(0, min(cap, unissued) - sum(self._issued.values()))
 
     def end_tick(self) -> None:
         """After this tick's loads are issued: the credit account counts
         them (``credits``/``credits_peak`` include H2D batches)."""
+        if self.life is not None:
+            self.life.step()
         s = self.sched
         wb = s.writeback
         if wb is None:
@@ -1253,6 +1412,11 @@ class TierPlans:
         self._issued[request_id] = n
         self._batches[request_id] = self._batches.get(request_id, 0) + 1
         self._final_issued[request_id] = not self._unissued[request_id]
+        if self.life is not None:
+            self.life.batch_issue(
+                request_id, self._batches[request_id], n, len(pending),
+                self._tick_budget,
+            )
         cpu = [c for _, c in batch]
         self._read.setdefault(request_id, []).extend(cpu)
         return [g for g, _ in batch], cpu
@@ -1292,6 +1456,8 @@ class TierPlans:
         # A batch resolved on every rank is restore
         # progress for the cap waiters, whatever its outcome.
         self._note_restore_progress(request_id)
+        if self.life is not None:
+            self.life.batch_commit(request_id, failed)
         # The unissued remainder stays recorded: a cancelled restore that
         # stops early is incomplete (``on_load_retired``), never complete.
         if failed or state.finished or not self._unissued.get(request_id):
@@ -1502,6 +1668,8 @@ class TierPlans:
             and state.lease is not None
             and state.lease.epoch == s.cache_epoch
         )
+        if self.life is not None:
+            self.life.retire(request_id, state, success)
         if admission is not None:
             self.accounting.complete(admission, success=success)
             self.accounting.forget(admission)
@@ -1551,6 +1719,11 @@ class TierPlans:
         for cause in self.MISS_CAUSES:
             out[f"miss_{cause}"] = self.miss_causes.get(cause, 0)
         out["lookup_evict_us"] = int(self.lookup_seconds * 1e6)
+        if self.start_any_step:
+            out["restore_seatless_starts"] = self.seatless_starts
+        if self.seat_hold and self.start_any_step:
+            out["restore_seat_holds"] = self.seat_holds
+            out["restore_seat_hold_timeouts"] = self.seat_hold_timeouts
         a = self.accounting
         out["union_hit_tokens"] = a.union_hit_tokens
         out["gpu_only_tokens"] = a.gpu_hit_tokens
@@ -1582,8 +1755,11 @@ class TierPlans:
         self._batch_issue_step.pop(request_id, None)
         self._batch_issue_time.pop(request_id, None)
         self._admitted_at.pop(request_id, None)
+        self._end_seat_hold(request_id)
         for inflight in self._inflight.values():
             inflight.waiters.discard(request_id)
+        if self.life is not None:
+            self.life.forget(request_id)
 
     def reset(self) -> None:
         self.release_pending()
@@ -1601,3 +1777,172 @@ class TierPlans:
         self._batch_issue_time.clear()
         self._admitted_at.clear()
         self._inflight.clear()
+        self._seat_hold = None
+        self._seat_hold_spent.clear()
+
+
+def _tier_diag_on() -> bool:
+    """MERLIN_KV_TIER_DIAG=1 (debug log lines only)."""
+    try:
+        from vllm.merlin.envs import read_registered
+
+        return bool(read_registered("MERLIN_KV_TIER_DIAG"))
+    except Exception:  # a debug switch must never break admission
+        return False
+
+
+class RestoreLifecycle:
+    """MERLIN_KV_TIER_DIAG=1: one ``KV tier diag: restore`` line per event of
+    each host restore, with the scheduler step (``_sched_step``: what an
+    admission records inside ``schedule()`` carries the step before that
+    schedule's connector build, which issues the batches) and the wall time
+    (``t``, Unix seconds, to join the request log):
+
+    * ``lease-ready``: the first pass that resolved a valid plan with a host
+      part (it may then coalesce or wait for the cap);
+    * ``slot-start``: the hand-off took a restore slot (``wait_*`` since
+      lease-ready, ``in_flight`` the slots taken after it);
+    * ``batch-issue``: credit batch ``batch`` of ``rows`` rows out of the
+      ``left`` still unissued; ``credit_bound=1`` when the tick's H2D budget
+      cut it short (``budget_left`` after it);
+    * ``batch-commit``: that batch resolved on every rank (``ok=0``: unwound
+      or stale epoch), ``lat_*`` since its issue;
+    * ``retire``: the load retired and its slot freed (``hold_*`` since
+      slot-start);
+    * ``first-compute``: the first step that schedules the request after a
+      successful retire (``since_*`` since the retire); ``head_step``: the
+      first step the request headed the seat queue (the first request a pass
+      with a running seat free looks at), -1 when it never did; also on
+      ``slot-start`` once known.
+
+    And one ``restore-step`` line per step with a restore in flight, a cap
+    waiter or a landed restore not yet scheduled: the cap waiters
+    (requests) and the cap-wait passes of the step, the slots in use, the
+    restore rows issued and unissued, and the GPU blocks the scheduler leaves
+    parked loads (``parked_reserved``; -1 when no scheduler is bound). Off,
+    ``TierPlans.life`` is None and nothing here runs."""
+
+    def __init__(self, plans: TierPlans):
+        self.plans = plans
+        # Bound by the scheduler: the blocks new admissions leave parked loads.
+        self.parked_reserved: Callable[[], int] | None = None
+        self._ready: dict[str, tuple[int, float]] = {}
+        self._slot: dict[str, tuple[int, float]] = {}
+        self._batch: dict[str, tuple[int, int, float]] = {}
+        self._landed: dict[str, tuple[Any, int, float]] = {}
+        self._head: dict[str, int] = {}
+        self._cap_wait_seen = plans.counters.restore_cap_wait
+
+    def _clock(self) -> tuple[int, float]:
+        return self.plans.sched._sched_step, time.time()
+
+    @staticmethod
+    def _line(event: str, req_id: str, step: int, t: float, **fields) -> None:
+        extra = "".join(f" {k}={v}" for k, v in fields.items())
+        logger.info(
+            "KV tier diag: restore %s req=%s step=%d t=%.3f%s",
+            event, req_id, step, t, extra,
+        )
+
+    def _in_flight(self) -> int:
+        cap = self.plans._restore_cap()
+        return cap.count if cap is not None else len(self.plans._plan_loads)
+
+    def lease_ready(self, req_id: str, rows: int) -> None:
+        if req_id in self._ready or req_id in self._slot:
+            return
+        step, t = self._clock()
+        self._ready[req_id] = (step, t)
+        self._line("lease-ready", req_id, step, t, rows=rows)
+
+    def seat_head(self, req_id: str) -> None:
+        if req_id not in self._head:
+            self._head[req_id] = self.plans.sched._sched_step
+
+    def slot_start(self, req_id: str, rows: int) -> None:
+        step, t = self._clock()
+        ready_step, ready_t = self._ready.pop(req_id, (step, t))
+        self._slot[req_id] = (step, t)
+        # ``seatless`` (1: started with every running seat taken) only with
+        # MERLIN_KV_HOST_TIER__RESTORE_START_ANY_STEP on.
+        extra: dict[str, int] = (
+            {"seatless": int(self.plans.seatless_pass)}
+            if self.plans.start_any_step
+            else {}
+        )
+        if req_id in self._head:
+            extra["head_step"] = self._head[req_id]
+        self._line(
+            "slot-start", req_id, step, t, rows=rows,
+            in_flight=self._in_flight(), wait_steps=step - ready_step,
+            wait_s=f"{t - ready_t:.3f}", **extra,
+        )
+
+    def batch_issue(
+        self, req_id: str, batch: int, rows: int, left: int, budget_left: int
+    ) -> None:
+        step, t = self._clock()
+        self._batch[req_id] = (batch, step, t)
+        self._line(
+            "batch-issue", req_id, step, t, batch=batch, rows=rows, left=left,
+            credit_bound=int(rows < left), budget_left=budget_left,
+        )
+
+    def batch_commit(self, req_id: str, failed: bool) -> None:
+        issued = self._batch.pop(req_id, None)
+        if issued is None:
+            return
+        batch, issue_step, issue_t = issued
+        step, t = self._clock()
+        self._line(
+            "batch-commit", req_id, step, t, batch=batch, ok=int(not failed),
+            lat_steps=step - issue_step, lat_s=f"{t - issue_t:.3f}",
+        )
+
+    def retire(self, req_id: str, state, success: bool) -> None:
+        self._batch.pop(req_id, None)
+        step, t = self._clock()
+        slot_step, slot_t = self._slot.pop(req_id, (step, t))
+        self._line(
+            "retire", req_id, step, t, ok=int(success),
+            hold_steps=step - slot_step, hold_s=f"{t - slot_t:.3f}",
+            in_flight=self._in_flight(),
+        )
+        if success and not state.finished:
+            self._landed[req_id] = (state.request, step, t)
+
+    def step(self) -> None:
+        from vllm.v1.request import RequestStatus
+
+        step, t = self._clock()
+        for req_id, (request, retire_step, retire_t) in list(self._landed.items()):
+            if request.status == RequestStatus.RUNNING:
+                del self._landed[req_id]
+                self._line(
+                    "first-compute", req_id, step, t,
+                    since_steps=step - retire_step, since_s=f"{t - retire_t:.3f}",
+                    head_step=self._head.pop(req_id, -1),
+                )
+        plans = self.plans
+        passes = plans.counters.restore_cap_wait - self._cap_wait_seen
+        self._cap_wait_seen = plans.counters.restore_cap_wait
+        waiters = len(plans._cap_waits)
+        loads = len(plans._plan_loads)
+        if not (loads or waiters or passes or self._landed):
+            return
+        reserved = self.parked_reserved() if self.parked_reserved is not None else -1
+        logger.info(
+            "KV tier diag: restore-step step=%d t=%.3f cap_waiters=%d "
+            "cap_wait_passes=%d in_flight=%d loads=%d issued_rows=%d "
+            "unissued_rows=%d landed_unscheduled=%d parked_reserved=%d",
+            step, t, waiters, passes, self._in_flight(), loads,
+            sum(plans._issued.values()),
+            sum(len(pairs) for pairs in plans._unissued.values()),
+            len(self._landed), reserved,
+        )
+
+    def forget(self, req_id: str) -> None:
+        """The request left: an in-flight restore still retires later."""
+        self._ready.pop(req_id, None)
+        self._landed.pop(req_id, None)
+        self._head.pop(req_id, None)

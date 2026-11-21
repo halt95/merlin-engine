@@ -14,7 +14,6 @@ embedded v2 sha256 table and changes nothing.
 """
 
 import argparse
-import fcntl
 import hashlib
 import importlib.metadata as md
 import importlib.util
@@ -151,6 +150,8 @@ def check_target() -> tuple[Path, Path]:
 
 def verify() -> None:
     """Offline: the eight installed files must be the authenticated v2 bytes."""
+    import fcntl
+
     purelib, package = check_target()
     lock_path = purelib / ".flashinfer-sm8x-patch.lock"
     if not lock_path.is_file():
@@ -176,6 +177,8 @@ def need_patch_tool() -> None:
 
 
 def install(wheel: Path) -> None:
+    import fcntl
+
     need_patch_tool()
     if hashlib.sha256(wheel.read_bytes()).hexdigest() != WHEEL_SHA:
         raise RuntimeError("wheel is not the pinned FlashInfer 0.7.2.post1 wheel")

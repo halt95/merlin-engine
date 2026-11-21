@@ -1,0 +1,6 @@
+{
+  "id": "calendar_utils",
+  "title": "Wrong month lengths and leap years",
+  "issue": "calendar_utils reports wrong results. is_leap(1900) returns True, but century years are leap years only when divisible by 400. days_in_month returns the length of the following month and crashes for December. A month outside 1..12 must raise ValueError. day_of_year is wrong as a consequence. The tests in tests/ describe the expected behaviour.",
+  "test_dir": "tests"
+}

@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by the Merlin project; see NOTICE.
 
 
 from http import HTTPStatus
@@ -25,6 +26,9 @@ from vllm.entrypoints.serve.utils.api_utils import (
     load_aware_call,
     validate_json_request,
     with_cancellation,
+)
+from vllm.entrypoints.serve.utils.sse_keep_alive import (  # noqa: E501
+    with_sse_keep_alive,
 )
 from vllm.logger import init_logger
 
@@ -84,7 +88,11 @@ async def create_messages(request: AnthropicMessagesRequest, raw_request: Reques
         logger.debug("Anthropic Messages Response: %s", resp)
         return JSONResponse(content=resp)
 
-    return StreamingResponse(content=generator, media_type="text/event-stream")
+    # Comment frames while the stream idles.
+    args = getattr(raw_request.app.state, "args", None)
+    keep_alive_interval = float(getattr(args, "sse_keep_alive_interval", 0))
+    sse = with_sse_keep_alive(generator, keep_alive_interval)
+    return StreamingResponse(content=sse, media_type="text/event-stream")
 
 
 @router.post(

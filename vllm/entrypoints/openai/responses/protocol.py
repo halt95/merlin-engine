@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by the Merlin project; see NOTICE.
 
 # Adapted from
 # https://github.com/lm-sys/FastChat/blob/168ccc29d3f7edc50823016105c024fe2282732a/fastchat/protocol/openai_api_protocol.py
@@ -16,6 +17,8 @@ from openai.types.responses import (
     ResponseContentPartDoneEvent,
     ResponseCustomToolCallInputDeltaEvent,
     ResponseCustomToolCallInputDoneEvent,
+    ResponseError,
+    ResponseErrorEvent,
     ResponseFunctionToolCall,
     ResponseInputItemParam,
     ResponseMcpCallArgumentsDeltaEvent,
@@ -871,6 +874,11 @@ class ResponsesResponse(OpenAIBaseModel):
     id: str = Field(default_factory=lambda: f"resp_{random_uuid()}")
     created_at: int = Field(default_factory=lambda: int(time.time()))
     # error: Optional[ResponseError] = None
+    # Set only on a stored response
+    # that failed; omitted from every other response.
+    error: ResponseError | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     incomplete_details: IncompleteDetails | None = None
     instructions: str | None = None
     metadata: Metadata | None = None
@@ -1054,6 +1062,7 @@ StreamingResponsesResponse: TypeAlias = (
     | ResponseInProgressEvent
     | ResponseCompletedEvent
     | ResponseIncompleteEvent
+    | ResponseErrorEvent
     | ResponseOutputItemAddedEvent
     | ResponseOutputItemDoneEvent
     | ResponseContentPartAddedEvent

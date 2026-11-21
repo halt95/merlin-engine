@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Modified by the Merlin project; see NOTICE.
 
 import asyncio
 import functools
@@ -55,13 +56,7 @@ async def listen_for_disconnect(request: Request) -> None:
     while True:
         message = await request.receive()
         if message["type"] == "http.disconnect":
-            # If load tracking is enabled *and* the counter exists, decrement
-            # it. Combines the previous nested checks into a single condition
-            # to satisfy the linter rule.
-            if getattr(
-                request.app.state, "enable_server_load_tracking", False
-            ) and hasattr(request.app.state, "server_load_metrics"):
-                request.app.state.server_load_metrics -= 1
+            decrement_server_load(request)
             break
 
 
@@ -180,7 +175,9 @@ def json_or_sse_responses(
 
 
 def decrement_server_load(request: Request):
-    request.app.state.server_load_metrics -= 1
+    if getattr(request.state, "_merlin_server_load_held", False):
+        request.state._merlin_server_load_held = False
+        request.app.state.server_load_metrics -= 1
 
 
 def load_aware_call(func):
@@ -201,10 +198,11 @@ def load_aware_call(func):
             raw_request.app.state.server_load_metrics = 0
 
         raw_request.app.state.server_load_metrics += 1
+        raw_request.state._merlin_server_load_held = True
         try:
             response = await func(*args, **kwargs)
-        except Exception:
-            raw_request.app.state.server_load_metrics -= 1
+        except BaseException:
+            decrement_server_load(raw_request)
             raise
 
         if isinstance(response, Response):
@@ -224,7 +222,7 @@ def load_aware_call(func):
                 tasks.add_task(decrement_server_load, raw_request)
                 response.background = tasks
         else:
-            raw_request.app.state.server_load_metrics -= 1
+            decrement_server_load(raw_request)
 
         return response
 

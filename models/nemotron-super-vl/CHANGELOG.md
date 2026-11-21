@@ -2,6 +2,14 @@
 
 Release notes of the Nemotron 3.5 Super VL recipe, newest first. See the [README](README.md).
 
+## Merlin 3.0.2.2
+
+The recipe runs on **vLLM 0.33.0**, as in 3.0.2.1; the recipe version stays 3.0.0. See the
+[engine changelog](../../docs/CHANGELOG.md#merlin-3022) for the full release.
+
+- **Tool calls** (`qwen3_coder` tool-call parser): the 3.0.2.2 tool-call changes apply; see the engine changelog.
+- **`--disable-chunked-mm-input` with a long-prefill cap (`LPT`) is refused** at launch.
+
 ## Merlin 3.0.2.1
 
 The recipe runs on **vLLM 0.33.0**, as in 3.0.2. See the [engine changelog](../../docs/CHANGELOG.md#merlin-3021) for

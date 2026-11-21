@@ -31,6 +31,7 @@ import torch
 import torch.nn as nn
 
 import vllm.envs as envs
+import vllm.merlin.grammar_step_diag as step_diag
 from vllm.compilation.breakable_cudagraph import BreakableCUDAGraphWrapper
 from vllm.compilation.counter import compilation_counter
 from vllm.compilation.cuda_graph import CUDAGraphStat, CUDAGraphWrapper
@@ -2284,6 +2285,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # The e2-toggles line if arm() had to defer it (a C++ static
             # still uninitialised). One bool check once it has been emitted.
             e2_toggles.maybe_emit()
+            from vllm.merlin import cold_experts
+            cold_experts.adaptive_step()  # between steps, outside graphs; off: 1 check
             # Update the request states.
             # The deferred commit and the frees, in
             # the order kv_host_tier.update_finished_and_deferred picks.
@@ -2689,6 +2692,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if dp_sync_state is not None
             else scheduler_output.skip_drafts
         )
+        step_diag.forward_end()
         self.execute_model_state = ExecuteModelState(
             input_batch=input_batch,
             attn_metadata=attn_metadata,
@@ -2725,6 +2729,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if self.execute_model_state is None:
             # The prior execute_model call must have failed.
             return None
+
+        step_diag.sample_start(grammar_output is not None)
 
         input_batch = self.execute_model_state.input_batch
         attn_metadata = self.execute_model_state.attn_metadata
@@ -3050,6 +3056,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         topk_counters.maybe_log(force=True)
         # A still-deferred e2-toggles line goes out now, 'uninit' and all.
         e2_toggles.maybe_emit(force=True)
+        from vllm.merlin import cold_experts
+
+        cold_experts.adaptive_report(once=True)  # swap totals: after the sync, before teardown
         if self._ple_offload_connector is not None:
             self._ple_offload_connector.close()
             self._ple_offload_connector = None
@@ -3060,6 +3069,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             BreakableCUDAGraphWrapper.clear_all_graphs()
         if self.aux_output_connector is not None:
             self.aux_output_connector.close()
+        # The last counter line and dump.
+        from vllm.merlin.spec_residual_diag import shutdown_all
+
+        shutdown_all()
         set_offloader(None)
         self.cudagraph_manager = None
         self.fast_prefill = None

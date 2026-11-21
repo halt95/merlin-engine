@@ -491,6 +491,16 @@ class DeepseekV4ForCausalLMConfig(VerifyAndUpdateConfig):
                 )
 
 
+# Hy4 Flash config-time settings (sparse MQA in the hash
+# key, the PP split); the logic lives in vllm/merlin/hy4flash_pp.py.
+class HYV4FlashForCausalLMConfig(VerifyAndUpdateConfig):
+    @staticmethod
+    def verify_and_update_config(vllm_config: "VllmConfig") -> None:
+        from vllm.merlin.hy4flash_pp import verify_and_update_hy4flash_config
+
+        verify_and_update_hy4flash_config(vllm_config)
+
+
 class KimiK3ForConditionalGenerationConfig(VerifyAndUpdateConfig):
     """Route MXFP4-checkpointed Kimi-K3 MoE experts to the MXFP4 interface.
 
@@ -1330,6 +1340,7 @@ MODELS_CONFIG_MAP: dict[str, type[VerifyAndUpdateConfig]] = {
     "Glm5NextForConditionalGeneration": Glm5NextModelConfig,
     "GlmMoeDsaForCausalLM": GlmMoeDsaForCausalLM,
     "GptOssForCausalLM": GptOssForCausalLMConfig,
+    "HYV4FlashForCausalLM": HYV4FlashForCausalLMConfig,
     "LongcatFlashNgramForCausalLM": LongcatFlashNgramForCausalLMConfig,
     "GteModel": SnowflakeGteNewModelConfig,
     "GteNewForSequenceClassification": GteNewModelConfig,

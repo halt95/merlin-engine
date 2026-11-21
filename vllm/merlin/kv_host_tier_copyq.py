@@ -347,9 +347,12 @@ class CopyQueue:
     # -- host-aware yield ---------------------------------------------------
     def _unit_state(self, unit: "RestoreUnit | None") -> str:
         """``complete`` (nothing dirty, nothing in flight), ``in_flight``
-        (a copy of it is in flight) or ``dirty``."""
-        if unit is None or self._units is None:
+        (a copy of it is in flight) or ``dirty``. A missing unit is
+        ``dirty``: nothing on the host backs it."""
+        if self._units is None:
             return "complete"
+        if unit is None:
+            return "dirty"
         tier = self.wb.tier
         in_flight = self.wb.in_flight
         dirty = False
@@ -364,6 +367,15 @@ class CopyQueue:
         if self.manager is None or self._units is None:
             return True
         return self._unit_state(self._grace_unit(request_id)) == "complete"
+
+    def grace_backed(self, request_id: str) -> bool:
+        """Verified host backing for a grace: the tier is bound, the grace
+        has a live restore unit and that unit is host-complete. The yield
+        best-fit (``SessionYield._backed``) is allowed only on these."""
+        if self.manager is None or self._units is None:
+            return False
+        unit = self._grace_unit(request_id)
+        return unit is not None and self._unit_state(unit) == "complete"
 
     def grace_state(self, request_id: str) -> str:
         if self.manager is None or self._units is None:

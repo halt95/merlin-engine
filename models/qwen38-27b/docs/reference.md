@@ -40,7 +40,7 @@ and drafter, FP8 E4M3 KV, MTP with **K=4** draft tokens per step, fp16 SSM state
   95 % Newcombe CI **[−5.89, +1.61] pp**, within CI and not significantly worse.
 - 27B TP2 serves images up to 8 MP. With the vision-peak option on (`VLLM_MERLIN_VISION_PEAK=1`, the TP2 launcher default), the 50-item TP2 stress sweep's worst minimum free was 806 MiB per card (2026-10-15), above the 524 MiB floor. A separate knob OFF/ON identity check matched tokens and logprobs on 6/6 prompts. Flash-Next (902 MiB) meets the target. 27B TP4 left 690 MiB free on the retired RecoverSSM-off pin; at the shipped chunk 4096 with RecoverSSM on, the 2026-10-20 bench card measured 862 MiB lowest free (one 8 MP image, two at once, and four in one prompt; 2 cards: 886 MiB), above the 524 MiB floor.
 
-The release engine is **Merlin 3.0.2.1 on vLLM 0.33.0**. The
+The release engine is **Merlin 3.0.2.2 on vLLM 0.33.0**. The
 [3.0.2.1 bench card](../benchmarks/2026-11-12/BENCH-CARD.md) holds the 3.0.2.1 results, the
 [3.0.2 bench card](../benchmarks/2026-11-04/BENCH-CARD.md) the 3.0.2 results, the
 [2026-11-02 bench card](../benchmarks/2026-11-02/BENCH-CARD.md) the 3.0.1 results and the
@@ -101,6 +101,11 @@ directory; export `HF_HUB_OFFLINE=0` to allow Hub lookups). The download step se
 | `models/qwen38-27b/serve-tp4.sh` | quad card (4, TP=4) | 262K | RecoverSSM on with the shipped geometry (`--block-size 1024 --max-num-batched-tokens 4096`, LPT 832), `--max-num-seqs 24` (32 with `merlin serve --swarm` and the 48g KV RAM cache, 3.0.1), 7 × 262K or 14 × 131K resident; P2P on by default, `P2P=off` without it (untested on 3090s) |
 | single card | 1 | 262K | Ships as `serve-1card.sh` (TP1): 4 MP images with the single-card memory settings (96 MiB FlashInfer workspace shared with the MTP drafter, in-place vision rotary); tested 2026-10-21 (pool 271,506) |
 
+**KV RAM cache hit rate at 48g and 96g (measured 2026-11-15 on Merlin 3.0.2.2).** On a busy 144-session multi-turn agent trace on 4 × RTX 3090 (TP4, GPU pool
+2,012,105 tokens), the server served from cache 11.4 % of the trace's ceiling with the `--swarm` default of 48g and 87.5 % with
+`--kv-ram-cache 96g`. At 96g the engine's processes peaked at about 121 GiB of host memory (about 73 GiB at 48g). The
+default stays 48g in 3.0.2.2; the 3.0.2.2 defaults give up copies the GPU still holds first and keep the waiting queue's sessions until last (`MERLIN_KV_HOST_TIER__EVICT_DUPLICATES_FIRST` and `MERLIN_KV_HOST_TIER__EVICT_WAITING_LAST`, both on), and the figures above were measured before them.
+
 ### Knobs
 
 | knob | default | what it does |
@@ -156,7 +161,7 @@ See the [CUDA driver requirements](../../../release/install-0.33.md). On the 3.0
 | Tools | git, `sha256sum`, GNU `patch`, `flock` (util-linux) | |
 | Disk | about 17 GB (15.9 GiB) for the checkpoint, plus the venv and the engine source tree (`.vllm-v2.5.2`) | |
 | System RAM | **about 2.4 GiB more than a standard vLLM serve**: the token-embedding table lives in pinned host RAM, 1.18 GiB per GPU on dual card or 0.59 on quad card | 192 GB host (152 GiB to the serving environment) |
-| Interconnect | GPU peer-to-peer (P2P): `P2P=on`, the default, skips vLLM's P2P check and sets `NCCL_P2P_LEVEL=SYS`. On `27b-tp2-3090` P2P=on also sets the measured TP2 levers: `NCCL_PROTO=Simple`, `VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC=1` (both owned by the P2P mode; an inherited value is not used), `VLLM_DRAFT_BOUNDED_PLAN=1`, `VLLM_GDN_DECODE_FASTPATH=1`, `VLLM_GDN_SHARED_ALIGN_INDEX=1` and `VLLM_TARGET_SEQ_LENS_ASYNC=1` (each can be overridden from the environment). Without P2P, `merlin serve 27b <dir> --tp 2` picks the no-P2P row, or set `P2P=off` (NCCL through host memory, `NCCL_P2P_DISABLE=1`). PCIe Gen4 x16 and P2P were used for every reference-host measurement | P2P-enabled driver |
+| Interconnect | GPU peer-to-peer (P2P): `P2P=on`, the default, skips vLLM's P2P check and sets `NCCL_P2P_LEVEL=SYS`. On `27b-tp2-3090` P2P=on also sets the measured TP2 levers: `NCCL_PROTO=Simple`, `VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC=1` (both owned by the P2P mode; an inherited value is not used), `VLLM_DRAFT_BOUNDED_PLAN=1`, `VLLM_GDN_DECODE_FASTPATH=1`, `VLLM_GDN_SHARED_ALIGN_INDEX=1` and `VLLM_TARGET_SEQ_LENS_ASYNC=1` (each can be overridden from the environment). On `27b-tp4-3090` P2P=on sets only the last four (`VLLM_DRAFT_BOUNDED_PLAN=1`, `VLLM_GDN_DECODE_FASTPATH=1`, `VLLM_GDN_SHARED_ALIGN_INDEX=1`, `VLLM_TARGET_SEQ_LENS_ASYNC=1`; each can be overridden from the environment); the other TP4 rows and `27b-tp1-3090` set none of them. Without P2P, `merlin serve 27b <dir> --tp 2` picks the no-P2P row, or set `P2P=off` (NCCL through host memory, `NCCL_P2P_DISABLE=1`). PCIe Gen4 x16 and P2P were used for every reference-host measurement | P2P-enabled driver |
 
 Not yet run on RTX 3090s without P2P on this release; the four-card no-P2P row was boot-checked with `--swarm` on
 2026-11-01. On the v1.3.0 engine, two cloud-hosted RTX 3090s without P2P ran the TP2

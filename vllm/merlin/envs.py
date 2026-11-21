@@ -56,6 +56,33 @@ if TYPE_CHECKING:
     # admission gave them (e.g. 7/1). Strict "0"/"1", default off. AOT: no.
     # CAPTURE: no -- scheduler-side step composition only.
     VLLM_MERLIN_PP_DECODE_BALANCE: bool = False
+    # Strict bounded strings: compile the tag without the character budget and apply
+    # the bound from a per-tokenizer length table (vllm/merlin/strict_length_table.py).
+    # Strict "0"/"1", default on; masks equal the budgeted grammar's. AOT: no.
+    # CAPTURE: no -- engine-core grammar masks only.
+    VLLM_MERLIN_STRICT_LENGTH_TABLE: bool = True
+    # Per-step grammar timing (vllm/merlin/grammar_step_diag.py): accept, trim and
+    # mask fill wall time per request and row, five step timestamps and the GPU gap
+    # between forward end and sampling, written as NDJSON. Strict "0"/"1", default
+    # off. AOT: no. CAPTURE: no -- host timing and CUDA events outside graphs.
+    VLLM_MERLIN_GRAMMAR_STEP_DIAG: bool = False
+    # Strict tool calls cap every whitespace run their grammar allows at this many
+    # characters (vllm/tool_parsers/structural_tag_registry.py): between parameters
+    # and in JSON values. A whole number from 1 to 128 (STRICT_WS_CAP_MAX), default
+    # 64; the cap bounds the per-request parser memory and fill time of a run, so it
+    # cannot be turned off (0 is a boot error). Above 128, xgrammar 0.2.8's masks
+    # admit a token its matcher then refuses. AOT: no. CAPTURE: no -- tool-call
+    # grammar text only.
+    VLLM_MERLIN_STRICT_WS_CAP: int = 64
+    # Slow-fill guard (vllm/merlin/strict_stall_guard.py): a tool-call request's
+    # mask fills of at least VLLM_MERLIN_STRICT_STALL_FLOOR_MS of CPU count over its
+    # last VLLM_MERLIN_STRICT_STALL_WINDOW fills; at VLLM_MERLIN_STRICT_STALL_BUDGET_MS
+    # the request ends with an error. Strict "0"/"1", default on. AOT: no.
+    # CAPTURE: no -- engine-core timing only.
+    VLLM_MERLIN_STRICT_STALL_GUARD: bool = True
+    VLLM_MERLIN_STRICT_STALL_FLOOR_MS: int = 300
+    VLLM_MERLIN_STRICT_STALL_BUDGET_MS: int = 5000
+    VLLM_MERLIN_STRICT_STALL_WINDOW: int = 64
     # Decode-first step budget: running decoders' tokens are
     # reserved before prefill chunks are sized, so a decoder behind a long
     # prefill still gets its step. Strict "0"/"1", default off. AOT: no.
@@ -109,16 +136,52 @@ if TYPE_CHECKING:
     MERLIN_KV_HOST_TIER__COPY_CREDITS: int = 32
     MERLIN_KV_HOST_TIER__ESCAPE_STEPS: int = 8
     MERLIN_KV_HOST_TIER__N_RESTORE: int = 2
-    MERLIN_KV_HOST_TIER__MAX_ASSEMBLING: int = 2
-    # Demotion-direction DMA credits (rows; default = the
-    # shared COPY_CREDITS) and an optional byte cap per rank in MiB (0 = rows
-    # only). Runtime-only: scheduler-side copy issue.
-    MERLIN_KV_HOST_TIER__COPY_CREDITS_D: int = 32
+    MERLIN_KV_HOST_TIER__MAX_ASSEMBLING: int = 8
+    # Demotion-direction DMA credits (rows; default 64 when neither this nor
+    # COPY_CREDITS is set, else the COPY_CREDITS value) and an optional byte
+    # cap per rank in MiB (0 = rows only). Runtime-only: scheduler-side copy
+    # issue.
+    MERLIN_KV_HOST_TIER__COPY_CREDITS_D: int = 64
     MERLIN_KV_HOST_TIER__COPY_BYTES_D_MIB: int = 0
     MERLIN_KV_HOST_TIER__MAX_PENDING_STORE_BLOCKS: int = 0
     # Keep a published successor's predecessor as its fallback restore
     # point (host eviction order only; 0/unset = off). Runtime-only.
     MERLIN_KV_HOST_TIER__FALLBACK_BOUNDARY: bool = False
+    # A walk-met block owned by more than one restore unit is copied as a
+    # lone row; 1 = on, 0/unset = the owners' union as one unit. Runtime-only:
+    # scheduler-side write-back selection.
+    MERLIN_KV_HOST_TIER__SHARED_ROW_LONE: bool = False
+    # Host eviction takes free-pool duplicates (the GPU still holds every
+    # row) before host-only units; 1 = on (the default), 0 = the order
+    # without it. Runtime-only: scheduler-side host eviction order.
+    MERLIN_KV_HOST_TIER__EVICT_DUPLICATES_FIRST: bool = True
+    # Host eviction takes the units requests in the waiting queue will use
+    # last, the furthest back first; 1 = on (the default), 0 = the order
+    # without it. Runtime-only: scheduler-side host eviction order.
+    MERLIN_KV_HOST_TIER__EVICT_WAITING_LAST: bool = True
+    # Duplicates first also guards a unit evicted early on its required keys
+    # that only the GPU holds (the draw hold, the walk's reach, the forced
+    # re-copy), not only on its early-freed keys; 1 = on (the default), 0 =
+    # the early keys only. Acts only with EVICT_DUPLICATES_FIRST on.
+    # Runtime-only: scheduler-side write-back and admission order.
+    MERLIN_KV_HOST_TIER__GUARD_REQUIRED_KEYS: bool = True
+    # A waiting restore's copy starts on any step a restore slot is free,
+    # bounded by the parked loads ahead of the seats; 1 = on, 0/unset = off
+    # (the default). Runtime-only: scheduler-side admission order.
+    MERLIN_KV_HOST_TIER__RESTORE_START_ANY_STEP: bool = False
+    # The restore copy budget is COPY_CREDITS rows per restore slot; 1/unset
+    # = on (the default), 0 = COPY_CREDITS for all restores. Runtime-only:
+    # scheduler-side copy issue.
+    MERLIN_KV_HOST_TIER__RESTORE_CREDITS_PER_SLOT: bool = True
+    # A freed running seat is held (once, bounded) for the seat-queue head
+    # whose restore copy is in flight; 1 = on (acts only with
+    # RESTORE_START_ANY_STEP on), 0/unset = off (the default). Runtime-only:
+    # scheduler-side admission order.
+    MERLIN_KV_HOST_TIER__RESTORE_SEAT_HOLD: bool = False
+    # Seconds a rank waits for the host-wide arena lock before it stops with an
+    # error naming the lock file; positive integer, unset = the module default
+    # (kv_host_tier.ARENA_LOCK_TIMEOUT_S). Runtime-only: boot-time host wait.
+    MERLIN_KV_HOST_TIER__ARENA_LOCK_TIMEOUT_S: int | None = None
     # DEBUG ONLY: the tier census (unit directory, proofs, histograms and the
     # per-request "tier return" lines a test run reads); 0/unset = off. The
     # per-rank store-copy timings behind the copy-cost metric
@@ -220,8 +283,17 @@ if TYPE_CHECKING:
     # persistent current_draft_step, seeds) are device buffers, so replay needs
     # no host RNG. Frozen at init, graphs never persisted.
     VLLM_SPEC_STEP_KEYED_RNG: bool = False
-    # Default-off numerical repair.
-    VLLM_SPEC_STABLE_RESIDUAL: bool = False
+    # Numerical repair, on by default; 0 restores the plain-float residual.
+    VLLM_SPEC_STABLE_RESIDUAL: bool = True
+
+    # DEBUG ONLY: rejection-sampler residual counters and their log line
+    # (vllm/merlin/spec_residual_diag.py); 0/unset = off, and the sampled
+    # tokens are the same either way. Observe-only torch ops after the
+    # rejection kernels, which run eager: AOT: no. CAPTURE: no.
+    MERLIN_SPEC_RESIDUAL_DIAG: bool = False
+    # Directory for the per-rank JSON dump of those counters ("" = no file).
+    # Runtime-only: AOT: no. CAPTURE: no.
+    MERLIN_SPEC_RESIDUAL_DIAG_OUT: str = ""
     # --- Flash-Next knobs ---------------------------------------------
     # Registered so compile_factors() hashes them; the read sites still parse
     # and fail closed themselves. Each entry states two identities: AOT (does it
@@ -418,17 +490,98 @@ if TYPE_CHECKING:
     MERLIN_COLD_EXPERTS: str | None = None
     MERLIN_COLD_EXPERTS_LAYERS: str | None = None
     MERLIN_COLD_EXPERTS_HOT_FRAC: str | None = None
+    # Routed-expert hit counter for a cold-expert
+    # hot profile (vllm/merlin/expert_hot_counts.py): a directory turns it on
+    # (unset, blank or 0 = OFF, nothing bound); MMAX = largest call counted as
+    # decode (default 32); POLL_S = dump-request poll period (default 0.5, 0 = no
+    # thread). Calibration boots only. Hashed (not IGNORED): the counter adds ops
+    # to the forward, so a cache built without it must not be reused.
+    MERLIN_EXPERT_HOT_COUNTS: str | None = None
+    MERLIN_EXPERT_HOT_MMAX: str | None = None
+    MERLIN_EXPERT_HOT_POLL_S: str | None = None
+    # WINDOW_STEPS = also count each segment in
+    # windows of this many decode calls (0 = off; the calibrator's step-level
+    # locality); WINDOWS = rows kept per segment (64, the last absorbs overflow).
+    # Hashed: adds ops to the captured forward.
+    MERLIN_EXPERT_HOT_WINDOW_STEPS: str | None = None
+    MERLIN_EXPERT_HOT_WINDOWS: str | None = None
+    # 1 = (with MERLIN_COLD_EXPERTS on) move hot
+    # rows between steps toward the experts the current decode window routes to
+    # (vllm/merlin/cold_experts.py, adaptive_settings). PERIOD = steps between
+    # swap passes (8), SWAPS = max swaps per layer per pass (4), WINDOW = steps
+    # between count halvings (64, 0 = never), MARGIN = count lead a cold expert
+    # needs over the hot row it replaces (2), MMAX = largest call counted as
+    # decode (32). Placement only (outputs unchanged), but the counters add ops
+    # to the captured forward: hashed, not IGNORED.
+    MERLIN_COLD_EXPERTS_ADAPTIVE: str | None = None
+    MERLIN_COLD_EXPERTS_ADAPTIVE_PERIOD: str | None = None
+    MERLIN_COLD_EXPERTS_ADAPTIVE_SWAPS: str | None = None
+    MERLIN_COLD_EXPERTS_ADAPTIVE_WINDOW: str | None = None
+    MERLIN_COLD_EXPERTS_ADAPTIVE_MARGIN: str | None = None
+    MERLIN_COLD_EXPERTS_ADAPTIVE_MMAX: str | None = None
+    # 1 = capture the Hy4 DFly draft query block
+    # as FULL CUDA graphs (vllm/models/hy_v4/nvidia/dfly_speculator.py);
+    # unset, blank or 0 = eager (default); anything else is a boot error.
+    MERLIN_HY4_DFLY_GRAPHS: str | None = None
+    # 1 = compute the Hy4 SWA causal window
+    # rows once per forward and copy them into later SWA layers; unset/blank/0 = stock.
+    MERLIN_HY4_SWA_WINDOW_REUSE: str | None = None
+    # 1 = fused iHC boundaries in the Hy4 Flash decoder
+    # layer (vllm/merlin/hy4_ihc_fuse.py): stage2 + rms_norm, rms_norm + ihc_post
+    # (+ the next stage1), bit-identical to the stock kernels; unset/blank/0 =
+    # stock. Hashed: it changes the captured kernels.
+    MERLIN_HY4_FUSE_IHC: str | None = None
+    # 1 = fused FWHT/FP8 kernel (bitwise) and
+    # tile-skipping IndexPool scoring, stable expansion and RoPE.
+    MERLIN_HY4_INDEXER_FAST: str | None = None
+    # Experimental ratio-four gated pooling; qualify bitwise on the serving stack.
+    # Hashed independently of FAST; neither switch implies the other.
+    MERLIN_HY4_INDEXER_FAST2: str | None = None
+    # 1 = Hy4 decode router gate as one Triton
+    # GEMV on the BF16 weight (exact upcast, FP32 FMA accumulation), then the
+    # stock fused selection. Changes the FP32 reduction order (accuracy gate:
+    # tests/merlin/test_hy4_fused_router_gpu.py, development tree). Default off;
+    # hashed.
+    MERLIN_HY4_FUSED_ROUTER: str | None = None
+    # 1 = the glue around the IndexPool group
+    # topk/sort as Triton kernels (vllm/merlin/hy4_group_select.py, bitwise).
+    # Hashed: it changes the captured kernels.
+    MERLIN_HY4_INDEXER_SELECT: str | None = None
+    # 1 = Hy4 sparse MLA decode/spec-verify
+    # kernel (vllm/merlin/hy4_kernels.py sparse_mla_decode); unset/blank/0 =
+    # stock. HEAD_BLOCK = 16 or 32 heads per CTA (unset: 32 when heads >= 32).
+    MERLIN_HY4_SPARSE_DECODE: str | None = None
+    MERLIN_HY4_SPARSE_DECODE_HEAD_BLOCK: str | None = None
+    # 1 = also tune/prepare the LatentMoE latent
+    # width on the FlashInfer PCIe IPC all-reduce (the early latent reduce stops
+    # falling back to NCCL); unset/blank/0 = stock.
+    MERLIN_LATENT_IPC: str | None = None
     # Boot-memory helpers, both around post-load weight processing:
     # MERLIN_REPACK_RELEASE (default on, 0 = stock) empty_caches the allocator
     # after a module's repack (vllm/merlin/repack_release.py);
     # MERLIN_LOAD_PEAK_LOG=1 logs per-module load peaks, a diagnostic
-    # (vllm/merlin/load_peak_log.py). Both readers parse os.environ themselves;
-    # these entries are the registration. IGNORED as compile factors.
+    # (vllm/merlin/load_peak_log.py). Both readers take the value from this
+    # registry: exactly "0" or "1", anything else is a boot error. IGNORED as
+    # compile factors.
     MERLIN_REPACK_RELEASE: bool = True
     MERLIN_LOAD_PEAK_LOG: bool = False
+    # Chunked in-place Marlin WNA16 MoE repack: input MiB per expert chunk,
+    # default 64, 0 = the stock whole-layer repack. Read by
+    # vllm/merlin/moe_repack_chunk.py at post-load processing; the packed bytes
+    # are the stock ones. A non-integer is a boot error. IGNORED as a compile
+    # factor.
+    MERLIN_MOE_REPACK_CHUNK_MB: int = 64
+    # Tokens per Marlin MoE call, default 0
+    # (stock: one call per step). A step of more tokens runs the same call over
+    # token slices with caches sized for one slice (vllm/merlin/
+    # moe_workspace_chunk.py). A non-integer is a boot error. IGNORED as a
+    # compile factor.
+    MERLIN_MOE_CHUNK_TOKENS: int = 0
     # Qwen3 tool-call parser literal spans, default on, 0 = off: fenced
     # spans and tool blocks quoted in closed reasoning stay text. Parser-only
-    # (vllm/parser/qwen3.py reads it). IGNORED as a compile factor.
+    # (vllm/parser/qwen3.py reads it from this registry when the first parser
+    # is built, so a change needs a restart; a value other than "0" or "1" is
+    # an error there). IGNORED as a compile factor.
     MERLIN_QWEN3_LITERAL_SPANS: bool = True
     #
     # NOT REGISTERED: MERLIN_TOPK_EXACT_TRAP is a build-time -D define in
@@ -457,6 +610,30 @@ def _ple_store_value() -> str:
     if value not in ("ram", "disk"):
         raise ValueError(f"VLLM_E2_PLE_STORE must be ram or disk, got {value!r}")
     return value
+
+
+def _int_in_range(name: str, default: int, low: int, high: int) -> int:
+    raw = os.getenv(name, str(default))
+    if not (raw.isascii() and raw.isdigit()) or not low <= int(raw) <= high:
+        raise ValueError(
+            f"{name} must be a whole number from {low} to {high}, got {raw!r}"
+        )
+    return int(raw)
+
+
+STRICT_WS_CAP_MAX = 128
+
+
+def _strict_ws_cap() -> int:
+    raw = os.getenv("VLLM_MERLIN_STRICT_WS_CAP", "64")
+    if not (raw.isascii() and raw.isdigit()) or not 1 <= int(raw) <= STRICT_WS_CAP_MAX:
+        raise ValueError(
+            "VLLM_MERLIN_STRICT_WS_CAP must be a whole number from 1 to "
+            f"{STRICT_WS_CAP_MAX} (default 64), got {raw!r}: it caps every "
+            "whitespace run a strict tool call may write, which bounds the "
+            "per-request parser memory and mask fill time, so it cannot be off"
+        )
+    return int(raw)
 
 
 def _ple_disk_threads() -> int:
@@ -598,6 +775,15 @@ def kv_host_tier_admission() -> str | None:
     return admission_mode(raw)
 
 
+def kv_host_tier_arena_lock_timeout_s() -> int | None:
+    """Seconds to wait for the host-wide arena lock; None when unset (the
+    caller applies ``kv_host_tier.ARENA_LOCK_TIMEOUT_S``). A bad value is a
+    boot error."""
+    if os.environ.get("MERLIN_KV_HOST_TIER__ARENA_LOCK_TIMEOUT_S") is None:
+        return None
+    return _e2_positive_int("MERLIN_KV_HOST_TIER__ARENA_LOCK_TIMEOUT_S", 1)
+
+
 def kv_host_tier_fail_loads() -> int:
     """Debug fault injection: first N restore transfers per rank, never CUDA chunks.
 
@@ -618,9 +804,11 @@ def _e2_positive_int(name: str, default: int) -> int:
     return value
 
 
-# Architectures whose embedding tables may be kept in pinned host memory
-# (VLLM_HOST_EMBED_TABLE): host_embed_archs(). Other architectures never take
-# this path.
+# Architectures whose embedding tables the runner moves to pinned host memory
+# after loading (VLLM_HOST_EMBED_TABLE, on when unset): host_embed_archs().
+# Other architectures never take that path; model code that builds its tables
+# on the host itself (the Flash-Next family, DFlash drafters) asks
+# host_embed_table_setting() and gets them only on an explicit 1.
 def host_embed_archs() -> tuple[str, ...]:
     """Architectures whose embedding shards may live on the host: the Qwen3.5 lineage
     (vllm/qwen35_family.py, dense and MoE) and Nemotron 3.5 Super VL."""
@@ -629,23 +817,36 @@ def host_embed_archs() -> tuple[str, ...]:
     return (
         *qwen35_family.gdn_archs(),
         "NemotronH_Omni_Reasoning_V3",  # Nemotron 3.5 Super VL
+        "HYV4FlashForCausalLM",
     )
 
 
-def host_embed_table_enabled_for_model(architecture: str) -> bool:
-    """Resolve VLLM_HOST_EMBED_TABLE for one architecture.
+def host_embed_table_setting(architecture: str) -> bool:
+    """Resolve VLLM_HOST_EMBED_TABLE for one architecture: the only reader.
 
-    Only ``host_embed_archs()`` are eligible. For those, ``1`` turns
-    host embedding on, ``0`` turns it off and unset means on (the default).
+    ``host_embed_archs()``: ``1`` is on, ``0`` is off and unset means on (the
+    default). Any other architecture: only an explicit ``1`` is on; unset and
+    ``0`` are off. Callers pass the architecture of the model that owns the
+    table (a drafter passes its own, not its target's).
     """
-    if architecture not in host_embed_archs():
-        return False
     # Read through vllm.envs so the value comes from the same (possibly cached)
     # module __getattr__ as every other reader; keep module imports stdlib-only.
     import vllm.envs as envs
 
     setting = envs.VLLM_HOST_EMBED_TABLE
-    return True if setting is None else setting
+    if architecture in host_embed_archs():
+        return True if setting is None else setting
+    return setting is True
+
+
+def host_embed_table_enabled_for_model(architecture: str) -> bool:
+    """Whether the runner moves this architecture's tables to the host after
+    loading. Only ``host_embed_archs()`` are eligible, an explicit ``1``
+    included; the value comes from ``host_embed_table_setting``.
+    """
+    if architecture not in host_embed_archs():
+        return False
+    return host_embed_table_setting(architecture)
 
 
 # Shipped value of each determinism toggle. The registry getters default to
@@ -813,8 +1014,15 @@ MERLIN_ENV: dict[str, Callable[[], Any]] = {
     ),
     # Reject misspelled boolean values.
     "VLLM_SPEC_STABLE_RESIDUAL": lambda: _e2_strict_switch(
-        "VLLM_SPEC_STABLE_RESIDUAL", default=False
+        "VLLM_SPEC_STABLE_RESIDUAL", default=True
     ),
+    # Read in vllm/merlin/spec_residual_diag.py.
+    "MERLIN_SPEC_RESIDUAL_DIAG": lambda: _e2_strict_switch(
+        "MERLIN_SPEC_RESIDUAL_DIAG", default=False
+    ),
+    "MERLIN_SPEC_RESIDUAL_DIAG_OUT": lambda: os.getenv(
+        "MERLIN_SPEC_RESIDUAL_DIAG_OUT", ""
+    ).strip(),
     # --- Flash-Next fork knobs; see the TYPE_CHECKING block for
     # which of these are compile/capture factors and which are ignored.
     # Compile/capture factors.
@@ -912,11 +1120,56 @@ MERLIN_ENV: dict[str, Callable[[], Any]] = {
     "MERLIN_COLD_EXPERTS": lambda: os.getenv("MERLIN_COLD_EXPERTS", None),
     "MERLIN_COLD_EXPERTS_LAYERS": lambda: os.getenv("MERLIN_COLD_EXPERTS_LAYERS", None),
     "MERLIN_COLD_EXPERTS_HOT_FRAC": lambda: os.getenv("MERLIN_COLD_EXPERTS_HOT_FRAC", None),
+
+    "MERLIN_EXPERT_HOT_COUNTS": lambda: os.getenv("MERLIN_EXPERT_HOT_COUNTS", None),
+    "MERLIN_EXPERT_HOT_MMAX": lambda: os.getenv("MERLIN_EXPERT_HOT_MMAX", None),
+    "MERLIN_EXPERT_HOT_POLL_S": lambda: os.getenv("MERLIN_EXPERT_HOT_POLL_S", None),
+    "MERLIN_EXPERT_HOT_WINDOW_STEPS": lambda: os.getenv("MERLIN_EXPERT_HOT_WINDOW_STEPS", None),
+    "MERLIN_EXPERT_HOT_WINDOWS": lambda: os.getenv("MERLIN_EXPERT_HOT_WINDOWS", None),
+
+    "MERLIN_COLD_EXPERTS_ADAPTIVE": lambda: os.getenv("MERLIN_COLD_EXPERTS_ADAPTIVE", None),
+    "MERLIN_COLD_EXPERTS_ADAPTIVE_PERIOD": lambda: os.getenv("MERLIN_COLD_EXPERTS_ADAPTIVE_PERIOD", None),
+    "MERLIN_COLD_EXPERTS_ADAPTIVE_SWAPS": lambda: os.getenv("MERLIN_COLD_EXPERTS_ADAPTIVE_SWAPS", None),
+    "MERLIN_COLD_EXPERTS_ADAPTIVE_WINDOW": lambda: os.getenv("MERLIN_COLD_EXPERTS_ADAPTIVE_WINDOW", None),
+    "MERLIN_COLD_EXPERTS_ADAPTIVE_MARGIN": lambda: os.getenv("MERLIN_COLD_EXPERTS_ADAPTIVE_MARGIN", None),
+    "MERLIN_COLD_EXPERTS_ADAPTIVE_MMAX": lambda: os.getenv("MERLIN_COLD_EXPERTS_ADAPTIVE_MMAX", None),
+
+    "MERLIN_HY4_DFLY_GRAPHS": lambda: os.getenv("MERLIN_HY4_DFLY_GRAPHS", None),
+
+    "MERLIN_HY4_SWA_WINDOW_REUSE": lambda: os.getenv("MERLIN_HY4_SWA_WINDOW_REUSE", None),
+
+    "MERLIN_HY4_FUSE_IHC": lambda: os.getenv("MERLIN_HY4_FUSE_IHC", None),
+
+    "MERLIN_HY4_INDEXER_FAST": lambda: os.getenv("MERLIN_HY4_INDEXER_FAST", None),
+    "MERLIN_HY4_INDEXER_FAST2": lambda: os.getenv("MERLIN_HY4_INDEXER_FAST2", None),
+
+    "MERLIN_HY4_FUSED_ROUTER": lambda: os.getenv("MERLIN_HY4_FUSED_ROUTER", None),
+
+    "MERLIN_HY4_INDEXER_SELECT": lambda: os.getenv("MERLIN_HY4_INDEXER_SELECT", None),
+
+    "MERLIN_HY4_SPARSE_DECODE": lambda: os.getenv("MERLIN_HY4_SPARSE_DECODE", None),
+    "MERLIN_HY4_SPARSE_DECODE_HEAD_BLOCK": lambda: os.getenv(
+        "MERLIN_HY4_SPARSE_DECODE_HEAD_BLOCK", None
+    ),
+
+    "MERLIN_LATENT_IPC": lambda: os.getenv("MERLIN_LATENT_IPC", None),
     # Boot-memory helpers and the Qwen3 parser literal spans: the
-    # same parse as their readers (repack_release.py, load_peak_log.py, parser/qwen3.py).
-    "MERLIN_REPACK_RELEASE": lambda: os.getenv("MERLIN_REPACK_RELEASE", "1") != "0",
-    "MERLIN_LOAD_PEAK_LOG": lambda: os.getenv("MERLIN_LOAD_PEAK_LOG", "0") == "1",
-    "MERLIN_QWEN3_LITERAL_SPANS": lambda: os.getenv("MERLIN_QWEN3_LITERAL_SPANS", "1") != "0",
+    # one parse for their readers (repack_release.py, load_peak_log.py,
+    # parser/qwen3.py). Strict: a value other than "0" or "1" raises.
+    "MERLIN_REPACK_RELEASE": lambda: _e2_strict_switch(
+        "MERLIN_REPACK_RELEASE", default=True
+    ),
+    "MERLIN_LOAD_PEAK_LOG": lambda: _e2_strict_switch(
+        "MERLIN_LOAD_PEAK_LOG", default=False
+    ),
+    "MERLIN_MOE_REPACK_CHUNK_MB": lambda: _e2_nonneg_int(
+        "MERLIN_MOE_REPACK_CHUNK_MB", 64
+    ),
+
+    "MERLIN_MOE_CHUNK_TOKENS": lambda: _e2_nonneg_int("MERLIN_MOE_CHUNK_TOKENS", 0),
+    "MERLIN_QWEN3_LITERAL_SPANS": lambda: _e2_strict_switch(
+        "MERLIN_QWEN3_LITERAL_SPANS", default=True
+    ),
     # Prefix-cache thrash fixes (default ON). Read in cache_thrash.py.
     "VLLM_E2_SCHED_MISS_DEFER_S": lambda: _e2_nonneg_int(
         "VLLM_E2_SCHED_MISS_DEFER_S", default=120
@@ -928,6 +1181,33 @@ MERLIN_ENV: dict[str, Callable[[], Any]] = {
     # async_scheduler.py.
     "VLLM_MERLIN_PP_DECODE_BALANCE": lambda: _e2_strict_switch(
         "VLLM_MERLIN_PP_DECODE_BALANCE", default=False
+    ),
+    # Strict bounded strings by length table, default on. Read in
+    # vllm/merlin/strict_length_table.py.
+    "VLLM_MERLIN_STRICT_LENGTH_TABLE": lambda: _e2_strict_switch(
+        "VLLM_MERLIN_STRICT_LENGTH_TABLE", default=True
+    ),
+    # Per-step grammar timing, default off. Read in
+    # vllm/merlin/grammar_step_diag.py.
+    "VLLM_MERLIN_GRAMMAR_STEP_DIAG": lambda: _e2_strict_switch(
+        "VLLM_MERLIN_GRAMMAR_STEP_DIAG", default=False
+    ),
+    # Strict whitespace cap, 1 to 128, default 64. Read in
+    # vllm/tool_parsers/structural_tag_registry.py.
+    "VLLM_MERLIN_STRICT_WS_CAP": lambda: _strict_ws_cap(),
+    # Slow-fill guard, default on, and its thresholds. Read in
+    # vllm/merlin/strict_stall_guard.py.
+    "VLLM_MERLIN_STRICT_STALL_GUARD": lambda: _e2_strict_switch(
+        "VLLM_MERLIN_STRICT_STALL_GUARD", default=True
+    ),
+    "VLLM_MERLIN_STRICT_STALL_FLOOR_MS": lambda: _int_in_range(
+        "VLLM_MERLIN_STRICT_STALL_FLOOR_MS", 300, 1, 600000
+    ),
+    "VLLM_MERLIN_STRICT_STALL_BUDGET_MS": lambda: _int_in_range(
+        "VLLM_MERLIN_STRICT_STALL_BUDGET_MS", 5000, 50, 3600000
+    ),
+    "VLLM_MERLIN_STRICT_STALL_WINDOW": lambda: _int_in_range(
+        "VLLM_MERLIN_STRICT_STALL_WINDOW", 64, 1, 100000
     ),
     # Decode-first step budget, default off. Read in
     # vllm/merlin/decode_first.py.
@@ -987,13 +1267,16 @@ MERLIN_ENV: dict[str, Callable[[], Any]] = {
         "MERLIN_KV_HOST_TIER__N_RESTORE", 2
     ),
     "MERLIN_KV_HOST_TIER__MAX_ASSEMBLING": lambda: _e2_positive_int(
-        "MERLIN_KV_HOST_TIER__MAX_ASSEMBLING", 2
+        "MERLIN_KV_HOST_TIER__MAX_ASSEMBLING", 8
     ),
-    # Per-direction credits. The demotion rows default to the
-    # shared COPY_CREDITS; the byte cap is MiB per rank, 0 = rows only.
+    # Per-direction credits. The demotion rows follow an explicitly set
+    # COPY_CREDITS and are 64 when neither is set; the byte cap is MiB per
+    # rank, 0 = rows only.
     "MERLIN_KV_HOST_TIER__COPY_CREDITS_D": lambda: _e2_positive_int(
         "MERLIN_KV_HOST_TIER__COPY_CREDITS_D",
-        _e2_positive_int("MERLIN_KV_HOST_TIER__COPY_CREDITS", 32),
+        _e2_positive_int("MERLIN_KV_HOST_TIER__COPY_CREDITS", 32)
+        if "MERLIN_KV_HOST_TIER__COPY_CREDITS" in os.environ
+        else 64,
     ),
     "MERLIN_KV_HOST_TIER__COPY_BYTES_D_MIB": lambda: _e2_nonneg_int(
         "MERLIN_KV_HOST_TIER__COPY_BYTES_D_MIB", 0
@@ -1004,6 +1287,30 @@ MERLIN_ENV: dict[str, Callable[[], Any]] = {
     "MERLIN_KV_HOST_TIER__FALLBACK_BOUNDARY": lambda: _e2_strict_switch(
         "MERLIN_KV_HOST_TIER__FALLBACK_BOUNDARY", default=False
     ),
+    "MERLIN_KV_HOST_TIER__SHARED_ROW_LONE": lambda: _e2_strict_switch(
+        "MERLIN_KV_HOST_TIER__SHARED_ROW_LONE", default=False
+    ),
+    "MERLIN_KV_HOST_TIER__EVICT_DUPLICATES_FIRST": lambda: _e2_strict_switch(
+        "MERLIN_KV_HOST_TIER__EVICT_DUPLICATES_FIRST", default=True
+    ),
+    "MERLIN_KV_HOST_TIER__EVICT_WAITING_LAST": lambda: _e2_strict_switch(
+        "MERLIN_KV_HOST_TIER__EVICT_WAITING_LAST", default=True
+    ),
+    "MERLIN_KV_HOST_TIER__GUARD_REQUIRED_KEYS": lambda: _e2_strict_switch(
+        "MERLIN_KV_HOST_TIER__GUARD_REQUIRED_KEYS", default=True
+    ),
+    "MERLIN_KV_HOST_TIER__RESTORE_START_ANY_STEP": lambda: _e2_strict_switch(
+        "MERLIN_KV_HOST_TIER__RESTORE_START_ANY_STEP", default=False
+    ),
+    "MERLIN_KV_HOST_TIER__RESTORE_CREDITS_PER_SLOT": lambda: _e2_strict_switch(
+        "MERLIN_KV_HOST_TIER__RESTORE_CREDITS_PER_SLOT", default=True
+    ),
+    "MERLIN_KV_HOST_TIER__RESTORE_SEAT_HOLD": lambda: _e2_strict_switch(
+        "MERLIN_KV_HOST_TIER__RESTORE_SEAT_HOLD", default=False
+    ),
+    # Wait for the host-wide arena lock, seconds; None when unset. Read in
+    # vllm/merlin/kv_host_tier.py (arena_lock_timeout_s).
+    "MERLIN_KV_HOST_TIER__ARENA_LOCK_TIMEOUT_S": kv_host_tier_arena_lock_timeout_s,
 }
 
 
@@ -1075,6 +1382,17 @@ MERLIN_IGNORED: frozenset[str] = frozenset(
     # Balanced PP decode microbatches: which decode rows a step
     # schedules; shapes stay within the captured batch sizes either way.
     "VLLM_MERLIN_PP_DECODE_BALANCE",
+    # Strict length table: engine-core grammar masks only.
+    "VLLM_MERLIN_STRICT_LENGTH_TABLE",
+    # Grammar step timing: writes a log file; no compiled shape changes.
+    "VLLM_MERLIN_GRAMMAR_STEP_DIAG",
+    # Strict whitespace cap: tool-call grammar text only.
+    "VLLM_MERLIN_STRICT_WS_CAP",
+    # Slow-fill guard: engine-core timing; no compiled shape changes.
+    "VLLM_MERLIN_STRICT_STALL_GUARD",
+    "VLLM_MERLIN_STRICT_STALL_FLOOR_MS",
+    "VLLM_MERLIN_STRICT_STALL_BUDGET_MS",
+    "VLLM_MERLIN_STRICT_STALL_WINDOW",
     # Decode-first step budget: how many tokens a prefill chunk takes
     # this step; shapes stay within the captured batch sizes either way.
     "VLLM_MERLIN_DECODE_FIRST",
@@ -1121,6 +1439,25 @@ MERLIN_IGNORED: frozenset[str] = frozenset(
     "MERLIN_KV_HOST_TIER__MAX_PENDING_STORE_BLOCKS",
     # Scheduler-side host eviction order only.
     "MERLIN_KV_HOST_TIER__FALLBACK_BOUNDARY",
+    # Scheduler-side write-back
+    # selection only.
+    "MERLIN_KV_HOST_TIER__SHARED_ROW_LONE",
+    # Scheduler-side host eviction order only (duplicates first).
+    "MERLIN_KV_HOST_TIER__EVICT_DUPLICATES_FIRST",
+    # Scheduler-side host eviction order only (waiting last).
+    "MERLIN_KV_HOST_TIER__EVICT_WAITING_LAST",
+    # Scheduler-side write-back and
+    # admission order only (required keys guarded).
+    "MERLIN_KV_HOST_TIER__GUARD_REQUIRED_KEYS",
+    # Scheduler-side admission order only.
+    "MERLIN_KV_HOST_TIER__RESTORE_START_ANY_STEP",
+    # Scheduler-side copy issue only.
+    "MERLIN_KV_HOST_TIER__RESTORE_CREDITS_PER_SLOT",
+    # Scheduler-side admission order only.
+    "MERLIN_KV_HOST_TIER__RESTORE_SEAT_HOLD",
+    # Host-side wait for a lock file at worker start; no compiled or captured
+    # operation depends on it.
+    "MERLIN_KV_HOST_TIER__ARENA_LOCK_TIMEOUT_S",
     # Placement only: rewrites CUDA_VISIBLE_DEVICES for the PLE offload
     # child, and CUDA_VISIBLE_DEVICES is already ignored above.
     "VLLM_PLE_OFFLOAD_HOME_DEVICE",
@@ -1159,6 +1496,11 @@ MERLIN_IGNORED: frozenset[str] = frozenset(
     # Init-frozen Triton constexpr, like RNG.
     # JIT specialization keys it; graphs are not persisted and AOT is unaffected.
     "VLLM_SPEC_STABLE_RESIDUAL",
+
+    # Observe-only counters after the eager rejection kernels, and their dump
+    # directory: no compiled code or captured graph reads either.
+    "MERLIN_SPEC_RESIDUAL_DIAG",
+    "MERLIN_SPEC_RESIDUAL_DIAG_OUT",
     # Logging cadence for an already-compiled kernel's counters: it gates a
     # host-side timer and a snapshot op, and is read by no compiled code, so
     # hashing it would invalidate every compile cache for a log interval.
@@ -1199,6 +1541,12 @@ MERLIN_IGNORED: frozenset[str] = frozenset(
     # Load-peak log: a diagnostic that brackets post-load processing
     # with memory reads and logs them; nothing compiled or captured reads it.
     "MERLIN_LOAD_PEAK_LOG",
+    # Chunked MoE repack: how post-load processing walks the experts; the
+    # packed weights, kernels and graphs are the stock ones.
+    "MERLIN_MOE_REPACK_CHUNK_MB",
+    # Token slices inside the fused MoE custom
+    # op (opaque to the compiler); graphs at or below the slice size are stock.
+    "MERLIN_MOE_CHUNK_TOKENS",
     # Qwen3 parser literal spans: API-server output parsing only; the
     # model forward never sees it.
     "MERLIN_QWEN3_LITERAL_SPANS",
@@ -1267,6 +1615,10 @@ MERLIN_RETIRED: dict[str, str] = {}
 # every name the tools read or the docs name is here or a registered knob.
 MERLIN_TOOL_ONLY: frozenset[str] = frozenset({
     "MERLIN_ALLOW_SERVER_DEV_MODE",
+    # The fork-line budget check's base ref, trial-merge mode and scrub escape (a developer check, not shipped).
+    "MERLIN_BUDGET_BASE_IS_REF",
+    "MERLIN_BUDGET_BASE_REF",
+    "MERLIN_BUDGET_SCRUB",
     "MERLIN_CHECKPOINT_DIR",
     "MERLIN_EMULATE_VRAM_CLASS",
     "MERLIN_HOME",
@@ -1279,10 +1631,15 @@ MERLIN_TOOL_ONLY: frozenset[str] = frozenset({
     "MERLIN_PYTHON",
     "MERLIN_READY_BANNER",
     "MERLIN_RELEASE_VERSION",
+    # Inherited serve-lock descriptor passed from the instance parent to its launcher.
+    "MERLIN_SERVE_LOCK_FD",
+    "MERLIN_SKIP_NATIVE_CHECK",
     "MERLIN_SKIP_PORT_CHECK",
     "MERLIN_SKIP_RAM_CHECK",
     "MERLIN_UV_VERSION",
     "MERLIN_WHEEL",
+    # release/build-wheel.sh: the release string carried in the wheel's local version.
+    "MERLIN_WHEEL_RELEASE",
     "MERLIN_WHEEL_URL",
 })
 
@@ -1299,6 +1656,16 @@ def unknown_merlin_env_warning(name: str) -> str | None:
         f"Unknown Merlin environment variable detected: {name} "
         "(not a registered knob; check the spelling)"
     )
+
+
+# Knobs read at boot (Platform.validate_environ), so a bad value stops the server
+# before it serves rather than failing the first request that reads it.
+BOOT_CHECKED = ("VLLM_MERLIN_STRICT_WS_CAP",)
+
+
+def check_at_boot() -> None:
+    for name in BOOT_CHECKED:
+        MERLIN_ENV[name]()
 
 
 def read_registered(name: str) -> Any:

@@ -23,6 +23,7 @@ import msgspec
 import zmq
 
 import vllm.envs as envs
+import vllm.merlin.grammar_step_diag as step_diag
 from vllm.config import ParallelConfig, VllmConfig
 from vllm.config.pooler import POOLER_CONFIG_LOG_FIELDS
 from vllm.distributed import (
@@ -782,6 +783,7 @@ class EngineCore:
             return {}, False
         scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
         future = self.model_executor.execute_model(scheduler_output, non_block=True)
+        step_diag.mark("exec_issued")
         grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
         with (
             self.capture_iteration_details(scheduler_output) as iteration_details,
@@ -799,6 +801,7 @@ class EngineCore:
         )
         self._attach_iteration_details(engine_core_outputs, iteration_details)
         self._attach_weight_version(engine_core_outputs)
+        step_diag.flush()
 
         return engine_core_outputs, scheduler_output.total_num_scheduled_tokens > 0
 
@@ -843,6 +846,7 @@ class EngineCore:
                 exec_future = self.model_executor.execute_model(
                     scheduler_output, non_block=True
                 )
+            step_diag.mark("exec_issued")
             if not self.is_mm_encoder_only:
                 model_executed = scheduler_output.total_num_scheduled_tokens > 0
 
@@ -859,6 +863,8 @@ class EngineCore:
                     future = self.model_executor.sample_tokens(
                         grammar_output, non_block=True
                     )
+
+                    step_diag.mark("sample_issued")
                 else:
                     # We need to defer sampling until we have processed the model output
                     # from the prior step.
@@ -887,6 +893,7 @@ class EngineCore:
             self.log_error_detail(scheduler_output),
         ):
             model_output = future.result()
+            step_diag.mark("prev_result")
             if model_output is None:
                 # None from sample_tokens() implies that the original execute_model()
                 # call failed - raise that exception.
@@ -925,8 +932,10 @@ class EngineCore:
                 deferred_scheduler_output
             )
             future = self.model_executor.sample_tokens(grammar_output, non_block=True)
+            step_diag.mark("sample_issued")
             batch_queue.appendleft((future, deferred_scheduler_output, exec_future))
 
+        step_diag.flush()
         return engine_core_outputs, model_executed
 
     def _process_aborts_queue(self):
