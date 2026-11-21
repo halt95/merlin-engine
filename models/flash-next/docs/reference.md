@@ -1,7 +1,7 @@
 # Reference
 
 The detail behind the [README](../README.md) for Merlin 3.0.2.2, Merlin engine **built on vLLM 0.33.0**.
-The current measured claims are in the [3.0.2.1 bench card](../benchmarks/2026-11-12/BENCH-CARD.md) (the [3.0.2 card](../benchmarks/2026-11-04/BENCH-CARD.md) is its comparator, and the [3.0.1 card](../benchmarks/2026-11-02/BENCH-CARD.md) has the release before); see also [Benchmarks](#benchmarks). Historical measurements are explicitly marked
+The 4× 24 GB figures are the [3.0.2.1 bench card](../benchmarks/2026-11-12/BENCH-CARD.md)'s, carried after a 3.0.2.2 spot check inside their run-to-run band; the 4× 20 GB row was re-measured on the [3.0.2.2 bench card](../benchmarks/2026-11-21/BENCH-CARD.md) (the [3.0.2 card](../benchmarks/2026-11-04/BENCH-CARD.md) is its comparator, and the [3.0.1 card](../benchmarks/2026-11-02/BENCH-CARD.md) has the release before); see also [Benchmarks](#benchmarks). Historical measurements are explicitly marked
 **v3.0.0 (0.30) figure**; their original release labels are retained, and they are not re-measured 0.32 or 0.33 results.
 
 - [Overview](#overview)

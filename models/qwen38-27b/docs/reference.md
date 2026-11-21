@@ -3,7 +3,7 @@
 > **Recipe 3.0.0 / Merlin 3.0.2:** vLLM **0.33.0**, FlashInfer **0.7.2.post1** with the ported tile,
 > **FGPC ON**, RecoverSSM on every layout, pools **826,689 / 2,012,105 tokens** (TP2 / TP4),
 > and an **8 MP** release cap.
-> The [2026-11-02 card](../benchmarks/2026-11-02/BENCH-CARD.md) has the current 3.0.1 results; the [2026-10-20 card](../benchmarks/2026-10-20/BENCH-CARD.md) has the 3.0.0 results; the [2026-10-15 card](../benchmarks/2026-10-15/BENCH-CARD.md) records the 0.32 tile reclaim.
+> The [2026-11-21 card](../benchmarks/2026-11-21/BENCH-CARD.md) has the current Merlin 3.0.2.2 four-card results and the [2026-11-12 card](../benchmarks/2026-11-12/BENCH-CARD.md) the 3.0.2.1 results carried for one and two cards; the [2026-11-02 card](../benchmarks/2026-11-02/BENCH-CARD.md) has the 3.0.1 results; the [2026-10-20 card](../benchmarks/2026-10-20/BENCH-CARD.md) has the 3.0.0 results; the [2026-10-15 card](../benchmarks/2026-10-15/BENCH-CARD.md) records the 0.32 tile reclaim.
 > Unless explicitly marked 0.32 or 3.0.0, numerical results, boot logs and patch-series descriptions below are
 > historical v1.3.x **vLLM 0.30** evidence. They have not been revalidated for the assembled release.
 > The old bundle route is archived at tag `v1.3.1` of halt95/qwen38-27b-3090s; use the shared [release tooling](../../../release/README.md).
@@ -487,7 +487,7 @@ calibration data is distributed. The 11 files are checksummed in `models/qwen38-
 ### Serving an agent
 
 The operational settings below include historical 0.30 check results; those counts and timings are not 0.32 remeasurements.
-For current evidence, use the [2026-11-02 card](../benchmarks/2026-11-02/BENCH-CARD.md) (3.0.1) and the [2026-10-20 card](../benchmarks/2026-10-20/BENCH-CARD.md) (3.0.0); the [2026-10-15 card](../benchmarks/2026-10-15/BENCH-CARD.md) is the tile-reclaim card.
+For current evidence, use the [2026-11-21 card](../benchmarks/2026-11-21/BENCH-CARD.md) (3.0.2.2, four cards) and the [2026-11-12 card](../benchmarks/2026-11-12/BENCH-CARD.md) (3.0.2.1); earlier, the [2026-11-02 card](../benchmarks/2026-11-02/BENCH-CARD.md) (3.0.1) and the [2026-10-20 card](../benchmarks/2026-10-20/BENCH-CARD.md) (3.0.0); the [2026-10-15 card](../benchmarks/2026-10-15/BENCH-CARD.md) is the tile-reclaim card.
 
 
 | agent need | as served |

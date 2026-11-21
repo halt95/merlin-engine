@@ -279,7 +279,7 @@ def _check_row_env(reg: dict[str, Any], p: dict[str, Any]) -> list[str]:
     if not isinstance(env, dict) or not env:  # before any iteration: null / a number / a list
         return [f"{pid}: env must be a non-empty object of NAME: string value"]
     # A hy4flash row may carry the cold-expert defaults and
-    # (hy4-rel3022-defaults) the Hy4 speed flags, each "0" or "1"
+    # (Hy4 Flash 3.0.2.2 defaults) the Hy4 speed flags, each "0" or "1"
     hy4 = reg.get("model") == "hy4flash"
     if hy4:
         allowed = ROW_COLD_EXPERTS + ROW_HY4_SPEED

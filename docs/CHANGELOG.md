@@ -245,7 +245,7 @@ The 20 GB row is measured on 4 × RTX 3090 that emulate 20 GB cards (4 GiB held 
 | Ornith 1.5 | 4× | 894,618 | 152 / 106 / 106 | 2,302 tok/s | 522 / 481 | 195 / 192 |
 
 ‡ 3.0.2.1 figures, carried forward: the lane (or, in a 4× cell, that one figure) was not re-measured on 3.0.2.2. The 20 GB row has no GSM8K run; the one- and two-card rows have no thinking-on GSM8K-200 run (`-`), as in 3.0.2.1.
-† The Flash-Next and Swift1.5-Huihui thinking-off 8-agent cells are from 3.0.2.1's previous build: their runs on the published 3.0.2.1 wheel ended early (one reply stopped by itself; overlap windows of 0.25 and 0.29 s) and were not used.
+† From 3.0.2.1's previous build (built 2026-11-10), as in the 3.0.2.1 section: the Flash-Next and Swift1.5-Huihui thinking-off 8-agent cells (their runs on the published 3.0.2.1 wheel ended early: one reply stopped by itself; overlap windows of 0.25 and 0.29 s), and the carried Qwen3.8-27B one- and two-card, ThinkingCap two-card (its 262K decode excepted) and Nemotron 3.5 Super VL cells, which were not re-measured on the published 3.0.2.1 wheel.
 
 The spot checks of the carried lanes (4K thinking-on decode and 100K prefill on 3.0.2.2, against 3.0.2.1 and that row's band):
 - **Flash-Next 4× 24 GB:** 171.6 against 174.0 tok/s (band ±3 %); 6,999 against 7,036 tok/s (band ±3 %).
@@ -285,10 +285,10 @@ time). DFly2 drafts; K=3 is the shipped default.
 
 | Checkpoint | GPUs | KV pool, tokens | Decode, tok/s, 4K / 128K / 262K | 262K prefill | 8 agents | GSM8K-200 |
 |---|---|---|---|---|---|---|
-| Hy4 Flash (`hy4flash-quad-3090`) | 4× | 609,398 | 75.7 / 67.1 § / 89.3 § | 1,384 tok/s | not run | not run |
+| Hy4 Flash (`hy4flash-quad-3090`) | 4× | 609,398 | 75.7 / 67.1 § / 89.3 § | 1,384 tok/s § | not run | not run |
 | Hy4 Flash (`hy4flash-octo-3090`) | 8× | 4,196,751 (estimate) | untested on hardware | untested | untested | untested |
 
-§ Measured at K=5 (the boot of the K sweep that ran every row), not at the shipped K=3. At 4K: K=3 75.7 tok/s (13.19 ms per token: median event
+§ Measured at K=5 (the boot of the K sweep that ran every row, prefill included), not at the shipped K=3. At 4K: K=3 75.7 tok/s (13.19 ms per token: median event
 interval / tokens per step), K=5 75.3 (13.33 ms), K=7 68.1 (14.77 ms), DFly2 off 45.1 (22.05 ms). 128K is a
 130,816-token prompt (sends 66.3–71.4 tok/s), 262K is exactly 261,888 tokens (sends 77.6–89.7). Cold prefill
 1,672 tok/s at 10,240 tokens and 1,608 tok/s at 102,400; 262K time to first token 189.3 s. The 8-card
@@ -544,6 +544,8 @@ Every row except Hy4 Flash is in the bench cards; the Hy4 Flash rows are in this
 
 ### Known limits
 
+- **A fresh install of the 3.0.2.2 wheel on the pinned lock has not been done.** The compiled code is the 3.0.2.1
+  build, whose fresh install on this lock passed on 2026-11-12 (install, verify and identity checks).
 - **Hy4 Flash is new in this release.** The four-card row (`hy4flash-quad-3090`) is testing: its full-model runs
   passed on our 4 x RTX 3090 host at the 1,600,000,000 B pin (the same tokens as the stock kernels on serial prompts,
   262K prefill and decode with no out-of-memory, 13.19 ms per output token at K=3, a 609,398-token pool; the

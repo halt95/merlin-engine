@@ -68,7 +68,7 @@ from source, which takes about 1.5 hours on 8 cores. The first start compiles ke
 Decode: one stream, thinking on, full 262K context · 8 agents: total throughput on 16K conversations · GSM8K-200: correct out of 200.<br>
 Build of each cell, ranges and method: the [3.0.2.2 bench cards](benchmarks/2026-11-21/README.md) and the [3.0.2.1 bench cards](benchmarks/2026-11-12/README.md); † carried 3.0.2.1 cells from that release's previous build (ThinkingCap's two-card 262K decode excepted), see cards.</sub>
 
-**Hy4 Flash** (new in 3.0.2.2) is a `tools/merlin/launch.py` lane on four RTX 3090s (in testing: full-model runs passed,
+**Hy4 Flash** (new in 3.0.2.2, [checkpoint](https://huggingface.co/halt95/Hy4-flash-W4A16-Merlin)) is a `tools/merlin/launch.py` lane on four RTX 3090s (in testing: full-model runs passed,
 kernel parity qualification pending), started with
 `./setup.sh --model hy4flash`, which downloads and verifies its pack (`--engram bf16` for the BF16 Engram pack;
 see [Known limits](docs/CHANGELOG.md#known-limits)).
