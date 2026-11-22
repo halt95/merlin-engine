@@ -343,7 +343,18 @@ class Worker(WorkerBase):
         if not current_platform.is_cuda():
             unsupported.append(f"device={current_platform.device_type}")
         if parallel_config.nnodes != 1:
-            unsupported.append(f"nnodes={parallel_config.nnodes}")
+            # The PLE CPU worker is spawned from global rank 0 and its pullers
+            # register over a local IPC socket, shared memory and CUDA IPC, so
+            # every PLE-owning rank has to be on node 0. With the mp backend a
+            # node holds a contiguous block of ranks. Only PLE-owning ranks
+            # reach this check (_has_ple_layers follows the PP split), so a
+            # layout whose PLE stage is stage 0 passes; TP across nodes does not.
+            local_world_size = parallel_config.world_size // parallel_config.nnodes
+            if self.rank >= local_world_size:
+                unsupported.append(
+                    f"nnodes={parallel_config.nnodes} with PLE-owning rank "
+                    f"{self.rank} outside node 0"
+                )
         if parallel_config.data_parallel_backend != "mp":
             unsupported.append(f"DP backend={parallel_config.data_parallel_backend}")
         if (
