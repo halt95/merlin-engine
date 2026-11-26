@@ -525,3 +525,8 @@ def enable_qwen4_exp_low_latency_gemm(
 
     if warmup_configs:
         shape_dynamic_skinny_gemm.request_warmup_configs(dtype, warmup_configs)
+
+    # lebeche fork: fused small-M HC epilogues on top of the patched Linears.
+    from .hc_small_fused import enable_qwen4_exp_hc_small_fused
+
+    enable_qwen4_exp_hc_small_fused(module, dtype)

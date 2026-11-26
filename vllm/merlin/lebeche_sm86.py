@@ -16,7 +16,10 @@ The fused HC down+SiLU kernel (ops/cute_dsl/hc_down_silu.py) stays Hopper+: its
 ``1 <= M <= MAX_FUSED_M`` test is a Python branch in the traced forward, which
 torch.compile resolves once at trace time (guards are dropped), so it cannot
 select M <= 4 at run time. The merged HC down+inject projection is served by a
-skinny plan instead, followed by the stock ``hc_silu`` kernel.
+skinny plan instead, followed by the stock ``hc_silu`` kernel. With
+``MERLIN_LEBECHE_HC_FUSE`` (default on) the SiLU and the gate mix run as
+epilogues of the skinny down/up GEMMs, dispatched at run time inside custom ops
+(vllm/models/qwen4_exp/nvidia/hc_small_fused.py).
 
 ``MERLIN_LEBECHE_SM86_LL`` (default "1"; "0" = exactly stock 3.0.2.2) is read
 once at import. It is a hashed compile factor. Other capabilities are never
