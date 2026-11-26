@@ -108,7 +108,7 @@ _warmed_up = False
 def warmup_mtp_tc_gemm() -> None:
     """Compile and preload both BLOCK_M={16, 32} specializations at startup."""
     global _warmed_up
-    if _warmed_up or not mtp_tc_gemm_active():
+    if _warmed_up or not mtp_tc_gemm_active() or not torch.cuda.is_initialized():
         return
     from vllm.merlin.triton_preload import preload_triton_kernels
 
