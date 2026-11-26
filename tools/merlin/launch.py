@@ -100,6 +100,7 @@ KV_TIER_EXPERIMENTAL_27B = ("WARNING: KV RAM cache on the 27B is experimental: a
 FN_MARLIN_MOE_CFG = "MERLIN_MARLIN_MOE_CFG"  # per-shape Marlin MoE kernel choice; the engine parses it (vllm/merlin/marlin_moe_cfg.py)
 FN_LEBECHE_HC_FUSE = "MERLIN_LEBECHE_HC_FUSE"  # lebeche fork: fused small-M HC SiLU / gate-mix epilogues, 1 (engine default) / 0 = commit b5519de (vllm/models/qwen4_exp/nvidia/hc_small_fused.py)
 FN_LEBECHE_MOE_GLUE = "MERLIN_LEBECHE_MOE_GLUE"  # lebeche fork: small-batch MoE glue kernels, 1 (engine default) / 0 = stock (vllm/merlin/lebeche_moe_glue.py)
+FN_LEBECHE_SHARED_ACT_FUSE = "MERLIN_LEBECHE_SHARED_ACT_FUSE"  # lebeche fork: fused small-M shared-expert gate_up+SiLU, 1 (engine default) / 0 = commit fbc1a32 (vllm/merlin/lebeche_shared_act.py)
 FN_LEBECHE_SM86_LL = "MERLIN_LEBECHE_SM86_LL"  # lebeche fork: sm_8x skinny-GEMM plans, 1 (engine default) / 0 = stock (vllm/merlin/lebeche_sm86.py)
 FN_LPT_DEFAULT = "512"  # Flash-Next --long-prefill-token-threshold default; LPT=0 = off
 # Flash-Next prefill runs (vllm/merlin/prefill_runs.py), on by default; PREFILL_RUNS=0 = off. The decode share and the
@@ -1820,6 +1821,12 @@ def _build_flash_next(reg, p, checkpoint, ckpt, env, extra, repo: Path) -> Plan:
         raise LaunchError(f"{FN_LEBECHE_MOE_GLUE}={moe_glue!r}: use 1 (on, the default) or 0 (stock kernels)", 2)
     if moe_glue:
         env[FN_LEBECHE_MOE_GLUE] = moe_glue
+    # Same rule for the fused small-M shared-expert gate_up+SiLU switch (default on; needs SM86_LL).
+    shared_act = (environ_in.get(FN_LEBECHE_SHARED_ACT_FUSE) or "").strip()
+    if shared_act not in ("", "0", "1"):
+        raise LaunchError(f"{FN_LEBECHE_SHARED_ACT_FUSE}={shared_act!r}: use 1 (on, the default) or 0 (unfused shared-expert activation)", 2)
+    if shared_act:
+        env[FN_LEBECHE_SHARED_ACT_FUSE] = shared_act
     # The dense Marlin config is forwarded only when a table is given.
     dense_cfg = (environ_in.get("MERLIN_MARLIN_DENSE_CFG") or "").strip()
     if dense_cfg:
