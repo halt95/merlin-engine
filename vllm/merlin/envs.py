@@ -604,6 +604,12 @@ if TYPE_CHECKING:
     # MERLIN_LEBECHE_SM86_LL); 0 = behaviour of commit f332186. Bit-identical
     # at M <= 4. Hashed.
     MERLIN_LEBECHE_FUSED_ROUTER: bool = True
+    # lebeche fork: 1 (default) = sm_80/86 QSA decode glue chain fusion:
+    # direct-block early-exit split-K/merge (eliminates expand + dead
+    # output.zero_(), num_stages=1 E4M3, 4 warps) and bounded-grid MQA
+    # indexer with max_visible <= block_topk skip
+    # (vllm/merlin/lebeche_qsa_fuse.py); 0 = f332186. Bit-exact. Hashed.
+    MERLIN_LEBECHE_QSA_CHAIN_FUSE: bool = True
     # 1 = fused FWHT/FP8 kernel (bitwise) and
     # tile-skipping IndexPool scoring, stable expansion and RoPE.
     MERLIN_HY4_INDEXER_FAST: str | None = None
@@ -1226,6 +1232,7 @@ MERLIN_ENV: dict[str, Callable[[], Any]] = {
     "MERLIN_LEBECHE_P2P_ALLGATHER": lambda: _e2_strict_switch("MERLIN_LEBECHE_P2P_ALLGATHER", True),
     "MERLIN_LEBECHE_SHARED_GATE_FUSE": lambda: _e2_strict_switch("MERLIN_LEBECHE_SHARED_GATE_FUSE", True),
     "MERLIN_LEBECHE_FUSED_ROUTER": lambda: _e2_strict_switch("MERLIN_LEBECHE_FUSED_ROUTER", True),
+    "MERLIN_LEBECHE_QSA_CHAIN_FUSE": lambda: _e2_strict_switch("MERLIN_LEBECHE_QSA_CHAIN_FUSE", True),
 
     "MERLIN_HY4_INDEXER_FAST": lambda: os.getenv("MERLIN_HY4_INDEXER_FAST", None),
     "MERLIN_HY4_INDEXER_FAST2": lambda: os.getenv("MERLIN_HY4_INDEXER_FAST2", None),

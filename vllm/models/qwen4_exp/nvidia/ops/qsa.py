@@ -1054,6 +1054,17 @@ def warmup_qsa_sparse_paged_attention(
     # Load the binaries now, not mid-forward.
     from vllm.merlin.triton_preload import preload_qsa_sparse_kernels
     preload_qsa_sparse_kernels(warmed)
+    from vllm.merlin.lebeche_qsa_fuse import (
+        qsa_chain_fuse_active,
+        warmup_qsa_direct_sparse_attention,
+    )
+    if qsa_chain_fuse_active():
+        warmup_qsa_direct_sparse_attention(
+            kv_cache,
+            block_table,
+            num_query_heads=num_query_heads,
+            selection_width=selection_width,
+        )
     return tuple(warmed)
 
 
