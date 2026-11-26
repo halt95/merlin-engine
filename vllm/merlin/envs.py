@@ -551,6 +551,12 @@ if TYPE_CHECKING:
     # MERLIN_LEBECHE_SM86_LL); 0 = behaviour of commit fbc1a32. Bit-identical
     # at M <= 4. Hashed: it changes the traced graph and captured kernels.
     MERLIN_LEBECHE_SHARED_ACT_FUSE: bool = True
+    # lebeche fork: 1 (default) = fuse small-M (M <= 6) MoE route + align into
+    # one single-CTA CuTe-DSL kernel and use hardware PTX in _post_kernel on
+    # sm_80/86/89 (vllm/merlin/lebeche_moe_glue.py; needs MERLIN_LEBECHE_MOE_GLUE
+    # and MERLIN_LEBECHE_SM86_LL); 0 = behaviour of commit fbc1a32. Bit-identical.
+    # Hashed: it changes the captured kernels.
+    MERLIN_LEBECHE_MOE_ROUTE_FUSE: bool = True
     # 1 = fused FWHT/FP8 kernel (bitwise) and
     # tile-skipping IndexPool scoring, stable expansion and RoPE.
     MERLIN_HY4_INDEXER_FAST: str | None = None
@@ -1163,6 +1169,7 @@ MERLIN_ENV: dict[str, Callable[[], Any]] = {
     "MERLIN_LEBECHE_HC_FUSE": lambda: _e2_strict_switch("MERLIN_LEBECHE_HC_FUSE", True),
     "MERLIN_LEBECHE_MOE_GLUE": lambda: _e2_strict_switch("MERLIN_LEBECHE_MOE_GLUE", True),
     "MERLIN_LEBECHE_SHARED_ACT_FUSE": lambda: _e2_strict_switch("MERLIN_LEBECHE_SHARED_ACT_FUSE", True),
+    "MERLIN_LEBECHE_MOE_ROUTE_FUSE": lambda: _e2_strict_switch("MERLIN_LEBECHE_MOE_ROUTE_FUSE", True),
 
     "MERLIN_HY4_INDEXER_FAST": lambda: os.getenv("MERLIN_HY4_INDEXER_FAST", None),
     "MERLIN_HY4_INDEXER_FAST2": lambda: os.getenv("MERLIN_HY4_INDEXER_FAST2", None),

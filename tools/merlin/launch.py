@@ -101,6 +101,7 @@ FN_MARLIN_MOE_CFG = "MERLIN_MARLIN_MOE_CFG"  # per-shape Marlin MoE kernel choic
 FN_LEBECHE_HC_FUSE = "MERLIN_LEBECHE_HC_FUSE"  # lebeche fork: fused small-M HC SiLU / gate-mix epilogues, 1 (engine default) / 0 = commit b5519de (vllm/models/qwen4_exp/nvidia/hc_small_fused.py)
 FN_LEBECHE_MOE_GLUE = "MERLIN_LEBECHE_MOE_GLUE"  # lebeche fork: small-batch MoE glue kernels, 1 (engine default) / 0 = stock (vllm/merlin/lebeche_moe_glue.py)
 FN_LEBECHE_SHARED_ACT_FUSE = "MERLIN_LEBECHE_SHARED_ACT_FUSE"  # lebeche fork: fused small-M shared-expert gate_up+SiLU, 1 (engine default) / 0 = commit fbc1a32 (vllm/merlin/lebeche_shared_act.py)
+FN_LEBECHE_MOE_ROUTE_FUSE = "MERLIN_LEBECHE_MOE_ROUTE_FUSE"  # lebeche fork: single-CTA fused MoE route+align + hw-PTX post, 1 (engine default) / 0 = commit fbc1a32 (vllm/merlin/lebeche_moe_glue.py)
 FN_LEBECHE_SM86_LL = "MERLIN_LEBECHE_SM86_LL"  # lebeche fork: sm_8x skinny-GEMM plans, 1 (engine default) / 0 = stock (vllm/merlin/lebeche_sm86.py)
 FN_LPT_DEFAULT = "512"  # Flash-Next --long-prefill-token-threshold default; LPT=0 = off
 # Flash-Next prefill runs (vllm/merlin/prefill_runs.py), on by default; PREFILL_RUNS=0 = off. The decode share and the
@@ -1827,6 +1828,12 @@ def _build_flash_next(reg, p, checkpoint, ckpt, env, extra, repo: Path) -> Plan:
         raise LaunchError(f"{FN_LEBECHE_SHARED_ACT_FUSE}={shared_act!r}: use 1 (on, the default) or 0 (unfused shared-expert activation)", 2)
     if shared_act:
         env[FN_LEBECHE_SHARED_ACT_FUSE] = shared_act
+    # Same rule for the single-CTA fused MoE route+align switch (default on; needs MOE_GLUE + SM86_LL).
+    moe_route_fuse = (environ_in.get(FN_LEBECHE_MOE_ROUTE_FUSE) or "").strip()
+    if moe_route_fuse not in ("", "0", "1"):
+        raise LaunchError(f"{FN_LEBECHE_MOE_ROUTE_FUSE}={moe_route_fuse!r}: use 1 (on, the default) or 0 (two-kernel Triton glue)", 2)
+    if moe_route_fuse:
+        env[FN_LEBECHE_MOE_ROUTE_FUSE] = moe_route_fuse
     # The dense Marlin config is forwarded only when a table is given.
     dense_cfg = (environ_in.get("MERLIN_MARLIN_DENSE_CFG") or "").strip()
     if dense_cfg:

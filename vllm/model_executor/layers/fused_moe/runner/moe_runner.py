@@ -336,6 +336,11 @@ class MoERunner(MoERunnerInterface):
 
         # For smuggling this layer into the fused moe custom op
         register_layer_for_moe_forward_op(get_current_vllm_config(), self)
+        if lebeche_moe_glue.ROUTE_FUSE_SWITCH:
+            lebeche_moe_glue.maybe_register_route_warmup(
+                self.moe_config.num_experts,
+                getattr(self.router, "top_k", 0),
+            )
 
     def load_weights(
         self, weights: Iterable[tuple[str, torch.Tensor]]

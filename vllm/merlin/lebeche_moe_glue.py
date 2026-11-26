@@ -74,6 +74,10 @@ sm_80/86/89 device (:func:`glue_active`).
 
 from __future__ import annotations
 
+from collections.abc import Iterable
+from functools import partial
+from typing import Any
+
 import torch
 
 from vllm.merlin.envs import read_registered
@@ -90,6 +94,9 @@ except ImportError:  # no Triton: the glue stays off
 MOE_GLUE_SWITCH: bool = bool(read_registered("MERLIN_LEBECHE_MOE_GLUE"))
 # Module bool for the cheap test on the hot path.
 GLUE_SWITCH: bool = MOE_GLUE_SWITCH and SM86_LL_SWITCH and libdevice is not None
+MOE_ROUTE_FUSE_SWITCH: bool = bool(read_registered("MERLIN_LEBECHE_MOE_ROUTE_FUSE"))
+# Single-CTA CuTe-DSL fused route+align and hardware-PTX post combine.
+ROUTE_FUSE_SWITCH: bool = MOE_ROUTE_FUSE_SWITCH and GLUE_SWITCH
 
 MAX_M = 8  # one block of 8 per expert holds at most MAX_M entries
 BLOCK_SIZE_M = 8  # the Marlin MoE block size fused_marlin_moe picks for M <= 8
@@ -103,8 +110,10 @@ ALIGN_MAX_ENTRIES = 64  # fused alignment up to 6 rows of top-10
 # the stock order; checked bit for bit by the unit test), False = the same
 # adds spelled out through scratch memory (slower, no reliance on Triton).
 LANE_SUM_REDUCE = True
-POST_BLOCK = 256  # 10 single-warp CTAs per row of 2560
+POST_BLOCK = 256  # 10 single-warp CTAs per row of 2560 (fbc1a32)
+POST_BLOCK_OPT = 128  # 20 single-warp CTAs per row -> 80 CTAs at M=4 (~82 SMs on 3090)
 POST_NUM_WARPS = 1
+ROUTE_FUSE_MAX_M = 6
 # How torch computes sigmoid on bf16 (checked over all 65536 inputs by the test).
 SIG_ROUNDED = 1  # round to bf16 after exp, after 1 + e and after the division
 SIG_SINGLE = 2  # fp32 throughout, one rounding to bf16 (what torch does)
@@ -112,12 +121,17 @@ SIG_PRECOMPUTED = 0  # gate tensor already holds sigmoid(gate)
 POST_SIG_MODE = SIG_SINGLE
 
 # Kernel launch counters (tests assert on them); never read by the engine.
-CALLS = {"route_align": 0, "post": 0, "take_align": 0}
+CALLS = {"route_align": 0, "route_align_cute": 0, "post": 0, "post_opt": 0, "take_align": 0}
 
 
 def glue_active() -> bool:
     """Both switches on and the device is sm_80/86/89."""
     return GLUE_SWITCH and sm86_ll_active()
+
+
+def route_fuse_active() -> bool:
+    """Fused single-CTA route+align and hardware-PTX post combine active on sm_8x."""
+    return ROUTE_FUSE_SWITCH and sm86_ll_active()
 
 
 # --------------------------------------------------------------------- kernels
@@ -365,6 +379,220 @@ def _post_kernel(
     tl.store(out_ptr + m * K + offs, res.to(tl.bfloat16), mask=kmask)
 
 
+@triton.jit
+def _round_bf16_hw(x):
+    """Hardware round-to-nearest-even bf16 then upcast to f32 (prevents fusion)."""
+    return tl.inline_asm_elementwise(
+        asm="{ .reg .b16 tmp; cvt.rn.bf16.f32 tmp, $1; cvt.f32.bf16 $0, tmp; }",
+        constraints="=r,r",
+        args=[x],
+        dtype=tl.float32,
+        is_pure=True,
+        pack=1,
+    )
+
+
+@triton.jit
+def _rcp_rn_f32_hw(x):
+    """Hardware IEEE round-to-nearest-even 1.0f / x (1 instruction on sm_8x)."""
+    return tl.inline_asm_elementwise(
+        asm="rcp.rn.f32 $0, $1;",
+        constraints="=r,r",
+        args=[x],
+        dtype=tl.float32,
+        is_pure=True,
+        pack=1,
+    )
+
+
+@triton.jit
+def _post_kernel_opt(
+    moe_ptr,  # bf16 [M, TOPK, K]
+    ids_ptr,  # int32 [M, TOPK]
+    map_ptr,  # int32 [E]
+    sh_ptr,  # bf16 [M, K]
+    gate_ptr,  # bf16 [M]
+    out_ptr,  # bf16 [M, K]
+    K,
+    TOPK: tl.constexpr,
+    HAS_MAP: tl.constexpr,
+    HAS_SHARED: tl.constexpr,
+    SIG_MODE: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    m = tl.program_id(0)
+    offs = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    kmask = offs < K
+    gids = ()
+    for k in tl.static_range(TOPK):
+        gids += (tl.load(ids_ptr + m * TOPK + k),)  # type: ignore[assignment]
+    takes = ()
+    for k in tl.static_range(TOPK):
+        take = gids[k] >= 0
+        if HAS_MAP:
+            take = take & (tl.load(map_ptr + tl.where(take, gids[k], 0)) >= 0)
+        takes += (take,)  # type: ignore[assignment]
+    acc = tl.zeros([BLOCK], dtype=tl.float32)
+    for k in tl.static_range(TOPK):
+        x = tl.load(
+            moe_ptr + (m * TOPK + k) * K + offs, mask=kmask & takes[k], other=0.0
+        )
+        acc = acc + x.to(tl.float32)
+    res = _round_bf16_hw(acc)
+    if HAS_SHARED:
+        g = tl.load(gate_ptr + m).to(tl.float32)
+        if SIG_MODE == 1:
+            e = _round_bf16_hw(libdevice.exp(-g))
+            d = _round_bf16_hw(1.0 + e)
+            sig = _round_bf16_hw(_rcp_rn_f32_hw(d))
+        elif SIG_MODE == 2:
+            sig = _round_bf16_hw(_rcp_rn_f32_hw(1.0 + libdevice.exp(-g)))
+        else:
+            sig = g
+        sh = tl.load(sh_ptr + m * K + offs, mask=kmask, other=0.0).to(tl.float32)
+        res = _round_bf16_hw(sig * sh) + res
+    tl.store(out_ptr + m * K + offs, res.to(tl.bfloat16), mask=kmask)
+
+
+# (num_rows, top_k, num_experts, block_size_m)
+_RouteKey = tuple[int, int, int, int]
+
+
+class _RouteAlignFused:
+    """Compile cache and CuTe-DSL warmup provider for CuteFusedRouteAlign."""
+
+    def __init__(self) -> None:
+        self._compiled: dict[_RouteKey, Any] = {}
+        self._warmup: set[_RouteKey] = set()
+        self._warmup_registered = False
+
+    def _compile(self, key: _RouteKey) -> None:
+        if key in self._compiled:
+            return
+        import cutlass.cute as cute
+        from cutlass import BFloat16, Float32, Int32, Uint8
+        from quack.compile_utils import make_fake_tensor
+
+        from vllm.merlin._lebeche_moe_route_cute import CuteFusedRouteAlign
+        from vllm.model_executor.kernels.linear.cute_dsl.skinny_gemm import (
+            shape_dynamic_skinny_gemm,
+        )
+
+        m, top_k, e, bs = key
+        gl = make_fake_tensor(BFloat16, (m, e), divisibility=8)
+        gp = make_fake_tensor(Uint8, (cute.sym_int(),), divisibility=1)
+        gm = make_fake_tensor(Int32, (cute.sym_int(),), divisibility=1)
+        gw = make_fake_tensor(Float32, (m, top_k), divisibility=1)
+        gi = make_fake_tensor(Int32, (m, top_k), divisibility=1)
+        gs = make_fake_tensor(Int32, (m * top_k * bs,), divisibility=4)
+        ge = make_fake_tensor(Int32, (m * top_k,), divisibility=1)
+        gn = make_fake_tensor(Int32, (1,), divisibility=1)
+        kern = CuteFusedRouteAlign(
+            num_rows=m, top_k=top_k, num_experts=e, block_size_m=bs
+        )
+        self._compiled[key] = cute.compile(
+            kern,
+            gl,
+            gp,
+            gm,
+            gw,
+            gi,
+            gs,
+            ge,
+            gn,
+            Int32(0),
+            Int32(1),
+            Int32(1),
+            shape_dynamic_skinny_gemm._stream(),
+            options="--enable-tvm-ffi",
+        )
+
+    def request_warmup(self, keys: Iterable[_RouteKey]) -> None:
+        self._warmup.update(keys)
+        if self._warmup_registered or not self._warmup:
+            return
+        from vllm.model_executor.warmup.cutedsl_warmup import (
+            register_cutedsl_warmup_provider,
+        )
+
+        register_cutedsl_warmup_provider(self)
+        self._warmup_registered = True
+
+    def get_cutedsl_warmup_compile_units(self):
+        from vllm.model_executor.warmup.cutedsl_warmup import CuTeDSLCompileUnit
+
+        return tuple(
+            CuTeDSLCompileUnit(
+                name=f"Lebeche MoE fused route+align M={k[0]} E={k[2]} K={k[1]}",
+                key=("lebeche-moe-route-align", *k),
+                compile=partial(self._compile, k),
+            )
+            for k in sorted(self._warmup)
+        )
+
+    def run(
+        self,
+        logits: torch.Tensor,
+        expert_map: torch.Tensor | None,
+        is_padding: torch.Tensor | None,
+        top_k: int,
+        renormalize: bool,
+        w: torch.Tensor,
+        ids: torch.Tensor,
+        sorted_ids: torch.Tensor,
+        eids: torch.Tensor,
+        npost: torch.Tensor,
+    ) -> None:
+        from vllm.model_executor.kernels.linear.cute_dsl.skinny_gemm import (
+            shape_dynamic_skinny_gemm,
+        )
+
+        m, e = logits.shape
+        key: _RouteKey = (m, top_k, e, BLOCK_SIZE_M)
+        if key not in self._compiled:
+            self._compile(key)
+        # Dynamic-1D gPad/gMap accept already-allocated tensors when unused (no alloc).
+        pad_t = is_padding.view(torch.uint8) if is_padding is not None else npost.view(torch.uint8)
+        map_t = expert_map if expert_map is not None else eids
+        self._compiled[key](
+            logits,
+            pad_t,
+            map_t,
+            w,
+            ids,
+            sorted_ids,
+            eids,
+            npost,
+            1 if is_padding is not None else 0,
+            1 if expert_map is not None else 0,
+            1 if renormalize else 0,
+            shape_dynamic_skinny_gemm._stream(),
+        )
+
+
+route_align_fused = _RouteAlignFused()
+
+
+def maybe_register_route_warmup(num_experts: int, top_k: int) -> None:
+    """Register M=1..6 single-CTA route+align compile units for cutedsl_warmup."""
+    if not route_fuse_active():
+        return
+    if num_experts != NUM_EXPERTS or not (1 <= top_k <= MAX_TOPK):
+        return
+    from vllm.model_executor.kernels.linear.cute_dsl.skinny_gemm import (
+        shape_dynamic_skinny_gemm,
+    )
+
+    if not shape_dynamic_skinny_gemm.is_available():
+        return
+    keys = [
+        (m, top_k, num_experts, BLOCK_SIZE_M)
+        for m in range(1, ROUTE_FUSE_MAX_M + 1)
+        if m * top_k <= ALIGN_MAX_ENTRIES
+    ]
+    route_align_fused.request_warmup(keys)
+
+
 # -------------------------------------------------------------------- wrappers
 def _pow2(n: int) -> int:
     return 1 << max(n - 1, 0).bit_length()
@@ -394,6 +622,34 @@ def route_align(
     npost = torch.empty((1,), dtype=torch.int32, device=dev)
     CALLS["route_align"] += 1
     fused_align = n <= ALIGN_MAX_ENTRIES
+    if (
+        fused_align
+        and route_fuse_active()
+        and 1 <= m <= ROUTE_FUSE_MAX_M
+        and e == NUM_EXPERTS
+        and 1 <= top_k <= MAX_TOPK
+        and num_warps is None
+        and lane_sum_reduce is None
+    ):
+        from vllm.model_executor.kernels.linear.cute_dsl.skinny_gemm import (
+            shape_dynamic_skinny_gemm,
+        )
+
+        if shape_dynamic_skinny_gemm.is_available():
+            CALLS["route_align_cute"] += 1
+            route_align_fused.run(
+                logits,
+                expert_map,
+                is_padding,
+                top_k,
+                bool(renormalize),
+                w,
+                ids,
+                sorted_ids,
+                eids,
+                npost,
+            )
+            return w, ids, sorted_ids, eids, npost
     lane_reduce = LANE_SUM_REDUCE if lane_sum_reduce is None else lane_sum_reduce
     _route_kernel[(m,)](
         logits,
@@ -453,8 +709,27 @@ def post_combine(
     """``out = moe_sum(moe_out) [+ sigmoid(gate) * shared]`` with the stock
     bf16 roundings; ``moe_out`` is ``[M, top_k, K]`` and ``out`` ``[M, K]``."""
     m, top_k, k = moe_out.shape
-    block = POST_BLOCK if block is None else block
     CALLS["post"] += 1
+    if route_fuse_active():
+        opt_block = POST_BLOCK_OPT if block is None else block
+        CALLS["post_opt"] += 1
+        _post_kernel_opt[(m, triton.cdiv(k, opt_block))](
+            moe_out,
+            topk_ids,
+            expert_map,
+            shared,
+            gate if shared is not None else None,
+            out,
+            k,
+            TOPK=top_k,
+            HAS_MAP=expert_map is not None,
+            HAS_SHARED=shared is not None,
+            SIG_MODE=POST_SIG_MODE if sig_mode is None else sig_mode,
+            BLOCK=opt_block,
+            num_warps=POST_NUM_WARPS if num_warps is None else num_warps,
+        )
+        return out
+    block = POST_BLOCK if block is None else block
     _post_kernel[(m, triton.cdiv(k, block))](
         moe_out,
         topk_ids,
