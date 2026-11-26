@@ -50,9 +50,10 @@ from .low_latency_gemm import (
     _is_packed_row_major,
     _qwen4_exp_low_latency_gemm,
 )
-from .ops.hc import hc_gate_mix, hc_silu
+from .ops.hc import hc_combine_norm, hc_gate_mix, hc_silu
 
 HC_FUSE_SWITCH: bool = bool(read_registered("MERLIN_LEBECHE_HC_FUSE"))
+HC_SM86_TUNE_SWITCH: bool = bool(read_registered("MERLIN_LEBECHE_HC_SM86_TUNE"))
 
 _DOWN = "down_silu"
 _UP = "up_gate_mix"
@@ -72,14 +73,18 @@ HC_DOWN_SILU_SM86_PLANS: dict[tuple[int, int], dict[int, SkinnyGemmConfig]] = {
         1: SkinnyGemmConfig(1, 64, 1, static_k=10240),
         2: SkinnyGemmConfig(2, 64, 1, static_k=10240),
         3: SkinnyGemmConfig(3, 160, 2, static_k=10240),
-        4: SkinnyGemmConfig(4, 128, 2, static_k=10240),
+        4: SkinnyGemmConfig(
+            4, 128, 1 if HC_SM86_TUNE_SWITCH else 2, static_k=10240
+        ),
     },
     # Final HC mixer down projection.
     (320, 10240): {
         1: SkinnyGemmConfig(1, 64, 2, vector_width=2, static_k=10240),
         2: SkinnyGemmConfig(2, 160, 1, static_k=10240),
         3: SkinnyGemmConfig(3, 256, 2, k_unroll=2),
-        4: SkinnyGemmConfig(4, 128, 2, static_k=10240),
+        4: SkinnyGemmConfig(
+            4, 128, 1 if HC_SM86_TUNE_SWITCH else 2, static_k=10240
+        ),
     },
 }
 # outputs_per_block counts weight rows: hc streams x inner indices per block.
@@ -341,6 +346,195 @@ direct_register_custom_op(
 )
 
 
+_CombineNormKey = tuple[bool, int, int, float]
+
+
+class HcCombineNormCute:
+    """Compile cache and CuTe-DSL warmup provider for dynamic-M combine+norm."""
+
+    def __init__(self) -> None:
+        self._compiled: dict[_CombineNormKey, Any] = {}
+        self._warmup: set[_CombineNormKey] = set()
+        self._warmup_registered = False
+
+    def _compile(self, key: _CombineNormKey) -> None:
+        if key in self._compiled:
+            return
+        import cutlass.cute as cute
+        from cutlass import BFloat16
+        from quack.compile_utils import make_fake_tensor
+
+        from .ops.cute_dsl._hc_combine_norm import CuteHcCombineNorm
+
+        has_inj, hc, hc_dim, eps = key
+        k = hc * hc_dim
+        m_sym = cute.sym_int()
+        kernel = CuteHcCombineNorm(
+            element_type=BFloat16,
+            has_inj=has_inj,
+            warps_per_stream=10,
+            hc=hc,
+            hc_dim=hc_dim,
+            eps=eps,
+        )
+        self._compiled[key] = cute.compile(
+            kernel,
+            make_fake_tensor(BFloat16, (m_sym, k), divisibility=8),
+            make_fake_tensor(BFloat16, (m_sym, hc_dim), divisibility=8),
+            make_fake_tensor(BFloat16, (m_sym, hc), divisibility=1),
+            make_fake_tensor(BFloat16, (1, k), divisibility=8),
+            make_fake_tensor(BFloat16, (m_sym, k), divisibility=8),
+            make_fake_tensor(BFloat16, (m_sym, k), divisibility=8),
+            shape_dynamic_skinny_gemm._stream(),
+            options="--enable-tvm-ffi",
+        )
+
+    def request_warmup(self, keys: Iterable[_CombineNormKey]) -> None:
+        self._warmup.update(keys)
+        if self._warmup_registered or not self._warmup:
+            return
+        from vllm.model_executor.warmup.cutedsl_warmup import (
+            register_cutedsl_warmup_provider,
+        )
+
+        register_cutedsl_warmup_provider(self)
+        self._warmup_registered = True
+
+    def get_cutedsl_warmup_compile_units(self):
+        from vllm.model_executor.warmup.cutedsl_warmup import CuTeDSLCompileUnit
+
+        return tuple(
+            CuTeDSLCompileUnit(
+                name="Qwen4Exp HC dynamic-M combine+norm",
+                key=("qwen4-exp-hc-combine-norm", *key),
+                compile=partial(self._compile, key),
+            )
+            for key in sorted(self._warmup)
+        )
+
+    def __call__(
+        self,
+        residual: torch.Tensor,
+        block_output: torch.Tensor,
+        injection_logits: torch.Tensor | None,
+        norm_weight: torch.Tensor,
+        eps: float,
+        hc_count: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        hc_dim = residual.shape[1] // hc_count
+        has_inj = injection_logits is not None
+        key: _CombineNormKey = (has_inj, hc_count, hc_dim, float(eps))
+        if key not in self._compiled:
+            self._compile(key)
+        out = residual.new_empty(residual.shape)
+        xn = residual.new_empty(residual.shape)
+        inj_arg = (
+            injection_logits
+            if injection_logits is not None
+            else residual[:, :hc_count]
+        )
+        self._compiled[key](
+            residual,
+            block_output,
+            inj_arg,
+            norm_weight.view(1, -1),
+            out,
+            xn,
+            shape_dynamic_skinny_gemm._stream(),
+        )
+        return out, xn
+
+
+hc_combine_norm_cute = HcCombineNormCute()
+
+
+def _combine_norm_cute_ok(
+    residual: torch.Tensor,
+    block_output: torch.Tensor,
+    injection_logits: torch.Tensor | None,
+    norm_weight: torch.Tensor,
+    hc_count: int,
+) -> bool:
+    if (
+        not HC_SM86_TUNE_SWITCH
+        or not sm86_ll_active()
+        or envs.VLLM_BATCH_INVARIANT
+        or not shape_dynamic_skinny_gemm.is_available()
+    ):
+        return False
+    if (
+        residual.dim() != 2
+        or block_output.dim() != 2
+        or residual.shape[0] < 1
+        or hc_count != 4
+        or residual.shape[1] != 10240
+        or block_output.shape != (residual.shape[0], 2560)
+        or norm_weight.numel() != 10240
+        or residual.dtype != torch.bfloat16
+        or block_output.dtype != torch.bfloat16
+        or norm_weight.dtype != torch.bfloat16
+        or not residual.is_cuda
+        or block_output.device != residual.device
+        or norm_weight.device != residual.device
+        or not residual.is_contiguous()
+        or not block_output.is_contiguous()
+        or not norm_weight.is_contiguous()
+        or (residual.data_ptr() % 16) != 0
+        or (block_output.data_ptr() % 16) != 0
+        or (norm_weight.data_ptr() % 16) != 0
+    ):
+        return False
+    if injection_logits is not None and (
+        injection_logits.dim() != 2
+        or injection_logits.shape != (residual.shape[0], hc_count)
+        or injection_logits.dtype != torch.bfloat16
+        or injection_logits.device != residual.device
+        or injection_logits.stride(1) != 1
+    ):
+        return False
+    return True
+
+
+def _qwen4_exp_hc_combine_norm(
+    residual: torch.Tensor,
+    block_output: torch.Tensor,
+    injection_logits: torch.Tensor | None,
+    norm_weight: torch.Tensor,
+    eps: float,
+    hc_count: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if _combine_norm_cute_ok(
+        residual, block_output, injection_logits, norm_weight, hc_count
+    ):
+        return hc_combine_norm_cute(
+            residual, block_output, injection_logits, norm_weight, eps, hc_count
+        )
+    return hc_combine_norm(
+        residual, block_output, injection_logits, norm_weight, eps, hc_count
+    )
+
+
+def _qwen4_exp_hc_combine_norm_fake(
+    residual: torch.Tensor,
+    block_output: torch.Tensor,
+    injection_logits: torch.Tensor | None,
+    norm_weight: torch.Tensor,
+    eps: float,
+    hc_count: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return (
+        residual.new_empty(residual.shape),
+        residual.new_empty(residual.shape),
+    )
+
+
+direct_register_custom_op(
+    op_name="qwen4_exp_hc_combine_norm",
+    op_func=_qwen4_exp_hc_combine_norm,
+    fake_impl=_qwen4_exp_hc_combine_norm_fake,
+)
+
+
 def _patched(linear: nn.Module | None) -> bool:
     """The Linear already dispatches through ``qwen4_exp_low_latency_gemm``."""
     return (
@@ -360,15 +554,28 @@ def enable_qwen4_exp_hc_small_fused(module: nn.Module, dtype: torch.dtype) -> No
     modules: a projection is fused only if it already uses the low-latency op,
     so the ops' run-time fallback equals what the module did before.
     """
-    if dtype != torch.bfloat16 or not HC_FUSE_SWITCH or not sm86_ll_active():
+    if dtype != torch.bfloat16 or (not HC_FUSE_SWITCH and not HC_SM86_TUNE_SWITCH) or not sm86_ll_active():
         return
     if not shape_dynamic_skinny_gemm.is_available():
         return
     from .hyperconnection import GatedResidual
 
     warmup: set[_CompileKey] = set()
+    cn_warmup: set[_CombineNormKey] = set()
     for child in module.modules():
         if not isinstance(child, GatedResidual):
+            continue
+        if (
+            HC_SM86_TUNE_SWITCH
+            and child.hc_count == 4
+            and child.hidden_size == 2560
+            and child.hc_norm.weight.numel() == 10240
+        ):
+            child._hc_fast_combine_norm = True
+            eps = float(child.config.rms_norm_eps)
+            cn_warmup.add((True, 4, 2560, eps))
+            cn_warmup.add((False, 4, 2560, eps))
+        if not HC_FUSE_SWITCH:
             continue
         rank, hc = child.hc_lowrank, child.hc_count
         if child.use_combine:
@@ -397,10 +604,14 @@ def enable_qwen4_exp_hc_small_fused(module: nn.Module, dtype: torch.dtype) -> No
                 child._hc_fuse_up = True
                 warmup.update((_UP, c, 0, hc) for c in configs)
     hc_small_fused.request_warmup(warmup)
+    if cn_warmup:
+        hc_combine_norm_cute.request_warmup(cn_warmup)
 
 
 __all__ = [
     "HC_FUSE_SWITCH",
+    "HC_SM86_TUNE_SWITCH",
     "enable_qwen4_exp_hc_small_fused",
+    "hc_combine_norm_cute",
     "hc_small_fused",
 ]

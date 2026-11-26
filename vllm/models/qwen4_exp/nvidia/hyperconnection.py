@@ -85,6 +85,7 @@ class GatedResidual(nn.Module):
         # inside the custom ops, at run time.
         self._hc_fuse_down = False
         self._hc_fuse_up = False
+        self._hc_fast_combine_norm = False
 
         norm_size = (
             self.hyper_hidden_size if config.hc_per_branch_norm else config.hidden_size
@@ -218,14 +219,24 @@ class GatedResidual(nn.Module):
         module's input RMSNorm. A missing injection applies the block output
         to every stream with unit weight.
         """
-        hidden_states, xn = hc_combine_norm(
-            hidden_states,
-            prev_block_output,
-            prev_injection,
-            self.hc_norm.weight,
-            self.config.rms_norm_eps,
-            self.hc_count,
-        )
+        if self._hc_fast_combine_norm and not envs.VLLM_BATCH_INVARIANT:
+            hidden_states, xn = torch.ops.vllm.qwen4_exp_hc_combine_norm(
+                hidden_states,
+                prev_block_output,
+                prev_injection,
+                self.hc_norm.weight,
+                self.config.rms_norm_eps,
+                self.hc_count,
+            )
+        else:
+            hidden_states, xn = hc_combine_norm(
+                hidden_states,
+                prev_block_output,
+                prev_injection,
+                self.hc_norm.weight,
+                self.config.rms_norm_eps,
+                self.hc_count,
+            )
 
         lowrank, injection = self._down_and_inject(xn)
         block_input = self._up_and_gate_mix(xn, lowrank)
