@@ -114,6 +114,12 @@ class ShapeDynamicSkinnyGemm:
 
         return current_platform.is_arch_support_pdl()
 
+    @staticmethod
+    def _portable_elect() -> bool:
+        from vllm.merlin.lebeche_sm86 import sm86_ll_active
+
+        return sm86_ll_active()
+
     def _compile(
         self,
         dtype: torch.dtype,
@@ -154,6 +160,7 @@ class ShapeDynamicSkinnyGemm:
             has_residual=has_residual,
             use_pdl=self._use_pdl(),
             static_k=config.static_k,
+            portable_elect=self._portable_elect(),
         )
         self._compiled[(dtype, config, has_residual)] = cute.compile(
             kernel,

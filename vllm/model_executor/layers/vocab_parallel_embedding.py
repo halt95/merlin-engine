@@ -91,6 +91,14 @@ class UnquantizedEmbeddingMethod(QuantizeMethodBase):
             from vllm.model_executor.layers.utils import dispatch_cpu_unquantized_gemm
 
             dispatch_cpu_unquantized_gemm(layer, remove_weight=False)
+            return
+        from vllm.merlin.lebeche_lm_head_w8 import (
+            LM_HEAD_W8_SWITCH,
+            prepare_parallel_lm_head_w8,
+        )
+
+        if LM_HEAD_W8_SWITCH:
+            prepare_parallel_lm_head_w8(layer)
 
     def apply(
         self,
@@ -102,6 +110,15 @@ class UnquantizedEmbeddingMethod(QuantizeMethodBase):
             current_platform.is_cuda_alike() or current_platform.is_xpu()
         ):
             return linear_batch_invariant(x, layer.weight, bias)
+        from vllm.merlin.lebeche_lm_head_w8 import (
+            LM_HEAD_W8_SWITCH,
+            maybe_apply_lm_head_w8,
+        )
+
+        if LM_HEAD_W8_SWITCH:
+            out = maybe_apply_lm_head_w8(layer, x, bias)
+            if out is not None:
+                return out
         return dispatch_unquantized_gemm()(layer, x, layer.weight, bias)
 
     def embedding(self, layer: torch.nn.Module, input_: torch.Tensor) -> torch.Tensor:

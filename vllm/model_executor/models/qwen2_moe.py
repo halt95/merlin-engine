@@ -38,6 +38,7 @@ from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
 from vllm.logger import init_logger
+from vllm.merlin import lebeche_moe_glue, lebeche_shared_act
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.fused_moe import (
@@ -111,14 +112,51 @@ class Qwen2MoeMLP(nn.Module):
             )
         self.act_fn = SiluAndMul()
         self.expert_gate = expert_gate
+        self._lebeche_shared_act_gate = (
+            lebeche_shared_act.maybe_register_mlp_with_gate(self)
+            if lebeche_shared_act.SHARED_GATE_SWITCH
+            else False
+        )
+        self._lebeche_shared_act = (
+            False
+            if self._lebeche_shared_act_gate
+            else (
+                lebeche_shared_act.maybe_register_mlp(self)
+                if lebeche_shared_act.SHARED_ACT_SWITCH
+                else False
+            )
+        )
 
     def forward(self, x):
-        gate_up, _ = self.gate_up_proj(x)
-        out = self.act_fn(gate_up)
+        if self._lebeche_shared_act_gate:
+            out, gate = torch.ops.vllm.lebeche_shared_gate_up_silu_gate(
+                x, self.gate_up_proj.weight, self.expert_gate.weight
+            )
+            out, _ = self.down_proj(out)
+            if lebeche_moe_glue.GLUE_SWITCH and lebeche_moe_glue.defer_shared_gate(
+                out, gate
+            ):
+                return out
+            return F.sigmoid(gate) * out
+
+        if self._lebeche_shared_act:
+            out = torch.ops.vllm.lebeche_shared_gate_up_silu(
+                x, self.gate_up_proj.weight
+            )
+        else:
+            gate_up, _ = self.gate_up_proj(x)
+            out = self.act_fn(gate_up)
         out, _ = self.down_proj(out)
 
         if self.expert_gate is not None:
-            out = F.sigmoid(self.expert_gate(x)[0]) * out
+            gate = self.expert_gate(x)[0]
+            # lebeche fork: inside vllm.moe_forward_shared_glue a small batch
+            # leaves sigmoid(gate) * out to the fused post kernel.
+            if lebeche_moe_glue.GLUE_SWITCH and lebeche_moe_glue.defer_shared_gate(
+                out, gate
+            ):
+                return out
+            out = F.sigmoid(gate) * out
 
         return out
 

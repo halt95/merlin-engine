@@ -455,8 +455,6 @@ def _marlin_gemm(
     use_fp32_reduce: bool = False,
     is_zp_float: bool = False,
 ) -> torch.Tensor:
-    if workspace is None:
-        workspace = get_marlin_workspace(a.device)
     # A matched rule launches its pinned
     # tile; OFF and unmatched calls fall through to the direct call below. The
     # table is parsed once per process and the device limits are read once per
@@ -464,6 +462,27 @@ def _marlin_gemm(
     from vllm.merlin.marlin_dense_cfg import device_limits, env_rules, select_override
 
     rules = env_rules()
+    if not rules:
+        from vllm.merlin.lebeche_w8_gemm import maybe_w8_small_m_gemm
+
+        out = maybe_w8_small_m_gemm(
+            a,
+            b_q_weight,
+            b_bias,
+            b_scales,
+            a_scales,
+            global_scale,
+            b_zeros,
+            b_q_type_id,
+            size_m,
+            size_n,
+            size_k,
+            is_zp_float,
+        )
+        if out is not None:
+            return out
+    if workspace is None:
+        workspace = get_marlin_workspace(a.device)
     if rules and (
         a.device.type == "cuda"
         and a.dtype == torch.bfloat16
@@ -565,6 +584,16 @@ def marlin_permute_scales(
     else:
         s = s.reshape((-1, len(scale_perm_single)))[:, scale_perm_single]
     s = s.reshape((-1, size_n)).contiguous()
+    if (
+        (group_size == -1 or group_size == size_k)
+        and not is_a_8bit
+        and s.dtype == torch.bfloat16
+        and size_n % 64 == 0
+        and size_k % 128 == 0
+    ):
+        from vllm.merlin.lebeche_w8_gemm import request_w8_small_m_warmup
+
+        request_w8_small_m_warmup(size_n, size_k)
 
     return s
 

@@ -358,6 +358,7 @@ class QSAIndexer(nn.Module):
         attn: "Qwen4ExpQSAAttention",
         qkv: torch.Tensor | None = None,
         slot_mapping: torch.Tensor | None = None,
+        skip_expand: bool = False,
     ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor] | None]:
         """Update side caches and select token indices from pre-projected Q/K.
 
@@ -558,15 +559,16 @@ class QSAIndexer(nn.Module):
                 raise RuntimeError("QSA top-k reuse requires an output buffer")
             return out, main_outputs
 
-        if out is None:
-            out = torch.empty(
-                num_tokens,
-                self.packed_output_width,
-                dtype=torch.int32,
-                device=q.device,
-            )
-        elif out.shape != (num_tokens, self.packed_output_width):
-            raise ValueError("QSA selection output has an invalid shape")
+        if not skip_expand:
+            if out is None:
+                out = torch.empty(
+                    num_tokens,
+                    self.packed_output_width,
+                    dtype=torch.int32,
+                    device=q.device,
+                )
+            elif out.shape != (num_tokens, self.packed_output_width):
+                raise ValueError("QSA selection output has an invalid shape")
 
         num_decode_tokens = compressed_metadata.num_decode_tokens
         decode_query_len = compressed_metadata.decode_query_len
@@ -614,6 +616,9 @@ class QSAIndexer(nn.Module):
                 use_workspace=self._scratch_mode == "workspace",
                 backing_bytes=self._prefill_backing_bytes,
             )
+        if skip_expand:
+            return block_indices, main_outputs
+        assert out is not None
         expand_qsa_block_indices(
             block_indices,
             compressed_metadata.logical_positions[:num_tokens],

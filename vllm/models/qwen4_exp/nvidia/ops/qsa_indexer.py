@@ -490,6 +490,19 @@ def warmup_qsa_mqa_paged_decode(
     # Load the binaries now, not mid-forward.
     from vllm.merlin.triton_preload import preload_qsa_indexer_decode_kernels
     preload_qsa_indexer_decode_kernels(len(profiles))
+    from vllm.merlin.lebeche_qsa_fuse import (
+        qsa_chain_fuse_active,
+        warmup_qsa_mqa_bounded_decode,
+    )
+    if qsa_chain_fuse_active():
+        warmup_qsa_mqa_bounded_decode(
+            k_cache,
+            page_table,
+            num_heads=num_heads,
+            head_dim=head_dim,
+            max_decode_query_len=max_decode_query_len,
+            max_num_reqs=max_num_reqs,
+        )
     return profiles
 
 
@@ -749,34 +762,50 @@ def qsa_select_paged_decode(
     # Uses the shared workspace when it
     # fits.
     logits = _selection_logits((q.shape[0], columns), q.device, use_workspace)
-    tiles_per_program = _decode_tiles_per_program(num_requests, columns)
-    grid = (
-        num_requests,
-        triton.cdiv(columns, _DECODE_BLOCK_N * tiles_per_program),
+    from vllm.merlin.lebeche_qsa_fuse import (
+        qsa_chain_fuse_active,
+        qsa_mqa_paged_decode_bounded,
     )
-    _qsa_mqa_paged_uniform_kernel[grid](
-        q,
-        k_cache,
-        page_table,
-        visible_blocks,
-        logits,
-        *q.stride()[:-1],
-        *k_cache.stride()[:2],
-        *page_table.stride()[:-1],
-        *logits.stride()[:-1],
-        k_cache.shape[0],
-        guard_telemetry.counter(guard_telemetry.SITE_QSA_DECODE, q.device),
-        PAGE_SIZE=k_cache.shape[1],
-        PAGE_TABLE_WIDTH=page_table.shape[1],
-        NUM_HEADS=q.shape[1],
-        HEAD_DIM=q.shape[2],
-        DECODE_QUERY_LEN=decode_query_len,
-        BLOCK_N=_DECODE_BLOCK_N,
-        TILES_PER_PROG=tiles_per_program,
-        STAGES=2,
-        # tuned on GB300
-        num_warps=1 if k_cache.dtype == torch.float8_e4m3fn else 2,
-    )
+
+    if qsa_chain_fuse_active():
+        qsa_mqa_paged_decode_bounded(
+            q,
+            k_cache,
+            page_table,
+            visible_blocks,
+            logits,
+            decode_query_len,
+            token_topk // compress_ratio,
+        )
+    else:
+        tiles_per_program = _decode_tiles_per_program(num_requests, columns)
+        grid = (
+            num_requests,
+            triton.cdiv(columns, _DECODE_BLOCK_N * tiles_per_program),
+        )
+        _qsa_mqa_paged_uniform_kernel[grid](
+            q,
+            k_cache,
+            page_table,
+            visible_blocks,
+            logits,
+            *q.stride()[:-1],
+            *k_cache.stride()[:2],
+            *page_table.stride()[:-1],
+            *logits.stride()[:-1],
+            k_cache.shape[0],
+            guard_telemetry.counter(guard_telemetry.SITE_QSA_DECODE, q.device),
+            PAGE_SIZE=k_cache.shape[1],
+            PAGE_TABLE_WIDTH=page_table.shape[1],
+            NUM_HEADS=q.shape[1],
+            HEAD_DIM=q.shape[2],
+            DECODE_QUERY_LEN=decode_query_len,
+            BLOCK_N=_DECODE_BLOCK_N,
+            TILES_PER_PROG=tiles_per_program,
+            STAGES=2,
+            # tuned on GB300
+            num_warps=1 if k_cache.dtype == torch.float8_e4m3fn else 2,
+        )
     _topk(
         logits,
         visible_blocks,

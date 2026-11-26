@@ -181,12 +181,43 @@ def _rope_pos_guard(
 
 
 @triton.jit
+def _encode_f32_to_e4m3_uint8(x):
+    """Bit-exact __nv_cvt_float_to_fp8(x, __NV_SATFINITE, __NV_E4M3) -> uint8.
+
+    Used on sm_80/86 where Triton cannot lower float8e4nv pointers: the main
+    KV cache is passed as a uint8 byte view and encoded in software to match
+    reshape_and_cache_flash bit-for-bit across all 65,536 BF16 values.
+    """
+    xbits = x.to(tl.uint32, bitcast=True)
+    absx = xbits & 0x7FFFFFFF
+    is_nan = absx > 0x7F800000
+    sign = ((xbits >> 24) & 0x80).to(tl.uint8)
+    # Normal range [2^-6, 448): [0x3C800000, 0x43E00000), round-to-nearest-even.
+    exp = ((absx >> 23) - 120).to(tl.uint32)
+    mant = (absx >> 20) & 0x7
+    rem = absx & 0xFFFFF
+    round_up = ((rem > 0x80000) | ((rem == 0x80000) & ((mant & 1) != 0))).to(tl.uint32)
+    norm_mag = (((exp << 3) | mant) + round_up).to(tl.uint8)
+    # Subnormal range < 2^-6: scale by 2^9 (exact) and add 2^23 for IEEE RNE.
+    abs_f = absx.to(tl.float32, bitcast=True)
+    sub_f = abs_f * 512.0 + 8388608.0
+    sub_mag = (sub_f.to(tl.uint32, bitcast=True) & 0xF).to(tl.uint8)
+    mag = tl.where(absx < 0x3C800000, sub_mag, norm_mag)
+    mag = tl.where(absx >= 0x43E00000, tl.full(mag.shape, 0x7E, tl.uint8), mag)
+    res = sign | mag
+    return tl.where(is_nan, tl.full(res.shape, 0x7F, tl.uint8), res)
+
+
+@triton.jit
 def _to_dst_dtype(x, dst, scale):
     """Round to BF16 like the unfused path, then scale for an FP8 destination."""
     out_ty = dst.dtype.element_ty
     x = x.to(tl.bfloat16)
     if out_ty == tl.float8e4nv:
         x = x.to(tl.float32) / scale
+        return x.to(out_ty)
+    if out_ty == tl.uint8:
+        return _encode_f32_to_e4m3_uint8(tl.div_rn(x.to(tl.float32), scale))
     return x.to(out_ty)
 
 
@@ -839,6 +870,12 @@ def qsa_prepare(
     main_outputs: tuple[torch.Tensor, torch.Tensor] | None = None
     if has_main:
         assert main_qkv is not None and main_kv_cache is not None
+        if main_kv_cache.dtype == torch.float8_e4m3fn:
+            from .qsa import qsa_e4m3_uses_native_cast
+
+            if not qsa_e4m3_uses_native_cast():
+                # sm_80/86: view E4M3 storage as uint8 bytes for _encode_f32_to_e4m3_uint8.
+                main_kv_cache = main_kv_cache.view(torch.uint8)
         main_head_dim = main_kv_cache.shape[-1] // 2
         num_main_kv_heads = main_kv_cache.shape[2]
         num_main_q_heads = (

@@ -37,6 +37,7 @@ from ..common.hyperconnection import (
     GroupedGemmaRMSNorm,
     HyperConnectionConfig,
 )
+from . import hc_small_fused  # noqa: F401  (registers the fused HC custom ops)
 from .ops.cute_dsl.hc_down_silu import MAX_FUSED_M, hc_down_silu
 from .ops.hc import (
     grouped_gemma_rmsnorm,
@@ -78,6 +79,15 @@ class GatedResidual(nn.Module):
         self.hc_count = config.hc_count
         self.hidden_size = config.hidden_size
         self.use_combine = use_combine
+        # lebeche fork: set by enable_qwen4_exp_hc_small_fused (hc_small_fused.py)
+        # once the projections are known to run through the low-latency op.
+        # Plain bools, constant after model init; the token-count dispatch is
+        # inside the custom ops, at run time.
+        self._hc_fuse_down = False
+        self._hc_fuse_up = False
+        self._hc_fast_combine_norm = False
+        self._hc_w8_down = False
+        self._hc_w8_up = False
 
         norm_size = (
             self.hyper_hidden_size if config.hc_per_branch_norm else config.hidden_size
@@ -138,6 +148,46 @@ class GatedResidual(nn.Module):
         self, xn: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Down projection + SiLU; also returns injection logits if combined."""
+        if self._hc_w8_down and not envs.VLLM_BATCH_INVARIANT:
+            if self.use_combine:
+                down_mod = self.input_mix_weight_down_block_inject
+                lowrank, down = torch.ops.vllm.qwen4_exp_hc_down_silu_w8(
+                    xn,
+                    down_mod._hc_w8_qweight,
+                    down_mod._hc_w8_scales,
+                    self.hc_lowrank,
+                    self.hc_count,
+                    self.hc_count,
+                )
+                split_sizes = [self.hc_lowrank, self.hc_count, self.pad_size]
+                _, injection, _ = down.split(split_sizes, dim=-1)
+                return lowrank, injection
+            down_mod = self.input_mix_weight_down
+            lowrank, _ = torch.ops.vllm.qwen4_exp_hc_down_silu_w8(
+                xn,
+                down_mod._hc_w8_qweight,
+                down_mod._hc_w8_scales,
+                self.hc_lowrank,
+                0,
+                self.hc_count,
+            )
+            return lowrank, None
+        if self._hc_fuse_down and not envs.VLLM_BATCH_INVARIANT:
+            if self.use_combine:
+                lowrank, down = torch.ops.vllm.qwen4_exp_hc_down_silu(
+                    xn,
+                    self.input_mix_weight_down_block_inject.weight,
+                    self.hc_lowrank,
+                    self.hc_count,
+                    self.hc_count,
+                )
+                split_sizes = [self.hc_lowrank, self.hc_count, self.pad_size]
+                _, injection, _ = down.split(split_sizes, dim=-1)
+                return lowrank, injection
+            lowrank, _ = torch.ops.vllm.qwen4_exp_hc_down_silu(
+                xn, self.input_mix_weight_down.weight, self.hc_lowrank, 0, self.hc_count
+            )
+            return lowrank, None
         if not self.use_combine:
             return hc_silu(self.input_mix_weight_down(xn), self.hc_count), None
 
@@ -158,6 +208,24 @@ class GatedResidual(nn.Module):
         lowrank, injection, _ = down_and_injection.split(split_sizes, dim=-1)
         return hc_silu(lowrank, self.hc_count), injection
 
+    def _up_and_gate_mix(self, xn: torch.Tensor, lowrank: torch.Tensor) -> torch.Tensor:
+        """Up projection + sigmoid gate + mean over the HC streams."""
+        if self._hc_w8_up and not envs.VLLM_BATCH_INVARIANT:
+            up_mod = self.input_mix_weight_up
+            return torch.ops.vllm.qwen4_exp_hc_up_gate_mix_w8(
+                lowrank,
+                up_mod._hc_w8_qweight,
+                up_mod._hc_w8_scales,
+                xn,
+                self.hc_count,
+            )
+        if self._hc_fuse_up and not envs.VLLM_BATCH_INVARIANT:
+            return torch.ops.vllm.qwen4_exp_hc_up_gate_mix(
+                lowrank, self.input_mix_weight_up.weight, xn, self.hc_count
+            )
+        gate = self.input_mix_weight_up(lowrank)  # [M, D]
+        return hc_gate_mix(xn, gate, self.hc_count)
+
     def mix(
         self, hidden_states: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
@@ -169,8 +237,7 @@ class GatedResidual(nn.Module):
         )
 
         lowrank, injection = self._down_and_inject(xn)
-        gate = self.input_mix_weight_up(lowrank)  # [M, D]
-        block_input = hc_gate_mix(xn, gate, self.hc_count)
+        block_input = self._up_and_gate_mix(xn, lowrank)
 
         return hidden_states, block_input, injection
 
@@ -187,18 +254,27 @@ class GatedResidual(nn.Module):
         module's input RMSNorm. A missing injection applies the block output
         to every stream with unit weight.
         """
-        hidden_states, xn = hc_combine_norm(
-            hidden_states,
-            prev_block_output,
-            prev_injection,
-            self.hc_norm.weight,
-            self.config.rms_norm_eps,
-            self.hc_count,
-        )
+        if self._hc_fast_combine_norm and not envs.VLLM_BATCH_INVARIANT:
+            hidden_states, xn = torch.ops.vllm.qwen4_exp_hc_combine_norm(
+                hidden_states,
+                prev_block_output,
+                prev_injection,
+                self.hc_norm.weight,
+                self.config.rms_norm_eps,
+                self.hc_count,
+            )
+        else:
+            hidden_states, xn = hc_combine_norm(
+                hidden_states,
+                prev_block_output,
+                prev_injection,
+                self.hc_norm.weight,
+                self.config.rms_norm_eps,
+                self.hc_count,
+            )
 
         lowrank, injection = self._down_and_inject(xn)
-        gate = self.input_mix_weight_up(lowrank)  # [M, D]
-        block_input = hc_gate_mix(xn, gate, self.hc_count)
+        block_input = self._up_and_gate_mix(xn, lowrank)
 
         return hidden_states, block_input, injection
 

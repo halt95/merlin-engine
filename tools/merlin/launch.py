@@ -98,6 +98,24 @@ FN_KV_TIER_EXPERIMENTAL = ("WARNING: KV RAM cache on Flash-Next is experimental:
 KV_TIER_EXPERIMENTAL_27B = ("WARNING: KV RAM cache on the 27B is experimental: a session evicted under heavy "
                             "concurrent prefill may recompute (output identical)")
 FN_MARLIN_MOE_CFG = "MERLIN_MARLIN_MOE_CFG"  # per-shape Marlin MoE kernel choice; the engine parses it (vllm/merlin/marlin_moe_cfg.py)
+FN_LEBECHE_HC_FUSE = "MERLIN_LEBECHE_HC_FUSE"  # lebeche fork: fused small-M HC SiLU / gate-mix epilogues, 1 (engine default) / 0 = commit b5519de (vllm/models/qwen4_exp/nvidia/hc_small_fused.py)
+FN_LEBECHE_MOE_GLUE = "MERLIN_LEBECHE_MOE_GLUE"  # lebeche fork: small-batch MoE glue kernels, 1 (engine default) / 0 = stock (vllm/merlin/lebeche_moe_glue.py)
+FN_LEBECHE_SHARED_ACT_FUSE = "MERLIN_LEBECHE_SHARED_ACT_FUSE"  # lebeche fork: fused small-M shared-expert gate_up+SiLU, 1 (engine default) / 0 = commit fbc1a32 (vllm/merlin/lebeche_shared_act.py)
+FN_LEBECHE_MOE_ROUTE_FUSE = "MERLIN_LEBECHE_MOE_ROUTE_FUSE"  # lebeche fork: single-CTA fused MoE route+align + hw-PTX post, 1 (engine default) / 0 = commit fbc1a32 (vllm/merlin/lebeche_moe_glue.py)
+FN_LEBECHE_GDN_FUSE = "MERLIN_LEBECHE_GDN_FUSE"  # lebeche fork: small-batch GDN RecoverSSM decode fusion, 1 (engine default) / 0 = stock (vllm/merlin/lebeche_gdn_fuse.py)
+FN_LEBECHE_SM86_LL = "MERLIN_LEBECHE_SM86_LL"  # lebeche fork: sm_8x skinny-GEMM plans, 1 (engine default) / 0 = stock (vllm/merlin/lebeche_sm86.py)
+FN_LEBECHE_W8_SMALL_M = "MERLIN_LEBECHE_W8_SMALL_M"  # lebeche fork: sm_8x small-M W8 channelwise GEMM, 1 (engine default) / 0 = stock Marlin (vllm/merlin/lebeche_w8_gemm.py)
+FN_LEBECHE_SM86_LL_EXTRA = "MERLIN_LEBECHE_SM86_LL_EXTRA"  # lebeche fork: extra sm_8x skinny-GEMM coverage (3D fc_hidden, PLE kv_proj), 1 (engine default) / 0 = fbc1a32
+FN_LEBECHE_QSA_FUSE_PREPARE = "MERLIN_LEBECHE_QSA_FUSE_PREPARE"  # lebeche fork: sm_80/86 fused QSA prepare with bit-exact software E4M3FN write, 1 (engine default) / 0 = fbc1a32
+FN_LEBECHE_QSA_SM86_SPLITK = "MERLIN_LEBECHE_QSA_SM86_SPLITK"  # lebeche fork: sm_80/86 QSA split-K schedule (M=4..64), 1 (engine default) / 0 = fbc1a32
+FN_LEBECHE_HC_SM86_TUNE = "MERLIN_LEBECHE_HC_SM86_TUNE"  # lebeche fork: sm_8x HC M=4 opb=1 down_silu + dynamic-M CuTe hc_combine_norm, 1 (engine default) / 0 = fbc1a32
+FN_LEBECHE_P2P_ALLGATHER = "MERLIN_LEBECHE_P2P_ALLGATHER"  # lebeche fork: lossless TP=2 PCIe P2P IPC AllGather on sm_8x, 1 (engine default) / 0 = stock PyNccl (vllm/merlin/lebeche_p2p_comm.py)
+FN_LEBECHE_SHARED_GATE_FUSE = "MERLIN_LEBECHE_SHARED_GATE_FUSE"  # lebeche fork: fuse shared_expert_gate (1, 2560) into CuteSharedGateUpSilu, 1 (engine default) / 0 = f332186
+FN_LEBECHE_FUSED_ROUTER = "MERLIN_LEBECHE_FUSED_ROUTER"  # lebeche fork: cooperative single-launch router GEMM (512, 2560) + route + align, 1 (engine default) / 0 = f332186
+FN_LEBECHE_QSA_CHAIN_FUSE = "MERLIN_LEBECHE_QSA_CHAIN_FUSE"  # lebeche fork: sm_80/86 QSA decode glue chain fusion (direct splitK + bounded MQA + dead zero_ elim), 1 (engine default) / 0 = f332186
+FN_LEBECHE_MTP_LL_EXTRA = "MERLIN_LEBECHE_MTP_LL_EXTRA"  # lebeche fork: sm_80/86 Triton TC GEMM for MTP fc_hidden (1280, 2560) M=5..32, 1 (engine default) / 0 = f332186
+FN_LEBECHE_LM_HEAD_W8 = "MERLIN_LEBECHE_LM_HEAD_W8"  # lebeche fork (LOSSY, opt-in): on-the-fly per-channel W8 Marlin target lm_head on sm_8x, 0 (engine default) / 1 = on
+FN_LEBECHE_HC_W8 = "MERLIN_LEBECHE_HC_W8"  # lebeche fork (LOSSY, opt-in): on-the-fly W8 Tensor Core HC down_silu & up_gate_mix on sm_8x, 0 (engine default) / 1 = on
 FN_LPT_DEFAULT = "512"  # Flash-Next --long-prefill-token-threshold default; LPT=0 = off
 # Flash-Next prefill runs (vllm/merlin/prefill_runs.py), on by default; PREFILL_RUNS=0 = off. The decode share and the
 # per-step cost constants were measured on fn-quad-3090 (A/B runs, 2026-11-11); the other rows use the same values, except
@@ -1797,6 +1815,120 @@ def _build_flash_next(reg, p, checkpoint, ckpt, env, extra, repo: Path) -> Plan:
         raise LaunchError(f"{QWEN3_LITERAL_SPANS}={spans!r}: use 1 (on, the default) or 0 (off)", 2)
     if spans:
         env[QWEN3_LITERAL_SPANS] = spans
+    # lebeche fork: the sm_8x low-latency GEMM switch is a deliberate MERLIN_ knob too (it was stripped above with
+    # every other MERLIN_ export, so a caller's 0 served with the port on): 0 or 1 passes through, blank is not
+    # exported (the engine default, on), anything else fails before the boot.
+    sm86_ll = (environ_in.get(FN_LEBECHE_SM86_LL) or "").strip()
+    if sm86_ll not in ("", "0", "1"):
+        raise LaunchError(f"{FN_LEBECHE_SM86_LL}={sm86_ll!r}: use 1 (on, the default) or 0 (stock kernels)", 2)
+    if sm86_ll:
+        env[FN_LEBECHE_SM86_LL] = sm86_ll
+    # Same contract for the fused small-M HC epilogues (they need the switch above on).
+    hc_fuse = (environ_in.get(FN_LEBECHE_HC_FUSE) or "").strip()
+    if hc_fuse not in ("", "0", "1"):
+        raise LaunchError(f"{FN_LEBECHE_HC_FUSE}={hc_fuse!r}: use 1 (on, the default) or 0 (unfused HC kernels)", 2)
+    if hc_fuse:
+        env[FN_LEBECHE_HC_FUSE] = hc_fuse
+    # Same rule for the small-batch MoE glue switch (default on; it needs the switch above).
+    moe_glue = (environ_in.get(FN_LEBECHE_MOE_GLUE) or "").strip()
+    if moe_glue not in ("", "0", "1"):
+        raise LaunchError(f"{FN_LEBECHE_MOE_GLUE}={moe_glue!r}: use 1 (on, the default) or 0 (stock kernels)", 2)
+    if moe_glue:
+        env[FN_LEBECHE_MOE_GLUE] = moe_glue
+    # Same rule for the fused small-M shared-expert gate_up+SiLU switch (default on; needs SM86_LL).
+    shared_act = (environ_in.get(FN_LEBECHE_SHARED_ACT_FUSE) or "").strip()
+    if shared_act not in ("", "0", "1"):
+        raise LaunchError(f"{FN_LEBECHE_SHARED_ACT_FUSE}={shared_act!r}: use 1 (on, the default) or 0 (unfused shared-expert activation)", 2)
+    if shared_act:
+        env[FN_LEBECHE_SHARED_ACT_FUSE] = shared_act
+    # Same rule for the single-CTA fused MoE route+align switch (default on; needs MOE_GLUE + SM86_LL).
+    moe_route_fuse = (environ_in.get(FN_LEBECHE_MOE_ROUTE_FUSE) or "").strip()
+    if moe_route_fuse not in ("", "0", "1"):
+        raise LaunchError(f"{FN_LEBECHE_MOE_ROUTE_FUSE}={moe_route_fuse!r}: use 1 (on, the default) or 0 (two-kernel Triton glue)", 2)
+    if moe_route_fuse:
+        env[FN_LEBECHE_MOE_ROUTE_FUSE] = moe_route_fuse
+    # Same rule for the sm_8x small-M W8 channelwise GEMM switch (default on).
+    w8_small_m = (environ_in.get(FN_LEBECHE_W8_SMALL_M) or "").strip()
+    if w8_small_m not in ("", "0", "1"):
+        raise LaunchError(f"{FN_LEBECHE_W8_SMALL_M}={w8_small_m!r}: use 1 (on, the default) or 0 (stock Marlin)", 2)
+    if w8_small_m:
+        env[FN_LEBECHE_W8_SMALL_M] = w8_small_m
+    # Same rule for the small-batch GDN decode fusion switch (default on; needs SM86_LL).
+    gdn_fuse = (environ_in.get(FN_LEBECHE_GDN_FUSE) or "").strip()
+    if gdn_fuse not in ("", "0", "1"):
+        raise LaunchError(f"{FN_LEBECHE_GDN_FUSE}={gdn_fuse!r}: use 1 (on, the default) or 0 (stock kernels)", 2)
+    if gdn_fuse:
+        env[FN_LEBECHE_GDN_FUSE] = gdn_fuse
+    # Same rule for the extra sm_8x skinny-GEMM coverage switch (default on; needs SM86_LL).
+    sm86_ll_extra = (environ_in.get(FN_LEBECHE_SM86_LL_EXTRA) or "").strip()
+    if sm86_ll_extra not in ("", "0", "1"):
+        raise LaunchError(f"{FN_LEBECHE_SM86_LL_EXTRA}={sm86_ll_extra!r}: use 1 (on, the default) or 0 (fbc1a32)", 2)
+    if sm86_ll_extra:
+        env[FN_LEBECHE_SM86_LL_EXTRA] = sm86_ll_extra
+    # Same rule for the sm_80/86 fused QSA prepare switch (default on).
+    qsa_fuse_prepare = (environ_in.get(FN_LEBECHE_QSA_FUSE_PREPARE) or "").strip()
+    if qsa_fuse_prepare not in ("", "0", "1"):
+        raise LaunchError(f"{FN_LEBECHE_QSA_FUSE_PREPARE}={qsa_fuse_prepare!r}: use 1 (on, the default) or 0 (fbc1a32)", 2)
+    if qsa_fuse_prepare:
+        env[FN_LEBECHE_QSA_FUSE_PREPARE] = qsa_fuse_prepare
+    # Same rule for the sm_80/86 QSA split-K tuning switch (default on).
+    qsa_sm86_splitk = (environ_in.get(FN_LEBECHE_QSA_SM86_SPLITK) or "").strip()
+    if qsa_sm86_splitk not in ("", "0", "1"):
+        raise LaunchError(f"{FN_LEBECHE_QSA_SM86_SPLITK}={qsa_sm86_splitk!r}: use 1 (on, the default) or 0 (fbc1a32)", 2)
+    if qsa_sm86_splitk:
+        env[FN_LEBECHE_QSA_SM86_SPLITK] = qsa_sm86_splitk
+    # Same rule for the sm_8x HC tuning switch (default on; needs SM86_LL).
+    hc_sm86_tune = (environ_in.get(FN_LEBECHE_HC_SM86_TUNE) or "").strip()
+    if hc_sm86_tune not in ("", "0", "1"):
+        raise LaunchError(f"{FN_LEBECHE_HC_SM86_TUNE}={hc_sm86_tune!r}: use 1 (on, the default) or 0 (fbc1a32)", 2)
+    if hc_sm86_tune:
+        env[FN_LEBECHE_HC_SM86_TUNE] = hc_sm86_tune
+    # Same rule for the lossless TP=2 PCIe P2P IPC AllGather switch (default on).
+    p2p_allgather = (environ_in.get(FN_LEBECHE_P2P_ALLGATHER) or "").strip()
+    if p2p_allgather not in ("", "0", "1"):
+        raise LaunchError(f"{FN_LEBECHE_P2P_ALLGATHER}={p2p_allgather!r}: use 1 (on, the default) or 0 (stock PyNccl)", 2)
+    if p2p_allgather:
+        env[FN_LEBECHE_P2P_ALLGATHER] = p2p_allgather
+    # Same rule for fusing shared_expert_gate into CuteSharedGateUpSilu (default on; needs SHARED_ACT_FUSE + SM86_LL).
+    shared_gate = (environ_in.get(FN_LEBECHE_SHARED_GATE_FUSE) or "").strip()
+    if shared_gate not in ("", "0", "1"):
+        raise LaunchError(f"{FN_LEBECHE_SHARED_GATE_FUSE}={shared_gate!r}: use 1 (on, the default) or 0 (f332186)", 2)
+    if shared_gate:
+        env[FN_LEBECHE_SHARED_GATE_FUSE] = shared_gate
+    # Same rule for cooperative fused router GEMM + route + align (default on; needs MOE_ROUTE_FUSE + MOE_GLUE + SM86_LL).
+    fused_router = (environ_in.get(FN_LEBECHE_FUSED_ROUTER) or "").strip()
+    if fused_router not in ("", "0", "1"):
+        raise LaunchError(f"{FN_LEBECHE_FUSED_ROUTER}={fused_router!r}: use 1 (on, the default) or 0 (f332186)", 2)
+    if fused_router:
+        env[FN_LEBECHE_FUSED_ROUTER] = fused_router
+    # Same rule for the sm_80/86 QSA decode chain fusion switch (default on).
+    qsa_chain_fuse = (environ_in.get(FN_LEBECHE_QSA_CHAIN_FUSE) or "").strip()
+    if qsa_chain_fuse not in ("", "0", "1"):
+        raise LaunchError(f"{FN_LEBECHE_QSA_CHAIN_FUSE}={qsa_chain_fuse!r}: use 1 (on, the default) or 0 (f332186)", 2)
+    if qsa_chain_fuse:
+        env[FN_LEBECHE_QSA_CHAIN_FUSE] = qsa_chain_fuse
+    # Same rule for the sm_80/86 MTP fc_hidden TC GEMM switch (default on).
+    mtp_ll_extra = (environ_in.get(FN_LEBECHE_MTP_LL_EXTRA) or "").strip()
+    if mtp_ll_extra not in ("", "0", "1"):
+        raise LaunchError(f"{FN_LEBECHE_MTP_LL_EXTRA}={mtp_ll_extra!r}: use 1 (on, the default) or 0 (f332186)", 2)
+    if mtp_ll_extra:
+        env[FN_LEBECHE_MTP_LL_EXTRA] = mtp_ll_extra
+    # Opt-in (LABELLED LOSSY, default off): per-channel W8 Marlin target lm_head on sm_8x.
+    lm_head_w8 = (environ_in.get(FN_LEBECHE_LM_HEAD_W8) or "").strip()
+    if lm_head_w8 not in ("", "0", "1"):
+        raise LaunchError(f"{FN_LEBECHE_LM_HEAD_W8}={lm_head_w8!r}: use 0 (off, the default) or 1 (lossy W8 target lm_head)", 2)
+    if lm_head_w8:
+        env[FN_LEBECHE_LM_HEAD_W8] = lm_head_w8
+        if lm_head_w8 == "1":
+            notes.append(f"{FN_LEBECHE_LM_HEAD_W8}=1: LOSSY per-channel W8 Marlin target lm_head active")
+    # Opt-in (LABELLED LOSSY, default off): W8 Tensor Core HyperConnections on sm_8x.
+    hc_w8 = (environ_in.get(FN_LEBECHE_HC_W8) or "").strip()
+    if hc_w8 not in ("", "0", "1"):
+        raise LaunchError(f"{FN_LEBECHE_HC_W8}={hc_w8!r}: use 0 (off, the default) or 1 (lossy W8 HyperConnections)", 2)
+    if hc_w8:
+        env[FN_LEBECHE_HC_W8] = hc_w8
+        if hc_w8 == "1":
+            notes.append(f"{FN_LEBECHE_HC_W8}=1: LOSSY W8 HyperConnection down_silu/up_gate_mix active")
     # The dense Marlin config is forwarded only when a table is given.
     dense_cfg = (environ_in.get("MERLIN_MARLIN_DENSE_CFG") or "").strip()
     if dense_cfg:

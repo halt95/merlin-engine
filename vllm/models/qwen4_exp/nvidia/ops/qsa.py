@@ -20,7 +20,55 @@ from vllm.models.qwen4_exp.common.qsa_config import (
 from vllm.models.qwen4_exp.common.qsa_config import (
     select_qsa_sparse_config as _select_config,
 )
+from vllm.merlin.envs import read_registered
 from vllm.platforms import current_platform
+
+QSA_SM86_SPLITK_SWITCH: bool = bool(read_registered("MERLIN_LEBECHE_QSA_SM86_SPLITK"))
+
+
+@lru_cache(maxsize=1)
+def _qsa_sm86_splitk_active() -> bool:
+    if not QSA_SM86_SPLITK_SWITCH or not current_platform.is_cuda():
+        return False
+    cap = current_platform.get_device_capability()
+    return cap is not None and cap.to_int() in (80, 86)
+
+
+def _select_qsa_config_sm86(
+    num_rows: int,
+    num_kv_heads: int,
+    use_prefill_config: bool,
+    num_columns: int,
+    *,
+    is_fp8: bool = False,
+) -> tuple[int, int, int, int]:
+    """RTX 3090 (82-SM sm_80/86) split-K schedule for QSA decode/verify.
+
+    Stock default (tuned on GB300) uses 64 splits up to base_programs=24
+    (oversubscribing 82 SMs and doubling/quadrupling FP32 merge traffic) and
+    drops to num_warps=1 at base_programs=25..64 (3-5x slowdown at c8/M=32).
+    """
+    base_programs = num_rows * num_kv_heads
+    if _qsa_sm86_splitk_active() and not use_prefill_config and 4 <= base_programs <= 64:
+        block_n = 32
+        num_warps = 4
+        if base_programs <= 4:
+            target_splits = 32
+        elif base_programs <= 24:
+            target_splits = 16
+        else:
+            target_splits = 12
+        num_tiles = (num_columns + block_n - 1) // block_n
+        num_splits = min(target_splits, num_tiles)
+        return block_n, num_warps, num_tiles, num_splits
+    return _select_config(
+        num_rows,
+        num_kv_heads,
+        use_prefill_config,
+        num_columns,
+        is_fp8=is_fp8,
+        capability=qsa_tuning_capability(),
+    )
 from vllm.triton_utils import HAS_TRITON, tl, triton
 from vllm.models.qwen4_exp.nvidia.ops.qsa_launch import qsa_partial_num_stages  # noqa: I001
 
@@ -715,13 +763,12 @@ def qsa_sparse_paged_attention(
     group_size = q.shape[1] // k_cache.shape[2]
     block_m = triton.next_power_of_2(group_size)
     selection_width = logical_indices.shape[1] - 1  # trailing column is the count
-    block_n, partial_warps, num_tiles, num_splits = _select_config(
+    block_n, partial_warps, num_tiles, num_splits = _select_qsa_config_sm86(
         q.shape[0],
         k_cache.shape[2],
         use_prefill_config,
         selection_width,
         is_fp8=kv_dtype != 0,
-        capability=qsa_tuning_capability(),
     )
     if _force_num_warps is not None:
         partial_warps = _force_num_warps
@@ -832,14 +879,36 @@ def warmup_qsa_sparse_paged_attention(
 
     # FP8 storage (uint8 / E4M3 / E5M2) selects the arch tables' FP8 column;
     # the default table (sm_8x) ignores it.
-    profiles = qsa_sparse_warmup_profiles(
-        num_kv_heads,
-        selection_width,
-        max_num_rows=max_num_rows,
-        max_num_decode_rows=max_num_decode_rows,
-        is_fp8=key_cache.dtype != torch.bfloat16,
-        capability=qsa_tuning_capability(),
-    )
+    is_fp8_warm = key_cache.dtype != torch.bfloat16
+    if _qsa_sm86_splitk_active():
+        decode_limit = max_num_rows if max_num_decode_rows is None else max_num_decode_rows
+        profiles = tuple(
+            sorted(
+                {
+                    _select_qsa_config_sm86(
+                        r,
+                        num_kv_heads,
+                        use_prefill,
+                        selection_width,
+                        is_fp8=is_fp8_warm,
+                    )
+                    for use_prefill, row_limit in (
+                        (False, decode_limit),
+                        (True, max_num_rows),
+                    )
+                    for r in range(1, row_limit + 1)
+                }
+            )
+        )
+    else:
+        profiles = qsa_sparse_warmup_profiles(
+            num_kv_heads,
+            selection_width,
+            max_num_rows=max_num_rows,
+            max_num_decode_rows=max_num_decode_rows,
+            is_fp8=is_fp8_warm,
+            capability=qsa_tuning_capability(),
+        )
 
     # Scalars constant per deployment get their real values (their divisibility
     # specialization is wanted); the batch-varying ones are do_not_specialize'd
@@ -985,6 +1054,17 @@ def warmup_qsa_sparse_paged_attention(
     # Load the binaries now, not mid-forward.
     from vllm.merlin.triton_preload import preload_qsa_sparse_kernels
     preload_qsa_sparse_kernels(warmed)
+    from vllm.merlin.lebeche_qsa_fuse import (
+        qsa_chain_fuse_active,
+        warmup_qsa_direct_sparse_attention,
+    )
+    if qsa_chain_fuse_active():
+        warmup_qsa_direct_sparse_attention(
+            kv_cache,
+            block_table,
+            num_query_heads=num_query_heads,
+            selection_width=selection_width,
+        )
     return tuple(warmed)
 
 

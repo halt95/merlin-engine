@@ -74,7 +74,18 @@ from vllm.v1.kv_cache_interface import (
 from ..common.qsa_cache import QSAForwardMetadata
 from .indexer_qsa import QSAIndexer
 from .mtp_kv_scales import qsa_kv_scale_entries
+from vllm.merlin.envs import read_registered
+
 from .ops.qsa import qsa_e4m3_uses_native_cast
+
+QSA_FUSE_PREPARE_SWITCH: bool = bool(read_registered("MERLIN_LEBECHE_QSA_FUSE_PREPARE"))
+
+
+def _qsa_sm86_fused_prepare_ok() -> bool:
+    if not QSA_FUSE_PREPARE_SWITCH or not current_platform.is_cuda():
+        return False
+    cap = current_platform.get_device_capability()
+    return cap is not None and cap.to_int() in (80, 86)
 
 logger = init_logger(__name__)
 
@@ -461,6 +472,11 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
         output_gate: torch.Tensor,
         output_scale: torch.Tensor | None = None,
         output_block_scale: torch.Tensor | None = None,
+        direct_block_indices: torch.Tensor | None = None,
+        direct_query_positions: torch.Tensor | None = None,
+        direct_visible_blocks: torch.Tensor | None = None,
+        direct_compress_ratio: int = 0,
+        direct_token_topk: int = 0,
     ) -> torch.Tensor:
         del key, value
         if output_scale is not None or output_block_scale is not None:
@@ -470,10 +486,21 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
         if self.sliding_window != (-1, -1):
             raise NotImplementedError("QSA does not support sliding-window attention")
 
+        from vllm.merlin.lebeche_qsa_fuse import qsa_chain_fuse_active
+
         num_tokens = attn_metadata.num_actual_tokens
-        output.zero_()
-        if num_tokens == 0:
-            return output
+        if qsa_chain_fuse_active():
+            # Sparse attention unconditionally overwrites output[:num_tokens];
+            # only zero any trailing padded rows (none in decode CUDA graphs).
+            if num_tokens == 0:
+                output.zero_()
+                return output
+            if num_tokens < output.shape[0]:
+                output[num_tokens:].zero_()
+        else:
+            output.zero_()
+            if num_tokens == 0:
+                return output
 
         topk_buffer = getattr(layer, "topk_indices_buffer", None)
         if topk_buffer is None:
@@ -515,19 +542,41 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
                 else "  (DEFAULT 1.0 -- no static calibration loaded)",
             )
 
-        qsa_sparse_paged_attention(
-            query[:num_tokens],
-            key_cache,
-            value_cache,
-            logical_indices,
-            attn_metadata.block_table,
-            token_to_req,
-            use_prefill_config,
-            out=output[:num_tokens],
-            k_scale=layer._k_scale,
-            v_scale=layer._v_scale,
-            output_gate=output_gate[:num_tokens],
-        )
+        if direct_block_indices is not None:
+            from vllm.merlin.lebeche_qsa_fuse import qsa_sparse_paged_attention_direct
+
+            assert direct_query_positions is not None
+            assert direct_visible_blocks is not None
+            qsa_sparse_paged_attention_direct(
+                query[:num_tokens],
+                key_cache,
+                value_cache,
+                direct_block_indices[:num_tokens],
+                direct_query_positions[:num_tokens],
+                direct_visible_blocks[:num_tokens],
+                attn_metadata.block_table,
+                token_to_req,
+                direct_compress_ratio,
+                direct_token_topk,
+                out=output[:num_tokens],
+                k_scale=layer._k_scale,
+                v_scale=layer._v_scale,
+                output_gate=output_gate[:num_tokens],
+            )
+        else:
+            qsa_sparse_paged_attention(
+                query[:num_tokens],
+                key_cache,
+                value_cache,
+                logical_indices,
+                attn_metadata.block_table,
+                token_to_req,
+                use_prefill_config,
+                out=output[:num_tokens],
+                k_scale=layer._k_scale,
+                v_scale=layer._v_scale,
+                output_gate=output_gate[:num_tokens],
+            )
         return output
 
 
@@ -709,6 +758,11 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             quant_config=quant_config,
             prefix=f"{prefix}.indexer",
         )
+        # MTP index sharing compacts and reuses topk_indices_buffer across draft
+        # steps; only bypass _expand_qsa_indices_kernel when sharing is off.
+        self._can_skip_expand = not getattr(
+            config, "index_share_for_mtp_iteration", False
+        )
         # One launch does the indexer prepare, the main QK-norm/RoPE/gate and
         # the main K/V cache write (see QSAIndexer.forward); otherwise all of
         # them take the separate kernels.
@@ -717,10 +771,14 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         self.use_fused_qsa_prepare = (
             self.use_fused_qk_norm_rope_gate
             and self.indexer.use_fused_pre_indexer
-            # The fused writer takes an FP8 cache
-            # only with a native E4M3 cast (Triton cannot lower an fp8 pointer
-            # below sm_89) and no clip interval.
-            and (not fp8_layer or qsa_e4m3_uses_native_cast())
+            # The fused writer takes an FP8 cache natively on sm_89+ or via the
+            # bit-exact software E4M3FN byte encoder on sm_80/86 (lebeche fork),
+            # with no clip interval.
+            and (
+                not fp8_layer
+                or qsa_e4m3_uses_native_cast()
+                or _qsa_sm86_fused_prepare_ok()
+            )
             and not (fp8_layer and _qsa_clip_interval > 0.0)
         )
         self.fuse_indexer_projection = vllm_config.lora_config is None
@@ -825,15 +883,40 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         )
         if side_metadata.num_actual_tokens != num_tokens:
             raise RuntimeError("QSA main and side metadata token counts disagree")
+        from vllm.merlin.lebeche_qsa_fuse import (
+            QSA_DIRECT_MAX_BASE_PROGRAMS,
+            qsa_chain_fuse_active,
+        )
+
+        use_prefill_config = main_metadata.max_query_len > self._max_decode_query_len
+        compress_ratio = self.indexer.compress_ratio
+        # kv_cache is [num_blocks, num_kv_heads, page_size, 2 * head_dim].
+        page_size = self.kv_cache.shape[2] if self.kv_cache.ndim >= 3 else 0
+        use_direct = (
+            qsa_chain_fuse_active()
+            and self._can_skip_expand
+            and not self.indexer.skip_topk
+            and not use_prefill_config
+            and 1 <= num_tokens * self.num_kv_heads <= QSA_DIRECT_MAX_BASE_PROGRAMS
+            and compress_ratio == 4
+            and page_size > 0
+            and page_size % compress_ratio == 0
+            and self.indexer.token_topk % compress_ratio == 0
+        )
         selected, main_outputs = self.indexer(
             projected_qk,
             positions,
-            self.topk_indices_buffer[:num_tokens],
+            None if use_direct else self.topk_indices_buffer[:num_tokens],
             attn=self,
             qkv=qkv,
             slot_mapping=main_metadata.slot_mapping,
+            skip_expand=use_direct,
         )
-        if selected.shape != (num_tokens, self.indexer.packed_output_width):
+        if use_direct:
+            expected_width = self.indexer.token_topk // compress_ratio
+        else:
+            expected_width = self.indexer.packed_output_width
+        if selected.shape != (num_tokens, expected_width):
             raise RuntimeError("QSA indexer returned an invalid selection shape")
         if _qsa_clip_interval > 0.0 and _is_qsa_fp8_cache_dtype(
             self.kv_cache_dtype
@@ -854,18 +937,41 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         else:
             query, output_gate = main_outputs
         assert query is not None and output_gate is not None
-        impl.forward_qsa(
-            self,
-            query,
-            key,
-            value,
-            self.kv_cache,
-            main_metadata,
-            output,
-            token_to_req=side_metadata.token_to_req,
-            use_prefill_config=main_metadata.max_query_len > self._max_decode_query_len,
-            output_gate=output_gate,
-        )
+        if use_direct:
+            compressed_meta = cast(
+                QSAForwardMetadata,
+                metadata[self.indexer.compressed_key_cache.prefix],
+            )
+            impl.forward_qsa(
+                self,
+                query,
+                key,
+                value,
+                self.kv_cache,
+                main_metadata,
+                output,
+                token_to_req=side_metadata.token_to_req,
+                use_prefill_config=use_prefill_config,
+                output_gate=output_gate,
+                direct_block_indices=selected,
+                direct_query_positions=compressed_meta.logical_positions,
+                direct_visible_blocks=compressed_meta.visible_blocks,
+                direct_compress_ratio=compress_ratio,
+                direct_token_topk=self.indexer.token_topk,
+            )
+        else:
+            impl.forward_qsa(
+                self,
+                query,
+                key,
+                value,
+                self.kv_cache,
+                main_metadata,
+                output,
+                token_to_req=side_metadata.token_to_req,
+                use_prefill_config=use_prefill_config,
+                output_gate=output_gate,
+            )
 
     def forward(
         self,

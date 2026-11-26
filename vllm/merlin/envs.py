@@ -531,6 +531,101 @@ if TYPE_CHECKING:
     # (+ the next stage1), bit-identical to the stock kernels; unset/blank/0 =
     # stock. Hashed: it changes the captured kernels.
     MERLIN_HY4_FUSE_IHC: str | None = None
+    # lebeche fork: 1 (default) = sm_80/86/89 port of the skinny-GEMM plans and the
+    # fused HC down+SiLU kernel (vllm/merlin/lebeche_sm86.py); 0 = stock 3.0.2.2.
+    # Inert on other capabilities. Hashed: it changes the captured kernels.
+    MERLIN_LEBECHE_SM86_LL: bool = True
+    # lebeche fork: 1 (default) = at decode token counts the HyperConnection SiLU
+    # and gate-mix kernels run as epilogues of the skinny down/up GEMMs
+    # (vllm/models/qwen4_exp/nvidia/hc_small_fused.py), bit-identical to the
+    # unfused skinny sequence; 0 = behaviour of commit b5519de. Needs
+    # MERLIN_LEBECHE_SM86_LL on an sm_80/86/89 device. Hashed: it changes the
+    # traced forward and the captured kernels.
+    MERLIN_LEBECHE_HC_FUSE: bool = True
+    # lebeche fork: 1 (default) = small-batch (M <= 8) MoE glue kernels on sm_80/86/89
+    # (vllm/merlin/lebeche_moe_glue.py; needs MERLIN_LEBECHE_SM86_LL); 0 = stock.
+    # Bit-identical to the stock kernels. Hashed: it changes the traced graph.
+    MERLIN_LEBECHE_MOE_GLUE: bool = True
+    # lebeche fork: 1 (default) = fuse small-M shared-expert gate_up_proj +
+    # silu_and_mul on sm_80/86/89 (vllm/merlin/lebeche_shared_act.py; needs
+    # MERLIN_LEBECHE_SM86_LL); 0 = behaviour of commit fbc1a32. Bit-identical
+    # at M <= 4. Hashed: it changes the traced graph and captured kernels.
+    MERLIN_LEBECHE_SHARED_ACT_FUSE: bool = True
+    # lebeche fork: 1 (default) = fuse small-M (M <= 6) MoE route + align into
+    # one single-CTA CuTe-DSL kernel and use hardware PTX in _post_kernel on
+    # sm_80/86/89 (vllm/merlin/lebeche_moe_glue.py; needs MERLIN_LEBECHE_MOE_GLUE
+    # and MERLIN_LEBECHE_SM86_LL); 0 = behaviour of commit fbc1a32. Bit-identical.
+    # Hashed: it changes the captured kernels.
+    MERLIN_LEBECHE_MOE_ROUTE_FUSE: bool = True
+    # lebeche fork: 1 (default) = small-M (M <= 8) direct-register Tensor Core
+    # W8 channelwise dense GEMM kernel on sm_80/86/89
+    # (vllm/merlin/lebeche_w8_gemm.py); 0 = stock Marlin. Inert on other
+    # capabilities. Hashed: it changes the captured kernels.
+    MERLIN_LEBECHE_W8_SMALL_M: bool = True
+    # lebeche fork: 1 (default) = small-batch (M <= 8) fused GDN RecoverSSM
+    # decode kernel on sm_80/86/89 (vllm/merlin/lebeche_gdn_fuse.py; needs
+    # MERLIN_LEBECHE_SM86_LL); 0 = stock behaviour of commit fbc1a32. Hashed:
+    # it replaces torch.zeros with torch.empty in forward_cuda and changes
+    # the captured kernels.
+    MERLIN_LEBECHE_GDN_FUSE: bool = True
+    # lebeche fork: 1 (default) = extra sm_8x skinny-GEMM coverage: 3D input
+    # support for MTP fc_hidden and PLE kv_proj (12800, 2560) + M=8 MTP fc plan
+    # (vllm/models/qwen4_exp/nvidia/low_latency_gemm.py); 0 = fbc1a32.
+    # Needs MERLIN_LEBECHE_SM86_LL on an sm_80/86/89 device. Hashed.
+    MERLIN_LEBECHE_SM86_LL_EXTRA: bool = True
+    # lebeche fork: 1 (default) = enable fused QSA prepare (indexer + main
+    # QK-norm/RoPE/gate + main E4M3 KV cache write in one Triton launch) on
+    # sm_80/86 via bit-exact software E4M3FN encoding
+    # (vllm/models/qwen4_exp/nvidia/ops/qsa_prepare.py); 0 = fbc1a32. Hashed.
+    MERLIN_LEBECHE_QSA_FUSE_PREPARE: bool = True
+    # lebeche fork: 1 (default) = sm_80/86-tuned split-K table for QSA sparse
+    # paged attention (vllm/models/qwen4_exp/nvidia/ops/qsa.py); 0 = fbc1a32.
+    # Inert on non-sm_80/86 devices. Hashed.
+    MERLIN_LEBECHE_QSA_SM86_SPLITK: bool = True
+    # lebeche fork: 1 (default) = sm_8x HyperConnection tuning: M=4 down_silu
+    # opb=1 (324 blocks, bit-exact) + dynamic-M CuTe-DSL hc_combine_norm
+    # (vllm/models/qwen4_exp/nvidia/hc_small_fused.py); 0 = fbc1a32.
+    # Needs MERLIN_LEBECHE_SM86_LL on an sm_80/86/89 device. Hashed.
+    MERLIN_LEBECHE_HC_SM86_TUNE: bool = True
+    # lebeche fork: 1 (default) = lossless TP=2 PCIe P2P CUDA-IPC AllGather
+    # (CuTe-DSL Atomic64 <=64 KiB + Flag128 <=8 MiB) on sm_8x
+    # (vllm/merlin/lebeche_p2p_comm.py); 0 = stock PyNccl. Inert on non-sm_8x,
+    # world_size != 2, or without P2P. Hashed.
+    MERLIN_LEBECHE_P2P_ALLGATHER: bool = True
+    # lebeche fork: 1 (default) = fuse small-M shared_expert_gate (1, 2560)
+    # into CuteSharedGateUpSilu on sm_80/86/89 (vllm/merlin/lebeche_shared_act.py;
+    # needs MERLIN_LEBECHE_SHARED_ACT_FUSE and MERLIN_LEBECHE_SM86_LL);
+    # 0 = behaviour of commit f332186. Bit-identical at M <= 4. Hashed.
+    MERLIN_LEBECHE_SHARED_GATE_FUSE: bool = True
+    # lebeche fork: 1 (default) = fuse MoE router GEMM (512, 2560) + softmax +
+    # top-k + block-size-8 align into one cooperative CuTe-DSL kernel on
+    # sm_80/86/89 for M in {1, 2, 3, 4, 6, 8} (vllm/merlin/lebeche_moe_glue.py;
+    # needs MERLIN_LEBECHE_MOE_ROUTE_FUSE, MERLIN_LEBECHE_MOE_GLUE and
+    # MERLIN_LEBECHE_SM86_LL); 0 = behaviour of commit f332186. Bit-identical
+    # at M <= 4. Hashed.
+    MERLIN_LEBECHE_FUSED_ROUTER: bool = True
+    # lebeche fork: 1 (default) = sm_80/86 QSA decode glue chain fusion:
+    # direct-block early-exit split-K/merge (eliminates expand + dead
+    # output.zero_(), num_stages=1 E4M3, 4 warps) and bounded-grid MQA
+    # indexer with max_visible <= block_topk skip
+    # (vllm/merlin/lebeche_qsa_fuse.py); 0 = f332186. Bit-exact. Hashed.
+    MERLIN_LEBECHE_QSA_CHAIN_FUSE: bool = True
+    # lebeche fork: 1 (default) = sm_80/86 1-pass Triton Tensor-Core GEMM for
+    # MTP fc_hidden (1280, 2560) at 5 <= M_flat <= 32, eliminating CUTLASS +
+    # cublasLt::splitKreduce on MTP step 0 (vllm/merlin/lebeche_mtp_gemm.py);
+    # 0 = f332186. Hashed.
+    MERLIN_LEBECHE_MTP_LL_EXTRA: bool = True
+    # lebeche fork (LABELLED LOSSY, opt-in default OFF): 1 = on-the-fly
+    # per-channel W8 Marlin quantization of target ParallelLMHead on sm_80/86/89
+    # (vllm/merlin/lebeche_lm_head_w8.py); 0 (default) = lossless BF16 lm_head.
+    # Inert on non-sm_8x devices. Hashed: changes captured kernels and weights.
+    MERLIN_LEBECHE_LM_HEAD_W8: bool = False
+    # lebeche fork (LABELLED LOSSY, opt-in default OFF): 1 = on-the-fly W8
+    # quantization (group-256 down + per-row up) and Tensor Core fused CuTe-DSL
+    # kernels for HyperConnection down_silu and up_gate_mix on sm_80/86/89
+    # (vllm/models/qwen4_exp/nvidia/hc_small_fused.py; needs MERLIN_LEBECHE_SM86_LL);
+    # 0 (default) = lossless BF16 HC. Inert on non-sm_8x devices. Hashed.
+    MERLIN_LEBECHE_HC_W8: bool = False
     # 1 = fused FWHT/FP8 kernel (bitwise) and
     # tile-skipping IndexPool scoring, stable expansion and RoPE.
     MERLIN_HY4_INDEXER_FAST: str | None = None
@@ -1139,6 +1234,24 @@ MERLIN_ENV: dict[str, Callable[[], Any]] = {
     "MERLIN_HY4_SWA_WINDOW_REUSE": lambda: os.getenv("MERLIN_HY4_SWA_WINDOW_REUSE", None),
 
     "MERLIN_HY4_FUSE_IHC": lambda: os.getenv("MERLIN_HY4_FUSE_IHC", None),
+    "MERLIN_LEBECHE_SM86_LL": lambda: _e2_strict_switch("MERLIN_LEBECHE_SM86_LL", True),
+    "MERLIN_LEBECHE_HC_FUSE": lambda: _e2_strict_switch("MERLIN_LEBECHE_HC_FUSE", True),
+    "MERLIN_LEBECHE_MOE_GLUE": lambda: _e2_strict_switch("MERLIN_LEBECHE_MOE_GLUE", True),
+    "MERLIN_LEBECHE_SHARED_ACT_FUSE": lambda: _e2_strict_switch("MERLIN_LEBECHE_SHARED_ACT_FUSE", True),
+    "MERLIN_LEBECHE_MOE_ROUTE_FUSE": lambda: _e2_strict_switch("MERLIN_LEBECHE_MOE_ROUTE_FUSE", True),
+    "MERLIN_LEBECHE_W8_SMALL_M": lambda: _e2_strict_switch("MERLIN_LEBECHE_W8_SMALL_M", True),
+    "MERLIN_LEBECHE_GDN_FUSE": lambda: _e2_strict_switch("MERLIN_LEBECHE_GDN_FUSE", True),
+    "MERLIN_LEBECHE_SM86_LL_EXTRA": lambda: _e2_strict_switch("MERLIN_LEBECHE_SM86_LL_EXTRA", True),
+    "MERLIN_LEBECHE_QSA_FUSE_PREPARE": lambda: _e2_strict_switch("MERLIN_LEBECHE_QSA_FUSE_PREPARE", True),
+    "MERLIN_LEBECHE_QSA_SM86_SPLITK": lambda: _e2_strict_switch("MERLIN_LEBECHE_QSA_SM86_SPLITK", True),
+    "MERLIN_LEBECHE_HC_SM86_TUNE": lambda: _e2_strict_switch("MERLIN_LEBECHE_HC_SM86_TUNE", True),
+    "MERLIN_LEBECHE_P2P_ALLGATHER": lambda: _e2_strict_switch("MERLIN_LEBECHE_P2P_ALLGATHER", True),
+    "MERLIN_LEBECHE_SHARED_GATE_FUSE": lambda: _e2_strict_switch("MERLIN_LEBECHE_SHARED_GATE_FUSE", True),
+    "MERLIN_LEBECHE_FUSED_ROUTER": lambda: _e2_strict_switch("MERLIN_LEBECHE_FUSED_ROUTER", True),
+    "MERLIN_LEBECHE_QSA_CHAIN_FUSE": lambda: _e2_strict_switch("MERLIN_LEBECHE_QSA_CHAIN_FUSE", True),
+    "MERLIN_LEBECHE_MTP_LL_EXTRA": lambda: _e2_strict_switch("MERLIN_LEBECHE_MTP_LL_EXTRA", True),
+    "MERLIN_LEBECHE_LM_HEAD_W8": lambda: _e2_strict_switch("MERLIN_LEBECHE_LM_HEAD_W8", False),
+    "MERLIN_LEBECHE_HC_W8": lambda: _e2_strict_switch("MERLIN_LEBECHE_HC_W8", False),
 
     "MERLIN_HY4_INDEXER_FAST": lambda: os.getenv("MERLIN_HY4_INDEXER_FAST", None),
     "MERLIN_HY4_INDEXER_FAST2": lambda: os.getenv("MERLIN_HY4_INDEXER_FAST2", None),
