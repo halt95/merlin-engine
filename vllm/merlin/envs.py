@@ -578,6 +578,10 @@ if TYPE_CHECKING:
     # sm_80/86 via bit-exact software E4M3FN encoding
     # (vllm/models/qwen4_exp/nvidia/ops/qsa_prepare.py); 0 = fbc1a32. Hashed.
     MERLIN_LEBECHE_QSA_FUSE_PREPARE: bool = True
+    # lebeche fork: 1 (default) = sm_80/86-tuned split-K table for QSA sparse
+    # paged attention (vllm/models/qwen4_exp/nvidia/ops/qsa.py); 0 = fbc1a32.
+    # Inert on non-sm_80/86 devices. Hashed.
+    MERLIN_LEBECHE_QSA_SM86_SPLITK: bool = True
     # 1 = fused FWHT/FP8 kernel (bitwise) and
     # tile-skipping IndexPool scoring, stable expansion and RoPE.
     MERLIN_HY4_INDEXER_FAST: str | None = None
@@ -1195,6 +1199,7 @@ MERLIN_ENV: dict[str, Callable[[], Any]] = {
     "MERLIN_LEBECHE_GDN_FUSE": lambda: _e2_strict_switch("MERLIN_LEBECHE_GDN_FUSE", True),
     "MERLIN_LEBECHE_SM86_LL_EXTRA": lambda: _e2_strict_switch("MERLIN_LEBECHE_SM86_LL_EXTRA", True),
     "MERLIN_LEBECHE_QSA_FUSE_PREPARE": lambda: _e2_strict_switch("MERLIN_LEBECHE_QSA_FUSE_PREPARE", True),
+    "MERLIN_LEBECHE_QSA_SM86_SPLITK": lambda: _e2_strict_switch("MERLIN_LEBECHE_QSA_SM86_SPLITK", True),
 
     "MERLIN_HY4_INDEXER_FAST": lambda: os.getenv("MERLIN_HY4_INDEXER_FAST", None),
     "MERLIN_HY4_INDEXER_FAST2": lambda: os.getenv("MERLIN_HY4_INDEXER_FAST2", None),
