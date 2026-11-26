@@ -531,6 +531,10 @@ if TYPE_CHECKING:
     # (+ the next stage1), bit-identical to the stock kernels; unset/blank/0 =
     # stock. Hashed: it changes the captured kernels.
     MERLIN_HY4_FUSE_IHC: str | None = None
+    # lebeche fork: 1 (default) = sm_80/86/89 port of the skinny-GEMM plans and the
+    # fused HC down+SiLU kernel (vllm/merlin/lebeche_sm86.py); 0 = stock 3.0.2.2.
+    # Inert on other capabilities. Hashed: it changes the captured kernels.
+    MERLIN_LEBECHE_SM86_LL: bool = True
     # 1 = fused FWHT/FP8 kernel (bitwise) and
     # tile-skipping IndexPool scoring, stable expansion and RoPE.
     MERLIN_HY4_INDEXER_FAST: str | None = None
@@ -1139,6 +1143,7 @@ MERLIN_ENV: dict[str, Callable[[], Any]] = {
     "MERLIN_HY4_SWA_WINDOW_REUSE": lambda: os.getenv("MERLIN_HY4_SWA_WINDOW_REUSE", None),
 
     "MERLIN_HY4_FUSE_IHC": lambda: os.getenv("MERLIN_HY4_FUSE_IHC", None),
+    "MERLIN_LEBECHE_SM86_LL": lambda: _e2_strict_switch("MERLIN_LEBECHE_SM86_LL", True),
 
     "MERLIN_HY4_INDEXER_FAST": lambda: os.getenv("MERLIN_HY4_INDEXER_FAST", None),
     "MERLIN_HY4_INDEXER_FAST2": lambda: os.getenv("MERLIN_HY4_INDEXER_FAST2", None),

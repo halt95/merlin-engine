@@ -34,6 +34,7 @@ class CuteSkinnyGemm:
         has_residual: bool = False,
         use_pdl: bool = False,
         static_k: int | None = None,
+        portable_elect: bool = False,
     ) -> None:
         if block_size % cute.arch.WARP_SIZE != 0:
             raise ValueError("block_size must be a multiple of the warp size")
@@ -51,6 +52,8 @@ class CuteSkinnyGemm:
         self.has_residual = has_residual
         self.use_pdl = use_pdl
         self.static_k = static_k
+        # sm_80/86/89 have no elect.sync: lane 0 of each warp stores instead.
+        self.portable_elect = portable_elect
         self.num_warps = block_size // cute.arch.WARP_SIZE
 
     @cute.jit
@@ -226,10 +229,16 @@ class CuteSkinnyGemm:
         )
         smem = cutlass.utils.SmemAllocator()
         partials = smem.allocate_tensor(cutlass.Float32, smem_layout, byte_alignment=16)
-        with cute.arch.elect_one():
-            for mi in cutlass.range_constexpr(num_rows):
-                for ni in cutlass.range_constexpr(outputs_per_block):
-                    partials[mi, ni, warp_idx] = acc[mi, ni]
+        if const_expr(self.portable_elect):
+            if tidx % cute.arch.WARP_SIZE == 0:
+                for mi in cutlass.range_constexpr(num_rows):
+                    for ni in cutlass.range_constexpr(outputs_per_block):
+                        partials[mi, ni, warp_idx] = acc[mi, ni]
+        else:
+            with cute.arch.elect_one():
+                for mi in cutlass.range_constexpr(num_rows):
+                    for ni in cutlass.range_constexpr(outputs_per_block):
+                        partials[mi, ni, warp_idx] = acc[mi, ni]
 
         cute.arch.sync_threads()
         if tidx == 0:

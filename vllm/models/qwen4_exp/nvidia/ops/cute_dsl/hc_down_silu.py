@@ -19,6 +19,7 @@ from typing import Any, Literal
 
 import torch
 
+from vllm.merlin.lebeche_sm86 import SM86_FUSED_HC_MAX_M, sm86_ll_active
 from vllm.platforms import current_platform
 
 logger = logging.getLogger(__name__)
@@ -32,6 +33,17 @@ _SM100F_TUNED_SPLITK: dict[int, tuple[int, int, int]] = {
     **{m: (6, 5, 16) for m in range(17, 33)},
     **{m: (6, 4, 16) for m in range(33, MAX_FUSED_M + 1)},
 }
+
+
+def hc_down_silu_supported() -> bool:
+    """Hopper+, or sm_80/86/89 with the lebeche port on (FMA backend only)."""
+    return current_platform.has_device_capability(90) or sm86_ll_active()
+
+
+def hc_down_silu_max_m() -> int:
+    """Largest token count that takes the fused kernel on this platform."""
+    return SM86_FUSED_HC_MAX_M if sm86_ll_active() else MAX_FUSED_M
+
 
 # FMA: (backend, M, K, threadblock_size); MMA: (backend, split_k, stages, tile_n).
 CompileKey = tuple[Literal["fma", "mma"], int, int, int]
@@ -67,7 +79,13 @@ class HcDownSiluGemm:
         N = cute.sym_int()
         gemm: Any
         extra_args: tuple[int, ...]
+        sm86 = sm86_ll_active()
         if compile_key[0] == "mma":
+            if sm86:
+                raise RuntimeError(
+                    "hc_down_silu: the split-K MMA backend needs sm_90+; "
+                    f"sm_8x is limited to M <= {SM86_FUSED_HC_MAX_M}"
+                )
             from ._hc_down_silu_mma import HcDownSiluMma
 
             _, split_k, num_stages, tile_n = compile_key
@@ -91,6 +109,8 @@ class HcDownSiluGemm:
                 prefetch_pdl_weights=self._prefetch_pdl_weights,
                 rank=self.rank,
                 hc=self.hc,
+                use_pdl=not sm86,
+                portable_elect=sm86,
             )
             extra_args = (M, K, 1)  # runtime N placeholder
             options = "--enable-tvm-ffi --ptxas-options -maxrregcount=64"
@@ -209,9 +229,9 @@ def request_hc_down_silu_warmup(
         k: Input feature size.
 
     """
-    if not current_platform.has_device_capability(90) or k % 8 != 0:
+    if not hc_down_silu_supported() or k % 8 != 0:
         return
-    m_set = {int(m) for m in m_values if 1 <= m <= MAX_FUSED_M}
+    m_set = {int(m) for m in m_values if 1 <= m <= hc_down_silu_max_m()}
     # M=1 dispatches to the weight-prefetching PDL variant.
     _get_kernel(rank, hc, k, True).request_warmup(m_set & {1})
     _get_kernel(rank, hc, k).request_warmup(m_set - {1})
@@ -220,5 +240,7 @@ def request_hc_down_silu_warmup(
 __all__ = [
     "MAX_FUSED_M",
     "hc_down_silu",
+    "hc_down_silu_max_m",
+    "hc_down_silu_supported",
     "request_hc_down_silu_warmup",
 ]
