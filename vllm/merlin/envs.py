@@ -615,6 +615,11 @@ if TYPE_CHECKING:
     # cublasLt::splitKreduce on MTP step 0 (vllm/merlin/lebeche_mtp_gemm.py);
     # 0 = f332186. Hashed.
     MERLIN_LEBECHE_MTP_LL_EXTRA: bool = True
+    # lebeche fork (LABELLED LOSSY, opt-in default OFF): 1 = on-the-fly
+    # per-channel W8 Marlin quantization of target ParallelLMHead on sm_80/86/89
+    # (vllm/merlin/lebeche_lm_head_w8.py); 0 (default) = lossless BF16 lm_head.
+    # Inert on non-sm_8x devices. Hashed: changes captured kernels and weights.
+    MERLIN_LEBECHE_LM_HEAD_W8: bool = False
     # 1 = fused FWHT/FP8 kernel (bitwise) and
     # tile-skipping IndexPool scoring, stable expansion and RoPE.
     MERLIN_HY4_INDEXER_FAST: str | None = None
@@ -1239,6 +1244,7 @@ MERLIN_ENV: dict[str, Callable[[], Any]] = {
     "MERLIN_LEBECHE_FUSED_ROUTER": lambda: _e2_strict_switch("MERLIN_LEBECHE_FUSED_ROUTER", True),
     "MERLIN_LEBECHE_QSA_CHAIN_FUSE": lambda: _e2_strict_switch("MERLIN_LEBECHE_QSA_CHAIN_FUSE", True),
     "MERLIN_LEBECHE_MTP_LL_EXTRA": lambda: _e2_strict_switch("MERLIN_LEBECHE_MTP_LL_EXTRA", True),
+    "MERLIN_LEBECHE_LM_HEAD_W8": lambda: _e2_strict_switch("MERLIN_LEBECHE_LM_HEAD_W8", False),
 
     "MERLIN_HY4_INDEXER_FAST": lambda: os.getenv("MERLIN_HY4_INDEXER_FAST", None),
     "MERLIN_HY4_INDEXER_FAST2": lambda: os.getenv("MERLIN_HY4_INDEXER_FAST2", None),
