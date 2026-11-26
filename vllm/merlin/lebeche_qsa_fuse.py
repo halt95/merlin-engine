@@ -114,7 +114,7 @@ def _qsa_direct_splitk_kernel(
     kv_head = tl.program_id(1)
     split_id = tl.program_id(2)
 
-    query_position = tl.load(query_positions_ptr + row)
+    query_position = tl.load(query_positions_ptr + row).to(tl.int32)
     visible_blocks = tl.load(visible_blocks_ptr + row)
     complete_blocks = tl.maximum(tl.minimum(visible_blocks, BLOCK_TOPK), 0)
     expanded_count = complete_blocks * COMPRESS_RATIO
@@ -359,7 +359,7 @@ def _qsa_merge_fast_kernel(
 ) -> None:
     row = tl.program_id(0)
     head = tl.program_id(1)
-    query_position = tl.load(query_positions_ptr + row)
+    query_position = tl.load(query_positions_ptr + row).to(tl.int32)
     visible_blocks = tl.load(visible_blocks_ptr + row)
     complete_blocks = tl.maximum(tl.minimum(visible_blocks, BLOCK_TOPK), 0)
     safe_qpos_p1 = tl.maximum(query_position + 1, 0)
@@ -482,7 +482,7 @@ def qsa_sparse_paged_attention_direct(
 
     assert q.dtype == torch.bfloat16
     assert block_indices.dtype == torch.int32 and block_indices.stride(1) == 1
-    assert query_positions.dtype == torch.int32 and query_positions.stride(0) == 1
+    assert query_positions.dtype in (torch.int32, torch.int64) and query_positions.stride(0) == 1
     assert visible_blocks.dtype == torch.int32 and visible_blocks.stride(0) == 1
     assert block_table.dtype == torch.int32 and block_table.stride(1) == 1
     assert token_to_req.dtype == torch.int32 and token_to_req.stride(0) == 1
@@ -687,6 +687,7 @@ def warmup_qsa_direct_sparse_attention(
     )
     blk_idx_ptr = TritonWarmupTensor(torch.int32, shape=(num_rows, block_topk))
     i32_1d = TritonWarmupTensor(torch.int32)
+    i64_1d = TritonWarmupTensor(torch.int64)
     block_table_ptr = TritonWarmupTensor(
         block_table.dtype,
         shape=tuple(block_table.shape),
@@ -721,7 +722,7 @@ def warmup_qsa_direct_sparse_attention(
             k_scale_ptr,
             v_scale_ptr,
             blk_idx_ptr,
-            i32_1d,
+            i64_1d,
             i32_1d,
             block_table_ptr,
             i32_1d,
@@ -777,7 +778,7 @@ def warmup_qsa_direct_sparse_attention(
             partial_lse_ptr,
             output_ptr,
             output_gate_ptr,
-            i32_1d,
+            i64_1d,
             i32_1d,
             row_stride,
             head_stride,
