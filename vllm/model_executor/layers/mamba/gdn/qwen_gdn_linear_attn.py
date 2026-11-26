@@ -28,6 +28,11 @@ from vllm.distributed import (
 )
 from vllm.forward_context import ForwardContext, get_forward_context
 from vllm.logger import init_logger
+from vllm.merlin.lebeche_gdn_fuse import (
+    gdn_fuse_active,
+    request_gdn_fuse_warmup,
+    try_fused_recoverssm_decode,
+)
 from vllm.model_executor.custom_op import CustomOp, PluggableLayer
 # Importing ba_splitk registers the gdn_ba_splitk custom op.
 from vllm.model_executor.layers.mamba.gdn import ba_splitk as _ba_splitk  # noqa: F401
@@ -879,6 +884,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             )
         if self.speculative_config is not None:
             logger.info_once("GDN spec decode kernel: %s", self.gdn_decode_kernel)
+        request_gdn_fuse_warmup(self)
 
         compilation_config = get_current_vllm_config().compilation_config
         if prefix in compilation_config.static_forward_context:
@@ -1364,11 +1370,18 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             and self.norm.weight.dtype in (torch.bfloat16, torch.float32)
         )
         if use_fused_gdn_spec_decode:
-            core_attn_out = torch.zeros(
-                (num_tokens, self.num_v_heads // self.tp_size, self.head_v_dim),
-                dtype=hidden_states.dtype,
-                device=hidden_states.device,
-            )
+            if gdn_fuse_active():
+                core_attn_out = torch.empty(
+                    (num_tokens, self.num_v_heads // self.tp_size, self.head_v_dim),
+                    dtype=hidden_states.dtype,
+                    device=hidden_states.device,
+                )
+            else:
+                core_attn_out = torch.zeros(
+                    (num_tokens, self.num_v_heads // self.tp_size, self.head_v_dim),
+                    dtype=hidden_states.dtype,
+                    device=hidden_states.device,
+                )
             torch.ops.vllm.qwen_gdn_attention_core_fused_norm_packed(
                 mixed_qkvz,
                 ba,
@@ -2414,10 +2427,18 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         if isinstance(attn_metadata_raw, dict):
             attn_metadata = attn_metadata_raw.get(self.prefix)
         if attn_metadata is None:
+            if gdn_fuse_active():
+                core_attn_out.zero_()
             self._warmup_prefill_kernels(mixed_qkvz[:, :qkv_size], 0)
             return
 
         assert isinstance(attn_metadata, GDNAttentionMetadata)
+        if gdn_fuse_active():
+            if try_fused_recoverssm_decode(
+                self, mixed_qkvz, ba, core_attn_out, attn_metadata
+            ):
+                return
+            core_attn_out.zero_()
         mixed_qkv, output_gate_flat = mixed_qkvz.split(
             [qkv_size, self.value_dim // self.tp_size], dim=-1
         )
