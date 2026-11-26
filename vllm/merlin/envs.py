@@ -542,6 +542,10 @@ if TYPE_CHECKING:
     # MERLIN_LEBECHE_SM86_LL on an sm_80/86/89 device. Hashed: it changes the
     # traced forward and the captured kernels.
     MERLIN_LEBECHE_HC_FUSE: bool = True
+    # lebeche fork: 1 (default) = small-batch (M <= 8) MoE glue kernels on sm_80/86/89
+    # (vllm/merlin/lebeche_moe_glue.py; needs MERLIN_LEBECHE_SM86_LL); 0 = stock.
+    # Bit-identical to the stock kernels. Hashed: it changes the traced graph.
+    MERLIN_LEBECHE_MOE_GLUE: bool = True
     # 1 = fused FWHT/FP8 kernel (bitwise) and
     # tile-skipping IndexPool scoring, stable expansion and RoPE.
     MERLIN_HY4_INDEXER_FAST: str | None = None
@@ -1152,6 +1156,7 @@ MERLIN_ENV: dict[str, Callable[[], Any]] = {
     "MERLIN_HY4_FUSE_IHC": lambda: os.getenv("MERLIN_HY4_FUSE_IHC", None),
     "MERLIN_LEBECHE_SM86_LL": lambda: _e2_strict_switch("MERLIN_LEBECHE_SM86_LL", True),
     "MERLIN_LEBECHE_HC_FUSE": lambda: _e2_strict_switch("MERLIN_LEBECHE_HC_FUSE", True),
+    "MERLIN_LEBECHE_MOE_GLUE": lambda: _e2_strict_switch("MERLIN_LEBECHE_MOE_GLUE", True),
 
     "MERLIN_HY4_INDEXER_FAST": lambda: os.getenv("MERLIN_HY4_INDEXER_FAST", None),
     "MERLIN_HY4_INDEXER_FAST2": lambda: os.getenv("MERLIN_HY4_INDEXER_FAST2", None),

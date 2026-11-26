@@ -10,7 +10,7 @@ import torch
 
 import vllm._custom_ops as ops
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
-from vllm.merlin import marlin_moe_cfg
+from vllm.merlin import lebeche_moe_glue, marlin_moe_cfg
 from vllm.model_executor.layers.fused_moe.activation import (
     ApplyMoEActivationConfig,
     MoEActivation,
@@ -378,13 +378,23 @@ def fused_marlin_moe(
     # Hot GPU + cold UVA rows, one moe_sum
     from vllm.merlin import cold_experts
     _align, _gemms = cold_experts.dispatch(w1, moe_align_block_size, _fused_marlin_moe)
-    sorted_token_ids, expert_ids, num_tokens_post_padded = _align(
-        topk_ids,
-        block_size_m,
-        global_num_experts,
-        expert_map,
-        ignore_invalid_experts=True,
-    )
+    # lebeche fork: a small batch routed by lebeche_moe_glue.route() comes with
+    # its alignment (same tensors, bit for bit); None = stock.
+    _pre = None
+    if lebeche_moe_glue.GLUE_SWITCH and _align is moe_align_block_size:
+        _pre = lebeche_moe_glue.take_align(
+            topk_ids, block_size_m, global_num_experts, expert_map
+        )
+    if _pre is not None:
+        sorted_token_ids, expert_ids, num_tokens_post_padded = _pre
+    else:
+        sorted_token_ids, expert_ids, num_tokens_post_padded = _align(
+            topk_ids,
+            block_size_m,
+            global_num_experts,
+            expert_map,
+            ignore_invalid_experts=True,
+        )
 
     assert activation is not None
     # Both halves write one [M*topk, K]
@@ -793,6 +803,12 @@ class MarlinExperts(LoRAExpertsMixin, MarlinExpertsBase):
                         ),
                         output,
                     )
+                    return
+                # lebeche fork: inside vllm.moe_forward_shared_glue a small
+                # batch leaves the reduction to the fused post kernel.
+                if lebeche_moe_glue.GLUE_SWITCH and lebeche_moe_glue.defer_sum(
+                    self.moe_sum, input, topk_ids, expert_map
+                ):
                     return
                 self.moe_sum(input, output, topk_ids, expert_map)
 

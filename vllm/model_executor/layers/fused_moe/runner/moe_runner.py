@@ -21,6 +21,7 @@ from vllm.forward_context import (
     is_forward_context_available,
 )
 from vllm.logger import init_logger
+from vllm.merlin import lebeche_moe_glue
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEConfig,
@@ -214,6 +215,44 @@ direct_register_custom_op(
 )
 
 
+# lebeche fork (vllm/merlin/lebeche_moe_glue.py): `moe_forward_shared` plus the
+# `shared_output + fused_output` add that MoERunner.forward does right after
+# it, as one opaque op. With at most lebeche_moe_glue.MAX_M rows the top-k
+# reduction, the shared-expert gate and that add run as one kernel; the row
+# count is tested at run time, inside the op.
+def _moe_forward_shared_glue(
+    hidden_states: torch.Tensor,
+    router_logits: torch.Tensor,
+    shared_experts_input: torch.Tensor | None,
+    input_ids: torch.Tensor | None,
+    layer_name: _layer_name_type,
+    hidden_dim_unpadded: int,
+) -> torch.Tensor:
+    layer = get_layer_from_name(_resolve_layer_name(layer_name))
+    return lebeche_moe_glue.forward_combined(
+        layer, hidden_states, router_logits, shared_experts_input, input_ids
+    )
+
+
+def _moe_forward_shared_glue_fake(
+    hidden_states: torch.Tensor,
+    router_logits: torch.Tensor,
+    shared_experts_input: torch.Tensor | None,
+    input_ids: torch.Tensor | None,
+    layer_name: _layer_name_type,
+    hidden_dim_unpadded: int,
+) -> torch.Tensor:
+    return torch.empty_like(hidden_states)
+
+
+direct_register_custom_op(
+    op_name="moe_forward_shared_glue",
+    op_func=_moe_forward_shared_glue,
+    fake_impl=_moe_forward_shared_glue_fake,
+    tags=(torch.Tag.needs_exact_strides,),
+)
+
+
 def _unpack(
     result: torch.Tensor
     | UnfinalizedMoEOutput
@@ -358,6 +397,30 @@ class MoERunner(MoERunnerInterface):
     @property
     def _quant_method(self) -> FusedMoEMethodBase:
         return self.routed_experts.quant_method
+
+    def _lebeche_glue_combined(self) -> bool:
+        """Trace-time choice of `vllm.moe_forward_shared_glue`: the switches
+        and device, and a layer whose forward() does nothing between the op
+        and `shared_output + fused_output`. Never depends on the batch."""
+        if not lebeche_moe_glue.glue_active():
+            return False
+        quant_method = self._quant_method
+        kernel = getattr(quant_method, "moe_kernel", None)
+        return (
+            self._shared_experts is not None
+            and self._forward_entry is torch.ops.vllm.moe_forward_shared
+            and kernel is not None
+            and not quant_method.is_monolithic
+            and not quant_method.has_unpadded_output
+            and not kernel.output_is_reduced()
+            and kernel.fused_experts.post_gemm2_hook is None
+            and self.routed_input_transform is None
+            and self.routed_output_transform is None
+            and self.routed_scaling_factor == 1.0
+            and not self.enable_dbo
+            and not self.do_naive_dispatch_combine
+            and self.moe_config.pcp_size == 1
+        )
 
     def apply_routed_input_transform(
         self,
@@ -627,12 +690,20 @@ class MoERunner(MoERunnerInterface):
             )
         else:
             # Modular kernels: select experts first, then call routed_experts
-            topk_weights, topk_ids = self.router.select_experts(
-                hidden_states=hidden_states,
-                router_logits=router_logits,
-                topk_indices_dtype=self._quant_method.topk_indices_dtype,
-                input_ids=input_ids,
-            )
+            # lebeche fork: a small batch gets routing and block alignment
+            # from one kernel (bit-identical); None = stock.
+            routed = None
+            if lebeche_moe_glue.GLUE_SWITCH:
+                routed = lebeche_moe_glue.route(self, hidden_states, router_logits)
+            if routed is not None:
+                topk_weights, topk_ids = routed
+            else:
+                topk_weights, topk_ids = self.router.select_experts(
+                    hidden_states=hidden_states,
+                    router_logits=router_logits,
+                    topk_indices_dtype=self._quant_method.topk_indices_dtype,
+                    input_ids=input_ids,
+                )
 
             fused_out = self.routed_experts.forward_modular(
                 x=hidden_states,
@@ -734,6 +805,22 @@ class MoERunner(MoERunnerInterface):
                 hidden_states,
             )
         )
+
+        if og_hidden_dim_pre_xform is None and self._lebeche_glue_combined():
+            # lebeche fork: same result as the stock sequence below, whose
+            # steps between the op and the add are all no-ops for this layer.
+            result = torch.ops.vllm.moe_forward_shared_glue(
+                hidden_states,
+                router_logits,
+                shared_experts_input,
+                input_ids,
+                self._encode_layer_name(),
+                0,
+            )
+            result = self._maybe_reduce_final_output(
+                result, og_hidden_dim_post_xform, False
+            )
+            return self._maybe_add_zero_expert_output(result)
 
         result = self._forward_entry(
             hidden_states,

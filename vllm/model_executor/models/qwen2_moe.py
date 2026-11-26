@@ -38,6 +38,7 @@ from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
 from vllm.logger import init_logger
+from vllm.merlin import lebeche_moe_glue
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.fused_moe import (
@@ -118,7 +119,14 @@ class Qwen2MoeMLP(nn.Module):
         out, _ = self.down_proj(out)
 
         if self.expert_gate is not None:
-            out = F.sigmoid(self.expert_gate(x)[0]) * out
+            gate = self.expert_gate(x)[0]
+            # lebeche fork: inside vllm.moe_forward_shared_glue a small batch
+            # leaves sigmoid(gate) * out to the fused post kernel.
+            if lebeche_moe_glue.GLUE_SWITCH and lebeche_moe_glue.defer_shared_gate(
+                out, gate
+            ):
+                return out
+            out = F.sigmoid(gate) * out
 
         return out
 
