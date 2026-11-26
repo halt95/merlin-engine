@@ -1,21 +1,26 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright 2026 lebeche hill-climb (fork of Merlin 3.0.2.2)
-"""sm_80/86/89 port of the low-latency CuTe-DSL decode kernels (lebeche fork).
+"""sm_80/86/89 port of the low-latency CuTe-DSL skinny GEMM (lebeche fork).
 
-Stock 3.0.2.2 only runs the skinny BF16 GEMM plans and the fused
-hyper-connection down+SiLU kernel on sm_90+. Nothing in their FMA kernels
-needs Hopper except ``cute.arch.elect_one()`` (``elect.sync``) and PDL
-(``griddepcontrol``). With the switch on, on a capability listed below:
+Stock 3.0.2.2 only runs the skinny BF16 GEMM plans on sm_90+. Nothing in the
+FMA kernel needs Hopper except ``cute.arch.elect_one()`` (``elect.sync``); PDL
+is already conditional. With the switch on, on a capability listed below:
 
-* the skinny GEMM / fused FMA kernels are built with a lane-0 test instead of
-  ``elect_one`` and without PDL;
-* ``QWEN4_EXP_SM86_GEMM_PLANS`` (low_latency_gemm.py) is registered;
-* ``GatedResidual`` uses the fused down+SiLU kernel for M <= 4 (FMA backend
-  only; the clustered split-K MMA backend stays Hopper+).
+* the skinny GEMM kernel is built with a lane-0 test instead of ``elect_one``;
+* ``QWEN4_EXP_SM86_GEMM_PLANS`` (low_latency_gemm.py) is registered, so
+  ``enable_qwen4_exp_low_latency_gemm`` patches the matching unquantized
+  Linear modules. Dispatch on the token count happens inside the opaque
+  ``qwen4_exp_low_latency_gemm`` custom op, i.e. at run time.
+
+The fused HC down+SiLU kernel (ops/cute_dsl/hc_down_silu.py) stays Hopper+: its
+``1 <= M <= MAX_FUSED_M`` test is a Python branch in the traced forward, which
+torch.compile resolves once at trace time (guards are dropped), so it cannot
+select M <= 4 at run time. The merged HC down+inject projection is served by a
+skinny plan instead, followed by the stock ``hc_silu`` kernel.
 
 ``MERLIN_LEBECHE_SM86_LL`` (default "1"; "0" = exactly stock 3.0.2.2) is read
-once at import. It is a hashed compile factor (it changes the captured
-kernels). Other capabilities are never affected.
+once at import. It is a hashed compile factor. Other capabilities are never
+affected. The Flash-Next launcher forwards it (tools/merlin/launch.py).
 """
 
 import torch
@@ -24,10 +29,6 @@ from vllm.merlin.envs import read_registered
 
 SM86_LL_CAPABILITIES: frozenset[tuple[int, int]] = frozenset({(8, 0), (8, 6), (8, 9)})
 SM86_LL_SWITCH: bool = bool(read_registered("MERLIN_LEBECHE_SM86_LL"))
-# Largest token count the fused HC down+SiLU FMA kernel beats the stock GEMM at
-# on an RTX 3090 (measured: wins at M <= 4, loses from M = 8).
-SM86_FUSED_HC_MAX_M = 4
-
 _active: bool | None = None
 
 

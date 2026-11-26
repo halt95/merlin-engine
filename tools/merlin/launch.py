@@ -98,6 +98,7 @@ FN_KV_TIER_EXPERIMENTAL = ("WARNING: KV RAM cache on Flash-Next is experimental:
 KV_TIER_EXPERIMENTAL_27B = ("WARNING: KV RAM cache on the 27B is experimental: a session evicted under heavy "
                             "concurrent prefill may recompute (output identical)")
 FN_MARLIN_MOE_CFG = "MERLIN_MARLIN_MOE_CFG"  # per-shape Marlin MoE kernel choice; the engine parses it (vllm/merlin/marlin_moe_cfg.py)
+FN_LEBECHE_SM86_LL = "MERLIN_LEBECHE_SM86_LL"  # lebeche fork: sm_8x skinny-GEMM plans, 1 (engine default) / 0 = stock (vllm/merlin/lebeche_sm86.py)
 FN_LPT_DEFAULT = "512"  # Flash-Next --long-prefill-token-threshold default; LPT=0 = off
 # Flash-Next prefill runs (vllm/merlin/prefill_runs.py), on by default; PREFILL_RUNS=0 = off. The decode share and the
 # per-step cost constants were measured on fn-quad-3090 (A/B runs, 2026-11-11); the other rows use the same values, except
@@ -1797,6 +1798,14 @@ def _build_flash_next(reg, p, checkpoint, ckpt, env, extra, repo: Path) -> Plan:
         raise LaunchError(f"{QWEN3_LITERAL_SPANS}={spans!r}: use 1 (on, the default) or 0 (off)", 2)
     if spans:
         env[QWEN3_LITERAL_SPANS] = spans
+    # lebeche fork: the sm_8x low-latency GEMM switch is a deliberate MERLIN_ knob too (it was stripped above with
+    # every other MERLIN_ export, so a caller's 0 served with the port on): 0 or 1 passes through, blank is not
+    # exported (the engine default, on), anything else fails before the boot.
+    sm86_ll = (environ_in.get(FN_LEBECHE_SM86_LL) or "").strip()
+    if sm86_ll not in ("", "0", "1"):
+        raise LaunchError(f"{FN_LEBECHE_SM86_LL}={sm86_ll!r}: use 1 (on, the default) or 0 (stock kernels)", 2)
+    if sm86_ll:
+        env[FN_LEBECHE_SM86_LL] = sm86_ll
     # The dense Marlin config is forwarded only when a table is given.
     dense_cfg = (environ_in.get("MERLIN_MARLIN_DENSE_CFG") or "").strip()
     if dense_cfg:

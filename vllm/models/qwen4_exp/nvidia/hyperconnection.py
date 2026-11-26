@@ -31,16 +31,13 @@ from vllm.model_executor.layers.linear import (
     ReplicatedLinear,
 )
 from vllm.model_executor.models.utils import maybe_prefix
+from vllm.platforms import current_platform
 
 from ..common.hyperconnection import (
     GroupedGemmaRMSNorm,
     HyperConnectionConfig,
 )
-from .ops.cute_dsl.hc_down_silu import (
-    hc_down_silu,
-    hc_down_silu_max_m,
-    hc_down_silu_supported,
-)
+from .ops.cute_dsl.hc_down_silu import MAX_FUSED_M, hc_down_silu
 from .ops.hc import (
     grouped_gemma_rmsnorm,
     hc_combine,
@@ -115,10 +112,8 @@ class GatedResidual(nn.Module):
             self._use_hc_down_silu = (
                 weight.shape[1] % 8 == 0
                 and weight.dtype == torch.bfloat16
-                and hc_down_silu_supported()
+                and current_platform.has_device_capability(90)
             )
-            # MAX_FUSED_M on Hopper+; 4 on sm_8x (lebeche port, FMA backend only).
-            self._hc_down_silu_max_m = hc_down_silu_max_m()
         else:
             self.input_mix_weight_down = ReplicatedLinear(
                 self.hyper_hidden_size,
@@ -149,7 +144,7 @@ class GatedResidual(nn.Module):
         use_fused = (
             self._use_hc_down_silu
             and not envs.VLLM_BATCH_INVARIANT
-            and 1 <= xn.shape[0] <= self._hc_down_silu_max_m
+            and 1 <= xn.shape[0] <= MAX_FUSED_M
         )
         if use_fused:
             return hc_down_silu(

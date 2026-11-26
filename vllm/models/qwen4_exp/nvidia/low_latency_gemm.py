@@ -306,11 +306,33 @@ QWEN4_EXP_SM121_GEMM_PLANS: dict[tuple[int, int], dict[int, SkinnyGemmConfig]] =
 # {static K, k_unroll}; `stock -> skinny` us per call. Only points that beat
 # the standard linear are listed (HC and shared-expert shapes lose from M=8;
 # the LM head is bandwidth-bound and stays on the standard path). The merged
-# HC down+inject projection (336, 10240) is served by the fused down+SiLU
-# kernel instead (ops/cute_dsl/hc_down_silu.py). The kernels need the
-# portable-elect build, see vllm/merlin/lebeche_sm86.py.
+# HC down+inject projection (336, 10240) is planned here because the fused
+# down+SiLU kernel cannot dispatch on M at run time under torch.compile; the
+# router gate (512, 2560) reaches this op through GateLinear's tier 7. The
+# kernels need the portable-elect build, see vllm/merlin/lebeche_sm86.py.
 QWEN4_EXP_SM86_GEMM_PLANS: dict[tuple[int, int], dict[int, SkinnyGemmConfig]] = {
 # skipped (no win) 96 2560 16 5.96 6.3
+    # Merged HC down+inject projection (replicated, padded to 16 rows).
+    (336, 10240): {
+        1: SkinnyGemmConfig(1, 64, 1, static_k=10240),  # 15.51 -> 9.66 us
+        2: SkinnyGemmConfig(2, 64, 1, static_k=10240),  # 15.2 -> 9.84 us
+        3: SkinnyGemmConfig(3, 160, 2, static_k=10240),  # 15.21 -> 10.45 us
+        4: SkinnyGemmConfig(4, 128, 2, static_k=10240),  # 15.35 -> 10.99 us
+    },
+    # MoE router gate (replicated; reached through GateLinear tier 7).
+    (512, 2560): {
+        1: SkinnyGemmConfig(1, 32, 1, vector_width=2, static_k=2560),  # 6.17 -> 4.9 us
+        2: SkinnyGemmConfig(2, 160, 1, static_k=2560),  # 8.45 -> 5.09 us
+        3: SkinnyGemmConfig(3, 128, 1, vector_width=4, static_k=2560),  # 8.48 -> 5.36 us
+        4: SkinnyGemmConfig(4, 64, 1, vector_width=4, static_k=2560),  # 8.49 -> 5.74 us
+    },
+    # Shared-expert gate (replicated).
+    (1, 2560): {
+        1: SkinnyGemmConfig(1, 256, 1, vector_width=2, static_k=2560),  # 3.6 -> 1.86 us
+        2: SkinnyGemmConfig(2, 320, 1, vector_width=4, static_k=2560),  # 3.64 -> 2.03 us
+        3: SkinnyGemmConfig(3, 128, 1, vector_width=4, static_k=2560),  # 3.61 -> 2.21 us
+        4: SkinnyGemmConfig(4, 128, 1, vector_width=4, static_k=2560),  # 3.62 -> 2.41 us
+    },
     # HC up projection (replicated).
     (10240, 320): {
         1: SkinnyGemmConfig(1, 32, 2, vector_width=2, static_k=320),  # 11.03 -> 9.43 us

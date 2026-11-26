@@ -41,8 +41,6 @@ class HcDownSiluFma:
         prefetch_pdl_weights: bool = False,
         rank: int = 320,
         hc: int = 4,
-        use_pdl: bool = True,
-        portable_elect: bool = False,
     ):
         self.threadblock_size = threadblock_size
         self.main_vec_width = main_vec_width
@@ -50,9 +48,6 @@ class HcDownSiluFma:
         self.prefetch_pdl_weights = prefetch_pdl_weights
         self.rank = rank
         self.hc = hc
-        # sm_80/86/89 (lebeche fork): no PDL (griddepcontrol) and no elect.sync.
-        self.use_pdl = use_pdl
-        self.portable_elect = portable_elect
         self.num_warps = threadblock_size // cute.arch.WARP_SIZE
         self._init_k_tiles(k)
         self.main_prefetch_tiles = min(self.main_tiles, 8)
@@ -201,7 +196,7 @@ class HcDownSiluFma:
             block=[self.threadblock_size, 1, 1],
             smem=M * 4 * self.num_warps,
             stream=stream,
-            use_pdl=self.use_pdl,
+            use_pdl=True,
             min_blocks_per_mp=1,
         )
 
@@ -256,8 +251,7 @@ class HcDownSiluFma:
                 for tile in cutlass.range_constexpr(prefetch_tiles):
                     cute.autovec_copy(tB[None, tile], prefetched_b[tile, None])
 
-        if const_expr(self.use_pdl):
-            cute.arch.griddepcontrol_wait()
+        cute.arch.griddepcontrol_wait()
 
         # 128-bit vectorized main loop
         if const_expr(k_main_elems > 0):
@@ -313,14 +307,9 @@ class HcDownSiluFma:
         smem_red_layout = cute.make_layout((M, num_warps), stride=(num_warps, 1))
         smem = cutlass.utils.SmemAllocator()
         sm = smem.allocate_tensor(cutlass.Float32, smem_red_layout, byte_alignment=16)
-        if const_expr(self.portable_elect):
-            if tidx % cute.arch.WARP_SIZE == 0:
-                for m in cutlass.range_constexpr(M):
-                    sm[m, wid] = acc[m]
-        else:
-            with cute.arch.elect_one():
-                for m in cutlass.range_constexpr(M):
-                    sm[m, wid] = acc[m]
+        with cute.arch.elect_one():
+            for m in cutlass.range_constexpr(M):
+                sm[m, wid] = acc[m]
 
         # Final reduction, fused mHC SiLU epilogue, and output.
         cute.arch.sync_threads()
@@ -342,5 +331,4 @@ class HcDownSiluFma:
                     gC[m, n_idx] = (z * _sigmoid_f32(z)).to(cutlass.BFloat16)
                 else:
                     gC[m, n_idx] = x_bf16
-        if const_expr(self.use_pdl):
-            cute.arch.griddepcontrol_launch_dependents()
+        cute.arch.griddepcontrol_launch_dependents()
