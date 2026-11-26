@@ -115,6 +115,7 @@ FN_LEBECHE_FUSED_ROUTER = "MERLIN_LEBECHE_FUSED_ROUTER"  # lebeche fork: coopera
 FN_LEBECHE_QSA_CHAIN_FUSE = "MERLIN_LEBECHE_QSA_CHAIN_FUSE"  # lebeche fork: sm_80/86 QSA decode glue chain fusion (direct splitK + bounded MQA + dead zero_ elim), 1 (engine default) / 0 = f332186
 FN_LEBECHE_MTP_LL_EXTRA = "MERLIN_LEBECHE_MTP_LL_EXTRA"  # lebeche fork: sm_80/86 Triton TC GEMM for MTP fc_hidden (1280, 2560) M=5..32, 1 (engine default) / 0 = f332186
 FN_LEBECHE_LM_HEAD_W8 = "MERLIN_LEBECHE_LM_HEAD_W8"  # lebeche fork (LOSSY, opt-in): on-the-fly per-channel W8 Marlin target lm_head on sm_8x, 0 (engine default) / 1 = on
+FN_LEBECHE_HC_W8 = "MERLIN_LEBECHE_HC_W8"  # lebeche fork (LOSSY, opt-in): on-the-fly W8 Tensor Core HC down_silu & up_gate_mix on sm_8x, 0 (engine default) / 1 = on
 FN_LPT_DEFAULT = "512"  # Flash-Next --long-prefill-token-threshold default; LPT=0 = off
 # Flash-Next prefill runs (vllm/merlin/prefill_runs.py), on by default; PREFILL_RUNS=0 = off. The decode share and the
 # per-step cost constants were measured on fn-quad-3090 (A/B runs, 2026-11-11); the other rows use the same values, except
@@ -1920,6 +1921,14 @@ def _build_flash_next(reg, p, checkpoint, ckpt, env, extra, repo: Path) -> Plan:
         env[FN_LEBECHE_LM_HEAD_W8] = lm_head_w8
         if lm_head_w8 == "1":
             notes.append(f"{FN_LEBECHE_LM_HEAD_W8}=1: LOSSY per-channel W8 Marlin target lm_head active")
+    # Opt-in (LABELLED LOSSY, default off): W8 Tensor Core HyperConnections on sm_8x.
+    hc_w8 = (environ_in.get(FN_LEBECHE_HC_W8) or "").strip()
+    if hc_w8 not in ("", "0", "1"):
+        raise LaunchError(f"{FN_LEBECHE_HC_W8}={hc_w8!r}: use 0 (off, the default) or 1 (lossy W8 HyperConnections)", 2)
+    if hc_w8:
+        env[FN_LEBECHE_HC_W8] = hc_w8
+        if hc_w8 == "1":
+            notes.append(f"{FN_LEBECHE_HC_W8}=1: LOSSY W8 HyperConnection down_silu/up_gate_mix active")
     # The dense Marlin config is forwarded only when a table is given.
     dense_cfg = (environ_in.get("MERLIN_MARLIN_DENSE_CFG") or "").strip()
     if dense_cfg:

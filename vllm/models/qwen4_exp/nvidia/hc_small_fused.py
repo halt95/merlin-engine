@@ -32,7 +32,9 @@ from functools import partial
 from typing import Any
 
 import torch
+import torch.nn.functional as F
 from torch import nn
+from torch.nn.parameter import Parameter
 
 import vllm.envs as envs
 from vllm.merlin.envs import read_registered
@@ -54,6 +56,7 @@ from .ops.hc import hc_combine_norm, hc_gate_mix, hc_silu
 
 HC_FUSE_SWITCH: bool = bool(read_registered("MERLIN_LEBECHE_HC_FUSE"))
 HC_SM86_TUNE_SWITCH: bool = bool(read_registered("MERLIN_LEBECHE_HC_SM86_TUNE"))
+HC_W8_SWITCH: bool = bool(read_registered("MERLIN_LEBECHE_HC_W8"))
 
 _DOWN = "down_silu"
 _UP = "up_gate_mix"
@@ -535,6 +538,485 @@ direct_register_custom_op(
 )
 
 
+
+# ---------------------------------------------------------------------------
+# Opt-in (LABELLED LOSSY, default OFF) W8 Tensor Core HyperConnection kernels
+# ---------------------------------------------------------------------------
+
+_HC_W8_MAX_M = 32
+_HC_W8_MAX_SK = 10
+_HC_W8_MAX_N = 336
+_HC_W8_DOWN_K = 10240
+_HC_W8_UP_K = 320
+_HC_W8_UP_N = 10240
+_HC_W8_HC = 4
+_HC_W8_RANK = 320
+_HC_W8_DOWN_GS = 256
+
+# Compile keys for HcSmallFusedW8:
+#   ("down", max_m, split_k) | ("up", max_m) | ("unpack_down",) | ("unpack_up_sm",)
+_W8Key = tuple[Any, ...]
+
+_HC_W8_WARMUP_KEYS: tuple[_W8Key, ...] = (
+    ("down", 8, 5),
+    ("down", 8, 10),
+    ("down", 16, 5),
+    ("down", 32, 5),
+    ("up", 4),
+    ("up", 8),
+    ("up", 16),
+    ("up", 32),
+    ("unpack_down",),
+    ("unpack_up_sm",),
+)
+
+_hc_w8_workspaces: dict[torch.device, tuple[torch.Tensor, torch.Tensor]] = {}
+
+
+def _get_hc_w8_workspace(device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
+    ws = _hc_w8_workspaces.get(device)
+    if ws is None:
+        part = torch.empty(
+            (_HC_W8_MAX_SK, _HC_W8_MAX_M, _HC_W8_MAX_N),
+            device=device,
+            dtype=torch.float32,
+        )
+        counter = torch.zeros(
+            (_HC_W8_MAX_N // 16,), device=device, dtype=torch.int32
+        )
+        ws = (part, counter)
+        _hc_w8_workspaces[device] = ws
+    return ws
+
+
+class HcSmallFusedW8:
+    """Compile cache and CuTe-DSL warmup provider for W8 Tensor Core HC ops."""
+
+    def __init__(self) -> None:
+        self._compiled: dict[_W8Key, Any] = {}
+        self._warmup: set[_W8Key] = set()
+        self._warmup_registered = False
+
+    def _compile(self, key: _W8Key) -> Any:
+        fn = self._compiled.get(key)
+        if fn is not None:
+            return fn
+        import cutlass
+        import cutlass.cute as cute
+        from quack.compile_utils import make_fake_tensor
+
+        from .ops.cute_dsl._hc_small_fused_w8 import (
+            CuteHcDownSiluW8TC,
+            CuteHcUpGateMixW8TC,
+            CuteUnpackDownW8,
+            CuteUnpackUpW8SM,
+        )
+
+        kind = key[0]
+        stream = shape_dynamic_skinny_gemm._stream()
+        m_sym = cute.sym_int(divisibility=1)
+
+        if kind == "down":
+            _, max_m, sk = key
+            n_tiles_sym = cute.sym_int(divisibility=1)
+            n_sym = cute.sym_int(divisibility=16)
+            kernel = CuteHcDownSiluW8TC(
+                max_m=max_m,
+                block_size=128,
+                split_k=sk,
+                hc=_HC_W8_HC,
+                rank=_HC_W8_RANK,
+                static_k=_HC_W8_DOWN_K,
+                group_size=_HC_W8_DOWN_GS,
+            )
+            fn = cute.compile(
+                kernel,
+                make_fake_tensor(
+                    cutlass.Int32, (m_sym, _HC_W8_DOWN_K // 2), divisibility=4
+                ),
+                make_fake_tensor(
+                    cutlass.Int32,
+                    (n_tiles_sym, _HC_W8_DOWN_K // 32, 32, 4),
+                    divisibility=4,
+                ),
+                make_fake_tensor(
+                    cutlass.BFloat16,
+                    (n_sym, _HC_W8_DOWN_K // _HC_W8_DOWN_GS),
+                    divisibility=1,
+                ),
+                make_fake_tensor(
+                    cutlass.Float32,
+                    (_HC_W8_MAX_SK, _HC_W8_MAX_M, _HC_W8_MAX_N),
+                    divisibility=1,
+                ),
+                make_fake_tensor(
+                    cutlass.Int32, (_HC_W8_MAX_N // 16,), divisibility=1
+                ),
+                make_fake_tensor(
+                    cutlass.BFloat16, (m_sym, _HC_W8_RANK), divisibility=1
+                ),
+                make_fake_tensor(
+                    cutlass.BFloat16, (m_sym, n_sym), divisibility=1
+                ),
+                cutlass.Int32(324),
+                stream,
+                options="--enable-tvm-ffi --ptxas-options -maxrregcount=64",
+            )
+        elif kind == "up":
+            _, max_m = key
+            kernel = CuteHcUpGateMixW8TC(
+                max_m=max_m,
+                block_size=160,
+                hc=_HC_W8_HC,
+                static_k=_HC_W8_UP_K,
+            )
+            fn = cute.compile(
+                kernel,
+                make_fake_tensor(
+                    cutlass.Int32, (m_sym, _HC_W8_UP_K // 2), divisibility=4
+                ),
+                make_fake_tensor(
+                    cutlass.Int32,
+                    (_HC_W8_UP_N // 32, _HC_W8_UP_K // 16, 32, 4),
+                    divisibility=4,
+                ),
+                make_fake_tensor(cutlass.BFloat16, (_HC_W8_UP_N,), divisibility=1),
+                make_fake_tensor(
+                    cutlass.BFloat16, (m_sym, _HC_W8_UP_N), divisibility=1
+                ),
+                make_fake_tensor(
+                    cutlass.BFloat16, (m_sym, _HC_W8_UP_N // _HC_W8_HC), divisibility=1
+                ),
+                stream,
+                options="--enable-tvm-ffi --ptxas-options -maxrregcount=64",
+            )
+        elif kind == "unpack_down":
+            n_tiles_sym = cute.sym_int(divisibility=1)
+            n_sym = cute.sym_int(divisibility=16)
+            kernel = CuteUnpackDownW8(
+                static_k=_HC_W8_DOWN_K, group_size=_HC_W8_DOWN_GS
+            )
+            fn = cute.compile(
+                kernel,
+                make_fake_tensor(
+                    cutlass.Int32,
+                    (n_tiles_sym, _HC_W8_DOWN_K // 32, 32, 4),
+                    divisibility=4,
+                ),
+                make_fake_tensor(
+                    cutlass.BFloat16,
+                    (n_sym, _HC_W8_DOWN_K // _HC_W8_DOWN_GS),
+                    divisibility=1,
+                ),
+                make_fake_tensor(
+                    cutlass.BFloat16, (n_sym, _HC_W8_DOWN_K), divisibility=8
+                ),
+                stream,
+                options="--enable-tvm-ffi",
+            )
+        elif kind == "unpack_up_sm":
+            kernel = CuteUnpackUpW8SM(static_k=_HC_W8_UP_K, hc=_HC_W8_HC)
+            fn = cute.compile(
+                kernel,
+                make_fake_tensor(
+                    cutlass.Int32,
+                    (_HC_W8_UP_N // 32, _HC_W8_UP_K // 16, 32, 4),
+                    divisibility=4,
+                ),
+                make_fake_tensor(cutlass.BFloat16, (_HC_W8_UP_N,), divisibility=1),
+                make_fake_tensor(
+                    cutlass.BFloat16, (_HC_W8_UP_N, _HC_W8_UP_K), divisibility=8
+                ),
+                stream,
+                options="--enable-tvm-ffi",
+            )
+        else:
+            raise ValueError(f"unknown HC W8 compile key {key!r}")
+
+        self._compiled[key] = fn
+        return fn
+
+    def request_warmup(self) -> None:
+        self._warmup.update(_HC_W8_WARMUP_KEYS)
+        if self._warmup_registered or not self._warmup:
+            return
+        from vllm.model_executor.warmup.cutedsl_warmup import (
+            register_cutedsl_warmup_provider,
+        )
+
+        register_cutedsl_warmup_provider(self)
+        self._warmup_registered = True
+
+    def get_cutedsl_warmup_compile_units(self):
+        from vllm.model_executor.warmup.cutedsl_warmup import CuTeDSLCompileUnit
+
+        return tuple(
+            CuTeDSLCompileUnit(
+                name=f"Qwen4Exp HC W8 {key[0]}",
+                key=("qwen4-exp-hc-w8", *key),
+                compile=partial(self._compile, key),
+            )
+            for key in sorted(self._warmup)
+        )
+
+    def unpack_down(self, qweight: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
+        key: _W8Key = ("unpack_down",)
+        fn = self._compiled.get(key)
+        if fn is None:
+            fn = self._compile(key)
+        n = qweight.shape[0] * 16
+        out = torch.empty((n, _HC_W8_DOWN_K), dtype=torch.bfloat16, device=qweight.device)
+        fn(qweight, scales, out, shape_dynamic_skinny_gemm._stream())
+        return out
+
+    def unpack_up_sm(self, qweight: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
+        key: _W8Key = ("unpack_up_sm",)
+        fn = self._compiled.get(key)
+        if fn is None:
+            fn = self._compile(key)
+        out = torch.empty(
+            (_HC_W8_UP_N, _HC_W8_UP_K), dtype=torch.bfloat16, device=qweight.device
+        )
+        fn(qweight, scales, out, shape_dynamic_skinny_gemm._stream())
+        return out
+
+    def down_silu(
+        self,
+        x: torch.Tensor,
+        qweight: torch.Tensor,
+        scales: torch.Tensor,
+        rank: int,
+        n_logits: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        m = x.shape[0]
+        if m <= 4:
+            key: _W8Key = ("down", 8, 5)
+        elif m <= 8:
+            key = ("down", 8, 10)
+        elif m <= 16:
+            key = ("down", 16, 5)
+        else:
+            key = ("down", 32, 5)
+        fn = self._compiled.get(key)
+        if fn is None:
+            fn = self._compile(key)
+        n = qweight.shape[0] * 16
+        part, counter = _get_hc_w8_workspace(x.device)
+        lowrank = torch.empty((m, rank), dtype=x.dtype, device=x.device)
+        down = torch.empty((m, n), dtype=x.dtype, device=x.device)
+        fn(
+            x.view(torch.int32),
+            qweight,
+            scales,
+            part,
+            counter,
+            lowrank,
+            down,
+            rank + n_logits,
+            shape_dynamic_skinny_gemm._stream(),
+        )
+        return lowrank, down
+
+    def up_gate_mix(
+        self,
+        lowrank: torch.Tensor,
+        qweight: torch.Tensor,
+        scales: torch.Tensor,
+        xn: torch.Tensor,
+    ) -> torch.Tensor:
+        m = lowrank.shape[0]
+        if m <= 4:
+            key: _W8Key = ("up", 4)
+        elif m <= 8:
+            key = ("up", 8)
+        elif m <= 16:
+            key = ("up", 16)
+        else:
+            key = ("up", 32)
+        fn = self._compiled.get(key)
+        if fn is None:
+            fn = self._compile(key)
+        out = torch.empty(
+            (m, _HC_W8_UP_N // _HC_W8_HC), dtype=lowrank.dtype, device=lowrank.device
+        )
+        fn(
+            lowrank.view(torch.int32),
+            qweight,
+            scales,
+            xn,
+            out,
+            shape_dynamic_skinny_gemm._stream(),
+        )
+        return out
+
+
+hc_small_fused_w8 = HcSmallFusedW8()
+
+
+class _HcW8DownLinearMethod(Qwen4ExpLowLatencyLinearMethod):
+    """Post-load W8 packer for ``GatedResidual`` down(+inject) projections."""
+
+    def process_weights_after_loading(self, layer: nn.Module) -> None:
+        weight = getattr(layer, "weight", None)
+        if (
+            not isinstance(weight, torch.Tensor)
+            or weight.dim() != 2
+            or not weight.is_cuda
+            or weight.dtype != torch.bfloat16
+        ):
+            return
+        from .ops.cute_dsl._hc_small_fused_w8 import quantize_pack_hc_down_w8
+
+        device, dtype = weight.device, weight.dtype
+        qweight, scales = quantize_pack_hc_down_w8(weight.detach())
+        layer.register_buffer("_hc_w8_qweight", qweight, persistent=False)
+        layer.register_buffer("_hc_w8_scales", scales, persistent=False)
+        _get_hc_w8_workspace(device)
+        del weight
+        layer.register_parameter(
+            "weight",
+            Parameter(torch.empty(0, dtype=dtype, device=device), requires_grad=False),
+        )
+
+    def apply(
+        self,
+        layer: nn.Module,
+        x: torch.Tensor,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if hasattr(layer, "_hc_w8_qweight"):
+            w_bf16 = hc_small_fused_w8.unpack_down(
+                layer._hc_w8_qweight, layer._hc_w8_scales
+            )
+            return F.linear(x, w_bf16, bias)
+        return super().apply(layer, x, bias)
+
+
+class _HcW8UpLinearMethod(Qwen4ExpLowLatencyLinearMethod):
+    """Post-load W8 packer for ``GatedResidual`` up projections."""
+
+    def process_weights_after_loading(self, layer: nn.Module) -> None:
+        weight = getattr(layer, "weight", None)
+        if (
+            not isinstance(weight, torch.Tensor)
+            or weight.dim() != 2
+            or not weight.is_cuda
+            or weight.dtype != torch.bfloat16
+        ):
+            return
+        from .ops.cute_dsl._hc_small_fused_w8 import quantize_pack_hc_up_w8
+
+        device, dtype = weight.device, weight.dtype
+        qweight, scales = quantize_pack_hc_up_w8(weight.detach(), hc=_HC_W8_HC)
+        layer.register_buffer("_hc_w8_qweight", qweight, persistent=False)
+        layer.register_buffer("_hc_w8_scales", scales, persistent=False)
+        del weight
+        layer.register_parameter(
+            "weight",
+            Parameter(torch.empty(0, dtype=dtype, device=device), requires_grad=False),
+        )
+
+    def apply(
+        self,
+        layer: nn.Module,
+        x: torch.Tensor,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if hasattr(layer, "_hc_w8_qweight"):
+            w_bf16 = hc_small_fused_w8.unpack_up_sm(
+                layer._hc_w8_qweight, layer._hc_w8_scales
+            )
+            return F.linear(x, w_bf16, bias)
+        return super().apply(layer, x, bias)
+
+
+def _qwen4_exp_hc_down_silu_w8(
+    x: torch.Tensor,
+    qweight: torch.Tensor,
+    scales: torch.Tensor,
+    rank: int,
+    n_logits: int,
+    hc: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if (
+        x.dim() == 2
+        and 1 <= x.shape[0] <= _HC_W8_MAX_M
+        and x.shape[1] == _HC_W8_DOWN_K
+        and x.dtype == torch.bfloat16
+        and x.is_cuda
+        and x.is_contiguous()
+        and (x.data_ptr() & 15) == 0
+        and rank == _HC_W8_RANK
+        and hc == _HC_W8_HC
+    ):
+        return hc_small_fused_w8.down_silu(x, qweight, scales, rank, n_logits)
+    w_bf16 = hc_small_fused_w8.unpack_down(qweight, scales)
+    out = F.linear(x, w_bf16)
+    return hc_silu(out[..., :rank], hc), out
+
+
+def _qwen4_exp_hc_down_silu_w8_fake(
+    x: torch.Tensor,
+    qweight: torch.Tensor,
+    scales: torch.Tensor,
+    rank: int,
+    n_logits: int,
+    hc: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return (
+        x.new_empty((*x.shape[:-1], rank)),
+        x.new_empty((*x.shape[:-1], qweight.shape[0] * 16)),
+    )
+
+
+def _qwen4_exp_hc_up_gate_mix_w8(
+    lowrank: torch.Tensor,
+    qweight: torch.Tensor,
+    scales: torch.Tensor,
+    xn: torch.Tensor,
+    hc: int,
+) -> torch.Tensor:
+    if (
+        lowrank.dim() == 2
+        and 1 <= lowrank.shape[0] <= _HC_W8_MAX_M
+        and lowrank.shape[1] == _HC_W8_UP_K
+        and lowrank.dtype == torch.bfloat16
+        and lowrank.is_cuda
+        and lowrank.is_contiguous()
+        and (lowrank.data_ptr() & 15) == 0
+        and xn.dim() == 2
+        and xn.shape == (lowrank.shape[0], _HC_W8_UP_N)
+        and xn.stride(1) == 1
+        and xn.dtype == torch.bfloat16
+        and xn.device == lowrank.device
+        and hc == _HC_W8_HC
+    ):
+        return hc_small_fused_w8.up_gate_mix(lowrank, qweight, scales, xn)
+    w_bf16 = hc_small_fused_w8.unpack_up_sm(qweight, scales)
+    return hc_gate_mix(xn, F.linear(lowrank, w_bf16), hc)
+
+
+def _qwen4_exp_hc_up_gate_mix_w8_fake(
+    lowrank: torch.Tensor,
+    qweight: torch.Tensor,
+    scales: torch.Tensor,
+    xn: torch.Tensor,
+    hc: int,
+) -> torch.Tensor:
+    return xn.new_empty((*xn.shape[:-1], (qweight.shape[0] * 32) // hc))
+
+
+direct_register_custom_op(
+    op_name="qwen4_exp_hc_down_silu_w8",
+    op_func=_qwen4_exp_hc_down_silu_w8,
+    fake_impl=_qwen4_exp_hc_down_silu_w8_fake,
+)
+direct_register_custom_op(
+    op_name="qwen4_exp_hc_up_gate_mix_w8",
+    op_func=_qwen4_exp_hc_up_gate_mix_w8,
+    fake_impl=_qwen4_exp_hc_up_gate_mix_w8_fake,
+)
+
 def _patched(linear: nn.Module | None) -> bool:
     """The Linear already dispatches through ``qwen4_exp_low_latency_gemm``."""
     return (
@@ -554,7 +1036,11 @@ def enable_qwen4_exp_hc_small_fused(module: nn.Module, dtype: torch.dtype) -> No
     modules: a projection is fused only if it already uses the low-latency op,
     so the ops' run-time fallback equals what the module did before.
     """
-    if dtype != torch.bfloat16 or (not HC_FUSE_SWITCH and not HC_SM86_TUNE_SWITCH) or not sm86_ll_active():
+    if (
+        dtype != torch.bfloat16
+        or (not HC_FUSE_SWITCH and not HC_SM86_TUNE_SWITCH and not HC_W8_SWITCH)
+        or not sm86_ll_active()
+    ):
         return
     if not shape_dynamic_skinny_gemm.is_available():
         return
@@ -562,6 +1048,7 @@ def enable_qwen4_exp_hc_small_fused(module: nn.Module, dtype: torch.dtype) -> No
 
     warmup: set[_CompileKey] = set()
     cn_warmup: set[_CombineNormKey] = set()
+    w8_any = False
     for child in module.modules():
         if not isinstance(child, GatedResidual):
             continue
@@ -575,8 +1062,7 @@ def enable_qwen4_exp_hc_small_fused(module: nn.Module, dtype: torch.dtype) -> No
             eps = float(child.config.rms_norm_eps)
             cn_warmup.add((True, 4, 2560, eps))
             cn_warmup.add((False, 4, 2560, eps))
-        if not HC_FUSE_SWITCH:
-            continue
+
         rank, hc = child.hc_lowrank, child.hc_count
         if child.use_combine:
             down = child.input_mix_weight_down_block_inject
@@ -584,6 +1070,30 @@ def enable_qwen4_exp_hc_small_fused(module: nn.Module, dtype: torch.dtype) -> No
         else:
             down = child.input_mix_weight_down
             n_logits = 0
+        up = child.input_mix_weight_up
+
+        # Opt-in (LABELLED LOSSY, default OFF) W8 Tensor Core HC path.
+        if (
+            HC_W8_SWITCH
+            and not envs.VLLM_BATCH_INVARIANT
+            and hc == _HC_W8_HC
+            and rank == _HC_W8_RANK
+            and child.hidden_size == 2560
+            and _patched(down)
+            and _patched(up)
+            and tuple(down.weight.shape) in ((336, _HC_W8_DOWN_K), (320, _HC_W8_DOWN_K))
+            and tuple(up.weight.shape) == (_HC_W8_UP_N, _HC_W8_UP_K)
+            and rank + n_logits <= down.weight.shape[0]
+        ):
+            down.quant_method = _HcW8DownLinearMethod()
+            up.quant_method = _HcW8UpLinearMethod()
+            child._hc_w8_down = True
+            child._hc_w8_up = True
+            w8_any = True
+            continue
+
+        if not HC_FUSE_SWITCH:
+            continue
         if _patched(down):
             n, k = down.weight.shape
             plan = HC_DOWN_SILU_SM86_PLANS.get((n, k), {})
@@ -591,7 +1101,6 @@ def enable_qwen4_exp_hc_small_fused(module: nn.Module, dtype: torch.dtype) -> No
             if configs and rank + n_logits <= n:
                 child._hc_fuse_down = True
                 warmup.update((_DOWN, c, rank, hc) for c in configs)
-        up = child.input_mix_weight_up
         if _patched(up):
             n, k = up.weight.shape
             plan = HC_UP_GATE_MIX_SM86_PLANS.get((n, k), {})
@@ -606,12 +1115,16 @@ def enable_qwen4_exp_hc_small_fused(module: nn.Module, dtype: torch.dtype) -> No
     hc_small_fused.request_warmup(warmup)
     if cn_warmup:
         hc_combine_norm_cute.request_warmup(cn_warmup)
+    if w8_any:
+        hc_small_fused_w8.request_warmup()
 
 
 __all__ = [
     "HC_FUSE_SWITCH",
     "HC_SM86_TUNE_SWITCH",
+    "HC_W8_SWITCH",
     "enable_qwen4_exp_hc_small_fused",
     "hc_combine_norm_cute",
     "hc_small_fused",
+    "hc_small_fused_w8",
 ]

@@ -86,6 +86,8 @@ class GatedResidual(nn.Module):
         self._hc_fuse_down = False
         self._hc_fuse_up = False
         self._hc_fast_combine_norm = False
+        self._hc_w8_down = False
+        self._hc_w8_up = False
 
         norm_size = (
             self.hyper_hidden_size if config.hc_per_branch_norm else config.hidden_size
@@ -146,6 +148,30 @@ class GatedResidual(nn.Module):
         self, xn: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Down projection + SiLU; also returns injection logits if combined."""
+        if self._hc_w8_down and not envs.VLLM_BATCH_INVARIANT:
+            if self.use_combine:
+                down_mod = self.input_mix_weight_down_block_inject
+                lowrank, down = torch.ops.vllm.qwen4_exp_hc_down_silu_w8(
+                    xn,
+                    down_mod._hc_w8_qweight,
+                    down_mod._hc_w8_scales,
+                    self.hc_lowrank,
+                    self.hc_count,
+                    self.hc_count,
+                )
+                split_sizes = [self.hc_lowrank, self.hc_count, self.pad_size]
+                _, injection, _ = down.split(split_sizes, dim=-1)
+                return lowrank, injection
+            down_mod = self.input_mix_weight_down
+            lowrank, _ = torch.ops.vllm.qwen4_exp_hc_down_silu_w8(
+                xn,
+                down_mod._hc_w8_qweight,
+                down_mod._hc_w8_scales,
+                self.hc_lowrank,
+                0,
+                self.hc_count,
+            )
+            return lowrank, None
         if self._hc_fuse_down and not envs.VLLM_BATCH_INVARIANT:
             if self.use_combine:
                 lowrank, down = torch.ops.vllm.qwen4_exp_hc_down_silu(
@@ -184,6 +210,15 @@ class GatedResidual(nn.Module):
 
     def _up_and_gate_mix(self, xn: torch.Tensor, lowrank: torch.Tensor) -> torch.Tensor:
         """Up projection + sigmoid gate + mean over the HC streams."""
+        if self._hc_w8_up and not envs.VLLM_BATCH_INVARIANT:
+            up_mod = self.input_mix_weight_up
+            return torch.ops.vllm.qwen4_exp_hc_up_gate_mix_w8(
+                lowrank,
+                up_mod._hc_w8_qweight,
+                up_mod._hc_w8_scales,
+                xn,
+                self.hc_count,
+            )
         if self._hc_fuse_up and not envs.VLLM_BATCH_INVARIANT:
             return torch.ops.vllm.qwen4_exp_hc_up_gate_mix(
                 lowrank, self.input_mix_weight_up.weight, xn, self.hc_count
