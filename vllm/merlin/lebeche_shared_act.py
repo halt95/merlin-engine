@@ -53,11 +53,12 @@ from vllm.model_executor.kernels.linear.cute_dsl.skinny_gemm import (
 from vllm.utils.torch_utils import direct_register_custom_op
 
 SHARED_ACT_SWITCH: bool = bool(read_registered("MERLIN_LEBECHE_SHARED_ACT_FUSE"))
+SHARED_GATE_SWITCH: bool = bool(read_registered("MERLIN_LEBECHE_SHARED_GATE_FUSE"))
 _WARP = 32
 _PREFETCH_TILES = 2
 
 # Test/diagnostic counters; never read on the hot path by the engine.
-CALLS = {"fused": 0, "fallback": 0}
+CALLS = {"fused": 0, "fallback": 0, "fused_gate": 0, "fallback_gate": 0}
 
 # RTX 3090 (sm_86) plans for TP=2 shared-expert gate_up_proj (640, 2560),
 # selected by CUDA-graph replay sweeps (24 distinct weights, best of 60).
@@ -75,9 +76,26 @@ SHARED_GATE_UP_SILU_SM86_PLANS: dict[tuple[int, int], dict[int, SkinnyGemmConfig
 }
 
 
+# Virtual-thread (gate_block_size, gate_vector_width) for shared_expert_gate (1, 2560),
+# matching QWEN4_EXP_SM86_GEMM_PLANS[(1, 2560)] bit-for-bit at M = 1..4.
+SHARED_GATE_MATCH_PLANS: dict[int, tuple[int, int]] = {
+    1: (256, 2),
+    2: (320, 4),
+    3: (128, 4),
+    4: (128, 4),
+    6: (64, 8),
+    8: (64, 8),
+}
+
+
 def shared_act_active() -> bool:
     """Both switches on and the current CUDA device is sm_80/86/89."""
     return SHARED_ACT_SWITCH and SM86_LL_SWITCH and sm86_ll_active()
+
+
+def shared_gate_active() -> bool:
+    """Shared gate+act fusion switches on and the current CUDA device is sm_80/86/89."""
+    return SHARED_GATE_SWITCH and shared_act_active()
 
 
 def _is_packed_row_major(tensor: torch.Tensor) -> bool:
@@ -146,12 +164,57 @@ def _build_cute_kernel(config: SkinnyGemmConfig):
     )
 
 
+def _build_cute_gate_kernel(
+    config: SkinnyGemmConfig, gate_block_size: int, gate_vector_width: int
+):
+    import cutlass.cute as cute
+    from cutlass import BFloat16
+    from quack.compile_utils import make_fake_tensor
+
+    from vllm.merlin._lebeche_shared_act_cute import CuteSharedGateUpSiluGate
+
+    assert config.static_k is not None
+    m = config.num_rows
+    n = cute.sym_int(divisibility=config.outputs_per_block)
+    k = config.static_k
+    a_div = max(config.vector_width, gate_vector_width)
+    a = make_fake_tensor(BFloat16, (m, k), divisibility=a_div)
+    b = make_fake_tensor(BFloat16, (n, k), divisibility=config.vector_width)
+    gw = make_fake_tensor(BFloat16, (1, k), divisibility=gate_vector_width)
+    c = make_fake_tensor(BFloat16, (m, cute.sym_int()), divisibility=1)
+    go = make_fake_tensor(BFloat16, (m, 1), divisibility=1)
+    kern = CuteSharedGateUpSiluGate(
+        element_type=BFloat16,
+        num_rows=m,
+        block_size=config.block_size,
+        outputs_per_block=config.outputs_per_block,
+        vector_width=config.vector_width,
+        k_unroll=config.k_unroll,
+        use_pdl=shape_dynamic_skinny_gemm._use_pdl(),
+        static_k=k,
+        gate_block_size=gate_block_size,
+        gate_vector_width=gate_vector_width,
+    )
+    return cute.compile(
+        kern,
+        a,
+        b,
+        gw,
+        c,
+        go,
+        shape_dynamic_skinny_gemm._stream(),
+        options="--enable-tvm-ffi --ptxas-options -maxrregcount=64",
+    )
+
+
 class SharedActFused:
     """Compile cache and CuTe-DSL warmup provider for fused shared-expert gate_up+SiLU."""
 
     def __init__(self) -> None:
         self._compiled: dict[SkinnyGemmConfig, Any] = {}
         self._warmup: set[SkinnyGemmConfig] = set()
+        self._compiled_gate: dict[tuple[SkinnyGemmConfig, int, int], Any] = {}
+        self._warmup_gate: set[tuple[SkinnyGemmConfig, int, int]] = set()
         self._warmup_registered = False
 
     def _compile(self, config: SkinnyGemmConfig) -> None:
@@ -159,9 +222,16 @@ class SharedActFused:
             return
         self._compiled[config] = _build_cute_kernel(config)
 
-    def request_warmup(self, configs: Iterable[SkinnyGemmConfig]) -> None:
-        self._warmup.update(configs)
-        if self._warmup_registered or not self._warmup:
+    def _compile_gate(
+        self, key: tuple[SkinnyGemmConfig, int, int]
+    ) -> None:
+        if key in self._compiled_gate:
+            return
+        cfg, gbs, gvw = key
+        self._compiled_gate[key] = _build_cute_gate_kernel(cfg, gbs, gvw)
+
+    def _ensure_warmup_registered(self) -> None:
+        if self._warmup_registered or (not self._warmup and not self._warmup_gate):
             return
         from vllm.model_executor.warmup.cutedsl_warmup import (
             register_cutedsl_warmup_provider,
@@ -170,27 +240,48 @@ class SharedActFused:
         register_cutedsl_warmup_provider(self)
         self._warmup_registered = True
 
+    def request_warmup(self, configs: Iterable[SkinnyGemmConfig]) -> None:
+        self._warmup.update(configs)
+        self._ensure_warmup_registered()
+
+    def request_gate_warmup(
+        self, items: Iterable[tuple[SkinnyGemmConfig, int, int]]
+    ) -> None:
+        self._warmup_gate.update(items)
+        self._ensure_warmup_registered()
+
     def get_cutedsl_warmup_compile_units(self):
         from vllm.model_executor.warmup.cutedsl_warmup import CuTeDSLCompileUnit
 
-        return tuple(
+        def _cfg_key(c: SkinnyGemmConfig):
+            return (
+                c.num_rows,
+                c.block_size,
+                c.outputs_per_block,
+                c.vector_width,
+                c.k_unroll,
+                c.static_k or 0,
+            )
+
+        units = [
             CuTeDSLCompileUnit(
                 name=f"Lebeche shared-expert fused gate_up+SiLU M={cfg.num_rows}",
                 key=("lebeche-shared-gate-up-silu", cfg),
                 compile=partial(self._compile, cfg),
             )
-            for cfg in sorted(
-                self._warmup,
-                key=lambda c: (
-                    c.num_rows,
-                    c.block_size,
-                    c.outputs_per_block,
-                    c.vector_width,
-                    c.k_unroll,
-                    c.static_k or 0,
-                ),
+            for cfg in sorted(self._warmup, key=_cfg_key)
+        ]
+        units.extend(
+            CuTeDSLCompileUnit(
+                name=f"Lebeche shared-expert fused gate_up+SiLU+gate M={item[0].num_rows}",
+                key=("lebeche-shared-gate-up-silu-gate", *item),
+                compile=partial(self._compile_gate, item),
+            )
+            for item in sorted(
+                self._warmup_gate, key=lambda it: (_cfg_key(it[0]), it[1], it[2])
             )
         )
+        return tuple(units)
 
     def gate_up_silu(
         self,
@@ -205,6 +296,27 @@ class SharedActFused:
         )
         self._compiled[config](x, weight, out, shape_dynamic_skinny_gemm._stream())
         return out
+
+    def gate_up_silu_gate(
+        self,
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        gate_weight: torch.Tensor,
+        config: SkinnyGemmConfig,
+        gate_block_size: int,
+        gate_vector_width: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        key = (config, gate_block_size, gate_vector_width)
+        if key not in self._compiled_gate:
+            self._compile_gate(key)
+        out = torch.empty(
+            (x.shape[0], weight.shape[0] // 2), dtype=x.dtype, device=x.device
+        )
+        gate_out = torch.empty((x.shape[0], 1), dtype=x.dtype, device=x.device)
+        self._compiled_gate[key](
+            x, weight, gate_weight, out, gate_out, shape_dynamic_skinny_gemm._stream()
+        )
+        return out, gate_out
 
 
 shared_act_fused = SharedActFused()
@@ -256,6 +368,73 @@ direct_register_custom_op(
 )
 
 
+def _gate_runtime_ok(
+    x: torch.Tensor,
+    gate_weight: torch.Tensor,
+    config: SkinnyGemmConfig,
+    gate_block_size: int,
+    gate_vector_width: int,
+) -> bool:
+    a_div = max(config.vector_width, gate_vector_width)
+    return (
+        config.static_k is not None
+        and config.static_k == x.shape[1]
+        and config.static_k % (gate_block_size * gate_vector_width) == 0
+        and x.stride(1) == 1
+        and (x.shape[0] == 1 or x.stride(0) % a_div == 0)
+        and _is_packed_row_major(gate_weight)
+        and gate_weight.shape == (1, x.shape[1])
+        and gate_weight.dtype == torch.bfloat16
+        and gate_weight.is_cuda
+        and gate_weight.device == x.device
+    )
+
+
+def _lebeche_shared_gate_up_silu_gate(
+    x: torch.Tensor, weight: torch.Tensor, gate_weight: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fused shared-expert ``gate_up+SiLU`` and ``shared_expert_gate`` with runtime M dispatch."""
+    if shared_gate_active() and shape_dynamic_skinny_gemm.is_available():
+        plan = SHARED_GATE_UP_SILU_SM86_PLANS.get((weight.shape[0], weight.shape[1]))
+        config = None if plan is None else plan.get(x.shape[0])
+        gmatch = SHARED_GATE_MATCH_PLANS.get(x.shape[0])
+        if (
+            config is not None
+            and gmatch is not None
+            and _runtime_ok(x, weight, config)
+            and _config_fits(config, weight.shape[0], weight.shape[1])
+            and _gate_runtime_ok(x, gate_weight, config, gmatch[0], gmatch[1])
+        ):
+            CALLS["fused_gate"] += 1
+            return shared_act_fused.gate_up_silu_gate(
+                x, weight, gate_weight, config, gmatch[0], gmatch[1]
+            )
+    CALLS["fallback_gate"] += 1
+    from vllm.models.qwen4_exp.nvidia.low_latency_gemm import (
+        _qwen4_exp_low_latency_gemm,
+    )
+
+    out = _lebeche_shared_gate_up_silu(x, weight)
+    gate = _qwen4_exp_low_latency_gemm(x, gate_weight)
+    return out, gate
+
+
+def _lebeche_shared_gate_up_silu_gate_fake(
+    x: torch.Tensor, weight: torch.Tensor, gate_weight: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return (
+        x.new_empty((*x.shape[:-1], weight.shape[0] // 2)),
+        x.new_empty((*x.shape[:-1], gate_weight.shape[0])),
+    )
+
+
+direct_register_custom_op(
+    op_name="lebeche_shared_gate_up_silu_gate",
+    op_func=_lebeche_shared_gate_up_silu_gate,
+    fake_impl=_lebeche_shared_gate_up_silu_gate_fake,
+)
+
+
 def maybe_register_mlp(mlp: nn.Module) -> bool:
     """Check static eligibility of a ``Qwen2MoeMLP`` and register warmup configs."""
     if not shared_act_active():
@@ -301,11 +480,83 @@ def maybe_register_mlp(mlp: nn.Module) -> bool:
     return True
 
 
+def maybe_register_mlp_with_gate(mlp: nn.Module) -> bool:
+    """Check static eligibility of a ``Qwen2MoeMLP`` with ``expert_gate`` and register warmup."""
+    if not shared_gate_active():
+        return False
+    if not shape_dynamic_skinny_gemm.is_available():
+        return False
+    from vllm.model_executor.layers.activation import SiluAndMul
+    from vllm.model_executor.layers.linear import (
+        MergedColumnParallelLinear,
+        ReplicatedLinear,
+        UnquantizedLinearMethod,
+    )
+
+    gate_up = getattr(mlp, "gate_up_proj", None)
+    act_fn = getattr(mlp, "act_fn", None)
+    expert_gate = getattr(mlp, "expert_gate", None)
+    if not isinstance(gate_up, MergedColumnParallelLinear):
+        return False
+    if not isinstance(act_fn, SiluAndMul):
+        return False
+    if not isinstance(expert_gate, ReplicatedLinear):
+        return False
+    if not isinstance(getattr(gate_up, "quant_method", None), UnquantizedLinearMethod):
+        return False
+    if not isinstance(
+        getattr(expert_gate, "quant_method", None), UnquantizedLinearMethod
+    ):
+        return False
+    if getattr(gate_up, "bias", None) is not None:
+        return False
+    if getattr(expert_gate, "bias", None) is not None:
+        return False
+    if getattr(gate_up, "gather_output", False):
+        return False
+    output_sizes = getattr(gate_up, "output_sizes", None)
+    if not output_sizes or len(output_sizes) != 2 or output_sizes[0] != output_sizes[1]:
+        return False
+    weight = getattr(gate_up, "weight", None)
+    gweight = getattr(expert_gate, "weight", None)
+    if weight is None or weight.dim() != 2 or weight.dtype != torch.bfloat16:
+        return False
+    if gweight is None or gweight.dim() != 2 or gweight.dtype != torch.bfloat16:
+        return False
+    n, k = int(weight.shape[0]), int(weight.shape[1])
+    if int(gweight.shape[0]) != 1 or int(gweight.shape[1]) != k:
+        return False
+    plan = SHARED_GATE_UP_SILU_SM86_PLANS.get((n, k))
+    if not plan:
+        return False
+    items: list[tuple[SkinnyGemmConfig, int, int]] = []
+    for m_val, c in plan.items():
+        gmatch = SHARED_GATE_MATCH_PLANS.get(m_val)
+        if (
+            gmatch is not None
+            and c.static_k == k
+            and _config_fits(c, n, k)
+            and k % (gmatch[0] * gmatch[1]) == 0
+        ):
+            items.append((c, gmatch[0], gmatch[1]))
+    if not items:
+        return False
+    global _FALLBACK_ACT
+    if _FALLBACK_ACT is None:
+        _FALLBACK_ACT = act_fn
+    shared_act_fused.request_gate_warmup(items)
+    return True
+
+
 __all__ = [
     "CALLS",
     "SHARED_ACT_SWITCH",
+    "SHARED_GATE_MATCH_PLANS",
+    "SHARED_GATE_SWITCH",
     "SHARED_GATE_UP_SILU_SM86_PLANS",
     "maybe_register_mlp",
+    "maybe_register_mlp_with_gate",
     "shared_act_active",
+    "shared_gate_active",
     "shared_act_fused",
 ]

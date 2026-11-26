@@ -112,13 +112,33 @@ class Qwen2MoeMLP(nn.Module):
             )
         self.act_fn = SiluAndMul()
         self.expert_gate = expert_gate
-        self._lebeche_shared_act = (
-            lebeche_shared_act.maybe_register_mlp(self)
-            if lebeche_shared_act.SHARED_ACT_SWITCH
+        self._lebeche_shared_act_gate = (
+            lebeche_shared_act.maybe_register_mlp_with_gate(self)
+            if lebeche_shared_act.SHARED_GATE_SWITCH
             else False
+        )
+        self._lebeche_shared_act = (
+            False
+            if self._lebeche_shared_act_gate
+            else (
+                lebeche_shared_act.maybe_register_mlp(self)
+                if lebeche_shared_act.SHARED_ACT_SWITCH
+                else False
+            )
         )
 
     def forward(self, x):
+        if self._lebeche_shared_act_gate:
+            out, gate = torch.ops.vllm.lebeche_shared_gate_up_silu_gate(
+                x, self.gate_up_proj.weight, self.expert_gate.weight
+            )
+            out, _ = self.down_proj(out)
+            if lebeche_moe_glue.GLUE_SWITCH and lebeche_moe_glue.defer_shared_gate(
+                out, gate
+            ):
+                return out
+            return F.sigmoid(gate) * out
+
         if self._lebeche_shared_act:
             out = torch.ops.vllm.lebeche_shared_gate_up_silu(
                 x, self.gate_up_proj.weight
