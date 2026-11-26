@@ -74,7 +74,18 @@ from vllm.v1.kv_cache_interface import (
 from ..common.qsa_cache import QSAForwardMetadata
 from .indexer_qsa import QSAIndexer
 from .mtp_kv_scales import qsa_kv_scale_entries
+from vllm.merlin.envs import read_registered
+
 from .ops.qsa import qsa_e4m3_uses_native_cast
+
+QSA_FUSE_PREPARE_SWITCH: bool = bool(read_registered("MERLIN_LEBECHE_QSA_FUSE_PREPARE"))
+
+
+def _qsa_sm86_fused_prepare_ok() -> bool:
+    if not QSA_FUSE_PREPARE_SWITCH or not current_platform.is_cuda():
+        return False
+    cap = current_platform.get_device_capability()
+    return cap is not None and cap.to_int() in (80, 86)
 
 logger = init_logger(__name__)
 
@@ -717,10 +728,14 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         self.use_fused_qsa_prepare = (
             self.use_fused_qk_norm_rope_gate
             and self.indexer.use_fused_pre_indexer
-            # The fused writer takes an FP8 cache
-            # only with a native E4M3 cast (Triton cannot lower an fp8 pointer
-            # below sm_89) and no clip interval.
-            and (not fp8_layer or qsa_e4m3_uses_native_cast())
+            # The fused writer takes an FP8 cache natively on sm_89+ or via the
+            # bit-exact software E4M3FN byte encoder on sm_80/86 (lebeche fork),
+            # with no clip interval.
+            and (
+                not fp8_layer
+                or qsa_e4m3_uses_native_cast()
+                or _qsa_sm86_fused_prepare_ok()
+            )
             and not (fp8_layer and _qsa_clip_interval > 0.0)
         )
         self.fuse_indexer_projection = vllm_config.lora_config is None

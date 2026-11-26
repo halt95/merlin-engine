@@ -106,6 +106,7 @@ FN_LEBECHE_GDN_FUSE = "MERLIN_LEBECHE_GDN_FUSE"  # lebeche fork: small-batch GDN
 FN_LEBECHE_SM86_LL = "MERLIN_LEBECHE_SM86_LL"  # lebeche fork: sm_8x skinny-GEMM plans, 1 (engine default) / 0 = stock (vllm/merlin/lebeche_sm86.py)
 FN_LEBECHE_W8_SMALL_M = "MERLIN_LEBECHE_W8_SMALL_M"  # lebeche fork: sm_8x small-M W8 channelwise GEMM, 1 (engine default) / 0 = stock Marlin (vllm/merlin/lebeche_w8_gemm.py)
 FN_LEBECHE_SM86_LL_EXTRA = "MERLIN_LEBECHE_SM86_LL_EXTRA"  # lebeche fork: extra sm_8x skinny-GEMM coverage (3D fc_hidden, PLE kv_proj), 1 (engine default) / 0 = fbc1a32
+FN_LEBECHE_QSA_FUSE_PREPARE = "MERLIN_LEBECHE_QSA_FUSE_PREPARE"  # lebeche fork: sm_80/86 fused QSA prepare with bit-exact software E4M3FN write, 1 (engine default) / 0 = fbc1a32
 FN_LPT_DEFAULT = "512"  # Flash-Next --long-prefill-token-threshold default; LPT=0 = off
 # Flash-Next prefill runs (vllm/merlin/prefill_runs.py), on by default; PREFILL_RUNS=0 = off. The decode share and the
 # per-step cost constants were measured on fn-quad-3090 (A/B runs, 2026-11-11); the other rows use the same values, except
@@ -1855,6 +1856,12 @@ def _build_flash_next(reg, p, checkpoint, ckpt, env, extra, repo: Path) -> Plan:
         raise LaunchError(f"{FN_LEBECHE_SM86_LL_EXTRA}={sm86_ll_extra!r}: use 1 (on, the default) or 0 (fbc1a32)", 2)
     if sm86_ll_extra:
         env[FN_LEBECHE_SM86_LL_EXTRA] = sm86_ll_extra
+    # Same rule for the sm_80/86 fused QSA prepare switch (default on).
+    qsa_fuse_prepare = (environ_in.get(FN_LEBECHE_QSA_FUSE_PREPARE) or "").strip()
+    if qsa_fuse_prepare not in ("", "0", "1"):
+        raise LaunchError(f"{FN_LEBECHE_QSA_FUSE_PREPARE}={qsa_fuse_prepare!r}: use 1 (on, the default) or 0 (fbc1a32)", 2)
+    if qsa_fuse_prepare:
+        env[FN_LEBECHE_QSA_FUSE_PREPARE] = qsa_fuse_prepare
     # The dense Marlin config is forwarded only when a table is given.
     dense_cfg = (environ_in.get("MERLIN_MARLIN_DENSE_CFG") or "").strip()
     if dense_cfg:
