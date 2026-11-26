@@ -568,6 +568,11 @@ if TYPE_CHECKING:
     # it replaces torch.zeros with torch.empty in forward_cuda and changes
     # the captured kernels.
     MERLIN_LEBECHE_GDN_FUSE: bool = True
+    # lebeche fork: 1 (default) = extra sm_8x skinny-GEMM coverage: 3D input
+    # support for MTP fc_hidden and PLE kv_proj (12800, 2560) + M=8 MTP fc plan
+    # (vllm/models/qwen4_exp/nvidia/low_latency_gemm.py); 0 = fbc1a32.
+    # Needs MERLIN_LEBECHE_SM86_LL on an sm_80/86/89 device. Hashed.
+    MERLIN_LEBECHE_SM86_LL_EXTRA: bool = True
     # 1 = fused FWHT/FP8 kernel (bitwise) and
     # tile-skipping IndexPool scoring, stable expansion and RoPE.
     MERLIN_HY4_INDEXER_FAST: str | None = None
@@ -1183,6 +1188,7 @@ MERLIN_ENV: dict[str, Callable[[], Any]] = {
     "MERLIN_LEBECHE_MOE_ROUTE_FUSE": lambda: _e2_strict_switch("MERLIN_LEBECHE_MOE_ROUTE_FUSE", True),
     "MERLIN_LEBECHE_W8_SMALL_M": lambda: _e2_strict_switch("MERLIN_LEBECHE_W8_SMALL_M", True),
     "MERLIN_LEBECHE_GDN_FUSE": lambda: _e2_strict_switch("MERLIN_LEBECHE_GDN_FUSE", True),
+    "MERLIN_LEBECHE_SM86_LL_EXTRA": lambda: _e2_strict_switch("MERLIN_LEBECHE_SM86_LL_EXTRA", True),
 
     "MERLIN_HY4_INDEXER_FAST": lambda: os.getenv("MERLIN_HY4_INDEXER_FAST", None),
     "MERLIN_HY4_INDEXER_FAST2": lambda: os.getenv("MERLIN_HY4_INDEXER_FAST2", None),

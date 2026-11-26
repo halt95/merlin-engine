@@ -21,7 +21,11 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     UnquantizedEmbeddingMethod,
 )
-from vllm.merlin.lebeche_sm86 import SM86_LL_CAPABILITIES, SM86_LL_SWITCH
+from vllm.merlin.lebeche_sm86 import (
+    SM86_LL_CAPABILITIES,
+    SM86_LL_EXTRA_SWITCH,
+    SM86_LL_SWITCH,
+)
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import direct_register_custom_op
 
@@ -401,6 +405,20 @@ QWEN4_EXP_SM86_GEMM_PLANS: dict[tuple[int, int], dict[int, SkinnyGemmConfig]] = 
     },
 }
 
+# lebeche fork (MERLIN_LEBECHE_SM86_LL_EXTRA): remaining decode BF16 fallback
+# shapes on RTX 3090 (PLE kv_proj and c=2 MTP fc_hidden at M_flat=8).
+if SM86_LL_EXTRA_SWITCH:
+    QWEN4_EXP_SM86_GEMM_PLANS[(1280, 2560)][8] = SkinnyGemmConfig(
+        8, 32, 2, static_k=2560
+    )  # 14.65 -> 12.33 us
+    # PLE fused key/value projection (replicated, layer 2).
+    QWEN4_EXP_SM86_GEMM_PLANS[(12800, 2560)] = {
+        1: SkinnyGemmConfig(1, 64, 1, k_unroll=2),  # 85.56 -> 75.64 us
+        2: SkinnyGemmConfig(2, 64, 1, k_unroll=2),  # 79.64 -> 75.66 us
+        3: SkinnyGemmConfig(3, 64, 1, k_unroll=2),  # 80.28 -> 75.95 us
+        4: SkinnyGemmConfig(4, 64, 1, k_unroll=2),  # 80.66 -> 76.29 us
+    }
+
 
 QWEN4_EXP_GEMM_PLANS_BY_CAPABILITY: dict[
     tuple[int, int] | None, dict[tuple[int, int], dict[int, SkinnyGemmConfig]]
@@ -464,13 +482,27 @@ def _qwen4_exp_low_latency_gemm(x: torch.Tensor, weight: torch.Tensor) -> torch.
         current_platform.get_device_capability(), {}
     )
     plan = plans.get((weight.shape[0], weight.shape[1]))
-    config = None if plan is None else plan.get(x.shape[0])
-    if (
-        config is not None
-        and _runtime_ok(x, weight, config)
-        and shape_dynamic_skinny_gemm.is_available()
-    ):
-        return shape_dynamic_skinny_gemm(x, weight, config)
+    if plan is not None:
+        if x.dim() == 2:
+            config = plan.get(x.shape[0])
+            if (
+                config is not None
+                and _runtime_ok(x, weight, config)
+                and shape_dynamic_skinny_gemm.is_available()
+            ):
+                return shape_dynamic_skinny_gemm(x, weight, config)
+        elif SM86_LL_EXTRA_SWITCH and x.dim() > 2 and x.is_contiguous():
+            # MTP fc_hidden passes a contiguous 3D tensor [T, hc_count, H].
+            x_2d = x.view(-1, x.shape[-1])
+            config = plan.get(x_2d.shape[0])
+            if (
+                config is not None
+                and _runtime_ok(x_2d, weight, config)
+                and shape_dynamic_skinny_gemm.is_available()
+            ):
+                return shape_dynamic_skinny_gemm(x_2d, weight, config).view(
+                    *x.shape[:-1], weight.shape[0]
+                )
     return torch.nn.functional.linear(x, weight)
 
 

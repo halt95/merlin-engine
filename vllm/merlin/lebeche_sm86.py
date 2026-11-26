@@ -32,6 +32,7 @@ from vllm.merlin.envs import read_registered
 
 SM86_LL_CAPABILITIES: frozenset[tuple[int, int]] = frozenset({(8, 0), (8, 6), (8, 9)})
 SM86_LL_SWITCH: bool = bool(read_registered("MERLIN_LEBECHE_SM86_LL"))
+SM86_LL_EXTRA_SWITCH: bool = bool(read_registered("MERLIN_LEBECHE_SM86_LL_EXTRA"))
 _active: bool | None = None
 
 
