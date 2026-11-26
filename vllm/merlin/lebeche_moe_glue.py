@@ -97,6 +97,9 @@ GLUE_SWITCH: bool = MOE_GLUE_SWITCH and SM86_LL_SWITCH and libdevice is not None
 MOE_ROUTE_FUSE_SWITCH: bool = bool(read_registered("MERLIN_LEBECHE_MOE_ROUTE_FUSE"))
 # Single-CTA CuTe-DSL fused route+align and hardware-PTX post combine.
 ROUTE_FUSE_SWITCH: bool = MOE_ROUTE_FUSE_SWITCH and GLUE_SWITCH
+FUSED_ROUTER_ENV: bool = bool(read_registered("MERLIN_LEBECHE_FUSED_ROUTER"))
+# Cooperative single-launch router GEMM (512, 2560) + softmax + top-k + align.
+FUSED_ROUTER_SWITCH: bool = FUSED_ROUTER_ENV and ROUTE_FUSE_SWITCH
 
 MAX_M = 8  # one block of 8 per expert holds at most MAX_M entries
 BLOCK_SIZE_M = 8  # the Marlin MoE block size fused_marlin_moe picks for M <= 8
@@ -121,7 +124,7 @@ SIG_PRECOMPUTED = 0  # gate tensor already holds sigmoid(gate)
 POST_SIG_MODE = SIG_SINGLE
 
 # Kernel launch counters (tests assert on them); never read by the engine.
-CALLS = {"route_align": 0, "route_align_cute": 0, "post": 0, "post_opt": 0, "take_align": 0}
+CALLS = {"route_align": 0, "route_align_cute": 0, "fused_router": 0, "post": 0, "post_opt": 0, "take_align": 0}
 
 
 def glue_active() -> bool:
@@ -132,6 +135,11 @@ def glue_active() -> bool:
 def route_fuse_active() -> bool:
     """Fused single-CTA route+align and hardware-PTX post combine active on sm_8x."""
     return ROUTE_FUSE_SWITCH and sm86_ll_active()
+
+
+def fused_router_active() -> bool:
+    """Cooperative fused router GEMM + route + align active on sm_8x."""
+    return FUSED_ROUTER_SWITCH and sm86_ll_active()
 
 
 # --------------------------------------------------------------------- kernels
@@ -593,6 +601,227 @@ def maybe_register_route_warmup(num_experts: int, top_k: int) -> None:
     route_align_fused.request_warmup(keys)
 
 
+# (group_bs, groups_per_cta, opb_per_group, vector_width) per M for (512, 2560).
+# M = 1..4 match (block_size, vector_width) of QWEN4_EXP_SM86_GEMM_PLANS[(512, 2560)]
+# so logits and routing outputs are 100% bit-identical to commit f332186.
+FUSED_ROUTER_HIDDEN = 2560
+FUSED_ROUTER_SM86_PLANS: dict[int, tuple[int, int, int, int]] = {
+    1: (32, 4, 1, 2),    # grid=128, 128t, exact bs=32 vw=2
+    2: (160, 1, 2, 8),   # grid=256, 160t, exact bs=160 vw=8
+    3: (128, 1, 1, 4),   # grid=512, 128t, exact bs=128 vw=4
+    4: (64, 2, 1, 4),    # grid=256, 128t, exact bs=64 vw=4
+    6: (64, 4, 2, 8),    # grid=64,  256t, vw=8 (exact FP32 vs cuBLAS)
+    8: (64, 4, 2, 8),    # grid=64,  256t, vw=8 (exact FP32 + exact 1-CTA align)
+}
+
+# (num_rows, top_k, num_experts, hidden_size, block_size_m)
+_FusedRouterKey = tuple[int, int, int, int, int]
+
+
+class _FusedRouterRouteAlign:
+    """Compile cache, persistent scratch and cutedsl_warmup provider for CuteFusedRouterRouteAlign."""
+
+    def __init__(self) -> None:
+        self._compiled: dict[_FusedRouterKey, Any] = {}
+        self._warmup: set[_FusedRouterKey] = set()
+        self._warmup_registered = False
+        # Per-device (logits [MAX_M, NUM_EXPERTS] bf16, ctr [1] int32 zero-init).
+        self._scratch: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+
+    def _get_scratch(self, dev: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
+        idx = dev.index if dev.index is not None else torch.cuda.current_device()
+        pair = self._scratch.get(idx)
+        if pair is None:
+            logits_buf = torch.empty((MAX_M, NUM_EXPERTS), dtype=torch.bfloat16, device=dev)
+            ctr_buf = torch.zeros((1,), dtype=torch.int32, device=dev)
+            pair = (logits_buf, ctr_buf)
+            self._scratch[idx] = pair
+        return pair
+
+    def _compile(self, key: _FusedRouterKey) -> None:
+        if key in self._compiled:
+            return
+        import cutlass.cute as cute
+        from cutlass import BFloat16, Float32, Int32, Uint8
+        from quack.compile_utils import make_fake_tensor
+
+        from vllm.merlin._lebeche_fused_router_cute import CuteFusedRouterRouteAlign
+        from vllm.model_executor.kernels.linear.cute_dsl.skinny_gemm import (
+            shape_dynamic_skinny_gemm,
+        )
+
+        m, top_k, e, k_dim, bs = key
+        gbs, gpc, opbg, vw = FUSED_ROUTER_SM86_PLANS[m]
+        ga = make_fake_tensor(BFloat16, (m, k_dim), divisibility=vw)
+        gwm = make_fake_tensor(BFloat16, (e, k_dim), divisibility=vw)
+        gl = make_fake_tensor(BFloat16, (m, e), divisibility=8)
+        gctr = make_fake_tensor(Int32, (1,), divisibility=1)
+        gp = make_fake_tensor(Uint8, (cute.sym_int(),), divisibility=1)
+        gm = make_fake_tensor(Int32, (cute.sym_int(),), divisibility=1)
+        gw = make_fake_tensor(Float32, (m, top_k), divisibility=1)
+        gi = make_fake_tensor(Int32, (m, top_k), divisibility=1)
+        gs = make_fake_tensor(Int32, (m * top_k * bs,), divisibility=4)
+        ge = make_fake_tensor(Int32, (m * top_k,), divisibility=1)
+        gn = make_fake_tensor(Int32, (1,), divisibility=1)
+        kern = CuteFusedRouterRouteAlign(
+            num_rows=m,
+            group_bs=gbs,
+            groups_per_cta=gpc,
+            opb_per_group=opbg,
+            vector_width=vw,
+            top_k=top_k,
+            num_experts=e,
+            block_size_m=bs,
+            static_k=k_dim,
+        )
+        self._compiled[key] = cute.compile(
+            kern,
+            ga,
+            gwm,
+            gl,
+            gctr,
+            gp,
+            gm,
+            gw,
+            gi,
+            gs,
+            ge,
+            gn,
+            Int32(0),
+            Int32(1),
+            Int32(1),
+            shape_dynamic_skinny_gemm._stream(),
+            options="--enable-tvm-ffi",
+        )
+
+    def request_warmup(self, keys: Iterable[_FusedRouterKey]) -> None:
+        self._warmup.update(keys)
+        if self._warmup_registered or not self._warmup:
+            return
+        from vllm.model_executor.warmup.cutedsl_warmup import (
+            register_cutedsl_warmup_provider,
+        )
+
+        register_cutedsl_warmup_provider(self)
+        self._warmup_registered = True
+
+    def get_cutedsl_warmup_compile_units(self):
+        from vllm.model_executor.warmup.cutedsl_warmup import CuTeDSLCompileUnit
+
+        return tuple(
+            CuTeDSLCompileUnit(
+                name=f"Lebeche MoE fused router+route+align M={k[0]} E={k[2]} K={k[1]}",
+                key=("lebeche-moe-fused-router", *k),
+                compile=partial(self._compile, k),
+            )
+            for k in sorted(self._warmup)
+        )
+
+    def run(
+        self,
+        hidden_states: torch.Tensor,
+        gate_weight: torch.Tensor,
+        expert_map: torch.Tensor | None,
+        is_padding: torch.Tensor | None,
+        top_k: int,
+        renormalize: bool,
+        w: torch.Tensor,
+        ids: torch.Tensor,
+        sorted_ids: torch.Tensor,
+        eids: torch.Tensor,
+        npost: torch.Tensor,
+    ) -> None:
+        from vllm.model_executor.kernels.linear.cute_dsl.skinny_gemm import (
+            shape_dynamic_skinny_gemm,
+        )
+
+        m, k_dim = hidden_states.shape
+        e = gate_weight.shape[0]
+        key: _FusedRouterKey = (m, top_k, e, k_dim, BLOCK_SIZE_M)
+        if key not in self._compiled:
+            self._compile(key)
+        logits_buf, ctr_buf = self._get_scratch(hidden_states.device)
+        pad_t = is_padding.view(torch.uint8) if is_padding is not None else npost.view(torch.uint8)
+        map_t = expert_map if expert_map is not None else eids
+        self._compiled[key](
+            hidden_states,
+            gate_weight,
+            logits_buf[:m],
+            ctr_buf,
+            pad_t,
+            map_t,
+            w,
+            ids,
+            sorted_ids,
+            eids,
+            npost,
+            1 if is_padding is not None else 0,
+            1 if expert_map is not None else 0,
+            1 if renormalize else 0,
+            shape_dynamic_skinny_gemm._stream(),
+        )
+
+
+fused_router_align = _FusedRouterRouteAlign()
+
+
+def _gate_eligible(gate: Any) -> bool:
+    from vllm.model_executor.layers.linear import (
+        ReplicatedLinear,
+        UnquantizedLinearMethod,
+    )
+
+    if not isinstance(gate, ReplicatedLinear):
+        return False
+    if not isinstance(getattr(gate, "quant_method", None), UnquantizedLinearMethod):
+        return False
+    if getattr(gate, "bias", None) is not None:
+        return False
+    if getattr(gate, "out_dtype", None) not in (None, torch.bfloat16):
+        return False
+    weight = getattr(gate, "weight", None)
+    if (
+        weight is None
+        or weight.dim() != 2
+        or weight.shape != (NUM_EXPERTS, FUSED_ROUTER_HIDDEN)
+        or weight.dtype != torch.bfloat16
+    ):
+        return False
+    return True
+
+
+def maybe_register_fused_router_warmup(
+    gate: Any, num_experts: int, top_k: int
+) -> None:
+    """Register M in FUSED_ROUTER_SM86_PLANS compile units for cutedsl_warmup."""
+    if not fused_router_active():
+        return
+    if num_experts != NUM_EXPERTS or not (1 <= top_k <= MAX_TOPK):
+        return
+    if not _gate_eligible(gate):
+        return
+    from vllm.model_executor.kernels.linear.cute_dsl.skinny_gemm import (
+        shape_dynamic_skinny_gemm,
+    )
+
+    if not shape_dynamic_skinny_gemm.is_available():
+        return
+    keys = [
+        (m, top_k, num_experts, FUSED_ROUTER_HIDDEN, BLOCK_SIZE_M)
+        for m in FUSED_ROUTER_SM86_PLANS
+    ]
+    fused_router_align.request_warmup(keys)
+    # Pre-allocate tiny per-device scratch before any CUDA graph capture.
+    if torch.cuda.is_initialized():
+        weight = getattr(gate, "weight", None)
+        dev = (
+            weight.device
+            if isinstance(weight, torch.Tensor) and weight.is_cuda
+            else torch.device("cuda", torch.cuda.current_device())
+        )
+        fused_router_align._get_scratch(dev)
+
+
 # -------------------------------------------------------------------- wrappers
 def _pow2(n: int) -> int:
     return 1 << max(n - 1, 0).bit_length()
@@ -843,6 +1072,124 @@ def route(
         runner.routed_experts.expert_map,
         quant_method.topk_indices_dtype,
     )
+
+
+def fused_router_route_align(
+    hidden_states: torch.Tensor,
+    gate_weight: torch.Tensor,
+    expert_map: torch.Tensor | None,
+    is_padding: torch.Tensor | None,
+    top_k: int,
+    renormalize: bool,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """One-launch router GEMM + softmax + top-k + block-size-8 align for planned M."""
+    m = hidden_states.shape[0]
+    dev = hidden_states.device
+    n = m * top_k
+    w = torch.empty((m, top_k), dtype=torch.float32, device=dev)
+    ids = torch.empty((m, top_k), dtype=torch.int32, device=dev)
+    sorted_ids = torch.empty((n * BLOCK_SIZE_M,), dtype=torch.int32, device=dev)
+    eids = torch.empty((n,), dtype=torch.int32, device=dev)
+    npost = torch.empty((1,), dtype=torch.int32, device=dev)
+    CALLS["fused_router"] += 1
+    fused_router_align.run(
+        hidden_states,
+        gate_weight,
+        expert_map,
+        is_padding,
+        top_k,
+        bool(renormalize),
+        w,
+        ids,
+        sorted_ids,
+        eids,
+        npost,
+    )
+    return w, ids, sorted_ids, eids, npost
+
+
+def fused_router_route(
+    runner, hidden_states: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """Hook of ``MoERunner._forward_impl``: fuse ``runner.gate`` + route + align."""
+    global _STASH
+    if not fused_router_active() or hidden_states.dim() != 2:
+        return None
+    m, k_dim = hidden_states.shape
+    plan = FUSED_ROUTER_SM86_PLANS.get(m)
+    if plan is None or k_dim != FUSED_ROUTER_HIDDEN:
+        return None
+    import vllm.envs as envs
+
+    if envs.VLLM_BATCH_INVARIANT or runner.enable_dbo:
+        return None
+    gate = runner.gate
+    if not _gate_eligible(gate):
+        return None
+    weight = gate.weight
+    vw = plan[3]
+    if (
+        hidden_states.dtype != torch.bfloat16
+        or not hidden_states.is_cuda
+        or hidden_states.stride(1) != 1
+        or (m > 1 and hidden_states.stride(0) % vw != 0)
+        or not weight.is_cuda
+        or weight.device != hidden_states.device
+        or weight.stride() != (k_dim, 1)
+    ):
+        return None
+    quant_method = runner._quant_method
+    kernel = getattr(quant_method, "moe_kernel", None)
+    if kernel is None:
+        return None
+    experts = kernel.fused_experts
+    if type(experts).__name__ != "MarlinExperts" or experts._lora_context is not None:
+        return None
+
+    router = runner.router
+    expert_map = runner.routed_experts.expert_map
+    topk_indices_dtype = quant_method.topk_indices_dtype
+    from vllm.model_executor.layers.fused_moe.router.fused_topk_router import (
+        FusedTopKRouter,
+        _get_padding_mask,
+    )
+
+    if (
+        type(router) is not FusedTopKRouter
+        or router.scoring_func != "softmax"
+        or router.global_num_experts != NUM_EXPERTS
+        or not (1 <= router.top_k <= MAX_TOPK)
+        or router.eplb_state is not None
+        or router.capture_fn is not None
+        or router._routing_replay_out is not None
+        or topk_indices_dtype not in (None, torch.int32)
+    ):
+        return None
+    dev = hidden_states.device
+    if expert_map is not None and not _plain_i32(expert_map, NUM_EXPERTS, dev):
+        return None
+    pad = _get_padding_mask(m)
+    if pad is not None and not (
+        pad.dtype == torch.bool
+        and pad.dim() == 1
+        and pad.shape[0] == m
+        and pad.device == dev
+        and pad.is_contiguous()
+    ):
+        return None
+    from vllm.model_executor.kernels.linear.cute_dsl.skinny_gemm import (
+        shape_dynamic_skinny_gemm,
+    )
+
+    if not shape_dynamic_skinny_gemm.is_available():
+        return None
+
+    _STASH = None
+    w, ids, sorted_ids, eids, npost = fused_router_route_align(
+        hidden_states, weight, expert_map, pad, router.top_k, router.renormalize
+    )
+    _STASH = (ids, expert_map, NUM_EXPERTS, sorted_ids, eids, npost)
+    return w, ids
 
 
 def take_align(

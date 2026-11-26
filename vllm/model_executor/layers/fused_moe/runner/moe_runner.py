@@ -341,6 +341,12 @@ class MoERunner(MoERunnerInterface):
                 self.moe_config.num_experts,
                 getattr(self.router, "top_k", 0),
             )
+        if lebeche_moe_glue.FUSED_ROUTER_SWITCH and self.gate is not None:
+            lebeche_moe_glue.maybe_register_fused_router_warmup(
+                self.gate,
+                self.moe_config.num_experts,
+                getattr(self.router, "top_k", 0),
+            )
 
     def load_weights(
         self, weights: Iterable[tuple[str, torch.Tensor]]
@@ -670,6 +676,7 @@ class MoERunner(MoERunnerInterface):
         shared_experts_input: torch.Tensor | None,
         input_ids: torch.Tensor | None = None,
         shared_experts_overlapping: bool = False,
+        pre_routed: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor | None, torch.Tensor | UnfinalizedMoEOutput]:
         """Run expert routing and the fused MoE kernel via the quant method.
 
@@ -697,8 +704,8 @@ class MoERunner(MoERunnerInterface):
             # Modular kernels: select experts first, then call routed_experts
             # lebeche fork: a small batch gets routing and block alignment
             # from one kernel (bit-identical); None = stock.
-            routed = None
-            if lebeche_moe_glue.GLUE_SWITCH:
+            routed = pre_routed
+            if routed is None and lebeche_moe_glue.GLUE_SWITCH:
                 routed = lebeche_moe_glue.route(self, hidden_states, router_logits)
             if routed is not None:
                 topk_weights, topk_ids = routed
@@ -996,7 +1003,18 @@ class MoERunner(MoERunnerInterface):
         # If the Runner holds the gate, apply it after the stream sync,
         # so it can run overlapped with the
         # NOTE: in future PR, MoE runner will always hold the gate.
-        if self.gate is not None:
+        pre_routed = None
+        if (
+            lebeche_moe_glue.FUSED_ROUTER_SWITCH
+            and self.gate is not None
+            and not self._fse_fuse_gate
+            and not self.do_naive_dispatch_combine
+            and self.moe_config.pcp_size == 1
+            and not self.routed_experts.quant_method.is_monolithic
+        ):
+            pre_routed = lebeche_moe_glue.fused_router_route(self, hidden_states)
+
+        if pre_routed is None and self.gate is not None:
             if self._fse_fuse_gate:
                 self._maybe_fuse_gate_weights()
                 router_logits = dispatch_unquantized_gemm()(
@@ -1009,10 +1027,11 @@ class MoERunner(MoERunnerInterface):
             # TODO(bnell): parts of the dispatch/combine steps will go away once
             # #32567 lands and the remaining kernels are made MKs.  The PCP
             # code will probably remain
-            hidden_states, router_logits = self._maybe_dispatch(
-                hidden_states,
-                router_logits,
-            )
+            if pre_routed is None:
+                hidden_states, router_logits = self._maybe_dispatch(
+                    hidden_states,
+                    router_logits,
+                )
 
             shared_output, hidden_states = self._apply_quant_method(
                 hidden_states=hidden_states,
@@ -1020,6 +1039,7 @@ class MoERunner(MoERunnerInterface):
                 shared_experts_input=shared_experts_input,
                 input_ids=input_ids,
                 shared_experts_overlapping=shared_experts_overlapping,
+                pre_routed=pre_routed,
             )
 
             return self._maybe_combine(

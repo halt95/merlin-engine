@@ -111,6 +111,7 @@ FN_LEBECHE_QSA_SM86_SPLITK = "MERLIN_LEBECHE_QSA_SM86_SPLITK"  # lebeche fork: s
 FN_LEBECHE_HC_SM86_TUNE = "MERLIN_LEBECHE_HC_SM86_TUNE"  # lebeche fork: sm_8x HC M=4 opb=1 down_silu + dynamic-M CuTe hc_combine_norm, 1 (engine default) / 0 = fbc1a32
 FN_LEBECHE_P2P_ALLGATHER = "MERLIN_LEBECHE_P2P_ALLGATHER"  # lebeche fork: lossless TP=2 PCIe P2P IPC AllGather on sm_8x, 1 (engine default) / 0 = stock PyNccl (vllm/merlin/lebeche_p2p_comm.py)
 FN_LEBECHE_SHARED_GATE_FUSE = "MERLIN_LEBECHE_SHARED_GATE_FUSE"  # lebeche fork: fuse shared_expert_gate (1, 2560) into CuteSharedGateUpSilu, 1 (engine default) / 0 = f332186
+FN_LEBECHE_FUSED_ROUTER = "MERLIN_LEBECHE_FUSED_ROUTER"  # lebeche fork: cooperative single-launch router GEMM (512, 2560) + route + align, 1 (engine default) / 0 = f332186
 FN_LPT_DEFAULT = "512"  # Flash-Next --long-prefill-token-threshold default; LPT=0 = off
 # Flash-Next prefill runs (vllm/merlin/prefill_runs.py), on by default; PREFILL_RUNS=0 = off. The decode share and the
 # per-step cost constants were measured on fn-quad-3090 (A/B runs, 2026-11-11); the other rows use the same values, except
@@ -1890,6 +1891,12 @@ def _build_flash_next(reg, p, checkpoint, ckpt, env, extra, repo: Path) -> Plan:
         raise LaunchError(f"{FN_LEBECHE_SHARED_GATE_FUSE}={shared_gate!r}: use 1 (on, the default) or 0 (f332186)", 2)
     if shared_gate:
         env[FN_LEBECHE_SHARED_GATE_FUSE] = shared_gate
+    # Same rule for cooperative fused router GEMM + route + align (default on; needs MOE_ROUTE_FUSE + MOE_GLUE + SM86_LL).
+    fused_router = (environ_in.get(FN_LEBECHE_FUSED_ROUTER) or "").strip()
+    if fused_router not in ("", "0", "1"):
+        raise LaunchError(f"{FN_LEBECHE_FUSED_ROUTER}={fused_router!r}: use 1 (on, the default) or 0 (f332186)", 2)
+    if fused_router:
+        env[FN_LEBECHE_FUSED_ROUTER] = fused_router
     # The dense Marlin config is forwarded only when a table is given.
     dense_cfg = (environ_in.get("MERLIN_MARLIN_DENSE_CFG") or "").strip()
     if dense_cfg:

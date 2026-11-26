@@ -597,6 +597,13 @@ if TYPE_CHECKING:
     # needs MERLIN_LEBECHE_SHARED_ACT_FUSE and MERLIN_LEBECHE_SM86_LL);
     # 0 = behaviour of commit f332186. Bit-identical at M <= 4. Hashed.
     MERLIN_LEBECHE_SHARED_GATE_FUSE: bool = True
+    # lebeche fork: 1 (default) = fuse MoE router GEMM (512, 2560) + softmax +
+    # top-k + block-size-8 align into one cooperative CuTe-DSL kernel on
+    # sm_80/86/89 for M in {1, 2, 3, 4, 6, 8} (vllm/merlin/lebeche_moe_glue.py;
+    # needs MERLIN_LEBECHE_MOE_ROUTE_FUSE, MERLIN_LEBECHE_MOE_GLUE and
+    # MERLIN_LEBECHE_SM86_LL); 0 = behaviour of commit f332186. Bit-identical
+    # at M <= 4. Hashed.
+    MERLIN_LEBECHE_FUSED_ROUTER: bool = True
     # 1 = fused FWHT/FP8 kernel (bitwise) and
     # tile-skipping IndexPool scoring, stable expansion and RoPE.
     MERLIN_HY4_INDEXER_FAST: str | None = None
@@ -1218,6 +1225,7 @@ MERLIN_ENV: dict[str, Callable[[], Any]] = {
     "MERLIN_LEBECHE_HC_SM86_TUNE": lambda: _e2_strict_switch("MERLIN_LEBECHE_HC_SM86_TUNE", True),
     "MERLIN_LEBECHE_P2P_ALLGATHER": lambda: _e2_strict_switch("MERLIN_LEBECHE_P2P_ALLGATHER", True),
     "MERLIN_LEBECHE_SHARED_GATE_FUSE": lambda: _e2_strict_switch("MERLIN_LEBECHE_SHARED_GATE_FUSE", True),
+    "MERLIN_LEBECHE_FUSED_ROUTER": lambda: _e2_strict_switch("MERLIN_LEBECHE_FUSED_ROUTER", True),
 
     "MERLIN_HY4_INDEXER_FAST": lambda: os.getenv("MERLIN_HY4_INDEXER_FAST", None),
     "MERLIN_HY4_INDEXER_FAST2": lambda: os.getenv("MERLIN_HY4_INDEXER_FAST2", None),
