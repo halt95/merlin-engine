@@ -327,9 +327,16 @@ def _build_cute_gdn_verify_norm_cls():
                 cutlass.Int32, cute.make_layout((4,)), byte_alignment=16
             )
 
-            # Zero CUDA-graph padded tokens [num_actual_tokens, num_padded_tokens)
-            if pid_b == 0 and pid_v == 0 and num_actual_tokens < num_padded_tokens:
-                pt = num_actual_tokens
+            # Zero CUDA-graph padded tokens [live_actual_tokens, num_padded_tokens).
+            # Read gQsl[batch] from device memory so FULL CUDA graph replays with
+            # fewer active tokens than captured never leave torch.empty() garbage.
+            if pid_b == 0 and pid_v == 0:
+                _, grid_b, _ = cute.arch.grid_dim()
+                pt = gQsl[grid_b]
+                if num_actual_tokens < pt:
+                    pt = num_actual_tokens
+                if pt < 0:
+                    pt = cutlass.Int32(0)
                 while pt < num_padded_tokens:
                     gOut[pt, pid_hv, tidx] = cutlass.BFloat16(0.0)
                     pt = pt + 1
@@ -660,8 +667,12 @@ class _GdnFuseRuntime:
                 cutlass.BFloat16, (m, HV, _HEAD_DIM), divisibility=4
             ),
             make_fake_tensor(cutlass.Int32, (mb, HV), divisibility=1),
-            make_fake_tensor(cutlass.Int32, (cute.sym_int(),), divisibility=1),
-            make_fake_tensor(cutlass.Int32, (b,), divisibility=1),
+            make_fake_tensor(
+                cutlass.Int32, (cute.sym_int(),), divisibility=1, leading_dim=None
+            ),
+            make_fake_tensor(
+                cutlass.Int32, (b,), divisibility=1, leading_dim=None
+            ),
             cutlass.Float32(_HEAD_DIM**-0.5),
             cutlass.Float32(1e-6),
             cutlass.Int32(0),
@@ -840,43 +851,76 @@ def try_fused_recoverssm_decode(
     self_kv_cache = layer.kv_cache
     if len(self_kv_cache) < 3:
         return False
+    conv_state_raw = self_kv_cache[0]
     ssm_state = self_kv_cache[1]
     replay_cache = self_kv_cache[2]
 
     spec_qsl = attn_metadata.spec_query_start_loc
     spec_sidx_tensor = attn_metadata.spec_state_indices_tensor
-    if spec_qsl is None or spec_sidx_tensor is None:
+    if (
+        spec_qsl is None
+        or spec_sidx_tensor is None
+        or spec_qsl.ndim != 1
+        or spec_qsl.shape[0] < batch + 1
+        or spec_sidx_tensor.ndim != 2
+        or spec_sidx_tensor.shape[0] < batch
+        or spec_sidx_tensor.shape[1] < 1
+    ):
         return False
     qsl = spec_qsl[: batch + 1]
     sidx = spec_sidx_tensor[:batch, 0]
 
-    # Strict layout, dtype, and 16-byte alignment checks for vectorized copies
+    # Layout, dtype, and 16-byte alignment checks for vectorized copies.
+    # Note:
+    # - MambaBase.bind_kv_cache() slices conv_state, ssm_state, and replay_cache
+    #   out of a single per-block packed page buffer, so ssm_state.stride(0) and
+    #   replay_cache.stride(0) exceed their inner block size (is_contiguous() is
+    #   False). We check inner contiguity plus 16-byte alignment of ssm_state
+    #   (data_ptr % 16 == 0 and stride(0) % 4 == 0) for LDG.E.128.
+    # - GDNRecoverSSMMetadataBuilder slices spec_state_indices_tensor[:, :1]
+    #   from a (max_bs, num_spec + 1) staging buffer, so sidx.stride(0) is
+    #   typically num_spec + 1 (e.g. 4), never 1. CuteGdnVerifyNorm takes
+    #   dynamic strides for both gQsl and gSidx (leading_dim=None).
+    replay_dim = 2 * _HEAD_DIM + 1
     if (
         mixed_qkvz.dtype != torch.bfloat16
         or ba.dtype != torch.bfloat16
         or core_attn_out.dtype != torch.bfloat16
+        or conv_state_raw.dtype != torch.bfloat16
         or ssm_state.dtype != torch.float32
         or replay_cache.dtype != torch.float32
         or layer.A_log.dtype not in (torch.bfloat16, torch.float32)
         or layer.dt_bias.dtype not in (torch.bfloat16, torch.float32)
         or layer.norm.weight.dtype not in (torch.bfloat16, torch.float32)
+        or mixed_qkvz.ndim != 2
         or tuple(mixed_qkvz.shape) != (num_padded_tokens, qkv_dim + z_dim)
+        or mixed_qkvz.stride(1) != 1
+        or (mixed_qkvz.stride(0) % 4) != 0
+        or ba.ndim != 2
+        or ba.shape[0] != num_padded_tokens
+        or ba.stride(1) != 1
         or tuple(core_attn_out.shape) != (num_padded_tokens, HV, _HEAD_DIM)
-        or tuple(ssm_state.shape[1:]) != (HV, _HEAD_DIM, _HEAD_DIM)
-        or tuple(replay_cache.shape)
-        != (ssm_state.shape[0], HV, spec_len, 2 * _HEAD_DIM + 1)
-        or not mixed_qkvz.is_contiguous()
-        or not ba.is_contiguous()
         or not core_attn_out.is_contiguous()
-        or not ssm_state.is_contiguous()
-        or not replay_cache.is_contiguous()
+        or ssm_state.ndim != 4
+        or tuple(ssm_state.shape[1:]) != (HV, _HEAD_DIM, _HEAD_DIM)
+        or ssm_state.stride()[1:] != (_HEAD_DIM * _HEAD_DIM, _HEAD_DIM, 1)
+        or ssm_state.stride(0) < 0
+        or (ssm_state.stride(0) % 4) != 0
+        or replay_cache.ndim != 4
+        or tuple(replay_cache.shape)
+        != (ssm_state.shape[0], HV, spec_len, replay_dim)
+        or replay_cache.stride()[1:] != (spec_len * replay_dim, replay_dim, 1)
+        or replay_cache.stride(0) < 0
+        or tuple(layer.A_log.shape) != (HV,)
+        or tuple(layer.dt_bias.shape) != (HV,)
+        or tuple(layer.norm.weight.shape) != (_HEAD_DIM,)
         or not layer.A_log.is_contiguous()
         or not layer.dt_bias.is_contiguous()
         or not layer.norm.weight.is_contiguous()
         or qsl.dtype != torch.int32
         or sidx.dtype != torch.int32
-        or qsl.stride(0) != 1
-        or sidx.stride(0) != 1
+        or qsl.stride(0) < 1
+        or sidx.stride(0) < 1
         or (mixed_qkvz.data_ptr() % 16) != 0
         or (core_attn_out.data_ptr() % 16) != 0
         or (ssm_state.data_ptr() % 16) != 0
@@ -889,14 +933,14 @@ def try_fused_recoverssm_decode(
     else:
         ba_b_off = 0
         ba_a_off = HV
-    if ba.ndim != 2 or ba.shape[0] != num_padded_tokens or ba.shape[1] < ba_a_off + HV:
+    if ba.shape[1] < ba_a_off + HV:
         return False
 
     # 1. Causal conv1d update in-place into mixed_qkvz[:num_actual_tokens, :qkv_dim]
     conv_state = (
-        self_kv_cache[0]
+        conv_state_raw
         if is_conv_state_dim_first()
-        else self_kv_cache[0].transpose(-1, -2)
+        else conv_state_raw.transpose(-1, -2)
     )
     conv_weights = layer.conv1d.weight.view(
         layer.conv1d.weight.size(0), layer.conv1d.weight.size(2)
@@ -909,7 +953,7 @@ def try_fused_recoverssm_decode(
         layer.activation,
         conv_state_indices=sidx,
         num_accepted_tokens=attn_metadata.num_accepted_tokens,
-        query_start_loc=spec_qsl,
+        query_start_loc=qsl,
         max_query_len=spec_len,
         validate_data=False,
     )
