@@ -1,3 +1,4 @@
+from typing import Any
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
@@ -117,6 +118,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         self.symm_mem_comm: SymmMemCommunicator | None = None
         self.fi_ar_comm: FlashInferAllReduce | None = None
         self.fi_pcie_ipc_ar_comm: FlashInferPcieIpcAllReduce | None = None
+        self.lebeche_p2p_ag_comm: Any | None = None
         self.aiter_ar_comm: AiterCustomAllreduce | None = None
         self.use_aiter_ag_rs: bool = False
 
@@ -144,6 +146,23 @@ class CudaCommunicator(DeviceCommunicatorBase):
             self.fi_pcie_ipc_ar_comm = FlashInferPcieIpcAllReduce(
                 group=self.device_group,
                 tune_group=self.cpu_group,
+                device=self.device,
+            )
+
+        use_ubatching = bool(
+            getattr(getattr(config, "parallel_config", None), "use_ubatching", False)
+        )
+        if (
+            unique_name.split(":")[0] == "tp"
+            and self.world_size == 2
+            and current_platform.is_cuda()
+            and not use_ubatching
+            and envs.MERLIN_LEBECHE_P2P_ALLGATHER
+        ):
+            from vllm.merlin.lebeche_p2p_comm import LebecheP2pAllGather
+
+            self.lebeche_p2p_ag_comm = LebecheP2pAllGather(
+                group=self.cpu_group,
                 device=self.device,
             )
 
@@ -466,6 +485,10 @@ class CudaCommunicator(DeviceCommunicatorBase):
             dim += input_.dim()
         if dim == 0 and should_nccl_symm_mem_ag_rs():
             return self._all_gather_symm_mem(input_.contiguous())
+
+        lebeche_p2p_ag = self.lebeche_p2p_ag_comm
+        if lebeche_p2p_ag is not None and lebeche_p2p_ag.should_use(input_, dim):
+            return lebeche_p2p_ag.all_gather(input_, dim)
 
         pynccl_comm = self.pynccl_comm
         if pynccl_comm is None or pynccl_comm.disabled:
@@ -818,6 +841,9 @@ class CudaCommunicator(DeviceCommunicatorBase):
         if self.fi_pcie_ipc_ar_comm is not None:
             self.fi_pcie_ipc_ar_comm.destroy()
             self.fi_pcie_ipc_ar_comm = None
+        if self.lebeche_p2p_ag_comm is not None:
+            self.lebeche_p2p_ag_comm.destroy()
+            self.lebeche_p2p_ag_comm = None
         if self.all2all_manager is not None:
             self.all2all_manager.destroy()
             self.all2all_manager = None  # type: ignore[assignment]

@@ -587,6 +587,11 @@ if TYPE_CHECKING:
     # (vllm/models/qwen4_exp/nvidia/hc_small_fused.py); 0 = fbc1a32.
     # Needs MERLIN_LEBECHE_SM86_LL on an sm_80/86/89 device. Hashed.
     MERLIN_LEBECHE_HC_SM86_TUNE: bool = True
+    # lebeche fork: 1 (default) = lossless TP=2 PCIe P2P CUDA-IPC AllGather
+    # (CuTe-DSL Atomic64 <=64 KiB + Flag128 <=8 MiB) on sm_8x
+    # (vllm/merlin/lebeche_p2p_comm.py); 0 = stock PyNccl. Inert on non-sm_8x,
+    # world_size != 2, or without P2P. Hashed.
+    MERLIN_LEBECHE_P2P_ALLGATHER: bool = True
     # 1 = fused FWHT/FP8 kernel (bitwise) and
     # tile-skipping IndexPool scoring, stable expansion and RoPE.
     MERLIN_HY4_INDEXER_FAST: str | None = None
@@ -1206,6 +1211,7 @@ MERLIN_ENV: dict[str, Callable[[], Any]] = {
     "MERLIN_LEBECHE_QSA_FUSE_PREPARE": lambda: _e2_strict_switch("MERLIN_LEBECHE_QSA_FUSE_PREPARE", True),
     "MERLIN_LEBECHE_QSA_SM86_SPLITK": lambda: _e2_strict_switch("MERLIN_LEBECHE_QSA_SM86_SPLITK", True),
     "MERLIN_LEBECHE_HC_SM86_TUNE": lambda: _e2_strict_switch("MERLIN_LEBECHE_HC_SM86_TUNE", True),
+    "MERLIN_LEBECHE_P2P_ALLGATHER": lambda: _e2_strict_switch("MERLIN_LEBECHE_P2P_ALLGATHER", True),
 
     "MERLIN_HY4_INDEXER_FAST": lambda: os.getenv("MERLIN_HY4_INDEXER_FAST", None),
     "MERLIN_HY4_INDEXER_FAST2": lambda: os.getenv("MERLIN_HY4_INDEXER_FAST2", None),
