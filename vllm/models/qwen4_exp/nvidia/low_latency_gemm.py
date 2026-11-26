@@ -21,6 +21,14 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     UnquantizedEmbeddingMethod,
 )
+from vllm.merlin.lebeche_mtp_gemm import (
+    MTP_FC_SHAPE,
+    MTP_TC_MAX_M,
+    MTP_TC_MIN_M,
+    mtp_tc_gemm,
+    mtp_tc_gemm_active,
+    warmup_mtp_tc_gemm,
+)
 from vllm.merlin.lebeche_sm86 import (
     SM86_LL_CAPABILITIES,
     SM86_LL_EXTRA_SWITCH,
@@ -478,10 +486,30 @@ class Qwen4ExpLowLatencyEmbeddingMethod(
 
 
 def _qwen4_exp_low_latency_gemm(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    shape = (weight.shape[0], weight.shape[1])
+    if (
+        shape == MTP_FC_SHAPE
+        and mtp_tc_gemm_active()
+        and not envs.VLLM_BATCH_INVARIANT
+        and _is_packed_row_major(weight)
+        and x.dtype == torch.bfloat16
+        and weight.dtype == torch.bfloat16
+        and x.is_cuda
+        and weight.is_cuda
+        and x.device == weight.device
+        and x.shape[-1] == weight.shape[1]
+    ):
+        if x.dim() == 2 and x.is_contiguous() and MTP_TC_MIN_M <= x.shape[0] <= MTP_TC_MAX_M:
+            return mtp_tc_gemm(x, weight)
+        if x.dim() > 2 and x.is_contiguous():
+            x_2d = x.view(-1, x.shape[-1])
+            if MTP_TC_MIN_M <= x_2d.shape[0] <= MTP_TC_MAX_M:
+                return mtp_tc_gemm(x_2d, weight).view(*x.shape[:-1], weight.shape[0])
+
     plans = QWEN4_EXP_GEMM_PLANS_BY_CAPABILITY.get(
         current_platform.get_device_capability(), {}
     )
-    plan = plans.get((weight.shape[0], weight.shape[1]))
+    plan = plans.get(shape)
     if plan is not None:
         if x.dim() == 2:
             config = plan.get(x.shape[0])
@@ -557,6 +585,8 @@ def enable_qwen4_exp_low_latency_gemm(
 
     if warmup_configs:
         shape_dynamic_skinny_gemm.request_warmup_configs(dtype, warmup_configs)
+    if mtp_tc_gemm_active():
+        warmup_mtp_tc_gemm()
 
     # lebeche fork: fused small-M HC epilogues on top of the patched Linears.
     from .hc_small_fused import enable_qwen4_exp_hc_small_fused

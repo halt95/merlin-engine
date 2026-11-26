@@ -610,6 +610,11 @@ if TYPE_CHECKING:
     # indexer with max_visible <= block_topk skip
     # (vllm/merlin/lebeche_qsa_fuse.py); 0 = f332186. Bit-exact. Hashed.
     MERLIN_LEBECHE_QSA_CHAIN_FUSE: bool = True
+    # lebeche fork: 1 (default) = sm_80/86 1-pass Triton Tensor-Core GEMM for
+    # MTP fc_hidden (1280, 2560) at 5 <= M_flat <= 32, eliminating CUTLASS +
+    # cublasLt::splitKreduce on MTP step 0 (vllm/merlin/lebeche_mtp_gemm.py);
+    # 0 = f332186. Hashed.
+    MERLIN_LEBECHE_MTP_LL_EXTRA: bool = True
     # 1 = fused FWHT/FP8 kernel (bitwise) and
     # tile-skipping IndexPool scoring, stable expansion and RoPE.
     MERLIN_HY4_INDEXER_FAST: str | None = None
@@ -1233,6 +1238,7 @@ MERLIN_ENV: dict[str, Callable[[], Any]] = {
     "MERLIN_LEBECHE_SHARED_GATE_FUSE": lambda: _e2_strict_switch("MERLIN_LEBECHE_SHARED_GATE_FUSE", True),
     "MERLIN_LEBECHE_FUSED_ROUTER": lambda: _e2_strict_switch("MERLIN_LEBECHE_FUSED_ROUTER", True),
     "MERLIN_LEBECHE_QSA_CHAIN_FUSE": lambda: _e2_strict_switch("MERLIN_LEBECHE_QSA_CHAIN_FUSE", True),
+    "MERLIN_LEBECHE_MTP_LL_EXTRA": lambda: _e2_strict_switch("MERLIN_LEBECHE_MTP_LL_EXTRA", True),
 
     "MERLIN_HY4_INDEXER_FAST": lambda: os.getenv("MERLIN_HY4_INDEXER_FAST", None),
     "MERLIN_HY4_INDEXER_FAST2": lambda: os.getenv("MERLIN_HY4_INDEXER_FAST2", None),
